@@ -1,0 +1,111 @@
+package db
+
+import (
+	"context"
+	"database/sql"
+	"os"
+	"path/filepath"
+	"runtime"
+	"testing"
+	"time"
+)
+
+func TestLoadMigrationsSortsSQLFiles(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{
+		"002_second.sql": "select 2;",
+		"001_first.sql":  "select 1;",
+		"README.md":      "ignore me",
+	}
+	for name, contents := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	migrations, err := LoadMigrations(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(migrations) != 2 {
+		t.Fatalf("expected 2 migrations, got %d", len(migrations))
+	}
+	if migrations[0].Name != "001_first.sql" || migrations[1].Name != "002_second.sql" {
+		t.Fatalf("migrations not sorted: %+v", migrations)
+	}
+}
+
+func TestOpenAndApplyMigrationsAgainstSQLite(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-test.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+		t.Fatal(err)
+	}
+
+	assertPragmaInt(t, database, "foreign_keys", 1)
+	assertPragmaInt(t, database, "busy_timeout", int((5 * time.Second).Milliseconds()))
+	assertPragmaText(t, database, "journal_mode", "wal")
+
+	var applied int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = ?`, "0001_initial").Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected initial migration to be recorded once, got %d", applied)
+	}
+
+	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = ?`, "0001_initial").Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected idempotent migration record, got %d", applied)
+	}
+
+	_, err = database.ExecContext(ctx, `INSERT INTO sessions(id, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)`, "missing-user", 999, time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339))
+	if err == nil {
+		t.Fatal("expected foreign-key violation for session with missing user")
+	}
+}
+
+func projectMigrationsDir(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	return filepath.Join(filepath.Dir(file), "..", "..", "migrations")
+}
+
+func assertPragmaInt(t *testing.T, database *sql.DB, name string, want int) {
+	t.Helper()
+	var got int
+	if err := database.QueryRow("PRAGMA " + name).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("PRAGMA %s: want %d, got %d", name, want, got)
+	}
+}
+
+func assertPragmaText(t *testing.T, database *sql.DB, name string, want string) {
+	t.Helper()
+	var got string
+	if err := database.QueryRow("PRAGMA " + name).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("PRAGMA %s: want %q, got %q", name, want, got)
+	}
+}

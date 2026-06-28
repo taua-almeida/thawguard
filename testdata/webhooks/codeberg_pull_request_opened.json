@@ -1,0 +1,18 @@
+{
+  "action": "opened",
+  "repository": {
+    "id": 1001,
+    "owner": { "login": "example-owner" },
+    "name": "example-repo",
+    "full_name": "example-owner/example-repo",
+    "clone_url": "https://codeberg.org/example-owner/example-repo.git"
+  },
+  "pull_request": {
+    "number": 42,
+    "title": "Example bug fix",
+    "state": "open",
+    "html_url": "https://codeberg.org/example-owner/example-repo/pulls/42",
+    "base": { "ref": "main" },
+    "head": { "sha": "0123456789abcdef0123456789abcdef01234567" }
+  }
+}

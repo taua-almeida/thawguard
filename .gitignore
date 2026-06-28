@@ -1,0 +1,14 @@
+# Build outputs
+/bin/
+/dist/
+/tmp/
+
+# Local runtime state
+*.db
+*.db-shm
+*.db-wal
+.env
+
+# Editor/OS noise
+.DS_Store
+*.swp
