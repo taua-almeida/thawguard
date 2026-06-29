@@ -8,7 +8,7 @@ import (
 
 	"github.com/taua-almeida/thawguard/internal/config"
 	"github.com/taua-almeida/thawguard/internal/db"
-	"github.com/taua-almeida/thawguard/internal/repository"
+	"github.com/taua-almeida/thawguard/internal/repositorysetup"
 	"github.com/taua-almeida/thawguard/internal/web"
 )
 
@@ -42,7 +42,7 @@ func (a *App) Run(ctx context.Context) error {
 		return err
 	}
 
-	repositoryStore := repository.NewStore(database)
+	repositoryStore := repositorysetup.NewService(database)
 	server := &http.Server{
 		Addr:              a.cfg.HTTPAddr,
 		Handler:           web.NewServer(web.Config{AppName: "Thawguard", RepositoryStore: repositoryStore}).Routes(),

@@ -72,11 +72,23 @@ func TestStoreRejectsMissingRequiredFields(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t, ctx)
 
-	if _, err := store.Create(ctx, CreateParams{Name: "repo"}); err == nil {
+	if _, err := store.Create(ctx, CreateParams{Name: "repo"}); !IsValidationError(err) {
 		t.Fatal("expected missing owner error")
 	}
-	if _, err := store.Create(ctx, CreateParams{Owner: "example"}); err == nil {
+	if _, err := store.Create(ctx, CreateParams{Owner: "example"}); !IsValidationError(err) {
 		t.Fatal("expected missing name error")
+	}
+}
+
+func TestStoreRejectsDuplicateRepositoryAsValidationError(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	params := CreateParams{Owner: "taua-almeida", Name: "thawguard"}
+	if _, err := store.Create(ctx, params); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(ctx, params); !IsValidationError(err) {
+		t.Fatalf("expected duplicate validation error, got %v", err)
 	}
 }
 

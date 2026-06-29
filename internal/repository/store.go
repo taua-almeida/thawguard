@@ -11,9 +11,26 @@ import (
 	"github.com/taua-almeida/thawguard/internal/domain"
 )
 
+type database interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 type Store struct {
-	db  *sql.DB
+	db  database
 	now func() time.Time
+}
+
+type ValidationError struct {
+	Message string
+}
+
+func (e ValidationError) Error() string { return e.Message }
+
+func IsValidationError(err error) bool {
+	var validationErr ValidationError
+	return errors.As(err, &validationErr)
 }
 
 type CreateParams struct {
@@ -25,6 +42,20 @@ type CreateParams struct {
 }
 
 func NewStore(db *sql.DB) *Store {
+	if db == nil {
+		return newStore(nil)
+	}
+	return newStore(db)
+}
+
+func NewStoreTx(tx *sql.Tx) *Store {
+	if tx == nil {
+		return newStore(nil)
+	}
+	return newStore(tx)
+}
+
+func newStore(db database) *Store {
 	return &Store{db: db, now: func() time.Time { return time.Now().UTC() }}
 }
 
@@ -42,15 +73,31 @@ func (s *Store) Create(ctx context.Context, params CreateParams) (domain.Reposit
 	nowText := now.Format(time.RFC3339Nano)
 	result, err := s.db.ExecContext(ctx, `
 INSERT INTO repositories(forge, base_url, owner, name, default_branch, active, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, 1, ?, ?)`, params.Forge, params.BaseURL, params.Owner, params.Name, params.DefaultBranch, nowText, nowText)
+	VALUES (?, ?, ?, ?, ?, 1, ?, ?)`, params.Forge, params.BaseURL, params.Owner, params.Name, params.DefaultBranch, nowText, nowText)
 	if err != nil {
-		return domain.Repository{}, fmt.Errorf("create repository: %w", err)
+		return domain.Repository{}, createRepositoryError(err)
 	}
 	id, err := result.LastInsertId()
 	if err != nil {
 		return domain.Repository{}, fmt.Errorf("created repository id: %w", err)
 	}
 	return s.Get(ctx, id)
+}
+
+func createRepositoryError(err error) error {
+	if isDuplicateRepositoryError(err) {
+		return ValidationError{Message: "repository already exists"}
+	}
+	return fmt.Errorf("create repository: %w", err)
+}
+
+func isDuplicateRepositoryError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "UNIQUE constraint failed: repositories.forge, repositories.base_url, repositories.owner, repositories.name") ||
+		strings.Contains(message, "constraint failed: UNIQUE constraint failed: repositories")
 }
 
 func (s *Store) Get(ctx context.Context, id int64) (domain.Repository, error) {
@@ -119,7 +166,7 @@ func validateCreateParams(params CreateParams) error {
 		missing = append(missing, "name")
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("missing required repository fields: %s", strings.Join(missing, ", "))
+		return ValidationError{Message: fmt.Sprintf("missing required repository fields: %s", strings.Join(missing, ", "))}
 	}
 	return nil
 }

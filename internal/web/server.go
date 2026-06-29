@@ -17,7 +17,7 @@ type Config struct {
 
 type RepositoryStore interface {
 	List(ctx context.Context) ([]domain.Repository, error)
-	Create(ctx context.Context, params repository.CreateParams) (domain.Repository, error)
+	Create(ctx context.Context, params repository.CreateParams, actor domain.Actor) (domain.Repository, error)
 }
 
 type Server struct {
@@ -95,8 +95,12 @@ func (s *Server) handleCreateRepository(w http.ResponseWriter, r *http.Request) 
 		Owner:         r.PostFormValue("owner"),
 		Name:          r.PostFormValue("name"),
 		DefaultBranch: r.PostFormValue("default_branch"),
-	})
+	}, session.auditActor())
 	if err != nil {
+		if !repository.IsValidationError(err) {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 		repositories, listErr := s.repositories(r.Context())
 		if listErr != nil {
 			http.Error(w, listErr.Error(), http.StatusInternalServerError)

@@ -25,6 +25,14 @@ type Repository struct {
 	UpdatedAt     time.Time
 }
 
+type Actor struct {
+	UserID *int64
+	Kind   string
+	Role   string
+}
+
+const ActorKindBootstrapAdmin = "bootstrap_admin"
+
 func (r Repository) FullName() string {
 	if r.Owner == "" {
 		return r.Name

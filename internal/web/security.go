@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/taua-almeida/thawguard/internal/auth"
+	"github.com/taua-almeida/thawguard/internal/domain"
 )
 
 const (
@@ -24,6 +25,10 @@ type sessionState struct {
 	CSRFToken string
 	Role      auth.Role
 	ExpiresAt time.Time
+}
+
+func (s sessionState) auditActor() domain.Actor {
+	return domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: string(s.Role)}
 }
 
 type sessionStore struct {

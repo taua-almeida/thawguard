@@ -58,6 +58,12 @@ func TestCreateRepositoryPostsToStore(t *testing.T) {
 	if store.created[0].Owner != "taua-almeida" || store.created[0].Name != "thawguard" {
 		t.Fatalf("unexpected create params: %+v", store.created[0])
 	}
+	if len(store.actors) != 1 {
+		t.Fatalf("expected 1 actor, got %d", len(store.actors))
+	}
+	if store.actors[0].Kind != domain.ActorKindBootstrapAdmin || store.actors[0].Role != "admin" {
+		t.Fatalf("unexpected actor: %+v", store.actors[0])
+	}
 }
 
 func TestCreateRepositoryRejectsMissingCSRFSession(t *testing.T) {
@@ -144,14 +150,16 @@ var csrfInputPattern = regexp.MustCompile(`name="` + csrfFormField + `" value="(
 type fakeRepositoryStore struct {
 	repositories []domain.Repository
 	created      []repository.CreateParams
+	actors       []domain.Actor
 }
 
 func (s *fakeRepositoryStore) List(ctx context.Context) ([]domain.Repository, error) {
 	return s.repositories, nil
 }
 
-func (s *fakeRepositoryStore) Create(ctx context.Context, params repository.CreateParams) (domain.Repository, error) {
+func (s *fakeRepositoryStore) Create(ctx context.Context, params repository.CreateParams, actor domain.Actor) (domain.Repository, error) {
 	s.created = append(s.created, params)
+	s.actors = append(s.actors, actor)
 	repo := domain.Repository{ID: int64(len(s.repositories) + 1), Forge: params.Forge, BaseURL: params.BaseURL, Owner: params.Owner, Name: params.Name, DefaultBranch: params.DefaultBranch, Active: true}
 	s.repositories = append(s.repositories, repo)
 	return repo, nil
