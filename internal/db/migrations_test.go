@@ -79,6 +79,39 @@ func TestOpenAndApplyMigrationsAgainstSQLite(t *testing.T) {
 	}
 }
 
+func TestApplyMigrationsAddsSetupChecksToExistingInitialDatabase(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-test.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	if _, err := database.ExecContext(ctx, ensureMigrationsTableSQL); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)`, "0001_initial", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+		t.Fatal(err)
+	}
+	assertTableExists(t, database, "setup_checks")
+
+	var applied int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = ?`, "0002_setup_checks").Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected setup checks migration to be recorded once, got %d", applied)
+	}
+}
+
 func projectMigrationsDir(t *testing.T) string {
 	t.Helper()
 	_, file, _, ok := runtime.Caller(0)
@@ -107,5 +140,13 @@ func assertPragmaText(t *testing.T, database *sql.DB, name string, want string) 
 	}
 	if got != want {
 		t.Fatalf("PRAGMA %s: want %q, got %q", name, want, got)
+	}
+}
+
+func assertTableExists(t *testing.T, database *sql.DB, name string) {
+	t.Helper()
+	var found string
+	if err := database.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, name).Scan(&found); err != nil {
+		t.Fatalf("expected table %s to exist: %v", name, err)
 	}
 }

@@ -2,15 +2,18 @@ package web
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/repository"
+	"github.com/taua-almeida/thawguard/internal/setupcheck"
 )
 
 func TestRepositoriesPageShowsManualSetupContext(t *testing.T) {
@@ -105,6 +108,115 @@ func TestCreateRepositoryRejectsInvalidCSRFToken(t *testing.T) {
 	}
 }
 
+func TestRepositoriesPageShowsSetupHealthResults(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	checkedAt := time.Date(2026, 6, 29, 14, 0, 0, 0, time.UTC)
+	server := NewServer(Config{
+		AppName:         "Thawguard",
+		RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}},
+		SetupCheckStore: &fakeSetupCheckStore{checks: map[int64][]setupcheck.Check{
+			repo.ID: {
+				{RepositoryID: repo.ID, Branch: "main", Result: setupcheck.Result{Name: "Bot can post statuses", Status: setupcheck.StatusOK, Description: "Thawguard can post statuses."}, CheckedAt: checkedAt},
+				{RepositoryID: repo.ID, Branch: "main", Result: setupcheck.Result{Name: "Pull request webhook configured", Status: setupcheck.StatusFailed, Description: "Webhook missing.", Remediation: "Configure a pull_request webhook."}, CheckedAt: checkedAt},
+			},
+		}},
+	})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{"Bot can post statuses", "ok", "Pull request webhook configured", "failed", "Record local setup placeholder", "placeholders until live Forgejo/Codeberg verification"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected body to contain %q, got %q", want, body)
+		}
+	}
+}
+
+func TestRunRepositorySetupCheckPostsToRunner(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	runner := &fakeSetupCheckRunner{}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, SetupCheckRunner: runner})
+	form := url.Values{"repository_id": {"1"}}
+	cookie, csrfToken := getRepositoryForm(t, server)
+	form.Set(csrfFormField, csrfToken)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/repositories/setup-check", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect, got %d", recorder.Code)
+	}
+	if len(runner.repositories) != 1 || runner.repositories[0].ID != repo.ID {
+		t.Fatalf("expected setup check for repository %d, got %+v", repo.ID, runner.repositories)
+	}
+}
+
+func TestRunRepositorySetupCheckRejectsMissingCSRFSession(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	runner := &fakeSetupCheckRunner{}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, SetupCheckRunner: runner})
+	form := url.Values{"repository_id": {"1"}}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/repositories/setup-check", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected forbidden status, got %d", recorder.Code)
+	}
+	if len(runner.repositories) != 0 {
+		t.Fatalf("expected no setup check runs, got %d", len(runner.repositories))
+	}
+}
+
+func TestRunRepositorySetupCheckRejectsInvalidCSRFToken(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	runner := &fakeSetupCheckRunner{}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, SetupCheckRunner: runner})
+	form := url.Values{"repository_id": {"1"}}
+	cookie, _ := getRepositoryForm(t, server)
+	form.Set(csrfFormField, "not-the-session-token")
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/repositories/setup-check", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected forbidden status, got %d", recorder.Code)
+	}
+	if len(runner.repositories) != 0 {
+		t.Fatalf("expected no setup check runs, got %d", len(runner.repositories))
+	}
+}
+
+func TestRunRepositorySetupCheckReportsRunnerError(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	runner := &fakeSetupCheckRunner{err: errors.New("setup check failed")}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, SetupCheckRunner: runner})
+	form := url.Values{"repository_id": {"1"}}
+	cookie, csrfToken := getRepositoryForm(t, server)
+	form.Set(csrfFormField, csrfToken)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/repositories/setup-check", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("expected bad gateway status, got %d", recorder.Code)
+	}
+}
+
 func repositoryCreateForm() url.Values {
 	return url.Values{
 		"forge":          {"forgejo"},
@@ -151,6 +263,27 @@ type fakeRepositoryStore struct {
 	repositories []domain.Repository
 	created      []repository.CreateParams
 	actors       []domain.Actor
+}
+
+type fakeSetupCheckStore struct {
+	checks map[int64][]setupcheck.Check
+}
+
+func (s *fakeSetupCheckStore) ListByRepository(ctx context.Context, repositoryID int64) ([]setupcheck.Check, error) {
+	return s.checks[repositoryID], nil
+}
+
+type fakeSetupCheckRunner struct {
+	repositories []domain.Repository
+	err          error
+}
+
+func (r *fakeSetupCheckRunner) Run(ctx context.Context, repo domain.Repository) ([]setupcheck.Result, error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+	r.repositories = append(r.repositories, repo)
+	return setupcheck.Evaluate(setupcheck.Report{}), nil
 }
 
 func (s *fakeRepositoryStore) List(ctx context.Context) ([]domain.Repository, error) {
