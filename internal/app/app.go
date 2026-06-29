@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/taua-almeida/thawguard/internal/config"
+	"github.com/taua-almeida/thawguard/internal/db"
+	"github.com/taua-almeida/thawguard/internal/repository"
 	"github.com/taua-almeida/thawguard/internal/web"
 )
 
@@ -26,9 +28,24 @@ func New(cfg config.Config, logger *slog.Logger) *App {
 }
 
 func (a *App) Run(ctx context.Context) error {
+	database, err := db.Open(ctx, db.DefaultConfig(a.cfg.DatabasePath))
+	if err != nil {
+		return err
+	}
+	defer database.Close()
+
+	migrations, err := db.LoadMigrations(db.DefaultMigrationsDir)
+	if err != nil {
+		return err
+	}
+	if err := db.ApplyMigrations(ctx, database, migrations); err != nil {
+		return err
+	}
+
+	repositoryStore := repository.NewStore(database)
 	server := &http.Server{
 		Addr:              a.cfg.HTTPAddr,
-		Handler:           web.NewServer(web.Config{AppName: "Thawguard"}).Routes(),
+		Handler:           web.NewServer(web.Config{AppName: "Thawguard", RepositoryStore: repositoryStore}).Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

@@ -14,12 +14,22 @@ const (
 )
 
 type Repository struct {
-	ID          int64
-	Forge       string
-	Owner       string
-	Name        string
-	DefaultBase string
-	Active      bool
+	ID            int64
+	Forge         string
+	BaseURL       string
+	Owner         string
+	Name          string
+	DefaultBranch string
+	Active        bool
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}
+
+func (r Repository) FullName() string {
+	if r.Owner == "" {
+		return r.Name
+	}
+	return r.Owner + "/" + r.Name
 }
 
 type PullRequest struct {

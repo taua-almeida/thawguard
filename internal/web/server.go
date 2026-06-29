@@ -1,12 +1,23 @@
 package web
 
 import (
-	"fmt"
+	"context"
+	"html/template"
 	"net/http"
+
+	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/repository"
+	"github.com/taua-almeida/thawguard/internal/setupcheck"
 )
 
 type Config struct {
-	AppName string
+	AppName         string
+	RepositoryStore RepositoryStore
+}
+
+type RepositoryStore interface {
+	List(ctx context.Context) ([]domain.Repository, error)
+	Create(ctx context.Context, params repository.CreateParams) (domain.Repository, error)
 }
 
 type Server struct {
@@ -30,6 +41,8 @@ func (s *Server) Routes() http.Handler {
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
 	s.mux.HandleFunc("GET /", s.handleDashboard)
+	s.mux.HandleFunc("GET /repositories", s.handleRepositories)
+	s.mux.HandleFunc("POST /repositories", s.handleCreateRepository)
 	s.mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.Dir("web/static"))))
 }
 
@@ -39,24 +52,142 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
+	repositories, err := s.repositories(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.render(w, dashboardTemplate, map[string]any{
+		"AppName":         s.cfg.AppName,
+		"RepositoryCount": len(repositories),
+	})
+}
+
+func (s *Server) handleRepositories(w http.ResponseWriter, r *http.Request) {
+	repositories, err := s.repositories(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.renderRepositories(w, repositories, "")
+}
+
+func (s *Server) handleCreateRepository(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.RepositoryStore == nil {
+		http.Error(w, "repository store is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	_, err := s.cfg.RepositoryStore.Create(r.Context(), repository.CreateParams{
+		Forge:         r.PostFormValue("forge"),
+		BaseURL:       r.PostFormValue("base_url"),
+		Owner:         r.PostFormValue("owner"),
+		Name:          r.PostFormValue("name"),
+		DefaultBranch: r.PostFormValue("default_branch"),
+	})
+	if err != nil {
+		repositories, listErr := s.repositories(r.Context())
+		if listErr != nil {
+			http.Error(w, listErr.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusBadRequest)
+		s.renderRepositories(w, repositories, err.Error())
+		return
+	}
+	http.Redirect(w, r, "/repositories", http.StatusSeeOther)
+}
+
+func (s *Server) repositories(ctx context.Context) ([]domain.Repository, error) {
+	if s.cfg.RepositoryStore == nil {
+		return nil, nil
+	}
+	return s.cfg.RepositoryStore.List(ctx)
+}
+
+func (s *Server) renderRepositories(w http.ResponseWriter, repositories []domain.Repository, formError string) {
+	s.render(w, repositoriesTemplate, map[string]any{
+		"AppName":         s.cfg.AppName,
+		"Repositories":    repositories,
+		"FormError":       formError,
+		"RequiredContext": domain.RequiredStatusContext,
+		"SetupSteps":      setupcheck.ManualSetupSteps(),
+	})
+}
+
+func (s *Server) render(w http.ResponseWriter, source string, data any) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = fmt.Fprintf(w, `<!doctype html>
+	tpl, err := template.New("page").Parse(source)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	_ = tpl.Execute(w, data)
+}
+
+const pageHead = `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>%s</title>
+  <title>{{ .AppName }}</title>
   <link rel="stylesheet" href="/static/thawguard.css">
 </head>
-<body>
+<body>`
+
+const pageFoot = `</body></html>`
+
+const dashboardTemplate = pageHead + `
   <main class="shell">
     <section class="hero">
       <div class="pixel-shield" aria-hidden="true"></div>
       <p class="eyebrow">Freeze branches. Thaw exceptions.</p>
-      <h1>%s scaffold is running</h1>
-      <p>Next implementation step: wire repositories, setup health, freeze policy, jobs, and audit events behind this server-rendered UI.</p>
+      <h1>{{ .AppName }} foundation is running</h1>
+      <p>{{ .RepositoryCount }} repositories are configured. Next implementation step: setup health, freeze policy, jobs, and audit events.</p>
+      <p><a class="button" href="/repositories">Manage repositories</a></p>
     </section>
-  </main>
-</body>
-</html>`, s.cfg.AppName, s.cfg.AppName)
-}
+  </main>` + pageFoot
+
+const repositoriesTemplate = pageHead + `
+  <main class="shell stack">
+    <nav class="topnav"><a href="/">Dashboard</a></nav>
+    <section class="panel">
+      <p class="eyebrow">Repositories</p>
+      <h1>Add repository</h1>
+      <p>Start with Forgejo/Codeberg repositories. Manual setup must require the exact status context <code>{{ .RequiredContext }}</code>.</p>
+      {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
+      <form method="post" action="/repositories" class="form-grid">
+        <label>Forge <input name="forge" value="forgejo"></label>
+        <label>Base URL <input name="base_url" value="https://codeberg.org"></label>
+        <label>Owner <input name="owner" required></label>
+        <label>Repository <input name="name" required></label>
+        <label>Default branch <input name="default_branch" value="main"></label>
+        <button type="submit">Add repository</button>
+      </form>
+    </section>
+
+    <section class="panel">
+      <h2>Configured repositories</h2>
+      {{ if .Repositories }}
+      <table>
+        <thead><tr><th>Repository</th><th>Forge</th><th>Default branch</th><th>Required context</th></tr></thead>
+        <tbody>
+        {{ range .Repositories }}
+          <tr><td>{{ .FullName }}</td><td>{{ .Forge }}</td><td>{{ .DefaultBranch }}</td><td><code>` + domain.RequiredStatusContext + `</code></td></tr>
+        {{ end }}
+        </tbody>
+      </table>
+      {{ else }}
+      <p>No repositories configured yet.</p>
+      {{ end }}
+    </section>
+
+    <section class="panel">
+      <h2>Manual setup checklist</h2>
+      <ol>{{ range .SetupSteps }}<li>{{ . }}</li>{{ end }}</ol>
+    </section>
+  </main>` + pageFoot

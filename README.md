@@ -6,7 +6,7 @@ Thawguard is a self-hosted branch-freeze controller for Forgejo/Codeberg-first t
 
 ## Status
 
-Early local scaffold. Not ready for production use.
+Early Milestone 1 foundation. Not ready for production use.
 
 ## Important boundary
 
@@ -20,6 +20,13 @@ go run ./cmd/thawguard
 ```
 
 The service listens on `:8080` by default. Override with `THAWGUARD_HTTP_ADDR`.
+
+The service creates `thawguard.db` by default. Override with `THAWGUARD_DB_PATH`.
+
+Current local pages:
+
+- `/` dashboard
+- `/repositories` repository setup form and manual setup checklist
 
 ## License
 
