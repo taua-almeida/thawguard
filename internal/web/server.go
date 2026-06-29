@@ -2,11 +2,13 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"html/template"
 	"net/http"
 	"strconv"
 	"strings"
 
+	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/freeze"
 	"github.com/taua-almeida/thawguard/internal/repository"
@@ -19,6 +21,7 @@ type Config struct {
 	SetupCheckStore  SetupCheckStore
 	SetupCheckRunner SetupCheckRunner
 	FreezeStore      FreezeStore
+	AuditStore       AuditStore
 }
 
 type RepositoryStore interface {
@@ -41,6 +44,10 @@ type FreezeStore interface {
 	Cancel(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error)
 }
 
+type AuditStore interface {
+	ListBySubjectType(ctx context.Context, subjectType string, limit int) ([]audit.Event, error)
+}
+
 type repositoryView struct {
 	Repository  domain.Repository
 	SetupChecks []setupcheck.Check
@@ -49,6 +56,18 @@ type repositoryView struct {
 type freezeView struct {
 	Freeze     domain.BranchFreeze
 	Repository domain.Repository
+}
+
+type freezeAuditView struct {
+	Action       string
+	SubjectID    string
+	RepositoryID string
+	Repository   domain.Repository
+	Branch       string
+	Status       string
+	Reason       string
+	Actor        string
+	CreatedAt    string
 }
 
 type Server struct {
@@ -172,12 +191,12 @@ func (s *Server) handleFreezes(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "create session", http.StatusInternalServerError)
 		return
 	}
-	repositories, freezes, err := s.freezePageData(r.Context())
+	repositories, freezes, auditEvents, err := s.freezePageData(r.Context())
 	if err != nil {
 		internalServerError(w)
 		return
 	}
-	s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), "", session.CSRFToken)
+	s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), auditEvents, "", session.CSRFToken)
 }
 
 func (s *Server) handleCreateFreeze(w http.ResponseWriter, r *http.Request) {
@@ -204,14 +223,14 @@ func (s *Server) handleCreateFreeze(w http.ResponseWriter, r *http.Request) {
 			internalServerError(w)
 			return
 		}
-		repositories, freezes, dataErr := s.freezePageData(r.Context())
+		repositories, freezes, auditEvents, dataErr := s.freezePageData(r.Context())
 		if dataErr != nil {
 			internalServerError(w)
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
-		s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), err.Error(), session.CSRFToken)
+		s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), auditEvents, err.Error(), session.CSRFToken)
 		return
 	}
 	http.Redirect(w, r, "/freezes", http.StatusSeeOther)
@@ -244,14 +263,14 @@ func (s *Server) handleCloseFreeze(w http.ResponseWriter, r *http.Request, close
 			internalServerError(w)
 			return
 		}
-		repositories, freezes, dataErr := s.freezePageData(r.Context())
+		repositories, freezes, auditEvents, dataErr := s.freezePageData(r.Context())
 		if dataErr != nil {
 			internalServerError(w)
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
-		s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), err.Error(), session.CSRFToken)
+		s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), auditEvents, err.Error(), session.CSRFToken)
 		return
 	}
 	http.Redirect(w, r, "/freezes", http.StatusSeeOther)
@@ -355,16 +374,20 @@ func (s *Server) activeFreezes(ctx context.Context) ([]domain.BranchFreeze, erro
 	return s.cfg.FreezeStore.ListActive(ctx)
 }
 
-func (s *Server) freezePageData(ctx context.Context) ([]domain.Repository, []domain.BranchFreeze, error) {
+func (s *Server) freezePageData(ctx context.Context) ([]domain.Repository, []domain.BranchFreeze, []freezeAuditView, error) {
 	repositories, err := s.repositories(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	freezes, err := s.activeFreezes(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return repositories, freezes, nil
+	auditEvents, err := s.freezeAuditViews(ctx, repositories)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return repositories, freezes, auditEvents, nil
 }
 
 func (s *Server) freezeViews(repositories []domain.Repository, freezes []domain.BranchFreeze) []freezeView {
@@ -377,6 +400,73 @@ func (s *Server) freezeViews(repositories []domain.Repository, freezes []domain.
 		views = append(views, freezeView{Freeze: freeze, Repository: repositoriesByID[freeze.RepositoryID]})
 	}
 	return views
+}
+
+func (s *Server) freezeAuditViews(ctx context.Context, repositories []domain.Repository) ([]freezeAuditView, error) {
+	if s.cfg.AuditStore == nil {
+		return nil, nil
+	}
+	events, err := s.cfg.AuditStore.ListBySubjectType(ctx, audit.SubjectTypeBranchFreeze, 50)
+	if err != nil {
+		return nil, err
+	}
+	repositoriesByID := repositoriesByID(repositories)
+	views := make([]freezeAuditView, 0, len(events))
+	for _, event := range events {
+		if !isFreezeAuditAction(event.Action) {
+			continue
+		}
+		view := freezeAuditView{
+			Action:    event.Action,
+			SubjectID: event.SubjectID,
+			CreatedAt: event.CreatedAt.UTC().Format("2006-01-02 15:04 UTC"),
+		}
+		var details map[string]string
+		if err := json.Unmarshal([]byte(event.DetailsJSON), &details); err == nil {
+			view.RepositoryID = details["repository_id"]
+			view.Branch = details["branch"]
+			view.Status = details["status"]
+			view.Reason = details["reason"]
+			view.Actor = actorLabel(details["actor_kind"], details["actor_role"])
+			if repositoryID, err := strconv.ParseInt(details["repository_id"], 10, 64); err == nil {
+				view.Repository = repositoriesByID[repositoryID]
+			}
+		}
+		views = append(views, view)
+	}
+	return views, nil
+}
+
+func isFreezeAuditAction(action string) bool {
+	switch action {
+	case audit.ActionBranchFreezeCreated, audit.ActionBranchFreezeEnded, audit.ActionBranchFreezeCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+func repositoriesByID(repositories []domain.Repository) map[int64]domain.Repository {
+	byID := make(map[int64]domain.Repository, len(repositories))
+	for _, repo := range repositories {
+		byID[repo.ID] = repo
+	}
+	return byID
+}
+
+func actorLabel(kind string, role string) string {
+	kind = strings.TrimSpace(kind)
+	role = strings.TrimSpace(role)
+	if kind == "" && role == "" {
+		return "unknown"
+	}
+	if role == "" {
+		return kind
+	}
+	if kind == "" {
+		return role
+	}
+	return kind + " (" + role + ")"
 }
 
 func (s *Server) repositoryByID(ctx context.Context, id int64) (domain.Repository, bool, error) {
@@ -434,11 +524,12 @@ func (s *Server) renderRepositories(w http.ResponseWriter, views []repositoryVie
 	})
 }
 
-func (s *Server) renderFreezes(w http.ResponseWriter, repositories []domain.Repository, freezes []freezeView, formError string, csrfToken string) {
+func (s *Server) renderFreezes(w http.ResponseWriter, repositories []domain.Repository, freezes []freezeView, auditEvents []freezeAuditView, formError string, csrfToken string) {
 	s.render(w, freezesTemplate, map[string]any{
 		"AppName":      s.cfg.AppName,
 		"Repositories": repositories,
 		"Freezes":      freezes,
+		"AuditEvents":  auditEvents,
 		"FormError":    formError,
 		"CSRFToken":    csrfToken,
 	})
@@ -604,6 +695,30 @@ const freezesTemplate = pageHead + `
       </table>
       {{ else }}
       <p>No active freezes yet.</p>
+      {{ end }}
+    </section>
+
+    <section class="panel">
+      <h2>Recent freeze audit events</h2>
+      {{ if .AuditEvents }}
+      <table>
+        <thead><tr><th>When</th><th>Action</th><th>Repository</th><th>Branch</th><th>Status</th><th>Actor</th><th>Reason</th></tr></thead>
+        <tbody>
+        {{ range .AuditEvents }}
+          <tr>
+            <td>{{ .CreatedAt }}</td>
+            <td><code>{{ .Action }}</code></td>
+            <td>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .RepositoryID }}{{ end }}</td>
+            <td>{{ .Branch }}</td>
+            <td>{{ .Status }}</td>
+            <td>{{ .Actor }}</td>
+            <td>{{ .Reason }}</td>
+          </tr>
+        {{ end }}
+        </tbody>
+      </table>
+      {{ else }}
+      <p>No freeze audit events yet.</p>
       {{ end }}
     </section>
   </main>` + pageFoot

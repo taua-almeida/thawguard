@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/freeze"
 	"github.com/taua-almeida/thawguard/internal/repository"
@@ -222,10 +223,18 @@ func TestRunRepositorySetupCheckReportsRunnerError(t *testing.T) {
 func TestFreezesPageShowsRepositoriesAndActiveFreezes(t *testing.T) {
 	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "dev"}
 	activeFreeze := domain.BranchFreeze{ID: 1, RepositoryID: repo.ID, Branch: "dev", Status: domain.BranchFreezeStatusActive, Active: true, Reason: "QA freeze"}
+	auditEvent := audit.Event{
+		Action:      audit.ActionBranchFreezeCreated,
+		SubjectType: audit.SubjectTypeBranchFreeze,
+		SubjectID:   "1",
+		DetailsJSON: `{"actor_kind":"bootstrap_admin","actor_role":"admin","repository_id":"1","branch":"dev","status":"active","reason":"QA freeze"}`,
+		CreatedAt:   time.Date(2026, 6, 29, 15, 30, 0, 0, time.UTC),
+	}
 	server := NewServer(Config{
 		AppName:         "Thawguard",
 		RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}},
 		FreezeStore:     &fakeFreezeStore{freezes: []domain.BranchFreeze{activeFreeze}},
+		AuditStore:      &fakeAuditStore{events: []audit.Event{auditEvent}},
 	})
 
 	recorder := httptest.NewRecorder()
@@ -240,10 +249,81 @@ func TestFreezesPageShowsRepositoriesAndActiveFreezes(t *testing.T) {
 	if token := csrfTokenFromBody(t, body); token == "" {
 		t.Fatal("expected CSRF token in freeze form")
 	}
-	for _, want := range []string{"Create active freeze", "taua-almeida/thawguard", "default dev", "QA freeze", "Freeze branch", "End freeze", "Cancel"} {
+	for _, want := range []string{"Create active freeze", "taua-almeida/thawguard", "default dev", "QA freeze", "Freeze branch", "End freeze", "Cancel", "Recent freeze audit events", "branch_freeze.created", "bootstrap_admin (admin)", "2026-06-29 15:30 UTC"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
+	}
+}
+
+func TestFreezesPageHidesNonFreezeAuditEvents(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	server := NewServer(Config{
+		AppName:         "Thawguard",
+		RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}},
+		FreezeStore:     &fakeFreezeStore{},
+		AuditStore: &fakeAuditStore{events: []audit.Event{
+			{Action: audit.ActionRepositoryCreated, SubjectType: audit.SubjectTypeRepository, SubjectID: "1", DetailsJSON: `{"owner":"taua-almeida","name":"thawguard"}`, CreatedAt: time.Date(2026, 6, 29, 15, 30, 0, 0, time.UTC)},
+		}},
+	})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/freezes", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	if strings.Contains(body, audit.ActionRepositoryCreated) {
+		t.Fatalf("expected repository audit events to be hidden, got %q", body)
+	}
+	if !strings.Contains(body, "No freeze audit events yet.") {
+		t.Fatalf("expected empty freeze audit state, got %q", body)
+	}
+}
+
+func TestFreezesPageHidesUnknownFreezeAuditActions(t *testing.T) {
+	server := NewServer(Config{
+		AppName:     "Thawguard",
+		FreezeStore: &fakeFreezeStore{},
+		AuditStore: &fakeAuditStore{events: []audit.Event{
+			{Action: "branch_freeze.internal", SubjectType: audit.SubjectTypeBranchFreeze, SubjectID: "1", DetailsJSON: `{"branch":"main"}`, CreatedAt: time.Date(2026, 6, 29, 15, 30, 0, 0, time.UTC)},
+		}},
+	})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/freezes", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	if strings.Contains(body, "branch_freeze.internal") {
+		t.Fatalf("expected unknown freeze action to be hidden, got %q", body)
+	}
+	if !strings.Contains(body, "No freeze audit events yet.") {
+		t.Fatalf("expected empty freeze audit state, got %q", body)
+	}
+}
+
+func TestFreezesPageDoesNotRenderRawAuditJSON(t *testing.T) {
+	server := NewServer(Config{
+		AppName:     "Thawguard",
+		FreezeStore: &fakeFreezeStore{},
+		AuditStore: &fakeAuditStore{events: []audit.Event{
+			{Action: audit.ActionBranchFreezeCreated, SubjectType: audit.SubjectTypeBranchFreeze, SubjectID: "1", DetailsJSON: `not-json-with-secret-token`, CreatedAt: time.Date(2026, 6, 29, 15, 30, 0, 0, time.UTC)},
+		}},
+	})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/freezes", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	if strings.Contains(body, "secret-token") || strings.Contains(body, "not-json") {
+		t.Fatalf("expected raw audit JSON to be hidden, got %q", body)
+	}
+	if !strings.Contains(body, audit.ActionBranchFreezeCreated) {
+		t.Fatalf("expected audit action to still render, got %q", body)
 	}
 }
 
@@ -571,6 +651,29 @@ func (s *fakeSetupCheckStore) ListByRepository(ctx context.Context, repositoryID
 type fakeSetupCheckRunner struct {
 	repositories []domain.Repository
 	err          error
+}
+
+type fakeAuditStore struct {
+	events               []audit.Event
+	err                  error
+	requestedSubjectType string
+}
+
+func (s *fakeAuditStore) ListBySubjectType(ctx context.Context, subjectType string, limit int) ([]audit.Event, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	s.requestedSubjectType = subjectType
+	filtered := make([]audit.Event, 0, len(s.events))
+	for _, event := range s.events {
+		if event.SubjectType == subjectType {
+			filtered = append(filtered, event)
+		}
+	}
+	if limit > 0 && len(filtered) > limit {
+		return filtered[:limit], nil
+	}
+	return filtered, nil
 }
 
 type fakeFreezeStore struct {

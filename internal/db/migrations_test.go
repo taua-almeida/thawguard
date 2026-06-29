@@ -106,6 +106,15 @@ CREATE TABLE branch_freezes (
   created_by INTEGER,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+CREATE TABLE audit_events (
+  id INTEGER PRIMARY KEY,
+  actor_user_id INTEGER,
+  action TEXT NOT NULL,
+  subject_type TEXT NOT NULL,
+  subject_id TEXT NOT NULL,
+  details_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
 );`); err != nil {
 		t.Fatal(err)
 	}
@@ -130,6 +139,7 @@ CREATE TABLE branch_freezes (
 		t.Fatalf("expected setup checks migration to be recorded once, got %d", applied)
 	}
 	assertIndexExists(t, database, "idx_branch_freezes_one_active")
+	assertIndexExists(t, database, "idx_audit_events_subject_type_id")
 }
 
 func projectMigrationsDir(t *testing.T) string {

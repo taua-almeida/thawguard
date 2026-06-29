@@ -112,6 +112,42 @@ LIMIT ?`, limit)
 	return events, nil
 }
 
+func (s *Store) ListBySubjectType(ctx context.Context, subjectType string, limit int) ([]Event, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("audit store has no database")
+	}
+	if subjectType == "" {
+		return nil, errors.New("audit event subject type is required")
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, actor_user_id, action, subject_type, subject_id, details_json, created_at
+FROM audit_events
+WHERE subject_type = ?
+ORDER BY id DESC
+LIMIT ?`, subjectType, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list audit events by subject type: %w", err)
+	}
+	defer rows.Close()
+
+	events := make([]Event, 0)
+	for rows.Next() {
+		event, err := scanEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list audit events by subject type rows: %w", err)
+	}
+	return events, nil
+}
+
 func normalizeEvent(event Event, now time.Time) Event {
 	if event.DetailsJSON == "" {
 		event.DetailsJSON = "{}"

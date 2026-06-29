@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"testing"
 	"time"
 
@@ -99,6 +100,41 @@ func TestStoreDefaultsDetailsAndCreatedAt(t *testing.T) {
 	}
 	if events[0].ActorUserID != nil {
 		t.Fatalf("expected nil actor user id, got %+v", events[0].ActorUserID)
+	}
+}
+
+func TestStoreListsAuditEventsBySubjectType(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	createdAt := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return createdAt }
+
+	if err := store.Record(ctx, Event{Action: ActionBranchFreezeCreated, SubjectType: SubjectTypeBranchFreeze, SubjectID: "freeze-1"}); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 60 {
+		if err := store.Record(ctx, Event{Action: ActionRepositoryCreated, SubjectType: SubjectTypeRepository, SubjectID: strconv.Itoa(i + 1)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	events, err := store.ListBySubjectType(ctx, SubjectTypeBranchFreeze, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 branch-freeze audit event, got %d", len(events))
+	}
+	if events[0].SubjectType != SubjectTypeBranchFreeze || events[0].SubjectID != "freeze-1" {
+		t.Fatalf("unexpected audit event: %+v", events[0])
+	}
+}
+
+func TestStoreRejectsMissingSubjectTypeFilter(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	if _, err := store.ListBySubjectType(ctx, "", 10); err == nil {
+		t.Fatal("expected missing subject type error")
 	}
 }
 
