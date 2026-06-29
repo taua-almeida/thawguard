@@ -9,6 +9,11 @@
 *.db-wal
 .env
 
+# Local tool versions; go.mod is the public Go version signal.
+.mise.toml
+.mise.local.toml
+mise.local.toml
+
 # Editor/OS noise
 .DS_Store
 *.swp
