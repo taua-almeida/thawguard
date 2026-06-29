@@ -41,6 +41,13 @@ type CreateParams struct {
 	DefaultBranch string
 }
 
+type RemoteParams struct {
+	Forge   string
+	BaseURL string
+	Owner   string
+	Name    string
+}
+
 func NewStore(db *sql.DB) *Store {
 	if db == nil {
 		return newStore(nil)
@@ -138,6 +145,28 @@ ORDER BY owner, name`)
 	return repositories, nil
 }
 
+func (s *Store) FindActiveByRemote(ctx context.Context, params RemoteParams) (domain.Repository, bool, error) {
+	if s == nil || s.db == nil {
+		return domain.Repository{}, false, errors.New("repository store has no database")
+	}
+	params = normalizeRemoteParams(params)
+	if params.Forge == "" || params.BaseURL == "" || params.Owner == "" || params.Name == "" {
+		return domain.Repository{}, false, ValidationError{Message: "missing required repository remote fields"}
+	}
+	row := s.db.QueryRowContext(ctx, `
+SELECT id, forge, base_url, owner, name, default_branch, active, created_at, updated_at
+FROM repositories
+	WHERE forge = ? AND base_url = ? AND owner = ? AND name = ? AND active = 1`, params.Forge, params.BaseURL, params.Owner, params.Name)
+	repo, err := scanRepository(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return domain.Repository{}, false, nil
+		}
+		return domain.Repository{}, false, err
+	}
+	return repo, true, nil
+}
+
 func normalizeCreateParams(params CreateParams) CreateParams {
 	params.Forge = strings.ToLower(strings.TrimSpace(params.Forge))
 	params.BaseURL = strings.TrimRight(strings.TrimSpace(params.BaseURL), "/")
@@ -153,6 +182,17 @@ func normalizeCreateParams(params CreateParams) CreateParams {
 	}
 	if params.DefaultBranch == "" {
 		params.DefaultBranch = "main"
+	}
+	return params
+}
+
+func normalizeRemoteParams(params RemoteParams) RemoteParams {
+	params.Forge = strings.ToLower(strings.TrimSpace(params.Forge))
+	params.BaseURL = strings.TrimRight(strings.TrimSpace(params.BaseURL), "/")
+	params.Owner = strings.TrimSpace(params.Owner)
+	params.Name = strings.TrimSpace(params.Name)
+	if params.Forge == "" {
+		params.Forge = "forgejo"
 	}
 	return params
 }

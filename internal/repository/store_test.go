@@ -92,6 +92,34 @@ func TestStoreRejectsDuplicateRepositoryAsValidationError(t *testing.T) {
 	}
 }
 
+func TestStoreFindsActiveRepositoryByRemote(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	created, err := store.Create(ctx, CreateParams{Forge: "Forgejo", BaseURL: "https://codeberg.org/", Owner: "example-owner", Name: "example-repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found, ok, err := store.FindActiveByRemote(ctx, RemoteParams{Forge: "forgejo", BaseURL: "https://codeberg.org/", Owner: "example-owner", Name: "example-repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected repository to be found")
+	}
+	if found.ID != created.ID {
+		t.Fatalf("expected repository %d, got %d", created.ID, found.ID)
+	}
+
+	_, ok, err = store.FindActiveByRemote(ctx, RemoteParams{Forge: "forgejo", BaseURL: "https://codeberg.org", Owner: "example-owner", Name: "missing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("expected missing repository not to be found")
+	}
+}
+
 func newTestStore(t *testing.T, ctx context.Context) *Store {
 	t.Helper()
 	database, err := db.Open(ctx, db.DefaultConfig(filepath.Join(t.TempDir(), "thawguard-test.db")))

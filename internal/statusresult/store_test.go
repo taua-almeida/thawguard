@@ -116,6 +116,59 @@ func TestServiceRunLocalAllowsUnfrozenBranch(t *testing.T) {
 	}
 }
 
+func TestServiceRunForPullRequestPersistsDecision(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	freezeService := freeze.NewService(database)
+	if _, err := freezeService.CreateActive(ctx, freeze.CreateParams{RepositoryID: repo.ID, Branch: "main", Reason: "release"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(NewStore(database), freezeService)
+
+	result, err := service.RunForPullRequest(ctx, domain.PullRequest{RepositoryID: repo.ID, Index: 42, State: "open", TargetBranch: "main", HeadSHA: "ABC123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State != domain.CommitStatusFailure || result.TargetBranch != "main" || result.HeadSHA != "abc123" {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+}
+
+func TestServiceRunForSharedHeadFailsIfAnyOpenPullRequestIsFrozen(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	freezeService := freeze.NewService(database)
+	if _, err := freezeService.CreateActive(ctx, freeze.CreateParams{RepositoryID: repo.ID, Branch: "release", Reason: "release"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(NewStore(database), freezeService)
+
+	result, err := service.RunForSharedHead(ctx, []domain.PullRequest{
+		{RepositoryID: repo.ID, Index: 1, State: "open", TargetBranch: "main", HeadSHA: "abc123"},
+		{RepositoryID: repo.ID, Index: 2, State: "open", TargetBranch: "release", HeadSHA: "abc123"},
+	}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State != domain.CommitStatusFailure || result.PullRequestIndex != 2 || result.TargetBranch != "release" {
+		t.Fatalf("expected shared-head failure on frozen PR, got %+v", result)
+	}
+}
+
+func TestServiceRunForSharedHeadRejectsClosedPullRequest(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	service := NewService(NewStore(database), freeze.NewService(database))
+
+	_, err := service.RunForSharedHead(ctx, []domain.PullRequest{{RepositoryID: repo.ID, Index: 1, State: "closed", TargetBranch: "main", HeadSHA: "abc123"}}, 1)
+	if !IsValidationError(err) {
+		t.Fatalf("expected validation error, got %v", err)
+	}
+}
+
 func TestServiceRunLocalRejectsMissingFields(t *testing.T) {
 	ctx := context.Background()
 	database := newTestDB(t, ctx)
