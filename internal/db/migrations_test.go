@@ -133,6 +133,7 @@ CREATE TABLE audit_events (
 	assertTableExists(t, database, "status_results")
 	assertColumnExists(t, database, "status_results", "target_branch")
 	assertTableExists(t, database, "pull_request_cache")
+	assertTableExists(t, database, "status_publication_intents")
 
 	var applied int
 	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = ?`, "0002_setup_checks").Scan(&applied); err != nil {
@@ -152,6 +153,12 @@ CREATE TABLE audit_events (
 	}
 	if applied != 1 {
 		t.Fatalf("expected pull request cache migration to be recorded once, got %d", applied)
+	}
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = ?`, "0007_status_publication_intents").Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected status publication intents migration to be recorded once, got %d", applied)
 	}
 	assertIndexExists(t, database, "idx_branch_freezes_one_active")
 	assertIndexExists(t, database, "idx_audit_events_subject_type_id")

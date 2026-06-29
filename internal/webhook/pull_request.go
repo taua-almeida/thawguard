@@ -11,6 +11,7 @@ import (
 
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/repository"
+	"github.com/taua-almeida/thawguard/internal/statuspublication"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
 )
 
@@ -28,6 +29,7 @@ type PullRequestProcessResult struct {
 	Repository    domain.Repository
 	PullRequest   domain.PullRequest
 	StatusResults []statusresult.Result
+	Publications  []statuspublication.Publication
 	Recomputed    bool
 }
 
@@ -45,10 +47,15 @@ type StatusRunner interface {
 	RunForSharedHead(ctx context.Context, prs []domain.PullRequest, preferredIndex int) (statusresult.Result, error)
 }
 
+type StatusPublisher interface {
+	Publish(ctx context.Context, result statusresult.Result) (statuspublication.Publication, error)
+}
+
 type PullRequestProcessor struct {
 	repositories RepositoryFinder
 	cache        PullRequestCache
 	statuses     StatusRunner
+	publisher    StatusPublisher
 }
 
 type ValidationError struct {
@@ -62,12 +69,12 @@ func IsValidationError(err error) bool {
 	return errors.As(err, &validationErr)
 }
 
-func NewPullRequestProcessor(repositories RepositoryFinder, cache PullRequestCache, statuses StatusRunner) *PullRequestProcessor {
-	return &PullRequestProcessor{repositories: repositories, cache: cache, statuses: statuses}
+func NewPullRequestProcessor(repositories RepositoryFinder, cache PullRequestCache, statuses StatusRunner, publisher StatusPublisher) *PullRequestProcessor {
+	return &PullRequestProcessor{repositories: repositories, cache: cache, statuses: statuses, publisher: publisher}
 }
 
 func (p *PullRequestProcessor) Process(ctx context.Context, body []byte) (PullRequestProcessResult, error) {
-	if p == nil || p.repositories == nil || p.cache == nil || p.statuses == nil {
+	if p == nil || p.repositories == nil || p.cache == nil || p.statuses == nil || p.publisher == nil {
 		return PullRequestProcessResult{}, errors.New("pull request processor is not configured")
 	}
 	event, err := ParsePullRequestEvent(body)
@@ -88,11 +95,15 @@ func (p *PullRequestProcessor) Process(ctx context.Context, body []byte) (PullRe
 	if err != nil {
 		return PullRequestProcessResult{}, err
 	}
-	cached, err := p.cache.Upsert(ctx, pr)
+	plans, err := p.recomputePlans(ctx, repo.ID, pr, previous, previousFound)
 	if err != nil {
 		return PullRequestProcessResult{}, err
 	}
-	results, err := p.recomputeSharedHeads(ctx, repo.ID, cached, previous, previousFound)
+	results, publications, err := p.recomputeAndPublish(ctx, plans)
+	if err != nil {
+		return PullRequestProcessResult{}, err
+	}
+	cached, err := p.cache.Upsert(ctx, pr)
 	if err != nil {
 		return PullRequestProcessResult{}, err
 	}
@@ -100,7 +111,7 @@ func (p *PullRequestProcessor) Process(ctx context.Context, body []byte) (PullRe
 		return PullRequestProcessResult{Event: event, Repository: repo, PullRequest: cached}, nil
 	}
 
-	return PullRequestProcessResult{Event: event, Repository: repo, PullRequest: cached, StatusResults: results, Recomputed: true}, nil
+	return PullRequestProcessResult{Event: event, Repository: repo, PullRequest: cached, StatusResults: results, Publications: publications, Recomputed: true}, nil
 }
 
 func (p *PullRequestProcessor) previousPullRequest(ctx context.Context, repositoryID int64, index int) (domain.PullRequest, bool, error) {
@@ -114,36 +125,62 @@ func (p *PullRequestProcessor) previousPullRequest(ctx context.Context, reposito
 	return previous, true, nil
 }
 
-func (p *PullRequestProcessor) recomputeSharedHeads(ctx context.Context, repositoryID int64, cached domain.PullRequest, previous domain.PullRequest, previousFound bool) ([]statusresult.Result, error) {
-	results := make([]statusresult.Result, 0, 2)
-	if status, ok, err := p.recomputeSharedHead(ctx, repositoryID, cached.HeadSHA, cached.Index); err != nil {
-		return nil, err
-	} else if ok {
-		results = append(results, status)
-	}
-	if previousFound && previous.IsOpen() && previous.HeadSHA != cached.HeadSHA {
-		if status, ok, err := p.recomputeSharedHead(ctx, repositoryID, previous.HeadSHA, previous.Index); err != nil {
-			return nil, err
-		} else if ok {
-			results = append(results, status)
-		}
-	}
-	return results, nil
+type recomputePlan struct {
+	PullRequests   []domain.PullRequest
+	PreferredIndex int
 }
 
-func (p *PullRequestProcessor) recomputeSharedHead(ctx context.Context, repositoryID int64, headSHA string, preferredIndex int) (statusresult.Result, bool, error) {
+func (p *PullRequestProcessor) recomputePlans(ctx context.Context, repositoryID int64, current domain.PullRequest, previous domain.PullRequest, previousFound bool) ([]recomputePlan, error) {
+	plans := make([]recomputePlan, 0, 2)
+	if prs, err := p.openPullRequestsForHead(ctx, repositoryID, current.HeadSHA, current); err != nil {
+		return nil, err
+	} else if len(prs) > 0 {
+		plans = append(plans, recomputePlan{PullRequests: prs, PreferredIndex: current.Index})
+	}
+	if previousFound && previous.IsOpen() && previous.HeadSHA != current.HeadSHA {
+		if prs, err := p.openPullRequestsForHead(ctx, repositoryID, previous.HeadSHA, current); err != nil {
+			return nil, err
+		} else if len(prs) > 0 {
+			plans = append(plans, recomputePlan{PullRequests: prs, PreferredIndex: previous.Index})
+		}
+	}
+	return plans, nil
+}
+
+func (p *PullRequestProcessor) openPullRequestsForHead(ctx context.Context, repositoryID int64, headSHA string, current domain.PullRequest) ([]domain.PullRequest, error) {
 	openPRs, err := p.cache.ListOpenByHead(ctx, repositoryID, headSHA)
 	if err != nil {
-		return statusresult.Result{}, false, err
+		return nil, err
 	}
-	if len(openPRs) == 0 {
-		return statusresult.Result{}, false, nil
+	filtered := make([]domain.PullRequest, 0, len(openPRs)+1)
+	for _, pr := range openPRs {
+		if pr.Index == current.Index {
+			continue
+		}
+		filtered = append(filtered, pr)
 	}
-	status, err := p.statuses.RunForSharedHead(ctx, openPRs, preferredIndex)
-	if err != nil {
-		return statusresult.Result{}, false, err
+	if current.IsOpen() && current.HeadSHA == headSHA {
+		filtered = append(filtered, current)
 	}
-	return status, true, nil
+	return filtered, nil
+}
+
+func (p *PullRequestProcessor) recomputeAndPublish(ctx context.Context, plans []recomputePlan) ([]statusresult.Result, []statuspublication.Publication, error) {
+	results := make([]statusresult.Result, 0, len(plans))
+	publications := make([]statuspublication.Publication, 0, len(plans))
+	for _, plan := range plans {
+		status, err := p.statuses.RunForSharedHead(ctx, plan.PullRequests, plan.PreferredIndex)
+		if err != nil {
+			return nil, nil, err
+		}
+		publication, err := p.publisher.Publish(ctx, status)
+		if err != nil {
+			return nil, nil, err
+		}
+		results = append(results, status)
+		publications = append(publications, publication)
+	}
+	return results, publications, nil
 }
 
 func ParsePullRequestEvent(body []byte) (PullRequestEvent, error) {
