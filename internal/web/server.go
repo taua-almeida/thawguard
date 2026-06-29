@@ -21,15 +21,16 @@ type RepositoryStore interface {
 }
 
 type Server struct {
-	cfg Config
-	mux *http.ServeMux
+	cfg      Config
+	mux      *http.ServeMux
+	sessions *sessionStore
 }
 
 func NewServer(cfg Config) *Server {
 	if cfg.AppName == "" {
 		cfg.AppName = "Thawguard"
 	}
-	s := &Server{cfg: cfg, mux: http.NewServeMux()}
+	s := &Server{cfg: cfg, mux: http.NewServeMux(), sessions: newSessionStore()}
 	s.routes()
 	return s
 }
@@ -64,12 +65,18 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRepositories(w http.ResponseWriter, r *http.Request) {
+	session, err := s.sessions.getOrCreate(w, r)
+	if err != nil {
+		http.Error(w, "create session", http.StatusInternalServerError)
+		return
+	}
+
 	repositories, err := s.repositories(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.renderRepositories(w, repositories, "")
+	s.renderRepositories(w, repositories, "", session.CSRFToken)
 }
 
 func (s *Server) handleCreateRepository(w http.ResponseWriter, r *http.Request) {
@@ -77,10 +84,11 @@ func (s *Server) handleCreateRepository(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "repository store is not configured", http.StatusServiceUnavailable)
 		return
 	}
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	session, ok := s.requireRepositoryManagerForm(w, r)
+	if !ok {
 		return
 	}
+
 	_, err := s.cfg.RepositoryStore.Create(r.Context(), repository.CreateParams{
 		Forge:         r.PostFormValue("forge"),
 		BaseURL:       r.PostFormValue("base_url"),
@@ -96,10 +104,31 @@ func (s *Server) handleCreateRepository(w http.ResponseWriter, r *http.Request) 
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
-		s.renderRepositories(w, repositories, err.Error())
+		s.renderRepositories(w, repositories, err.Error(), session.CSRFToken)
 		return
 	}
 	http.Redirect(w, r, "/repositories", http.StatusSeeOther)
+}
+
+func (s *Server) requireRepositoryManagerForm(w http.ResponseWriter, r *http.Request) (sessionState, bool) {
+	session, ok := s.sessions.get(r)
+	if !ok {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return sessionState{}, false
+	}
+	if !session.Role.CanManageRepositories() {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return sessionState{}, false
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return sessionState{}, false
+	}
+	if !constantTimeTokenEqual(r.PostForm.Get(csrfFormField), session.CSRFToken) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return sessionState{}, false
+	}
+	return session, true
 }
 
 func (s *Server) repositories(ctx context.Context) ([]domain.Repository, error) {
@@ -109,11 +138,12 @@ func (s *Server) repositories(ctx context.Context) ([]domain.Repository, error) 
 	return s.cfg.RepositoryStore.List(ctx)
 }
 
-func (s *Server) renderRepositories(w http.ResponseWriter, repositories []domain.Repository, formError string) {
+func (s *Server) renderRepositories(w http.ResponseWriter, repositories []domain.Repository, formError string, csrfToken string) {
 	s.render(w, repositoriesTemplate, map[string]any{
 		"AppName":         s.cfg.AppName,
 		"Repositories":    repositories,
 		"FormError":       formError,
+		"CSRFToken":       csrfToken,
 		"RequiredContext": domain.RequiredStatusContext,
 		"SetupSteps":      setupcheck.ManualSetupSteps(),
 	})
@@ -161,6 +191,7 @@ const repositoriesTemplate = pageHead + `
       <p>Start with Forgejo/Codeberg repositories. Manual setup must require the exact status context <code>{{ .RequiredContext }}</code>.</p>
       {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
       <form method="post" action="/repositories" class="form-grid">
+        <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
         <label>Forge <input name="forge" value="forgejo"></label>
         <label>Base URL <input name="base_url" value="https://codeberg.org"></label>
         <label>Owner <input name="owner" required></label>
