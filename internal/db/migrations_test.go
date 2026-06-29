@@ -130,6 +130,8 @@ CREATE TABLE audit_events (
 		t.Fatal(err)
 	}
 	assertTableExists(t, database, "setup_checks")
+	assertTableExists(t, database, "status_results")
+	assertColumnExists(t, database, "status_results", "target_branch")
 
 	var applied int
 	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = ?`, "0002_setup_checks").Scan(&applied); err != nil {
@@ -137,6 +139,12 @@ CREATE TABLE audit_events (
 	}
 	if applied != 1 {
 		t.Fatalf("expected setup checks migration to be recorded once, got %d", applied)
+	}
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = ?`, "0005_status_results").Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected status results migration to be recorded once, got %d", applied)
 	}
 	assertIndexExists(t, database, "idx_branch_freezes_one_active")
 	assertIndexExists(t, database, "idx_audit_events_subject_type_id")
@@ -187,4 +195,32 @@ func assertIndexExists(t *testing.T, database *sql.DB, name string) {
 	if err := database.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?`, name).Scan(&found); err != nil {
 		t.Fatalf("expected index %s to exist: %v", name, err)
 	}
+}
+
+func assertColumnExists(t *testing.T, database *sql.DB, table string, column string) {
+	t.Helper()
+	rows, err := database.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name string
+		var columnType string
+		var notNull int
+		var defaultValue sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			t.Fatal(err)
+		}
+		if name == column {
+			return
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	t.Fatalf("expected column %s.%s to exist", table, column)
 }

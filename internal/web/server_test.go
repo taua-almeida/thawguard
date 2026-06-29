@@ -17,6 +17,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/freeze"
 	"github.com/taua-almeida/thawguard/internal/repository"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
+	"github.com/taua-almeida/thawguard/internal/statusresult"
 )
 
 func TestRepositoriesPageShowsManualSetupContext(t *testing.T) {
@@ -570,6 +571,165 @@ func TestEndFreezeHidesInternalErrorDetails(t *testing.T) {
 	}
 }
 
+func TestDecisionsPageShowsFormAndRecentResults(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	createdAt := time.Date(2026, 6, 29, 16, 30, 0, 0, time.UTC)
+	result := statusresult.Result{ID: 1, RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "Branch is frozen; merge is blocked by Thawguard", CreatedAt: createdAt}
+	server := NewServer(Config{
+		AppName:             "Thawguard",
+		RepositoryStore:     &fakeRepositoryStore{repositories: []domain.Repository{repo}},
+		StatusDecisionStore: &fakeStatusDecisionStore{results: []statusresult.Result{result}},
+	})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/decisions", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	if sessionCookie := sessionCookieFromRecorder(t, recorder); sessionCookie.Value == "" {
+		t.Fatal("expected session cookie value")
+	}
+	body := recorder.Body.String()
+	if token := csrfTokenFromBody(t, body); token == "" {
+		t.Fatal("expected CSRF token in decision form")
+	}
+	for _, want := range []string{"Compute PR decision", "local preview only", "taua-almeida/thawguard", "Target branch", "main", "thawguard/freeze", "failure", "Branch is frozen", "2026-06-29 16:30 UTC"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected body to contain %q, got %q", want, body)
+		}
+	}
+}
+
+func TestDecisionsPageRequiresStatusDecisionStore(t *testing.T) {
+	server := NewServer(Config{AppName: "Thawguard"})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/decisions", nil))
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected service unavailable status, got %d", recorder.Code)
+	}
+}
+
+func TestCreateDecisionPostsToStore(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	store := &fakeStatusDecisionStore{}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, StatusDecisionStore: store})
+	form := decisionCreateForm()
+	cookie, csrfToken := getDecisionForm(t, server)
+	form.Set(csrfFormField, csrfToken)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/decisions", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect, got %d", recorder.Code)
+	}
+	if len(store.runs) != 1 {
+		t.Fatalf("expected 1 local decision run, got %d", len(store.runs))
+	}
+	run := store.runs[0]
+	if run.RepositoryID != repo.ID || run.PullRequestIndex != 42 || run.TargetBranch != "main" || run.HeadSHA != "abc123" {
+		t.Fatalf("unexpected local decision params: %+v", run)
+	}
+}
+
+func TestCreateDecisionRejectsMissingCSRFSession(t *testing.T) {
+	store := &fakeStatusDecisionStore{}
+	server := NewServer(Config{AppName: "Thawguard", StatusDecisionStore: store})
+	form := decisionCreateForm()
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/decisions", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected forbidden status, got %d", recorder.Code)
+	}
+	if len(store.runs) != 0 {
+		t.Fatalf("expected no local decision runs, got %d", len(store.runs))
+	}
+}
+
+func TestCreateDecisionRejectsInvalidCSRFToken(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	store := &fakeStatusDecisionStore{}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, StatusDecisionStore: store})
+	form := decisionCreateForm()
+	cookie, _ := getDecisionForm(t, server)
+	form.Set(csrfFormField, "not-the-session-token")
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/decisions", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected forbidden status, got %d", recorder.Code)
+	}
+	if len(store.runs) != 0 {
+		t.Fatalf("expected no local decision runs, got %d", len(store.runs))
+	}
+}
+
+func TestCreateDecisionShowsValidationError(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	store := &fakeStatusDecisionStore{err: statusresult.ValidationError{Message: "missing required local decision fields: head SHA"}}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, StatusDecisionStore: store})
+	form := decisionCreateForm()
+	cookie, csrfToken := getDecisionForm(t, server)
+	form.Set(csrfFormField, csrfToken)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/decisions", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected bad request status, got %d", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), "missing required local decision fields") {
+		t.Fatalf("expected validation message in body, got %q", recorder.Body.String())
+	}
+}
+
+func TestCreateDecisionHidesInternalErrorDetails(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	store := &fakeStatusDecisionStore{err: errors.New("database failed with secret-token")}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, StatusDecisionStore: store})
+	form := decisionCreateForm()
+	cookie, csrfToken := getDecisionForm(t, server)
+	form.Set(csrfFormField, csrfToken)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/decisions", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("expected internal server error status, got %d", recorder.Code)
+	}
+	if strings.Contains(recorder.Body.String(), "secret-token") {
+		t.Fatalf("expected generic error body, got %q", recorder.Body.String())
+	}
+}
+
+func decisionCreateForm() url.Values {
+	return url.Values{
+		"repository_id":      {"1"},
+		"pull_request_index": {"42"},
+		"target_branch":      {"main"},
+		"head_sha":           {"abc123"},
+	}
+}
+
 func freezeCloseForm(id int64) url.Values {
 	return url.Values{"freeze_id": {strconv.FormatInt(id, 10)}}
 }
@@ -608,6 +768,16 @@ func getFreezeForm(t *testing.T, server *Server) (*http.Cookie, string) {
 	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/freezes", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected freeze form status 200, got %d", recorder.Code)
+	}
+	return sessionCookieFromRecorder(t, recorder), csrfTokenFromBody(t, recorder.Body.String())
+}
+
+func getDecisionForm(t *testing.T, server *Server) (*http.Cookie, string) {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/decisions", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected decision form status 200, got %d", recorder.Code)
 	}
 	return sessionCookieFromRecorder(t, recorder), csrfTokenFromBody(t, recorder.Body.String())
 }
@@ -651,6 +821,33 @@ func (s *fakeSetupCheckStore) ListByRepository(ctx context.Context, repositoryID
 type fakeSetupCheckRunner struct {
 	repositories []domain.Repository
 	err          error
+}
+
+type fakeStatusDecisionStore struct {
+	results []statusresult.Result
+	runs    []statusresult.LocalDecisionParams
+	err     error
+	listErr error
+}
+
+func (s *fakeStatusDecisionStore) ListRecent(ctx context.Context, limit int) ([]statusresult.Result, error) {
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+	if limit > 0 && len(s.results) > limit {
+		return s.results[:limit], nil
+	}
+	return s.results, nil
+}
+
+func (s *fakeStatusDecisionStore) RunLocal(ctx context.Context, params statusresult.LocalDecisionParams) (statusresult.Result, error) {
+	if s.err != nil {
+		return statusresult.Result{}, s.err
+	}
+	s.runs = append(s.runs, params)
+	result := statusresult.Result{ID: int64(len(s.results) + 1), RepositoryID: params.RepositoryID, PullRequestIndex: params.PullRequestIndex, TargetBranch: params.TargetBranch, HeadSHA: params.HeadSHA, Context: domain.RequiredStatusContext, State: domain.CommitStatusSuccess, Description: "No active freeze applies to this PR", CreatedAt: time.Now().UTC()}
+	s.results = append(s.results, result)
+	return result, nil
 }
 
 type fakeAuditStore struct {

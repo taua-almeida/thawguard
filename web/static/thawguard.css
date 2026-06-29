@@ -196,6 +196,22 @@ small {
   background: #fee2e2;
 }
 
+.status-success {
+  color: #166534;
+  background: #dcfce7;
+}
+
+.status-failure,
+.status-error {
+  color: #991b1b;
+  background: #fee2e2;
+}
+
+.status-pending {
+  color: #92400e;
+  background: #fef3c7;
+}
+
 .status-frozen {
   color: #1e3a8a;
   background: #dbeafe;

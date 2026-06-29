@@ -13,15 +13,17 @@ import (
 	"github.com/taua-almeida/thawguard/internal/freeze"
 	"github.com/taua-almeida/thawguard/internal/repository"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
+	"github.com/taua-almeida/thawguard/internal/statusresult"
 )
 
 type Config struct {
-	AppName          string
-	RepositoryStore  RepositoryStore
-	SetupCheckStore  SetupCheckStore
-	SetupCheckRunner SetupCheckRunner
-	FreezeStore      FreezeStore
-	AuditStore       AuditStore
+	AppName             string
+	RepositoryStore     RepositoryStore
+	SetupCheckStore     SetupCheckStore
+	SetupCheckRunner    SetupCheckRunner
+	FreezeStore         FreezeStore
+	AuditStore          AuditStore
+	StatusDecisionStore StatusDecisionStore
 }
 
 type RepositoryStore interface {
@@ -48,6 +50,11 @@ type AuditStore interface {
 	ListBySubjectType(ctx context.Context, subjectType string, limit int) ([]audit.Event, error)
 }
 
+type StatusDecisionStore interface {
+	ListRecent(ctx context.Context, limit int) ([]statusresult.Result, error)
+	RunLocal(ctx context.Context, params statusresult.LocalDecisionParams) (statusresult.Result, error)
+}
+
 type repositoryView struct {
 	Repository  domain.Repository
 	SetupChecks []setupcheck.Check
@@ -68,6 +75,12 @@ type freezeAuditView struct {
 	Reason       string
 	Actor        string
 	CreatedAt    string
+}
+
+type statusResultView struct {
+	Result     statusresult.Result
+	Repository domain.Repository
+	CreatedAt  string
 }
 
 type Server struct {
@@ -99,6 +112,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /freezes", s.handleCreateFreeze)
 	s.mux.HandleFunc("POST /freezes/end", s.handleEndFreeze)
 	s.mux.HandleFunc("POST /freezes/cancel", s.handleCancelFreeze)
+	s.mux.HandleFunc("GET /decisions", s.handleDecisions)
+	s.mux.HandleFunc("POST /decisions", s.handleCreateDecision)
 	s.mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.Dir("web/static"))))
 }
 
@@ -123,6 +138,65 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		"RepositoryCount":   len(repositories),
 		"ActiveFreezeCount": len(freezes),
 	})
+}
+
+func (s *Server) handleDecisions(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.StatusDecisionStore == nil {
+		http.Error(w, "status decision store is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	session, err := s.sessions.getOrCreate(w, r)
+	if err != nil {
+		http.Error(w, "create session", http.StatusInternalServerError)
+		return
+	}
+	repositories, results, err := s.decisionPageData(r.Context())
+	if err != nil {
+		internalServerError(w)
+		return
+	}
+	s.renderDecisions(w, repositories, s.statusResultViews(repositories, results), "", session.CSRFToken)
+}
+
+func (s *Server) handleCreateDecision(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.StatusDecisionStore == nil {
+		http.Error(w, "status decision store is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	session, ok := s.requireFreezerForm(w, r)
+	if !ok {
+		return
+	}
+	repositoryID, err := strconv.ParseInt(strings.TrimSpace(r.PostFormValue("repository_id")), 10, 64)
+	if err != nil {
+		repositoryID = 0
+	}
+	pullRequestIndex, err := strconv.Atoi(strings.TrimSpace(r.PostFormValue("pull_request_index")))
+	if err != nil {
+		pullRequestIndex = 0
+	}
+	_, err = s.cfg.StatusDecisionStore.RunLocal(r.Context(), statusresult.LocalDecisionParams{
+		RepositoryID:     repositoryID,
+		PullRequestIndex: pullRequestIndex,
+		TargetBranch:     r.PostFormValue("target_branch"),
+		HeadSHA:          r.PostFormValue("head_sha"),
+	})
+	if err != nil {
+		if !statusresult.IsValidationError(err) {
+			internalServerError(w)
+			return
+		}
+		repositories, results, dataErr := s.decisionPageData(r.Context())
+		if dataErr != nil {
+			internalServerError(w)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusBadRequest)
+		s.renderDecisions(w, repositories, s.statusResultViews(repositories, results), err.Error(), session.CSRFToken)
+		return
+	}
+	http.Redirect(w, r, "/decisions", http.StatusSeeOther)
 }
 
 func (s *Server) handleRepositories(w http.ResponseWriter, r *http.Request) {
@@ -367,6 +441,34 @@ func (s *Server) repositories(ctx context.Context) ([]domain.Repository, error) 
 	return s.cfg.RepositoryStore.List(ctx)
 }
 
+func (s *Server) statusResults(ctx context.Context) ([]statusresult.Result, error) {
+	if s.cfg.StatusDecisionStore == nil {
+		return nil, nil
+	}
+	return s.cfg.StatusDecisionStore.ListRecent(ctx, 25)
+}
+
+func (s *Server) decisionPageData(ctx context.Context) ([]domain.Repository, []statusresult.Result, error) {
+	repositories, err := s.repositories(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	results, err := s.statusResults(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return repositories, results, nil
+}
+
+func (s *Server) statusResultViews(repositories []domain.Repository, results []statusresult.Result) []statusResultView {
+	repositoriesByID := repositoriesByID(repositories)
+	views := make([]statusResultView, 0, len(results))
+	for _, result := range results {
+		views = append(views, statusResultView{Result: result, Repository: repositoriesByID[result.RepositoryID], CreatedAt: result.CreatedAt.UTC().Format("2006-01-02 15:04 UTC")})
+	}
+	return views
+}
+
 func (s *Server) activeFreezes(ctx context.Context) ([]domain.BranchFreeze, error) {
 	if s.cfg.FreezeStore == nil {
 		return nil, nil
@@ -535,6 +637,17 @@ func (s *Server) renderFreezes(w http.ResponseWriter, repositories []domain.Repo
 	})
 }
 
+func (s *Server) renderDecisions(w http.ResponseWriter, repositories []domain.Repository, results []statusResultView, formError string, csrfToken string) {
+	s.render(w, decisionsTemplate, map[string]any{
+		"AppName":         s.cfg.AppName,
+		"Repositories":    repositories,
+		"Results":         results,
+		"FormError":       formError,
+		"CSRFToken":       csrfToken,
+		"RequiredContext": domain.RequiredStatusContext,
+	})
+}
+
 func (s *Server) render(w http.ResponseWriter, source string, data any) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	tpl, err := template.New("page").Parse(source)
@@ -568,7 +681,7 @@ const dashboardTemplate = pageHead + `
       <p class="eyebrow">Freeze branches. Thaw exceptions.</p>
       <h1>{{ .AppName }} foundation is running</h1>
       <p>{{ .RepositoryCount }} repositories are configured. {{ .ActiveFreezeCount }} active branch freezes are recorded locally.</p>
-      <p class="actions"><a class="button" href="/repositories">Manage repositories</a> <a class="button" href="/freezes">Manage freezes</a></p>
+      <p class="actions"><a class="button" href="/repositories">Manage repositories</a> <a class="button" href="/freezes">Manage freezes</a> <a class="button" href="/decisions">Preview decisions</a></p>
     </section>
   </main>` + pageFoot
 
@@ -719,6 +832,61 @@ const freezesTemplate = pageHead + `
       </table>
       {{ else }}
       <p>No freeze audit events yet.</p>
+      {{ end }}
+    </section>
+  </main>` + pageFoot
+
+const decisionsTemplate = pageHead + `
+  <main class="shell stack">
+    <nav class="topnav"><a href="/">Dashboard</a></nav>
+    <section class="panel">
+      <p class="eyebrow">Local status preview</p>
+      <h1>Compute PR decision</h1>
+      <p class="warning">This is a local preview only. Thawguard records the computed status result locally and does not post to Forgejo/Codeberg.</p>
+      <p class="warning">Bootstrap sessions are for local development only. Do not expose decision previews on a network until real local auth is configured.</p>
+      <p>Use this to verify the policy result for the required status context <code>{{ .RequiredContext }}</code> before live status posting is wired.</p>
+      {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
+      {{ if .Repositories }}
+      <form method="post" action="/decisions" class="form-grid">
+        <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
+        <label>Repository
+          <select name="repository_id" required>
+          {{ range .Repositories }}<option value="{{ .ID }}">{{ .FullName }}</option>{{ end }}
+          </select>
+        </label>
+        <label>PR number <input name="pull_request_index" inputmode="numeric" placeholder="42" required></label>
+        <label>Target branch <input name="target_branch" placeholder="main" required></label>
+        <label>Head SHA <input name="head_sha" placeholder="abc123" required></label>
+        <button type="submit">Compute local decision</button>
+      </form>
+      {{ else }}
+      <p>No repositories configured yet. Add a repository before computing decisions.</p>
+      <p><a class="button" href="/repositories">Add repository</a></p>
+      {{ end }}
+    </section>
+
+    <section class="panel">
+      <h2>Recent local status results</h2>
+      {{ if .Results }}
+      <table>
+        <thead><tr><th>When</th><th>Repository</th><th>PR</th><th>Target branch</th><th>Head SHA</th><th>Context</th><th>State</th><th>Description</th></tr></thead>
+        <tbody>
+        {{ range .Results }}
+          <tr>
+            <td>{{ .CreatedAt }}</td>
+            <td>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Result.RepositoryID }}{{ end }}</td>
+            <td>#{{ .Result.PullRequestIndex }}</td>
+            <td>{{ .Result.TargetBranch }}</td>
+            <td><code>{{ .Result.HeadSHA }}</code></td>
+            <td><code>{{ .Result.Context }}</code></td>
+            <td><span class="status status-{{ .Result.State }}">{{ .Result.State }}</span></td>
+            <td>{{ .Result.Description }}</td>
+          </tr>
+        {{ end }}
+        </tbody>
+      </table>
+      {{ else }}
+      <p>No local status results yet.</p>
       {{ end }}
     </section>
   </main>` + pageFoot
