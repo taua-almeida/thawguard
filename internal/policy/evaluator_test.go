@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/calitaz/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/domain"
 )
 
 func TestEvaluateAllowsUnfrozenBranch(t *testing.T) {

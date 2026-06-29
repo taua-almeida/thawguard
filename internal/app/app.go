@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/calitaz/thawguard/internal/config"
-	"github.com/calitaz/thawguard/internal/web"
+	"github.com/taua-almeida/thawguard/internal/config"
+	"github.com/taua-almeida/thawguard/internal/web"
 )
 
 // App wires the monolith together. The first scaffold keeps dependencies small:

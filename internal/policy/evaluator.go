@@ -3,7 +3,7 @@ package policy
 import (
 	"time"
 
-	"github.com/calitaz/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/domain"
 )
 
 type Input struct {

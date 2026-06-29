@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 
-	"github.com/calitaz/thawguard/internal/domain"
-	"github.com/calitaz/thawguard/internal/forge"
+	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/forge"
 )
 
 var ErrNotImplemented = errors.New("forgejo client not implemented in scaffold")

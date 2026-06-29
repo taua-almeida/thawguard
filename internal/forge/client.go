@@ -3,7 +3,7 @@ package forge
 import (
 	"context"
 
-	"github.com/calitaz/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/domain"
 )
 
 type CommitStatus struct {

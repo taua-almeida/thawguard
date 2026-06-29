@@ -23,4 +23,4 @@ The service listens on `:8080` by default. Override with `THAWGUARD_HTTP_ADDR`.
 
 ## License
 
-License is not chosen yet. Choose a license before publishing this repository as open source.
+Thawguard is licensed under the GNU Affero General Public License v3.0. See [LICENSE](LICENSE).

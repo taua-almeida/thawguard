@@ -1,4 +1,4 @@
-module github.com/calitaz/thawguard
+module github.com/taua-almeida/thawguard
 
 go 1.25.0
 

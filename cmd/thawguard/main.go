@@ -9,8 +9,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/calitaz/thawguard/internal/app"
-	"github.com/calitaz/thawguard/internal/config"
+	"github.com/taua-almeida/thawguard/internal/app"
+	"github.com/taua-almeida/thawguard/internal/config"
 )
 
 func main() {
