@@ -10,9 +10,11 @@ import (
 )
 
 const (
-	ActionRepositoryCreated = "repository.created"
+	ActionRepositoryCreated   = "repository.created"
+	ActionBranchFreezeCreated = "branch_freeze.created"
 
-	SubjectTypeRepository = "repository"
+	SubjectTypeRepository   = "repository"
+	SubjectTypeBranchFreeze = "branch_freeze"
 )
 
 type Event struct {

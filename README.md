@@ -19,7 +19,7 @@ go test ./...
 go run ./cmd/thawguard
 ```
 
-The service listens on `:8080` by default. Override with `THAWGUARD_HTTP_ADDR`.
+The service listens on `127.0.0.1:8080` by default. Override with `THAWGUARD_HTTP_ADDR`.
 
 The service creates `thawguard.db` by default. Override with `THAWGUARD_DB_PATH`.
 
@@ -27,6 +27,9 @@ Current local pages:
 
 - `/` dashboard
 - `/repositories` repository setup form and manual setup checklist
+- `/freezes` local active branch-freeze form and list
+
+Current bootstrap sessions are for local development only. Do not expose the server on a network until real local auth is configured.
 
 ## License
 

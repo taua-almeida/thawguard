@@ -8,6 +8,7 @@ import (
 
 	"github.com/taua-almeida/thawguard/internal/config"
 	"github.com/taua-almeida/thawguard/internal/db"
+	"github.com/taua-almeida/thawguard/internal/freeze"
 	"github.com/taua-almeida/thawguard/internal/repositorysetup"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
 	"github.com/taua-almeida/thawguard/internal/web"
@@ -46,9 +47,10 @@ func (a *App) Run(ctx context.Context) error {
 	repositoryStore := repositorysetup.NewService(database)
 	setupCheckStore := setupcheck.NewStore(database)
 	setupCheckRunner := localSetupHealthRunner{recorder: setupCheckStore}
+	freezeStore := freeze.NewService(database)
 	server := &http.Server{
 		Addr:              a.cfg.HTTPAddr,
-		Handler:           web.NewServer(web.Config{AppName: "Thawguard", RepositoryStore: repositoryStore, SetupCheckStore: setupCheckStore, SetupCheckRunner: setupCheckRunner}).Routes(),
+		Handler:           web.NewServer(web.Config{AppName: "Thawguard", RepositoryStore: repositoryStore, SetupCheckStore: setupCheckStore, SetupCheckRunner: setupCheckRunner, FreezeStore: freezeStore}).Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

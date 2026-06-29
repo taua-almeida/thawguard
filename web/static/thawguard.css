@@ -61,6 +61,12 @@ body {
   text-decoration: none;
 }
 
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
 .form-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
@@ -74,7 +80,8 @@ label {
   font-weight: 700;
 }
 
-input {
+input,
+select {
   width: 100%;
   border: 1px solid rgba(47, 159, 232, 0.3);
   border-radius: 0.75rem;
@@ -118,6 +125,14 @@ code {
   padding: 0.75rem;
   color: #991b1b;
   background: rgba(254, 226, 226, 0.7);
+}
+
+.warning {
+  border: 1px solid rgba(217, 119, 6, 0.25);
+  border-radius: 0.75rem;
+  padding: 0.75rem;
+  color: #92400e;
+  background: rgba(254, 243, 199, 0.7);
 }
 
 .eyebrow {
@@ -174,6 +189,11 @@ small {
 .status-failed {
   color: #991b1b;
   background: #fee2e2;
+}
+
+.status-frozen {
+  color: #1e3a8a;
+  background: #dbeafe;
 }
 
 .pixel-shield {

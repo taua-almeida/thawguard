@@ -90,6 +90,25 @@ func TestApplyMigrationsAddsSetupChecksToExistingInitialDatabase(t *testing.T) {
 	if _, err := database.ExecContext(ctx, ensureMigrationsTableSQL); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := database.ExecContext(ctx, `
+CREATE TABLE repositories (
+  id INTEGER PRIMARY KEY,
+  active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE branch_freezes (
+  id INTEGER PRIMARY KEY,
+  repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+  branch TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('scheduled', 'active', 'ended', 'cancelled')),
+  reason TEXT NOT NULL,
+  starts_at TEXT,
+  ends_at TEXT,
+  created_by INTEGER,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := database.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)`, "0001_initial", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
@@ -110,6 +129,7 @@ func TestApplyMigrationsAddsSetupChecksToExistingInitialDatabase(t *testing.T) {
 	if applied != 1 {
 		t.Fatalf("expected setup checks migration to be recorded once, got %d", applied)
 	}
+	assertIndexExists(t, database, "idx_branch_freezes_one_active")
 }
 
 func projectMigrationsDir(t *testing.T) string {
@@ -148,5 +168,13 @@ func assertTableExists(t *testing.T, database *sql.DB, name string) {
 	var found string
 	if err := database.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, name).Scan(&found); err != nil {
 		t.Fatalf("expected table %s to exist: %v", name, err)
+	}
+}
+
+func assertIndexExists(t *testing.T, database *sql.DB, name string) {
+	t.Helper()
+	var found string
+	if err := database.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?`, name).Scan(&found); err != nil {
+		t.Fatalf("expected index %s to exist: %v", name, err)
 	}
 }

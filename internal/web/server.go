@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/freeze"
 	"github.com/taua-almeida/thawguard/internal/repository"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
 )
@@ -17,6 +18,7 @@ type Config struct {
 	RepositoryStore  RepositoryStore
 	SetupCheckStore  SetupCheckStore
 	SetupCheckRunner SetupCheckRunner
+	FreezeStore      FreezeStore
 }
 
 type RepositoryStore interface {
@@ -32,9 +34,19 @@ type SetupCheckRunner interface {
 	Run(ctx context.Context, repo domain.Repository) ([]setupcheck.Result, error)
 }
 
+type FreezeStore interface {
+	ListActive(ctx context.Context) ([]domain.BranchFreeze, error)
+	CreateActive(ctx context.Context, params freeze.CreateParams, actor domain.Actor) (domain.BranchFreeze, error)
+}
+
 type repositoryView struct {
 	Repository  domain.Repository
 	SetupChecks []setupcheck.Check
+}
+
+type freezeView struct {
+	Freeze     domain.BranchFreeze
+	Repository domain.Repository
 }
 
 type Server struct {
@@ -62,6 +74,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /repositories", s.handleRepositories)
 	s.mux.HandleFunc("POST /repositories", s.handleCreateRepository)
 	s.mux.HandleFunc("POST /repositories/setup-check", s.handleRunRepositorySetupCheck)
+	s.mux.HandleFunc("GET /freezes", s.handleFreezes)
+	s.mux.HandleFunc("POST /freezes", s.handleCreateFreeze)
 	s.mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.Dir("web/static"))))
 }
 
@@ -76,9 +90,15 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	freezes, err := s.activeFreezes(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	s.render(w, dashboardTemplate, map[string]any{
-		"AppName":         s.cfg.AppName,
-		"RepositoryCount": len(repositories),
+		"AppName":           s.cfg.AppName,
+		"RepositoryCount":   len(repositories),
+		"ActiveFreezeCount": len(freezes),
 	})
 }
 
@@ -142,6 +162,57 @@ func (s *Server) handleCreateRepository(w http.ResponseWriter, r *http.Request) 
 	http.Redirect(w, r, "/repositories", http.StatusSeeOther)
 }
 
+func (s *Server) handleFreezes(w http.ResponseWriter, r *http.Request) {
+	session, err := s.sessions.getOrCreate(w, r)
+	if err != nil {
+		http.Error(w, "create session", http.StatusInternalServerError)
+		return
+	}
+	repositories, freezes, err := s.freezePageData(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), "", session.CSRFToken)
+}
+
+func (s *Server) handleCreateFreeze(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.FreezeStore == nil {
+		http.Error(w, "freeze store is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	session, ok := s.requireFreezerForm(w, r)
+	if !ok {
+		return
+	}
+
+	repositoryID, err := strconv.ParseInt(strings.TrimSpace(r.PostFormValue("repository_id")), 10, 64)
+	if err != nil {
+		repositoryID = 0
+	}
+	_, err = s.cfg.FreezeStore.CreateActive(r.Context(), freeze.CreateParams{
+		RepositoryID: repositoryID,
+		Branch:       r.PostFormValue("branch"),
+		Reason:       r.PostFormValue("reason"),
+	}, session.auditActor())
+	if err != nil {
+		if !freeze.IsValidationError(err) {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		repositories, freezes, dataErr := s.freezePageData(r.Context())
+		if dataErr != nil {
+			http.Error(w, dataErr.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusBadRequest)
+		s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), err.Error(), session.CSRFToken)
+		return
+	}
+	http.Redirect(w, r, "/freezes", http.StatusSeeOther)
+}
+
 func (s *Server) handleRunRepositorySetupCheck(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.SetupCheckRunner == nil {
 		http.Error(w, "setup check runner is not configured", http.StatusServiceUnavailable)
@@ -195,11 +266,63 @@ func (s *Server) requireRepositoryManagerForm(w http.ResponseWriter, r *http.Req
 	return session, true
 }
 
+func (s *Server) requireFreezerForm(w http.ResponseWriter, r *http.Request) (sessionState, bool) {
+	session, ok := s.sessions.get(r)
+	if !ok {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return sessionState{}, false
+	}
+	if !session.Role.CanFreeze() {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return sessionState{}, false
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return sessionState{}, false
+	}
+	if !constantTimeTokenEqual(r.PostForm.Get(csrfFormField), session.CSRFToken) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return sessionState{}, false
+	}
+	return session, true
+}
+
 func (s *Server) repositories(ctx context.Context) ([]domain.Repository, error) {
 	if s.cfg.RepositoryStore == nil {
 		return nil, nil
 	}
 	return s.cfg.RepositoryStore.List(ctx)
+}
+
+func (s *Server) activeFreezes(ctx context.Context) ([]domain.BranchFreeze, error) {
+	if s.cfg.FreezeStore == nil {
+		return nil, nil
+	}
+	return s.cfg.FreezeStore.ListActive(ctx)
+}
+
+func (s *Server) freezePageData(ctx context.Context) ([]domain.Repository, []domain.BranchFreeze, error) {
+	repositories, err := s.repositories(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	freezes, err := s.activeFreezes(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return repositories, freezes, nil
+}
+
+func (s *Server) freezeViews(repositories []domain.Repository, freezes []domain.BranchFreeze) []freezeView {
+	repositoriesByID := make(map[int64]domain.Repository, len(repositories))
+	for _, repo := range repositories {
+		repositoriesByID[repo.ID] = repo
+	}
+	views := make([]freezeView, 0, len(freezes))
+	for _, freeze := range freezes {
+		views = append(views, freezeView{Freeze: freeze, Repository: repositoriesByID[freeze.RepositoryID]})
+	}
+	return views
 }
 
 func (s *Server) repositoryByID(ctx context.Context, id int64) (domain.Repository, bool, error) {
@@ -257,6 +380,16 @@ func (s *Server) renderRepositories(w http.ResponseWriter, views []repositoryVie
 	})
 }
 
+func (s *Server) renderFreezes(w http.ResponseWriter, repositories []domain.Repository, freezes []freezeView, formError string, csrfToken string) {
+	s.render(w, freezesTemplate, map[string]any{
+		"AppName":      s.cfg.AppName,
+		"Repositories": repositories,
+		"Freezes":      freezes,
+		"FormError":    formError,
+		"CSRFToken":    csrfToken,
+	})
+}
+
 func (s *Server) render(w http.ResponseWriter, source string, data any) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	tpl, err := template.New("page").Parse(source)
@@ -285,18 +418,19 @@ const dashboardTemplate = pageHead + `
       <div class="pixel-shield" aria-hidden="true"></div>
       <p class="eyebrow">Freeze branches. Thaw exceptions.</p>
       <h1>{{ .AppName }} foundation is running</h1>
-      <p>{{ .RepositoryCount }} repositories are configured. Next implementation step: setup health, freeze policy, jobs, and audit events.</p>
-      <p><a class="button" href="/repositories">Manage repositories</a></p>
+      <p>{{ .RepositoryCount }} repositories are configured. {{ .ActiveFreezeCount }} active branch freezes are recorded locally.</p>
+      <p class="actions"><a class="button" href="/repositories">Manage repositories</a> <a class="button" href="/freezes">Manage freezes</a></p>
     </section>
   </main>` + pageFoot
 
 const repositoriesTemplate = pageHead + `
   <main class="shell stack">
     <nav class="topnav"><a href="/">Dashboard</a></nav>
-    <section class="panel">
-      <p class="eyebrow">Repositories</p>
-      <h1>Add repository</h1>
-      <p>Start with Forgejo/Codeberg repositories. Manual setup must require the exact status context <code>{{ .RequiredContext }}</code>.</p>
+	    <section class="panel">
+	      <p class="eyebrow">Repositories</p>
+	      <h1>Add repository</h1>
+	      <p class="warning">Bootstrap sessions are for local development only. Do not expose this server on a network until real local auth is configured.</p>
+	      <p>Start with Forgejo/Codeberg repositories. Manual setup must require the exact status context <code>{{ .RequiredContext }}</code>.</p>
       {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
       <form method="post" action="/repositories" class="form-grid">
         <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
@@ -352,5 +486,54 @@ const repositoriesTemplate = pageHead + `
     <section class="panel">
       <h2>Manual setup checklist</h2>
       <ol>{{ range .SetupSteps }}<li>{{ . }}</li>{{ end }}</ol>
+    </section>
+  </main>` + pageFoot
+
+const freezesTemplate = pageHead + `
+  <main class="shell stack">
+    <nav class="topnav"><a href="/">Dashboard</a></nav>
+    <section class="panel">
+      <p class="eyebrow">Branch freezes</p>
+      <h1>Create active freeze</h1>
+      <p class="warning">Bootstrap sessions are for local development only. Do not expose freeze controls on a network until real local auth is configured.</p>
+      <p>Record a cooperative branch freeze locally. Status posting and webhook recomputation will be wired in a later slice.</p>
+      {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
+      {{ if .Repositories }}
+      <form method="post" action="/freezes" class="form-grid">
+        <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
+        <label>Repository
+          <select name="repository_id" required>
+          {{ range .Repositories }}<option value="{{ .ID }}">{{ .FullName }} — default {{ .DefaultBranch }}</option>{{ end }}
+          </select>
+        </label>
+        <label>Branch <input name="branch" placeholder="main" required></label>
+        <label>Reason <input name="reason" placeholder="QA freeze, release window, incident response" required></label>
+        <button type="submit">Freeze branch</button>
+      </form>
+      {{ else }}
+      <p>No repositories configured yet. Add a repository before creating a freeze.</p>
+      <p><a class="button" href="/repositories">Add repository</a></p>
+      {{ end }}
+    </section>
+
+    <section class="panel">
+      <h2>Active freezes</h2>
+      {{ if .Freezes }}
+      <table>
+        <thead><tr><th>Repository</th><th>Branch</th><th>Status</th><th>Reason</th></tr></thead>
+        <tbody>
+        {{ range .Freezes }}
+          <tr>
+            <td>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Freeze.RepositoryID }}{{ end }}</td>
+            <td>{{ .Freeze.Branch }}</td>
+            <td><span class="status status-frozen">{{ .Freeze.Status }}</span></td>
+            <td>{{ .Freeze.Reason }}</td>
+          </tr>
+        {{ end }}
+        </tbody>
+      </table>
+      {{ else }}
+      <p>No active freezes yet.</p>
+      {{ end }}
     </section>
   </main>` + pageFoot

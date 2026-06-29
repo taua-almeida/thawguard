@@ -55,14 +55,26 @@ func (pr PullRequest) IsOpen() bool {
 	return pr.State == "open" || pr.State == ""
 }
 
+type BranchFreezeStatus string
+
+const (
+	BranchFreezeStatusScheduled BranchFreezeStatus = "scheduled"
+	BranchFreezeStatusActive    BranchFreezeStatus = "active"
+	BranchFreezeStatusEnded     BranchFreezeStatus = "ended"
+	BranchFreezeStatusCancelled BranchFreezeStatus = "cancelled"
+)
+
 type BranchFreeze struct {
 	ID           int64
 	RepositoryID int64
 	Branch       string
+	Status       BranchFreezeStatus
 	Active       bool
 	Reason       string
 	StartsAt     *time.Time
 	EndsAt       *time.Time
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 type ThawException struct {

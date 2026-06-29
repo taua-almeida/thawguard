@@ -11,7 +11,7 @@ type Config struct {
 
 func FromEnv() Config {
 	return Config{
-		HTTPAddr:     env("THAWGUARD_HTTP_ADDR", ":8080"),
+		HTTPAddr:     env("THAWGUARD_HTTP_ADDR", "127.0.0.1:8080"),
 		DatabasePath: env("THAWGUARD_DB_PATH", "thawguard.db"),
 		PublicURL:    env("THAWGUARD_PUBLIC_URL", "http://localhost:8080"),
 		Environment:  env("THAWGUARD_ENV", "development"),
