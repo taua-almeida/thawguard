@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -239,7 +240,7 @@ func TestFreezesPageShowsRepositoriesAndActiveFreezes(t *testing.T) {
 	if token := csrfTokenFromBody(t, body); token == "" {
 		t.Fatal("expected CSRF token in freeze form")
 	}
-	for _, want := range []string{"Create active freeze", "taua-almeida/thawguard", "default dev", "QA freeze", "Freeze branch"} {
+	for _, want := range []string{"Create active freeze", "taua-almeida/thawguard", "default dev", "QA freeze", "Freeze branch", "End freeze", "Cancel"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
@@ -336,6 +337,163 @@ func TestCreateFreezeShowsValidationError(t *testing.T) {
 	}
 }
 
+func TestEndFreezePostsToStore(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	store := &fakeFreezeStore{freezes: []domain.BranchFreeze{{ID: 9, RepositoryID: repo.ID, Branch: "main", Status: domain.BranchFreezeStatusActive, Active: true, Reason: "release"}}}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, FreezeStore: store})
+	form := freezeCloseForm(9)
+	cookie, csrfToken := getFreezeForm(t, server)
+	form.Set(csrfFormField, csrfToken)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/freezes/end", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect, got %d", recorder.Code)
+	}
+	if len(store.ended) != 1 || store.ended[0] != 9 {
+		t.Fatalf("expected freeze 9 to end, got %+v", store.ended)
+	}
+	if len(store.actors) != 1 || store.actors[0].Kind != domain.ActorKindBootstrapAdmin || store.actors[0].Role != "admin" {
+		t.Fatalf("unexpected actors: %+v", store.actors)
+	}
+}
+
+func TestCancelFreezePostsToStore(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	store := &fakeFreezeStore{freezes: []domain.BranchFreeze{{ID: 9, RepositoryID: repo.ID, Branch: "main", Status: domain.BranchFreezeStatusActive, Active: true, Reason: "mistake"}}}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, FreezeStore: store})
+	form := freezeCloseForm(9)
+	cookie, csrfToken := getFreezeForm(t, server)
+	form.Set(csrfFormField, csrfToken)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/freezes/cancel", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect, got %d", recorder.Code)
+	}
+	if len(store.cancelled) != 1 || store.cancelled[0] != 9 {
+		t.Fatalf("expected freeze 9 to cancel, got %+v", store.cancelled)
+	}
+}
+
+func TestEndFreezeRejectsMissingCSRFSession(t *testing.T) {
+	store := &fakeFreezeStore{}
+	server := NewServer(Config{AppName: "Thawguard", FreezeStore: store})
+	form := freezeCloseForm(9)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/freezes/end", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected forbidden status, got %d", recorder.Code)
+	}
+	if len(store.ended) != 0 {
+		t.Fatalf("expected no ended freezes, got %d", len(store.ended))
+	}
+}
+
+func TestEndFreezeRejectsInvalidCSRFToken(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	store := &fakeFreezeStore{}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, FreezeStore: store})
+	form := freezeCloseForm(9)
+	cookie, _ := getFreezeForm(t, server)
+	form.Set(csrfFormField, "not-the-session-token")
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/freezes/end", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected forbidden status, got %d", recorder.Code)
+	}
+	if len(store.ended) != 0 {
+		t.Fatalf("expected no ended freezes, got %d", len(store.ended))
+	}
+}
+
+func TestCancelFreezeRejectsInvalidCSRFToken(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	store := &fakeFreezeStore{}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, FreezeStore: store})
+	form := freezeCloseForm(9)
+	cookie, _ := getFreezeForm(t, server)
+	form.Set(csrfFormField, "not-the-session-token")
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/freezes/cancel", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected forbidden status, got %d", recorder.Code)
+	}
+	if len(store.cancelled) != 0 {
+		t.Fatalf("expected no cancelled freezes, got %d", len(store.cancelled))
+	}
+}
+
+func TestEndFreezeShowsValidationError(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	store := &fakeFreezeStore{err: freeze.ValidationError{Message: "freeze is not active"}}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, FreezeStore: store})
+	form := freezeCloseForm(9)
+	cookie, csrfToken := getFreezeForm(t, server)
+	form.Set(csrfFormField, csrfToken)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/freezes/end", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected bad request status, got %d", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), "freeze is not active") {
+		t.Fatalf("expected validation message in body, got %q", recorder.Body.String())
+	}
+}
+
+func TestEndFreezeHidesInternalErrorDetails(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	store := &fakeFreezeStore{err: errors.New("database failed with secret-token")}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, FreezeStore: store})
+	form := freezeCloseForm(9)
+	cookie, csrfToken := getFreezeForm(t, server)
+	form.Set(csrfFormField, csrfToken)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/freezes/end", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("expected internal server error status, got %d", recorder.Code)
+	}
+	if strings.Contains(recorder.Body.String(), "secret-token") {
+		t.Fatalf("expected generic error body, got %q", recorder.Body.String())
+	}
+}
+
+func freezeCloseForm(id int64) url.Values {
+	return url.Values{"freeze_id": {strconv.FormatInt(id, 10)}}
+}
+
 func freezeCreateForm() url.Values {
 	return url.Values{
 		"repository_id": {"1"},
@@ -416,10 +574,12 @@ type fakeSetupCheckRunner struct {
 }
 
 type fakeFreezeStore struct {
-	freezes []domain.BranchFreeze
-	created []freeze.CreateParams
-	actors  []domain.Actor
-	err     error
+	freezes   []domain.BranchFreeze
+	created   []freeze.CreateParams
+	ended     []int64
+	cancelled []int64
+	actors    []domain.Actor
+	err       error
 }
 
 func (s *fakeFreezeStore) ListActive(ctx context.Context) ([]domain.BranchFreeze, error) {
@@ -435,6 +595,24 @@ func (s *fakeFreezeStore) CreateActive(ctx context.Context, params freeze.Create
 	created := domain.BranchFreeze{ID: int64(len(s.freezes) + 1), RepositoryID: params.RepositoryID, Branch: params.Branch, Status: domain.BranchFreezeStatusActive, Active: true, Reason: params.Reason}
 	s.freezes = append(s.freezes, created)
 	return created, nil
+}
+
+func (s *fakeFreezeStore) End(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error) {
+	if s.err != nil {
+		return domain.BranchFreeze{}, s.err
+	}
+	s.ended = append(s.ended, id)
+	s.actors = append(s.actors, actor)
+	return domain.BranchFreeze{ID: id, Status: domain.BranchFreezeStatusEnded}, nil
+}
+
+func (s *fakeFreezeStore) Cancel(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error) {
+	if s.err != nil {
+		return domain.BranchFreeze{}, s.err
+	}
+	s.cancelled = append(s.cancelled, id)
+	s.actors = append(s.actors, actor)
+	return domain.BranchFreeze{ID: id, Status: domain.BranchFreezeStatusCancelled}, nil
 }
 
 func (r *fakeSetupCheckRunner) Run(ctx context.Context, repo domain.Repository) ([]setupcheck.Result, error) {

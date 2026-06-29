@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"testing"
 	"time"
 
@@ -100,6 +101,77 @@ VALUES (?, ?, ?, ?, ?, ?, ?)`, repo.ID, "main", domain.BranchFreezeStatusActive,
 	}
 }
 
+func TestStoreEndsActiveFreeze(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	store := NewStore(database)
+	created, err := store.CreateActive(ctx, CreateParams{RepositoryID: repo.ID, Branch: "main", Reason: "release"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ended, err := store.End(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ended.Status != domain.BranchFreezeStatusEnded || ended.Active || ended.EndsAt == nil {
+		t.Fatalf("expected ended inactive freeze with end time, got %+v", ended)
+	}
+	freezes, err := store.ListActive(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(freezes) != 0 {
+		t.Fatalf("expected no active freezes after ending, got %+v", freezes)
+	}
+	if _, err := store.CreateActive(ctx, CreateParams{RepositoryID: repo.ID, Branch: "main", Reason: "next release"}); err != nil {
+		t.Fatalf("expected branch to be free after ending freeze: %v", err)
+	}
+}
+
+func TestStoreCancelsActiveFreeze(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	store := NewStore(database)
+	created, err := store.CreateActive(ctx, CreateParams{RepositoryID: repo.ID, Branch: "main", Reason: "mistake"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cancelled, err := store.Cancel(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cancelled.Status != domain.BranchFreezeStatusCancelled || cancelled.Active || cancelled.EndsAt == nil {
+		t.Fatalf("expected cancelled inactive freeze with end time, got %+v", cancelled)
+	}
+}
+
+func TestStoreRejectsClosingInvalidOrInactiveFreeze(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	store := NewStore(database)
+	created, err := store.CreateActive(ctx, CreateParams{RepositoryID: repo.ID, Branch: "main", Reason: "release"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.End(ctx, 0); !IsValidationError(err) {
+		t.Fatalf("expected missing freeze validation error, got %v", err)
+	}
+	if _, err := store.End(ctx, 999); !IsValidationError(err) {
+		t.Fatalf("expected missing freeze validation error, got %v", err)
+	}
+	if _, err := store.End(ctx, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Cancel(ctx, created.ID); !IsValidationError(err) {
+		t.Fatalf("expected inactive freeze validation error, got %v", err)
+	}
+}
+
 func TestServiceCreatesFreezeAndAuditEventAtomically(t *testing.T) {
 	ctx := context.Background()
 	database := newTestDB(t, ctx)
@@ -131,6 +203,71 @@ func TestServiceCreatesFreezeAndAuditEventAtomically(t *testing.T) {
 	}
 }
 
+func TestServiceEndsFreezeAndRecordsAuditEvent(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	service := NewService(database)
+	created, err := service.CreateActive(ctx, CreateParams{RepositoryID: repo.ID, Branch: "main", Reason: "release window"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ended, err := service.End(ctx, created.ID, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ended.Status != domain.BranchFreezeStatusEnded {
+		t.Fatalf("expected ended freeze, got %+v", ended)
+	}
+	assertLatestFreezeAudit(t, ctx, database, audit.ActionBranchFreezeEnded, ended)
+}
+
+func TestServiceCancelsFreezeAndRecordsAuditEvent(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	service := NewService(database)
+	created, err := service.CreateActive(ctx, CreateParams{RepositoryID: repo.ID, Branch: "main", Reason: "mistake"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cancelled, err := service.Cancel(ctx, created.ID, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cancelled.Status != domain.BranchFreezeStatusCancelled {
+		t.Fatalf("expected cancelled freeze, got %+v", cancelled)
+	}
+	assertLatestFreezeAudit(t, ctx, database, audit.ActionBranchFreezeCancelled, cancelled)
+}
+
+func TestServiceRollsBackEndWhenAuditFails(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	service := NewService(database)
+	created, err := service.CreateActive(ctx, CreateParams{RepositoryID: repo.ID, Branch: "main", Reason: "release window"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	missingUserID := int64(999)
+
+	_, err = service.End(ctx, created.ID, domain.Actor{UserID: &missingUserID, Kind: "user", Role: "admin"})
+	if err == nil {
+		t.Fatal("expected audit foreign-key error")
+	}
+
+	freeze, getErr := NewStore(database).Get(ctx, created.ID)
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if freeze.Status != domain.BranchFreezeStatusActive || !freeze.Active || freeze.EndsAt != nil {
+		t.Fatalf("expected rollback to leave freeze active, got %+v", freeze)
+	}
+}
+
 func TestServiceRollsBackFreezeWhenAuditFails(t *testing.T) {
 	ctx := context.Background()
 	database := newTestDB(t, ctx)
@@ -159,6 +296,28 @@ func createTestRepository(t *testing.T, ctx context.Context, database *sql.DB) d
 		t.Fatal(err)
 	}
 	return repo
+}
+
+func assertLatestFreezeAudit(t *testing.T, ctx context.Context, database *sql.DB, action string, freeze domain.BranchFreeze) {
+	t.Helper()
+	events, err := audit.NewStore(database).List(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) == 0 {
+		t.Fatal("expected audit events")
+	}
+	event := events[0]
+	if event.Action != action || event.SubjectType != audit.SubjectTypeBranchFreeze || event.SubjectID != strconv.FormatInt(freeze.ID, 10) {
+		t.Fatalf("unexpected audit event: %+v", event)
+	}
+	var details map[string]string
+	if err := json.Unmarshal([]byte(event.DetailsJSON), &details); err != nil {
+		t.Fatal(err)
+	}
+	if details["actor_kind"] != domain.ActorKindBootstrapAdmin || details["actor_role"] != "admin" || details["repository_id"] != strconv.FormatInt(freeze.RepositoryID, 10) || details["branch"] != freeze.Branch || details["status"] != string(freeze.Status) || details["reason"] != freeze.Reason {
+		t.Fatalf("unexpected audit details: %s", event.DetailsJSON)
+	}
 }
 
 func newTestDB(t *testing.T, ctx context.Context) *sql.DB {

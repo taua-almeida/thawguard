@@ -101,6 +101,11 @@ button {
   font-weight: 800;
 }
 
+button.secondary {
+  color: var(--slate-900);
+  background: var(--ice-100);
+}
+
 table {
   width: 100%;
   border-collapse: collapse;

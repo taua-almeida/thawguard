@@ -19,7 +19,7 @@ go test ./...
 go run ./cmd/thawguard
 ```
 
-The service listens on `127.0.0.1:8080` by default. Override with `THAWGUARD_HTTP_ADDR`.
+The service listens on `127.0.0.1:8080` by default. Override with `THAWGUARD_HTTP_ADDR`; while bootstrap sessions are active, Thawguard refuses non-loopback bind addresses.
 
 The service creates `thawguard.db` by default. Override with `THAWGUARD_DB_PATH`.
 

@@ -40,6 +40,11 @@ type CreateParams struct {
 	CreatedByUserID *int64
 }
 
+type CloseParams struct {
+	ID     int64
+	Status domain.BranchFreezeStatus
+}
+
 func NewStore(db *sql.DB) *Store {
 	if db == nil {
 		return newStore(nil)
@@ -148,6 +153,50 @@ ORDER BY created_at DESC, id DESC`, domain.BranchFreezeStatusActive)
 	return freezes, nil
 }
 
+func (s *Store) End(ctx context.Context, id int64) (domain.BranchFreeze, error) {
+	return s.closeActive(ctx, CloseParams{ID: id, Status: domain.BranchFreezeStatusEnded})
+}
+
+func (s *Store) Cancel(ctx context.Context, id int64) (domain.BranchFreeze, error) {
+	return s.closeActive(ctx, CloseParams{ID: id, Status: domain.BranchFreezeStatusCancelled})
+}
+
+func (s *Store) closeActive(ctx context.Context, params CloseParams) (domain.BranchFreeze, error) {
+	if s == nil || s.db == nil {
+		return domain.BranchFreeze{}, errors.New("freeze store has no database")
+	}
+	if err := validateCloseParams(params); err != nil {
+		return domain.BranchFreeze{}, err
+	}
+
+	now := s.now().UTC().Format(time.RFC3339Nano)
+	result, err := s.db.ExecContext(ctx, `
+UPDATE branch_freezes
+SET status = ?, ends_at = ?, updated_at = ?
+WHERE id = ? AND status = ?`, params.Status, now, now, params.ID, domain.BranchFreezeStatusActive)
+	if err != nil {
+		return domain.BranchFreeze{}, fmt.Errorf("close branch freeze: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return domain.BranchFreeze{}, fmt.Errorf("close branch freeze rows affected: %w", err)
+	}
+	if affected == 0 {
+		existing, getErr := s.Get(ctx, params.ID)
+		if errors.Is(getErr, sql.ErrNoRows) {
+			return domain.BranchFreeze{}, ValidationError{Message: "active freeze not found"}
+		}
+		if getErr != nil {
+			return domain.BranchFreeze{}, getErr
+		}
+		if existing.Status != domain.BranchFreezeStatusActive {
+			return domain.BranchFreeze{}, ValidationError{Message: "freeze is not active"}
+		}
+		return domain.BranchFreeze{}, ValidationError{Message: "freeze is not active"}
+	}
+	return s.Get(ctx, params.ID)
+}
+
 func (s *Store) requireRepository(ctx context.Context, repositoryID int64) error {
 	var existing int64
 	err := s.db.QueryRowContext(ctx, `SELECT id FROM repositories WHERE id = ? AND active = 1`, repositoryID).Scan(&existing)
@@ -194,6 +243,16 @@ func validateCreateParams(params CreateParams) error {
 	}
 	if len(missing) > 0 {
 		return ValidationError{Message: fmt.Sprintf("missing required freeze fields: %s", strings.Join(missing, ", "))}
+	}
+	return nil
+}
+
+func validateCloseParams(params CloseParams) error {
+	if params.ID <= 0 {
+		return ValidationError{Message: "active freeze is required"}
+	}
+	if params.Status != domain.BranchFreezeStatusEnded && params.Status != domain.BranchFreezeStatusCancelled {
+		return ValidationError{Message: "freeze close status is invalid"}
 	}
 	return nil
 }

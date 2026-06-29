@@ -37,6 +37,8 @@ type SetupCheckRunner interface {
 type FreezeStore interface {
 	ListActive(ctx context.Context) ([]domain.BranchFreeze, error)
 	CreateActive(ctx context.Context, params freeze.CreateParams, actor domain.Actor) (domain.BranchFreeze, error)
+	End(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error)
+	Cancel(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error)
 }
 
 type repositoryView struct {
@@ -76,6 +78,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /repositories/setup-check", s.handleRunRepositorySetupCheck)
 	s.mux.HandleFunc("GET /freezes", s.handleFreezes)
 	s.mux.HandleFunc("POST /freezes", s.handleCreateFreeze)
+	s.mux.HandleFunc("POST /freezes/end", s.handleEndFreeze)
+	s.mux.HandleFunc("POST /freezes/cancel", s.handleCancelFreeze)
 	s.mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.Dir("web/static"))))
 }
 
@@ -87,12 +91,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	repositories, err := s.repositories(r.Context())
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		internalServerError(w)
 		return
 	}
 	freezes, err := s.activeFreezes(r.Context())
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		internalServerError(w)
 		return
 	}
 	s.render(w, dashboardTemplate, map[string]any{
@@ -111,12 +115,12 @@ func (s *Server) handleRepositories(w http.ResponseWriter, r *http.Request) {
 
 	repositories, err := s.repositories(r.Context())
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		internalServerError(w)
 		return
 	}
 	views, err := s.repositoryViews(r.Context(), repositories)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		internalServerError(w)
 		return
 	}
 	s.renderRepositories(w, views, "", session.CSRFToken)
@@ -141,17 +145,17 @@ func (s *Server) handleCreateRepository(w http.ResponseWriter, r *http.Request) 
 	}, session.auditActor())
 	if err != nil {
 		if !repository.IsValidationError(err) {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			internalServerError(w)
 			return
 		}
 		repositories, listErr := s.repositories(r.Context())
 		if listErr != nil {
-			http.Error(w, listErr.Error(), http.StatusInternalServerError)
+			internalServerError(w)
 			return
 		}
 		views, viewErr := s.repositoryViews(r.Context(), repositories)
 		if viewErr != nil {
-			http.Error(w, viewErr.Error(), http.StatusInternalServerError)
+			internalServerError(w)
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -170,7 +174,7 @@ func (s *Server) handleFreezes(w http.ResponseWriter, r *http.Request) {
 	}
 	repositories, freezes, err := s.freezePageData(r.Context())
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		internalServerError(w)
 		return
 	}
 	s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), "", session.CSRFToken)
@@ -197,12 +201,12 @@ func (s *Server) handleCreateFreeze(w http.ResponseWriter, r *http.Request) {
 	}, session.auditActor())
 	if err != nil {
 		if !freeze.IsValidationError(err) {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			internalServerError(w)
 			return
 		}
 		repositories, freezes, dataErr := s.freezePageData(r.Context())
 		if dataErr != nil {
-			http.Error(w, dataErr.Error(), http.StatusInternalServerError)
+			internalServerError(w)
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -211,6 +215,56 @@ func (s *Server) handleCreateFreeze(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/freezes", http.StatusSeeOther)
+}
+
+func (s *Server) handleEndFreeze(w http.ResponseWriter, r *http.Request) {
+	s.handleCloseFreeze(w, r, s.endFreeze)
+}
+
+func (s *Server) handleCancelFreeze(w http.ResponseWriter, r *http.Request) {
+	s.handleCloseFreeze(w, r, s.cancelFreeze)
+}
+
+func (s *Server) handleCloseFreeze(w http.ResponseWriter, r *http.Request, closeFreeze func(context.Context, int64, domain.Actor) error) {
+	if s.cfg.FreezeStore == nil {
+		http.Error(w, "freeze store is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	session, ok := s.requireFreezerForm(w, r)
+	if !ok {
+		return
+	}
+
+	freezeID, err := strconv.ParseInt(strings.TrimSpace(r.PostFormValue("freeze_id")), 10, 64)
+	if err != nil {
+		freezeID = 0
+	}
+	if err := closeFreeze(r.Context(), freezeID, session.auditActor()); err != nil {
+		if !freeze.IsValidationError(err) {
+			internalServerError(w)
+			return
+		}
+		repositories, freezes, dataErr := s.freezePageData(r.Context())
+		if dataErr != nil {
+			internalServerError(w)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusBadRequest)
+		s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), err.Error(), session.CSRFToken)
+		return
+	}
+	http.Redirect(w, r, "/freezes", http.StatusSeeOther)
+}
+
+func (s *Server) endFreeze(ctx context.Context, id int64, actor domain.Actor) error {
+	_, err := s.cfg.FreezeStore.End(ctx, id, actor)
+	return err
+}
+
+func (s *Server) cancelFreeze(ctx context.Context, id int64, actor domain.Actor) error {
+	_, err := s.cfg.FreezeStore.Cancel(ctx, id, actor)
+	return err
 }
 
 func (s *Server) handleRunRepositorySetupCheck(w http.ResponseWriter, r *http.Request) {
@@ -230,7 +284,7 @@ func (s *Server) handleRunRepositorySetupCheck(w http.ResponseWriter, r *http.Re
 	}
 	repo, found, err := s.repositoryByID(r.Context(), repositoryID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		internalServerError(w)
 		return
 	}
 	if !found {
@@ -239,7 +293,7 @@ func (s *Server) handleRunRepositorySetupCheck(w http.ResponseWriter, r *http.Re
 	}
 
 	if _, err := s.cfg.SetupCheckRunner.Run(r.Context(), repo); err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		http.Error(w, "setup check failed", http.StatusBadGateway)
 		return
 	}
 	http.Redirect(w, r, "/repositories", http.StatusSeeOther)
@@ -256,7 +310,7 @@ func (s *Server) requireRepositoryManagerForm(w http.ResponseWriter, r *http.Req
 		return sessionState{}, false
 	}
 	if err := r.ParseForm(); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, "bad request", http.StatusBadRequest)
 		return sessionState{}, false
 	}
 	if !constantTimeTokenEqual(r.PostForm.Get(csrfFormField), session.CSRFToken) {
@@ -277,7 +331,7 @@ func (s *Server) requireFreezerForm(w http.ResponseWriter, r *http.Request) (ses
 		return sessionState{}, false
 	}
 	if err := r.ParseForm(); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, "bad request", http.StatusBadRequest)
 		return sessionState{}, false
 	}
 	if !constantTimeTokenEqual(r.PostForm.Get(csrfFormField), session.CSRFToken) {
@@ -394,10 +448,14 @@ func (s *Server) render(w http.ResponseWriter, source string, data any) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	tpl, err := template.New("page").Parse(source)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		internalServerError(w)
 		return
 	}
 	_ = tpl.Execute(w, data)
+}
+
+func internalServerError(w http.ResponseWriter) {
+	http.Error(w, "internal server error", http.StatusInternalServerError)
 }
 
 const pageHead = `<!doctype html>
@@ -520,7 +578,7 @@ const freezesTemplate = pageHead + `
       <h2>Active freezes</h2>
       {{ if .Freezes }}
       <table>
-        <thead><tr><th>Repository</th><th>Branch</th><th>Status</th><th>Reason</th></tr></thead>
+        <thead><tr><th>Repository</th><th>Branch</th><th>Status</th><th>Reason</th><th>Actions</th></tr></thead>
         <tbody>
         {{ range .Freezes }}
           <tr>
@@ -528,6 +586,18 @@ const freezesTemplate = pageHead + `
             <td>{{ .Freeze.Branch }}</td>
             <td><span class="status status-frozen">{{ .Freeze.Status }}</span></td>
             <td>{{ .Freeze.Reason }}</td>
+            <td class="actions">
+              <form method="post" action="/freezes/end">
+                <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+                <input type="hidden" name="freeze_id" value="{{ .Freeze.ID }}">
+                <button type="submit">End freeze</button>
+              </form>
+              <form method="post" action="/freezes/cancel">
+                <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+                <input type="hidden" name="freeze_id" value="{{ .Freeze.ID }}">
+                <button type="submit" class="secondary">Cancel</button>
+              </form>
+            </td>
           </tr>
         {{ end }}
         </tbody>

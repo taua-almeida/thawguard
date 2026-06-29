@@ -30,6 +30,10 @@ func New(cfg config.Config, logger *slog.Logger) *App {
 }
 
 func (a *App) Run(ctx context.Context) error {
+	if err := validateBootstrapLocalBind(a.cfg.HTTPAddr); err != nil {
+		return err
+	}
+
 	database, err := db.Open(ctx, db.DefaultConfig(a.cfg.DatabasePath))
 	if err != nil {
 		return err
