@@ -2,8 +2,12 @@ package web
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"html/template"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -16,7 +20,10 @@ import (
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
 	"github.com/taua-almeida/thawguard/internal/statuspublication"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
+	"github.com/taua-almeida/thawguard/internal/webhook"
 )
+
+const defaultWebhookMaxBodyBytes int64 = 1 << 20
 
 type Config struct {
 	AppName                              string
@@ -28,6 +35,10 @@ type Config struct {
 	AuditStore                           AuditStore
 	StatusDecisionStore                  StatusDecisionStore
 	StatusPublicationStore               StatusPublicationStore
+	WebhookRepositoryStore               WebhookRepositoryStore
+	WebhookDeliveryStore                 WebhookDeliveryStore
+	PullRequestWebhookProcessor          PullRequestWebhookProcessor
+	WebhookMaxBodyBytes                  int64
 }
 
 type RepositoryStore interface {
@@ -62,6 +73,20 @@ type StatusDecisionStore interface {
 
 type StatusPublicationStore interface {
 	ListRecent(ctx context.Context, limit int) ([]statuspublication.Publication, error)
+}
+
+type WebhookRepositoryStore interface {
+	FindActiveByRemote(ctx context.Context, params repository.RemoteParams) (domain.Repository, bool, error)
+	WebhookSecret(ctx context.Context, repositoryID int64) (string, bool, error)
+}
+
+type WebhookDeliveryStore interface {
+	Record(ctx context.Context, params webhook.DeliveryRecordParams) (webhook.Delivery, error)
+	MarkProcessed(ctx context.Context, id int64, params webhook.DeliveryProcessParams) (webhook.Delivery, error)
+}
+
+type PullRequestWebhookProcessor interface {
+	Process(ctx context.Context, body []byte) (webhook.PullRequestProcessResult, error)
 }
 
 type repositoryView struct {
@@ -131,6 +156,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /decisions", s.handleDecisions)
 	s.mux.HandleFunc("POST /decisions", s.handleCreateDecision)
 	s.mux.HandleFunc("GET /publications", s.handlePublications)
+	s.mux.HandleFunc("POST /webhooks/forgejo", s.handleForgejoWebhook)
 	s.mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.Dir("web/static"))))
 }
 
@@ -231,6 +257,182 @@ func (s *Server) handlePublications(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.renderPublications(w, s.statusPublicationViews(repositories, publications))
+}
+
+func (s *Server) handleForgejoWebhook(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.WebhookRepositoryStore == nil || s.cfg.WebhookDeliveryStore == nil || s.cfg.PullRequestWebhookProcessor == nil {
+		http.Error(w, "webhook receiver is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	body, ok := s.readWebhookBody(w, r)
+	if !ok {
+		return
+	}
+	if len(body) == 0 || !webhookEventMayBePullRequest(r) {
+		acceptedWebhook(w)
+		return
+	}
+
+	event, err := webhook.ParsePullRequestEvent(body)
+	if err != nil {
+		acceptedWebhook(w)
+		return
+	}
+	repo, found, err := s.cfg.WebhookRepositoryStore.FindActiveByRemote(r.Context(), repository.RemoteParams{Forge: event.Forge, BaseURL: event.BaseURL, Owner: event.Owner, Name: event.RepositoryName})
+	if err != nil {
+		internalServerError(w)
+		return
+	}
+	if !found {
+		acceptedWebhook(w)
+		return
+	}
+
+	secret, found, err := s.cfg.WebhookRepositoryStore.WebhookSecret(r.Context(), repo.ID)
+	if err != nil {
+		if repositorysetup.IsConfigurationError(err) {
+			acceptedWebhook(w)
+			return
+		}
+		internalServerError(w)
+		return
+	}
+	if !found || !webhook.VerifyHMACSHA256(secret, body, webhookSignatureHeader(r)) {
+		acceptedWebhook(w)
+		return
+	}
+
+	delivery, err := s.cfg.WebhookDeliveryStore.Record(r.Context(), webhook.DeliveryRecordParams{RepositoryID: repo.ID, DeliveryID: webhookDeliveryID(r, repo.ID, body), Event: "pull_request", Action: event.Action, Verified: true})
+	if err != nil {
+		if webhook.IsValidationError(err) {
+			if delivery.ID != 0 && shouldRetryWebhookDelivery(delivery) {
+				s.processVerifiedPullRequestWebhook(w, r, delivery, repo.ID, event.Action, body)
+				return
+			}
+			acceptedWebhook(w)
+			return
+		}
+		internalServerError(w)
+		return
+	}
+	s.processVerifiedPullRequestWebhook(w, r, delivery, repo.ID, event.Action, body)
+}
+
+func (s *Server) processVerifiedPullRequestWebhook(w http.ResponseWriter, r *http.Request, delivery webhook.Delivery, repositoryID int64, action string, body []byte) {
+	if !supportedPullRequestAction(action) {
+		s.markWebhookProcessed(w, r, delivery.ID, repositoryID, action, "unsupported pull_request action")
+		return
+	}
+
+	_, processErr := s.cfg.PullRequestWebhookProcessor.Process(r.Context(), body)
+	if processErr != nil {
+		deliveryError := sanitizedWebhookProcessError(processErr)
+		if !s.markWebhookProcessed(w, r, delivery.ID, repositoryID, action, deliveryError) {
+			return
+		}
+		if webhook.IsValidationError(processErr) {
+			acceptedWebhook(w)
+			return
+		}
+		internalServerError(w)
+		return
+	}
+	_ = s.markWebhookProcessed(w, r, delivery.ID, repositoryID, action, "")
+}
+
+func (s *Server) readWebhookBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	limit := s.cfg.WebhookMaxBodyBytes
+	if limit <= 0 {
+		limit = defaultWebhookMaxBodyBytes
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "webhook payload too large", http.StatusRequestEntityTooLarge)
+			return nil, false
+		}
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return nil, false
+	}
+	return body, true
+}
+
+func (s *Server) markWebhookProcessed(w http.ResponseWriter, r *http.Request, deliveryID int64, repositoryID int64, action string, deliveryError string) bool {
+	if _, err := s.cfg.WebhookDeliveryStore.MarkProcessed(r.Context(), deliveryID, webhook.DeliveryProcessParams{RepositoryID: repositoryID, Action: action, Error: deliveryError}); err != nil {
+		internalServerError(w)
+		return false
+	}
+	if deliveryError == "" || deliveryError == "unsupported pull_request action" {
+		acceptedWebhook(w)
+	}
+	return true
+}
+
+func webhookEventMayBePullRequest(r *http.Request) bool {
+	event := strings.ToLower(firstHeader(r, "X-Gitea-Event", "X-Forgejo-Event", "X-Gogs-Event"))
+	return event == "" || event == "pull_request"
+}
+
+func webhookSignatureHeader(r *http.Request) string {
+	return firstHeader(r, "X-Gitea-Signature", "X-Forgejo-Signature", "X-Hub-Signature-256")
+}
+
+func webhookDeliveryID(r *http.Request, repositoryID int64, body []byte) string {
+	if deliveryID := firstHeader(r, "X-Gitea-Delivery", "X-Forgejo-Delivery", "X-Gogs-Delivery", "X-GitHub-Delivery"); deliveryID != "" {
+		if validWebhookDeliveryID(deliveryID) {
+			return deliveryID
+		}
+	}
+	sum := sha256.Sum256(body)
+	return "repo:" + strconv.FormatInt(repositoryID, 10) + ":sha256:" + hex.EncodeToString(sum[:])
+}
+
+func validWebhookDeliveryID(value string) bool {
+	if value == "" || len(value) > 255 {
+		return false
+	}
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func firstHeader(r *http.Request, names ...string) string {
+	for _, name := range names {
+		if value := strings.TrimSpace(r.Header.Get(name)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func supportedPullRequestAction(action string) bool {
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case "opened", "reopened", "synchronized", "synchronize", "edited", "closed":
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldRetryWebhookDelivery(delivery webhook.Delivery) bool {
+	return delivery.ProcessedAt == nil || delivery.Error == "webhook processing failed"
+}
+
+func sanitizedWebhookProcessError(err error) string {
+	if webhook.IsValidationError(err) {
+		return "webhook validation failed"
+	}
+	return "webhook processing failed"
+}
+
+func acceptedWebhook(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = w.Write([]byte("accepted\n"))
 }
 
 func (s *Server) handleRepositories(w http.ResponseWriter, r *http.Request) {
@@ -808,7 +1010,7 @@ const publicationsTemplate = pageHead + `
       <h1>Status publication intents</h1>
       <p class="warning">These are local records of statuses Thawguard would publish later. No status has been posted to Forgejo/Codeberg from this page or from the current local publisher.</p>
       <p class="warning">Bootstrap sessions are for local development only. Do not expose publication-intent visibility on a network until real local auth is configured.</p>
-      <p>Use this page to inspect the status context, state, head SHA, and description generated by the local recomputation pipeline before live posting or a public webhook endpoint is wired.</p>
+      <p>Use this page to inspect the status context, state, head SHA, and description generated by the local recomputation pipeline before live status posting is wired.</p>
     </section>
 
     <section class="panel">
@@ -845,7 +1047,7 @@ const repositoriesTemplate = pageHead + `
 	      <p class="eyebrow">Repositories</p>
 	      <h1>Add repository</h1>
 	      <p class="warning">Bootstrap sessions are for local development only. Do not expose this server on a network until real local auth is configured.</p>
-	      <p>Start with Forgejo/Codeberg repositories. Manual setup must require the exact status context <code>{{ .RequiredContext }}</code>. Webhook secret storage is preparatory until the signed webhook endpoint is enabled.</p>
+	      <p>Start with Forgejo/Codeberg repositories. Manual setup must require the exact status context <code>{{ .RequiredContext }}</code>. The signed webhook receiver is <code>/webhooks/forgejo</code>; current delivery handling recomputes local records and does not post live forge statuses.</p>
         {{ if not .WebhookSecretEncryptionConfigured }}<p class="warning">Webhook secret storage is disabled until <code>THAWGUARD_SECRET_KEY</code> is configured. Existing repository setup and local freeze flows remain available.</p>{{ end }}
       {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
       <form method="post" action="/repositories" class="form-grid">
@@ -889,7 +1091,7 @@ const repositoriesTemplate = pageHead + `
               <form method="post" action="/repositories/webhook-secret">
                 <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
                 <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
-                <label>Set or rotate webhook secret for future signed delivery <input type="password" name="webhook_secret" minlength="16" maxlength="512" autocomplete="new-password" required></label>
+                <label>Set or rotate webhook secret for signed delivery <input type="password" name="webhook_secret" minlength="16" maxlength="512" autocomplete="new-password" required></label>
                 <button type="submit">Save webhook secret</button>
               </form>
               {{ else }}
@@ -923,7 +1125,7 @@ const freezesTemplate = pageHead + `
       <p class="eyebrow">Branch freezes</p>
       <h1>Create active freeze</h1>
       <p class="warning">Bootstrap sessions are for local development only. Do not expose freeze controls on a network until real local auth is configured.</p>
-      <p>Record a cooperative branch freeze locally. Status posting and webhook recomputation will be wired in a later slice.</p>
+      <p>Record a cooperative branch freeze locally. Signed webhook recomputation updates local records; live forge status posting will be wired in a later slice.</p>
       {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
       {{ if .Repositories }}
       <form method="post" action="/freezes" class="form-grid">

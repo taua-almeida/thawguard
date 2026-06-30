@@ -11,12 +11,15 @@ import (
 	"github.com/taua-almeida/thawguard/internal/config"
 	"github.com/taua-almeida/thawguard/internal/db"
 	"github.com/taua-almeida/thawguard/internal/freeze"
+	"github.com/taua-almeida/thawguard/internal/pullrequest"
+	"github.com/taua-almeida/thawguard/internal/repository"
 	"github.com/taua-almeida/thawguard/internal/repositorysetup"
 	"github.com/taua-almeida/thawguard/internal/secrets"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
 	"github.com/taua-almeida/thawguard/internal/statuspublication"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
 	"github.com/taua-almeida/thawguard/internal/web"
+	"github.com/taua-almeida/thawguard/internal/webhook"
 )
 
 // App wires the monolith together. The first scaffold keeps dependencies small:
@@ -64,6 +67,9 @@ func (a *App) Run(ctx context.Context) error {
 	auditStore := audit.NewStore(database)
 	statusDecisionStore := statusresult.NewService(statusresult.NewStore(database), freezeStore)
 	statusPublicationStore := statuspublication.NewStore(database)
+	pullRequestStore := pullrequest.NewStore(database)
+	webhookDeliveryStore := webhook.NewDeliveryStore(database)
+	pullRequestWebhookProcessor := webhook.NewPullRequestProcessor(repository.NewStore(database), pullRequestStore, statusDecisionStore, statusPublicationStore)
 	server := &http.Server{
 		Addr: a.cfg.HTTPAddr,
 		Handler: web.NewServer(web.Config{
@@ -76,8 +82,12 @@ func (a *App) Run(ctx context.Context) error {
 			AuditStore:                           auditStore,
 			StatusDecisionStore:                  statusDecisionStore,
 			StatusPublicationStore:               statusPublicationStore,
+			WebhookRepositoryStore:               repositoryStore,
+			WebhookDeliveryStore:                 webhookDeliveryStore,
+			PullRequestWebhookProcessor:          pullRequestWebhookProcessor,
 		}).Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
 	}
 
 	errc := make(chan error, 1)

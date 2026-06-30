@@ -2,6 +2,9 @@ package web
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -20,6 +23,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
 	"github.com/taua-almeida/thawguard/internal/statuspublication"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
+	"github.com/taua-almeida/thawguard/internal/webhook"
 )
 
 func TestRepositoriesPageShowsManualSetupContext(t *testing.T) {
@@ -896,6 +900,194 @@ func TestPublicationsPageHidesInternalErrorDetails(t *testing.T) {
 	}
 }
 
+func TestForgejoWebhookProcessesValidSignedPullRequest(t *testing.T) {
+	repo := domain.Repository{ID: 1, Forge: "forgejo", BaseURL: "https://codeberg.org", Owner: "example-owner", Name: "example-repo", DefaultBranch: "main", HasWebhookSecret: true}
+	repositoryStore := &fakeWebhookRepositoryStore{repo: repo, secret: "super-secret-value", found: true, secretFound: true}
+	deliveryStore := newFakeWebhookDeliveryStore()
+	processor := &fakePullRequestWebhookProcessor{}
+	server := NewServer(Config{AppName: "Thawguard", WebhookRepositoryStore: repositoryStore, WebhookDeliveryStore: deliveryStore, PullRequestWebhookProcessor: processor})
+	body := pullRequestWebhookBody("opened")
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, signedWebhookRequest(t, body, "super-secret-value", "delivery-1"))
+
+	if recorder.Code != http.StatusAccepted || recorder.Body.String() != "accepted\n" {
+		t.Fatalf("expected generic accepted response, got status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+	if len(processor.bodies) != 1 || string(processor.bodies[0]) != body {
+		t.Fatalf("expected processor to receive body once, got %+v", processor.bodies)
+	}
+	if len(deliveryStore.records) != 1 || deliveryStore.records[0].RepositoryID != repo.ID || deliveryStore.records[0].DeliveryID != "delivery-1" || !deliveryStore.records[0].Verified {
+		t.Fatalf("unexpected delivery records: %+v", deliveryStore.records)
+	}
+	if len(deliveryStore.processed) != 1 || deliveryStore.processed[0].params.Error != "" || deliveryStore.processed[0].params.Action != "opened" {
+		t.Fatalf("unexpected processed deliveries: %+v", deliveryStore.processed)
+	}
+}
+
+func TestForgejoWebhookRejectsInvalidSignatureGenerically(t *testing.T) {
+	repo := domain.Repository{ID: 1, Forge: "forgejo", BaseURL: "https://codeberg.org", Owner: "example-owner", Name: "example-repo", DefaultBranch: "main", HasWebhookSecret: true}
+	repositoryStore := &fakeWebhookRepositoryStore{repo: repo, secret: "super-secret-value", found: true, secretFound: true}
+	deliveryStore := newFakeWebhookDeliveryStore()
+	processor := &fakePullRequestWebhookProcessor{}
+	server := NewServer(Config{AppName: "Thawguard", WebhookRepositoryStore: repositoryStore, WebhookDeliveryStore: deliveryStore, PullRequestWebhookProcessor: processor})
+	body := pullRequestWebhookBody("opened")
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, signedWebhookRequest(t, body, "wrong-secret-value", "delivery-1"))
+
+	if recorder.Code != http.StatusAccepted || recorder.Body.String() != "accepted\n" {
+		t.Fatalf("expected generic accepted response, got status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+	if len(processor.bodies) != 0 || len(deliveryStore.records) != 0 {
+		t.Fatalf("expected no processing or delivery record, processor=%d records=%d", len(processor.bodies), len(deliveryStore.records))
+	}
+	if strings.Contains(recorder.Body.String(), "super-secret-value") || strings.Contains(recorder.Body.String(), "signature") {
+		t.Fatalf("expected response not to leak verification details, got %q", recorder.Body.String())
+	}
+}
+
+func TestForgejoWebhookReturnsGenericResponseForUnknownRepository(t *testing.T) {
+	repositoryStore := &fakeWebhookRepositoryStore{found: false}
+	deliveryStore := newFakeWebhookDeliveryStore()
+	processor := &fakePullRequestWebhookProcessor{}
+	server := NewServer(Config{AppName: "Thawguard", WebhookRepositoryStore: repositoryStore, WebhookDeliveryStore: deliveryStore, PullRequestWebhookProcessor: processor})
+	body := pullRequestWebhookBody("opened")
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, signedWebhookRequest(t, body, "super-secret-value", "delivery-1"))
+
+	if recorder.Code != http.StatusAccepted || recorder.Body.String() != "accepted\n" {
+		t.Fatalf("expected generic accepted response, got status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+	if len(processor.bodies) != 0 || len(deliveryStore.records) != 0 {
+		t.Fatalf("expected no processing or delivery record, processor=%d records=%d", len(processor.bodies), len(deliveryStore.records))
+	}
+}
+
+func TestForgejoWebhookIgnoresDuplicateDeliveryID(t *testing.T) {
+	repo := domain.Repository{ID: 1, Forge: "forgejo", BaseURL: "https://codeberg.org", Owner: "example-owner", Name: "example-repo", DefaultBranch: "main", HasWebhookSecret: true}
+	repositoryStore := &fakeWebhookRepositoryStore{repo: repo, secret: "super-secret-value", found: true, secretFound: true}
+	deliveryStore := newFakeWebhookDeliveryStore()
+	processor := &fakePullRequestWebhookProcessor{}
+	server := NewServer(Config{AppName: "Thawguard", WebhookRepositoryStore: repositoryStore, WebhookDeliveryStore: deliveryStore, PullRequestWebhookProcessor: processor})
+	body := pullRequestWebhookBody("opened")
+
+	for range 2 {
+		recorder := httptest.NewRecorder()
+		server.Routes().ServeHTTP(recorder, signedWebhookRequest(t, body, "super-secret-value", "delivery-1"))
+		if recorder.Code != http.StatusAccepted {
+			t.Fatalf("expected generic accepted response, got status=%d body=%q", recorder.Code, recorder.Body.String())
+		}
+	}
+	if len(processor.bodies) != 1 || len(deliveryStore.records) != 1 || len(deliveryStore.processed) != 1 {
+		t.Fatalf("expected duplicate not to reprocess, processor=%d records=%d processed=%d", len(processor.bodies), len(deliveryStore.records), len(deliveryStore.processed))
+	}
+}
+
+func TestForgejoWebhookRetriesPreviouslyUnprocessedDuplicateDelivery(t *testing.T) {
+	repo := domain.Repository{ID: 1, Forge: "forgejo", BaseURL: "https://codeberg.org", Owner: "example-owner", Name: "example-repo", DefaultBranch: "main", HasWebhookSecret: true}
+	repositoryStore := &fakeWebhookRepositoryStore{repo: repo, secret: "super-secret-value", found: true, secretFound: true}
+	deliveryStore := newFakeWebhookDeliveryStore()
+	if _, err := deliveryStore.Record(context.Background(), webhook.DeliveryRecordParams{RepositoryID: repo.ID, DeliveryID: "delivery-unprocessed", Event: "pull_request", Action: "opened", Verified: true}); err != nil {
+		t.Fatal(err)
+	}
+	processor := &fakePullRequestWebhookProcessor{}
+	server := NewServer(Config{AppName: "Thawguard", WebhookRepositoryStore: repositoryStore, WebhookDeliveryStore: deliveryStore, PullRequestWebhookProcessor: processor})
+	body := pullRequestWebhookBody("opened")
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, signedWebhookRequest(t, body, "super-secret-value", "delivery-unprocessed"))
+
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("expected generic accepted response, got status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+	if len(processor.bodies) != 1 || len(deliveryStore.records) != 1 || len(deliveryStore.processed) != 1 {
+		t.Fatalf("expected unprocessed duplicate retry, processor=%d records=%d processed=%d", len(processor.bodies), len(deliveryStore.records), len(deliveryStore.processed))
+	}
+}
+
+func TestForgejoWebhookRecordsProcessorErrorWithoutLeakingDetails(t *testing.T) {
+	repo := domain.Repository{ID: 1, Forge: "forgejo", BaseURL: "https://codeberg.org", Owner: "example-owner", Name: "example-repo", DefaultBranch: "main", HasWebhookSecret: true}
+	repositoryStore := &fakeWebhookRepositoryStore{repo: repo, secret: "super-secret-value", found: true, secretFound: true}
+	deliveryStore := newFakeWebhookDeliveryStore()
+	processor := &fakePullRequestWebhookProcessor{err: errors.New("database failed with secret-token")}
+	server := NewServer(Config{AppName: "Thawguard", WebhookRepositoryStore: repositoryStore, WebhookDeliveryStore: deliveryStore, PullRequestWebhookProcessor: processor})
+	body := pullRequestWebhookBody("opened")
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, signedWebhookRequest(t, body, "super-secret-value", "delivery-failing"))
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("expected internal server error response for retryable processing failure, got status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "secret-token") {
+		t.Fatalf("expected generic error body, got %q", recorder.Body.String())
+	}
+	if len(deliveryStore.processed) != 1 || deliveryStore.processed[0].params.Error != "webhook processing failed" {
+		t.Fatalf("expected sanitized processing error delivery, got %+v", deliveryStore.processed)
+	}
+}
+
+func TestForgejoWebhookRecordsUnsupportedVerifiedPullRequestAction(t *testing.T) {
+	repo := domain.Repository{ID: 1, Forge: "forgejo", BaseURL: "https://codeberg.org", Owner: "example-owner", Name: "example-repo", DefaultBranch: "main", HasWebhookSecret: true}
+	repositoryStore := &fakeWebhookRepositoryStore{repo: repo, secret: "super-secret-value", found: true, secretFound: true}
+	deliveryStore := newFakeWebhookDeliveryStore()
+	processor := &fakePullRequestWebhookProcessor{}
+	server := NewServer(Config{AppName: "Thawguard", WebhookRepositoryStore: repositoryStore, WebhookDeliveryStore: deliveryStore, PullRequestWebhookProcessor: processor})
+	body := pullRequestWebhookBody("assigned")
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, signedWebhookRequest(t, body, "super-secret-value", "delivery-unsupported"))
+
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("expected generic accepted response, got status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+	if len(processor.bodies) != 0 {
+		t.Fatalf("expected unsupported action not to process, got %d calls", len(processor.bodies))
+	}
+	if len(deliveryStore.records) != 1 || len(deliveryStore.processed) != 1 || deliveryStore.processed[0].params.Error != "unsupported pull_request action" {
+		t.Fatalf("expected verified unsupported action delivery error, records=%+v processed=%+v", deliveryStore.records, deliveryStore.processed)
+	}
+}
+
+func TestForgejoWebhookIgnoresUnsupportedEventHeader(t *testing.T) {
+	repo := domain.Repository{ID: 1, Forge: "forgejo", BaseURL: "https://codeberg.org", Owner: "example-owner", Name: "example-repo", DefaultBranch: "main", HasWebhookSecret: true}
+	repositoryStore := &fakeWebhookRepositoryStore{repo: repo, secret: "super-secret-value", found: true, secretFound: true}
+	deliveryStore := newFakeWebhookDeliveryStore()
+	processor := &fakePullRequestWebhookProcessor{}
+	server := NewServer(Config{AppName: "Thawguard", WebhookRepositoryStore: repositoryStore, WebhookDeliveryStore: deliveryStore, PullRequestWebhookProcessor: processor})
+	body := pullRequestWebhookBody("opened")
+	request := signedWebhookRequest(t, body, "super-secret-value", "delivery-push")
+	request.Header.Set("X-Gitea-Event", "push")
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("expected generic accepted response, got status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+	if len(processor.bodies) != 0 || len(deliveryStore.records) != 0 {
+		t.Fatalf("expected unsupported event not to process or record, processor=%d records=%d", len(processor.bodies), len(deliveryStore.records))
+	}
+}
+
+func TestForgejoWebhookRejectsOversizedPayload(t *testing.T) {
+	deliveryStore := newFakeWebhookDeliveryStore()
+	processor := &fakePullRequestWebhookProcessor{}
+	server := NewServer(Config{AppName: "Thawguard", WebhookRepositoryStore: &fakeWebhookRepositoryStore{}, WebhookDeliveryStore: deliveryStore, PullRequestWebhookProcessor: processor, WebhookMaxBodyBytes: 8})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, signedWebhookRequest(t, pullRequestWebhookBody("opened"), "super-secret-value", "delivery-large"))
+
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected payload too large status, got %d", recorder.Code)
+	}
+	if len(processor.bodies) != 0 || len(deliveryStore.records) != 0 {
+		t.Fatalf("expected oversized payload not to process or record, processor=%d records=%d", len(processor.bodies), len(deliveryStore.records))
+	}
+}
+
 func decisionCreateForm() url.Values {
 	return url.Values{
 		"repository_id":      {"1"},
@@ -978,6 +1170,125 @@ func csrfTokenFromBody(t *testing.T, body string) string {
 }
 
 var csrfInputPattern = regexp.MustCompile(`name="` + csrfFormField + `" value="([^"]+)"`)
+
+func pullRequestWebhookBody(action string) string {
+	return strings.ReplaceAll(`{
+  "action": "{{ACTION}}",
+  "repository": {
+    "owner": { "login": "example-owner" },
+    "name": "example-repo",
+    "full_name": "example-owner/example-repo",
+    "clone_url": "https://codeberg.org/example-owner/example-repo.git"
+  },
+  "pull_request": {
+    "number": 42,
+    "title": "Example bug fix",
+    "state": "open",
+    "html_url": "https://codeberg.org/example-owner/example-repo/pulls/42",
+    "base": { "ref": "main" },
+    "head": { "sha": "0123456789abcdef0123456789abcdef01234567" }
+  }
+}`, "{{ACTION}}", action)
+}
+
+func signedWebhookRequest(t *testing.T, body string, secret string, deliveryID string) *http.Request {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodPost, "/webhooks/forgejo", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Gitea-Event", "pull_request")
+	request.Header.Set("X-Gitea-Signature", "sha256="+webhookSignature(body, secret))
+	if deliveryID != "" {
+		request.Header.Set("X-Gitea-Delivery", deliveryID)
+	}
+	return request
+}
+
+func webhookSignature(body string, secret string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(body))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+type fakeWebhookRepositoryStore struct {
+	repo         domain.Repository
+	secret       string
+	found        bool
+	secretFound  bool
+	findErr      error
+	secretErr    error
+	remoteParams []repository.RemoteParams
+}
+
+func (s *fakeWebhookRepositoryStore) FindActiveByRemote(ctx context.Context, params repository.RemoteParams) (domain.Repository, bool, error) {
+	s.remoteParams = append(s.remoteParams, params)
+	if s.findErr != nil {
+		return domain.Repository{}, false, s.findErr
+	}
+	return s.repo, s.found, nil
+}
+
+func (s *fakeWebhookRepositoryStore) WebhookSecret(ctx context.Context, repositoryID int64) (string, bool, error) {
+	if s.secretErr != nil {
+		return "", false, s.secretErr
+	}
+	return s.secret, s.secretFound, nil
+}
+
+type fakePullRequestWebhookProcessor struct {
+	bodies [][]byte
+	err    error
+}
+
+func (p *fakePullRequestWebhookProcessor) Process(ctx context.Context, body []byte) (webhook.PullRequestProcessResult, error) {
+	copyBody := make([]byte, len(body))
+	copy(copyBody, body)
+	p.bodies = append(p.bodies, copyBody)
+	if p.err != nil {
+		return webhook.PullRequestProcessResult{}, p.err
+	}
+	return webhook.PullRequestProcessResult{}, nil
+}
+
+type fakeWebhookDeliveryStore struct {
+	nextID       int64
+	records      []webhook.DeliveryRecordParams
+	processed    []fakeWebhookProcessedDelivery
+	deliveries   map[int64]webhook.Delivery
+	deliveryByID map[string]int64
+}
+
+type fakeWebhookProcessedDelivery struct {
+	id     int64
+	params webhook.DeliveryProcessParams
+}
+
+func newFakeWebhookDeliveryStore() *fakeWebhookDeliveryStore {
+	return &fakeWebhookDeliveryStore{deliveries: make(map[int64]webhook.Delivery), deliveryByID: make(map[string]int64)}
+}
+
+func (s *fakeWebhookDeliveryStore) Record(ctx context.Context, params webhook.DeliveryRecordParams) (webhook.Delivery, error) {
+	if existingID, found := s.deliveryByID[params.DeliveryID]; found {
+		return s.deliveries[existingID], webhook.ValidationError{Message: "webhook delivery already recorded"}
+	}
+	s.nextID++
+	delivery := webhook.Delivery{ID: s.nextID, RepositoryID: params.RepositoryID, DeliveryID: params.DeliveryID, Event: params.Event, Action: params.Action, Verified: params.Verified}
+	s.deliveryByID[params.DeliveryID] = delivery.ID
+	s.deliveries[delivery.ID] = delivery
+	s.records = append(s.records, params)
+	return delivery, nil
+}
+
+func (s *fakeWebhookDeliveryStore) MarkProcessed(ctx context.Context, id int64, params webhook.DeliveryProcessParams) (webhook.Delivery, error) {
+	delivery := s.deliveries[id]
+	delivery.RepositoryID = params.RepositoryID
+	delivery.Action = params.Action
+	delivery.Error = params.Error
+	processedAt := time.Now().UTC()
+	delivery.ProcessedAt = &processedAt
+	s.deliveries[id] = delivery
+	s.processed = append(s.processed, fakeWebhookProcessedDelivery{id: id, params: params})
+	return delivery, nil
+}
 
 type fakeRepositoryStore struct {
 	repositories        []domain.Repository

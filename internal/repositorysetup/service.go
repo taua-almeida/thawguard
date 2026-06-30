@@ -58,6 +58,13 @@ func (s *Service) List(ctx context.Context) ([]domain.Repository, error) {
 	return repository.NewStore(s.db).List(ctx)
 }
 
+func (s *Service) FindActiveByRemote(ctx context.Context, params repository.RemoteParams) (domain.Repository, bool, error) {
+	if s == nil || s.db == nil {
+		return domain.Repository{}, false, errors.New("repository setup service has no database")
+	}
+	return repository.NewStore(s.db).FindActiveByRemote(ctx, params)
+}
+
 func (s *Service) Create(ctx context.Context, params repository.CreateParams, actor domain.Actor) (domain.Repository, error) {
 	if s == nil || s.db == nil {
 		return domain.Repository{}, errors.New("repository setup service has no database")

@@ -40,8 +40,8 @@ func Evaluate(report Report) []Result {
 		{
 			Name:        "Pull request webhook configured",
 			Status:      statusFromBool(report.WebhookConfigured),
-			Description: "PR webhooks will let Thawguard recompute status when PRs open, update, retarget, or close after the signed webhook endpoint is enabled.",
-			Remediation: "After the signed webhook endpoint is configured, add a pull_request webhook with a shared secret and verify delivery health.",
+			Description: "PR webhooks let Thawguard recompute local status decisions when PRs open, update, retarget, or close.",
+			Remediation: "Add a pull_request webhook pointing at /webhooks/forgejo with a shared secret and verify delivery health.",
 		},
 	}
 }
@@ -56,7 +56,7 @@ func statusFromBool(ok bool) Status {
 func ManualSetupSteps() []string {
 	return []string{
 		"Create or choose a Forgejo/Codeberg bot token that can post commit statuses.",
-		"After the signed webhook endpoint is enabled, add a pull_request webhook pointing at this Thawguard instance.",
+		"Add a pull_request webhook pointing at /webhooks/forgejo with the repository webhook secret.",
 		"Configure branch protection to require the exact status context " + domain.RequiredStatusContext + ".",
 		"Run setup health checks before relying on a freeze.",
 	}
