@@ -4,24 +4,31 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/taua-almeida/thawguard/internal/audit"
+	"github.com/taua-almeida/thawguard/internal/db"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/freeze"
+	"github.com/taua-almeida/thawguard/internal/pullrequest"
 	"github.com/taua-almeida/thawguard/internal/repository"
 	"github.com/taua-almeida/thawguard/internal/repositorysetup"
+	"github.com/taua-almeida/thawguard/internal/secrets"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
 	"github.com/taua-almeida/thawguard/internal/statuspublication"
+	"github.com/taua-almeida/thawguard/internal/statuspublisher"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
 	"github.com/taua-almeida/thawguard/internal/webhook"
 )
@@ -988,6 +995,98 @@ func TestForgejoWebhookProcessesValidSignedPullRequest(t *testing.T) {
 	}
 }
 
+func TestForgejoWebhookSmokeWithSQLiteStores(t *testing.T) {
+	ctx := context.Background()
+	database := newWebTestDB(t, ctx)
+	secretStore, err := secrets.NewAESGCMStore(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repositorySetup := repositorysetup.NewServiceWithSecrets(database, secretStore)
+	actor := domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}
+	repo, err := repositorySetup.Create(ctx, repository.CreateParams{Forge: "forgejo", BaseURL: "https://codeberg.org", Owner: "example-owner", Name: "example-repo", DefaultBranch: "main"}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repositorySetup.SetWebhookSecret(ctx, repo.ID, "super-secret-value", actor); err != nil {
+		t.Fatal(err)
+	}
+	freezeService := freeze.NewService(database)
+	if _, err := freezeService.CreateActive(ctx, freeze.CreateParams{RepositoryID: repo.ID, Branch: "main", Reason: "release freeze"}, actor); err != nil {
+		t.Fatal(err)
+	}
+
+	pullRequestStore := pullrequest.NewStore(database)
+	statusStore := statusresult.NewStore(database)
+	statusService := statusresult.NewService(statusStore, freezeService)
+	publicationStore := statuspublication.NewStore(database)
+	dryRunPublisher := statuspublisher.NewDryRunPublisher(publicationStore, publicationStore)
+	deliveryStore := webhook.NewDeliveryStore(database)
+	processor := webhook.NewPullRequestProcessor(repository.NewStore(database), pullRequestStore, statusService, dryRunPublisher)
+	server := NewServer(Config{
+		AppName:                     "Thawguard",
+		RepositoryStore:             repositorySetup,
+		StatusPublicationStore:      publicationStore,
+		WebhookRepositoryStore:      repositorySetup,
+		WebhookDeliveryStore:        deliveryStore,
+		PullRequestWebhookProcessor: processor,
+	})
+
+	body := pullRequestWebhookBody("opened")
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, signedWebhookRequest(t, body, "super-secret-value", "delivery-smoke"))
+
+	if recorder.Code != http.StatusAccepted || recorder.Body.String() != "accepted\n" {
+		t.Fatalf("expected generic accepted response, got status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+	deliveries, err := deliveryStore.ListRecent(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries) != 1 || deliveries[0].DeliveryID != "delivery-smoke" || deliveries[0].RepositoryID != repo.ID || !deliveries[0].Verified || deliveries[0].Action != "opened" || deliveries[0].ProcessedAt == nil || deliveries[0].Error != "" {
+		t.Fatalf("expected processed signed delivery, got %+v", deliveries)
+	}
+	cached, err := pullRequestStore.Get(ctx, repo.ID, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached.TargetBranch != "main" || cached.HeadSHA != "0123456789abcdef0123456789abcdef01234567" || cached.State != "open" {
+		t.Fatalf("expected cached PR from webhook, got %+v", cached)
+	}
+	results, err := statusStore.ListRecent(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].RepositoryID != repo.ID || results[0].PullRequestIndex != 42 || results[0].State != domain.CommitStatusFailure || !strings.Contains(results[0].Description, "Branch is frozen") {
+		t.Fatalf("expected failing freeze status result, got %+v", results)
+	}
+	publications, err := publicationStore.ListRecent(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(publications) != 1 || publications[0].StatusResultID != results[0].ID || publications[0].HeadSHA != results[0].HeadSHA || publications[0].DeliveryMode != statuspublication.DeliveryModeLocalRecord {
+		t.Fatalf("expected local publication intent, got %+v", publications)
+	}
+	attempts, err := publicationStore.ListRecentAttempts(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 1 || attempts[0].PublicationID != publications[0].ID || attempts[0].StatusResultID != results[0].ID || attempts[0].Mode != statuspublication.AttemptModeDryRun || attempts[0].Result != statuspublication.AttemptResultPlanned {
+		t.Fatalf("expected dry-run publication attempt, got %+v", attempts)
+	}
+
+	webhooksPage := httptest.NewRecorder()
+	server.Routes().ServeHTTP(webhooksPage, httptest.NewRequest(http.MethodGet, "/webhooks", nil))
+	if webhooksPage.Code != http.StatusOK || !strings.Contains(webhooksPage.Body.String(), "delivery-smoke") || !strings.Contains(webhooksPage.Body.String(), "processed") {
+		t.Fatalf("expected webhook delivery page to show processed delivery, status=%d body=%q", webhooksPage.Code, webhooksPage.Body.String())
+	}
+	publicationsPage := httptest.NewRecorder()
+	server.Routes().ServeHTTP(publicationsPage, httptest.NewRequest(http.MethodGet, "/publications", nil))
+	if publicationsPage.Code != http.StatusOK || !strings.Contains(publicationsPage.Body.String(), "dry_run") || !strings.Contains(publicationsPage.Body.String(), "Branch is frozen") {
+		t.Fatalf("expected publications page to show dry-run attempt, status=%d body=%q", publicationsPage.Code, publicationsPage.Body.String())
+	}
+}
+
 func TestForgejoWebhookRejectsInvalidSignatureGenerically(t *testing.T) {
 	repo := domain.Repository{ID: 1, Forge: "forgejo", BaseURL: "https://codeberg.org", Owner: "example-owner", Name: "example-repo", DefaultBranch: "main", HasWebhookSecret: true}
 	repositoryStore := &fakeWebhookRepositoryStore{repo: repo, secret: "super-secret-value", found: true, secretFound: true}
@@ -1267,6 +1366,32 @@ func signedWebhookRequest(t *testing.T, body string, secret string, deliveryID s
 		request.Header.Set("X-Gitea-Delivery", deliveryID)
 	}
 	return request
+}
+
+func newWebTestDB(t *testing.T, ctx context.Context) *sql.DB {
+	t.Helper()
+	database, err := db.Open(ctx, db.DefaultConfig(filepath.Join(t.TempDir(), "thawguard-test.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	migrations, err := db.LoadMigrations(webTestMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ApplyMigrations(ctx, database, migrations); err != nil {
+		t.Fatal(err)
+	}
+	return database
+}
+
+func webTestMigrationsDir(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	return filepath.Join(filepath.Dir(file), "..", "..", "migrations")
 }
 
 func webhookSignature(body string, secret string) string {

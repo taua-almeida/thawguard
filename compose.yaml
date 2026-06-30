@@ -1,0 +1,19 @@
+services:
+  thawguard:
+    build:
+      context: .
+    image: thawguard:local-alpha
+    # Host networking lets the bootstrap-only server bind to 127.0.0.1
+    # while remaining reachable at http://127.0.0.1:8080 on Linux hosts.
+    network_mode: host
+    environment:
+      THAWGUARD_HTTP_ADDR: 127.0.0.1:8080
+      THAWGUARD_DB_PATH: /data/thawguard.db
+      THAWGUARD_PUBLIC_URL: ${THAWGUARD_PUBLIC_URL:-http://127.0.0.1:8080}
+      THAWGUARD_SECRET_KEY: ${THAWGUARD_SECRET_KEY:?set THAWGUARD_SECRET_KEY in .env}
+    volumes:
+      - thawguard-data:/data
+    restart: unless-stopped
+
+volumes:
+  thawguard-data:

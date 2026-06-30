@@ -1,0 +1,31 @@
+# Build outputs
+/bin/
+/dist/
+/tmp/
+
+# Local runtime state and secrets
+*.db
+*.db-shm
+*.db-wal
+.env
+*.env
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.csr
+*.log
+*secret*
+*token*
+*_payload.json
+raw-webhook*.json
+
+# VCS and editor noise
+.git/
+.DS_Store
+*.swp
+
+# Test/cache artifacts
+coverage.out
+*.test
