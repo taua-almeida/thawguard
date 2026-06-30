@@ -1024,8 +1024,11 @@ func TestForgejoWebhookRecordsProcessorErrorWithoutLeakingDetails(t *testing.T) 
 	if strings.Contains(recorder.Body.String(), "secret-token") {
 		t.Fatalf("expected generic error body, got %q", recorder.Body.String())
 	}
-	if len(deliveryStore.processed) != 1 || deliveryStore.processed[0].params.Error != "webhook processing failed" {
-		t.Fatalf("expected sanitized processing error delivery, got %+v", deliveryStore.processed)
+	if len(deliveryStore.failed) != 1 || deliveryStore.failed[0].message != "webhook processing failed" {
+		t.Fatalf("expected sanitized processing failure delivery, processed=%+v failed=%+v", deliveryStore.processed, deliveryStore.failed)
+	}
+	if len(deliveryStore.processed) != 0 {
+		t.Fatalf("expected retryable processing failure not to be terminally processed, got %+v", deliveryStore.processed)
 	}
 }
 
@@ -1252,7 +1255,9 @@ func (p *fakePullRequestWebhookProcessor) Process(ctx context.Context, body []by
 type fakeWebhookDeliveryStore struct {
 	nextID       int64
 	records      []webhook.DeliveryRecordParams
+	claims       []int64
 	processed    []fakeWebhookProcessedDelivery
+	failed       []fakeWebhookFailedDelivery
 	deliveries   map[int64]webhook.Delivery
 	deliveryByID map[string]int64
 }
@@ -1262,32 +1267,75 @@ type fakeWebhookProcessedDelivery struct {
 	params webhook.DeliveryProcessParams
 }
 
+type fakeWebhookFailedDelivery struct {
+	id      int64
+	message string
+}
+
 func newFakeWebhookDeliveryStore() *fakeWebhookDeliveryStore {
 	return &fakeWebhookDeliveryStore{deliveries: make(map[int64]webhook.Delivery), deliveryByID: make(map[string]int64)}
 }
 
 func (s *fakeWebhookDeliveryStore) Record(ctx context.Context, params webhook.DeliveryRecordParams) (webhook.Delivery, error) {
-	if existingID, found := s.deliveryByID[params.DeliveryID]; found {
+	key := fakeWebhookDeliveryKey(params.RepositoryID, params.DeliveryID)
+	if existingID, found := s.deliveryByID[key]; found {
 		return s.deliveries[existingID], webhook.ValidationError{Message: "webhook delivery already recorded"}
 	}
 	s.nextID++
 	delivery := webhook.Delivery{ID: s.nextID, RepositoryID: params.RepositoryID, DeliveryID: params.DeliveryID, Event: params.Event, Action: params.Action, Verified: params.Verified}
-	s.deliveryByID[params.DeliveryID] = delivery.ID
+	s.deliveryByID[key] = delivery.ID
 	s.deliveries[delivery.ID] = delivery
 	s.records = append(s.records, params)
 	return delivery, nil
 }
 
+func (s *fakeWebhookDeliveryStore) ClaimForProcessing(ctx context.Context, id int64) (webhook.Delivery, bool, error) {
+	delivery := s.deliveries[id]
+	if delivery.ID == 0 {
+		return webhook.Delivery{}, false, nil
+	}
+	if delivery.ProcessingStartedAt != nil || delivery.ProcessedAt != nil {
+		return delivery, false, nil
+	}
+	now := time.Now().UTC()
+	delivery.ProcessingStartedAt = &now
+	delivery.Error = ""
+	s.deliveries[id] = delivery
+	s.claims = append(s.claims, id)
+	return delivery, true, nil
+}
+
 func (s *fakeWebhookDeliveryStore) MarkProcessed(ctx context.Context, id int64, params webhook.DeliveryProcessParams) (webhook.Delivery, error) {
 	delivery := s.deliveries[id]
+	if delivery.ProcessingStartedAt == nil || params.ProcessingStartedAt == nil || !delivery.ProcessingStartedAt.Equal(*params.ProcessingStartedAt) {
+		return webhook.Delivery{}, errors.New("delivery claim mismatch")
+	}
 	delivery.RepositoryID = params.RepositoryID
 	delivery.Action = params.Action
 	delivery.Error = params.Error
 	processedAt := time.Now().UTC()
+	delivery.ProcessingStartedAt = nil
 	delivery.ProcessedAt = &processedAt
 	s.deliveries[id] = delivery
 	s.processed = append(s.processed, fakeWebhookProcessedDelivery{id: id, params: params})
 	return delivery, nil
+}
+
+func (s *fakeWebhookDeliveryStore) MarkProcessingFailed(ctx context.Context, id int64, message string, processingStartedAt time.Time) (webhook.Delivery, error) {
+	delivery := s.deliveries[id]
+	if delivery.ProcessingStartedAt == nil || !delivery.ProcessingStartedAt.Equal(processingStartedAt) {
+		return webhook.Delivery{}, errors.New("delivery claim mismatch")
+	}
+	delivery.ProcessingStartedAt = nil
+	delivery.ProcessedAt = nil
+	delivery.Error = message
+	s.deliveries[id] = delivery
+	s.failed = append(s.failed, fakeWebhookFailedDelivery{id: id, message: message})
+	return delivery, nil
+}
+
+func fakeWebhookDeliveryKey(repositoryID int64, deliveryID string) string {
+	return strconv.FormatInt(repositoryID, 10) + ":" + deliveryID
 }
 
 type fakeRepositoryStore struct {

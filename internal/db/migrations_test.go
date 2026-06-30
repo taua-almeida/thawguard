@@ -136,6 +136,7 @@ CREATE TABLE audit_events (
 	assertTableExists(t, database, "pull_request_cache")
 	assertTableExists(t, database, "status_publication_intents")
 	assertTableExists(t, database, "webhook_deliveries")
+	assertColumnExists(t, database, "webhook_deliveries", "processing_started_at")
 	assertTableExists(t, database, "repository_webhook_secrets")
 
 	var applied int
@@ -175,8 +176,102 @@ CREATE TABLE audit_events (
 	if applied != 1 {
 		t.Fatalf("expected repository webhook secrets migration to be recorded once, got %d", applied)
 	}
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = ?`, "0010_webhook_delivery_claims").Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected webhook delivery claims migration to be recorded once, got %d", applied)
+	}
+	assertWebhookDeliveriesAreRepositoryScoped(t, database)
 	assertIndexExists(t, database, "idx_branch_freezes_one_active")
 	assertIndexExists(t, database, "idx_audit_events_subject_type_id")
+}
+
+func TestApplyMigrationsRebuildsWebhookDeliveriesForRepositoryScopedClaims(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-test.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	if _, err := database.ExecContext(ctx, ensureMigrationsTableSQL); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `
+CREATE TABLE repositories (
+  id INTEGER PRIMARY KEY,
+  active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE webhook_deliveries (
+  id INTEGER PRIMARY KEY,
+  repository_id INTEGER REFERENCES repositories(id) ON DELETE SET NULL,
+  delivery_id TEXT NOT NULL,
+  event TEXT NOT NULL,
+  action TEXT,
+  received_at TEXT NOT NULL,
+  verified INTEGER NOT NULL DEFAULT 0,
+  processed_at TEXT,
+  error TEXT,
+  UNIQUE (delivery_id)
+);
+INSERT INTO repositories(id, active) VALUES (1, 1), (2, 1);
+INSERT INTO webhook_deliveries(id, repository_id, delivery_id, event, action, received_at, verified, processed_at, error)
+VALUES
+  (1, 1, 'retry-me', 'pull_request', 'opened', '2026-06-30T12:00:00.000000000Z', 1, '2026-06-30T12:00:01.000000000Z', 'webhook processing failed'),
+  (2, 1, 'terminal-validation', 'pull_request', 'opened', '2026-06-30T12:00:02.000000000Z', 1, '2026-06-30T12:00:03.000000000Z', 'webhook validation failed'),
+  (3, 1, 'unprocessed', 'pull_request', 'opened', '2026-06-30T12:00:04.000000000Z', 1, NULL, NULL);
+`); err != nil {
+		t.Fatal(err)
+	}
+	for _, version := range []string{"0001_initial", "0002_setup_checks", "0003_active_freeze_uniqueness", "0004_audit_subject_type_index", "0005_status_results", "0006_pull_request_cache", "0007_status_publication_intents", "0008_webhook_deliveries", "0009_repository_webhook_secrets"} {
+		if _, err := database.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)`, version, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+		t.Fatal(err)
+	}
+	assertColumnExists(t, database, "webhook_deliveries", "processing_started_at")
+
+	var retryProcessedAt sql.NullString
+	if err := database.QueryRowContext(ctx, `SELECT processed_at FROM webhook_deliveries WHERE delivery_id = 'retry-me'`).Scan(&retryProcessedAt); err != nil {
+		t.Fatal(err)
+	}
+	if retryProcessedAt.Valid {
+		t.Fatalf("expected retryable processing failure to clear processed_at, got %q", retryProcessedAt.String)
+	}
+	var terminalProcessedAt sql.NullString
+	if err := database.QueryRowContext(ctx, `SELECT processed_at FROM webhook_deliveries WHERE delivery_id = 'terminal-validation'`).Scan(&terminalProcessedAt); err != nil {
+		t.Fatal(err)
+	}
+	if !terminalProcessedAt.Valid {
+		t.Fatal("expected terminal validation delivery to keep processed_at")
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO webhook_deliveries(repository_id, delivery_id, event, received_at, verified) VALUES (2, 'retry-me', 'pull_request', '2026-06-30T12:00:05.000000000Z', 1)`); err != nil {
+		t.Fatalf("expected repository-scoped duplicate delivery id after rebuild: %v", err)
+	}
+}
+
+func assertWebhookDeliveriesAreRepositoryScoped(t *testing.T, database *sql.DB) {
+	t.Helper()
+	if _, err := database.Exec(`INSERT INTO repositories(id, active) VALUES (1, 1), (2, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO webhook_deliveries(repository_id, delivery_id, event, received_at, verified) VALUES (1, 'delivery-1', 'pull_request', '2026-06-30T12:00:00.000000000Z', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO webhook_deliveries(repository_id, delivery_id, event, received_at, verified) VALUES (2, 'delivery-1', 'pull_request', '2026-06-30T12:00:01.000000000Z', 1)`); err != nil {
+		t.Fatalf("expected same delivery id to be allowed for another repository: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO webhook_deliveries(repository_id, delivery_id, event, received_at, verified) VALUES (1, 'delivery-1', 'pull_request', '2026-06-30T12:00:02.000000000Z', 1)`); err == nil {
+		t.Fatal("expected duplicate delivery id for the same repository to be rejected")
+	}
 }
 
 func projectMigrationsDir(t *testing.T) string {

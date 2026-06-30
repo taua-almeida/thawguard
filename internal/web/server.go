@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/domain"
@@ -82,7 +83,9 @@ type WebhookRepositoryStore interface {
 
 type WebhookDeliveryStore interface {
 	Record(ctx context.Context, params webhook.DeliveryRecordParams) (webhook.Delivery, error)
+	ClaimForProcessing(ctx context.Context, id int64) (webhook.Delivery, bool, error)
 	MarkProcessed(ctx context.Context, id int64, params webhook.DeliveryProcessParams) (webhook.Delivery, error)
+	MarkProcessingFailed(ctx context.Context, id int64, message string, processingStartedAt time.Time) (webhook.Delivery, error)
 }
 
 type PullRequestWebhookProcessor interface {
@@ -305,39 +308,60 @@ func (s *Server) handleForgejoWebhook(w http.ResponseWriter, r *http.Request) {
 	delivery, err := s.cfg.WebhookDeliveryStore.Record(r.Context(), webhook.DeliveryRecordParams{RepositoryID: repo.ID, DeliveryID: webhookDeliveryID(r, repo.ID, body), Event: "pull_request", Action: event.Action, Verified: true})
 	if err != nil {
 		if webhook.IsValidationError(err) {
-			if delivery.ID != 0 && shouldRetryWebhookDelivery(delivery) {
-				s.processVerifiedPullRequestWebhook(w, r, delivery, repo.ID, event.Action, body)
-				return
-			}
-			acceptedWebhook(w)
+			s.claimAndProcessVerifiedPullRequestWebhook(w, r, delivery, repo.ID, event.Action, body)
 			return
 		}
 		internalServerError(w)
 		return
 	}
-	s.processVerifiedPullRequestWebhook(w, r, delivery, repo.ID, event.Action, body)
+	s.claimAndProcessVerifiedPullRequestWebhook(w, r, delivery, repo.ID, event.Action, body)
+}
+
+func (s *Server) claimAndProcessVerifiedPullRequestWebhook(w http.ResponseWriter, r *http.Request, delivery webhook.Delivery, repositoryID int64, action string, body []byte) {
+	if delivery.ID == 0 {
+		acceptedWebhook(w)
+		return
+	}
+	claimedDelivery, claimed, err := s.cfg.WebhookDeliveryStore.ClaimForProcessing(r.Context(), delivery.ID)
+	if err != nil {
+		internalServerError(w)
+		return
+	}
+	if !claimed {
+		acceptedWebhook(w)
+		return
+	}
+	s.processVerifiedPullRequestWebhook(w, r, claimedDelivery, repositoryID, action, body)
 }
 
 func (s *Server) processVerifiedPullRequestWebhook(w http.ResponseWriter, r *http.Request, delivery webhook.Delivery, repositoryID int64, action string, body []byte) {
+	if delivery.ProcessingStartedAt == nil {
+		internalServerError(w)
+		return
+	}
 	if !supportedPullRequestAction(action) {
-		s.markWebhookProcessed(w, r, delivery.ID, repositoryID, action, "unsupported pull_request action")
+		s.markWebhookProcessed(w, r, delivery.ID, repositoryID, action, "unsupported pull_request action", delivery.ProcessingStartedAt)
 		return
 	}
 
 	_, processErr := s.cfg.PullRequestWebhookProcessor.Process(r.Context(), body)
 	if processErr != nil {
 		deliveryError := sanitizedWebhookProcessError(processErr)
-		if !s.markWebhookProcessed(w, r, delivery.ID, repositoryID, action, deliveryError) {
+		if webhook.IsValidationError(processErr) {
+			if !s.markWebhookProcessed(w, r, delivery.ID, repositoryID, action, deliveryError, delivery.ProcessingStartedAt) {
+				return
+			}
+			acceptedWebhook(w)
 			return
 		}
-		if webhook.IsValidationError(processErr) {
-			acceptedWebhook(w)
+		if _, err := s.cfg.WebhookDeliveryStore.MarkProcessingFailed(r.Context(), delivery.ID, deliveryError, *delivery.ProcessingStartedAt); err != nil {
+			internalServerError(w)
 			return
 		}
 		internalServerError(w)
 		return
 	}
-	_ = s.markWebhookProcessed(w, r, delivery.ID, repositoryID, action, "")
+	_ = s.markWebhookProcessed(w, r, delivery.ID, repositoryID, action, "", delivery.ProcessingStartedAt)
 }
 
 func (s *Server) readWebhookBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
@@ -358,8 +382,8 @@ func (s *Server) readWebhookBody(w http.ResponseWriter, r *http.Request) ([]byte
 	return body, true
 }
 
-func (s *Server) markWebhookProcessed(w http.ResponseWriter, r *http.Request, deliveryID int64, repositoryID int64, action string, deliveryError string) bool {
-	if _, err := s.cfg.WebhookDeliveryStore.MarkProcessed(r.Context(), deliveryID, webhook.DeliveryProcessParams{RepositoryID: repositoryID, Action: action, Error: deliveryError}); err != nil {
+func (s *Server) markWebhookProcessed(w http.ResponseWriter, r *http.Request, deliveryID int64, repositoryID int64, action string, deliveryError string, processingStartedAt *time.Time) bool {
+	if _, err := s.cfg.WebhookDeliveryStore.MarkProcessed(r.Context(), deliveryID, webhook.DeliveryProcessParams{RepositoryID: repositoryID, Action: action, Error: deliveryError, ProcessingStartedAt: processingStartedAt}); err != nil {
 		internalServerError(w)
 		return false
 	}
@@ -416,10 +440,6 @@ func supportedPullRequestAction(action string) bool {
 	default:
 		return false
 	}
-}
-
-func shouldRetryWebhookDelivery(delivery webhook.Delivery) bool {
-	return delivery.ProcessedAt == nil || delivery.Error == "webhook processing failed"
 }
 
 func sanitizedWebhookProcessError(err error) string {

@@ -9,7 +9,10 @@ import (
 	"time"
 )
 
-const deliveryTimeFormat = "2006-01-02T15:04:05.000000000Z07:00"
+const (
+	deliveryTimeFormat             = "2006-01-02T15:04:05.000000000Z07:00"
+	deliveryProcessingClaimTimeout = 10 * time.Minute
+)
 
 type deliveryDatabase interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
@@ -22,15 +25,16 @@ type DeliveryStore struct {
 }
 
 type Delivery struct {
-	ID           int64
-	RepositoryID int64
-	DeliveryID   string
-	Event        string
-	Action       string
-	ReceivedAt   time.Time
-	Verified     bool
-	ProcessedAt  *time.Time
-	Error        string
+	ID                  int64
+	RepositoryID        int64
+	DeliveryID          string
+	Event               string
+	Action              string
+	ReceivedAt          time.Time
+	Verified            bool
+	ProcessingStartedAt *time.Time
+	ProcessedAt         *time.Time
+	Error               string
 }
 
 type DeliveryRecordParams struct {
@@ -42,9 +46,10 @@ type DeliveryRecordParams struct {
 }
 
 type DeliveryProcessParams struct {
-	RepositoryID int64
-	Action       string
-	Error        string
+	RepositoryID        int64
+	Action              string
+	Error               string
+	ProcessingStartedAt *time.Time
 }
 
 func NewDeliveryStore(db *sql.DB) *DeliveryStore {
@@ -66,7 +71,7 @@ func (s *DeliveryStore) Record(ctx context.Context, params DeliveryRecordParams)
 	if err := validateDeliveryRecordParams(params); err != nil {
 		return Delivery{}, err
 	}
-	if existing, found, err := s.FindByDeliveryID(ctx, params.DeliveryID); err != nil {
+	if existing, found, err := s.FindByRepositoryDeliveryID(ctx, params.RepositoryID, params.DeliveryID); err != nil {
 		return Delivery{}, err
 	} else if found {
 		return existing, ValidationError{Message: "webhook delivery already recorded"}
@@ -78,7 +83,7 @@ INSERT INTO webhook_deliveries(repository_id, delivery_id, event, action, receiv
 VALUES (?, ?, ?, ?, ?, ?)`, nullableDeliveryInt64(params.RepositoryID), params.DeliveryID, params.Event, nullableDeliveryString(params.Action), receivedAt, boolInt(params.Verified))
 	if err != nil {
 		if isDuplicateDeliveryError(err) {
-			if existing, found, findErr := s.FindByDeliveryID(ctx, params.DeliveryID); findErr == nil && found {
+			if existing, found, findErr := s.FindByRepositoryDeliveryID(ctx, params.RepositoryID, params.DeliveryID); findErr == nil && found {
 				return existing, ValidationError{Message: "webhook delivery already recorded"}
 			}
 		}
@@ -91,6 +96,35 @@ VALUES (?, ?, ?, ?, ?, ?)`, nullableDeliveryInt64(params.RepositoryID), params.D
 	return s.Get(ctx, id)
 }
 
+func (s *DeliveryStore) ClaimForProcessing(ctx context.Context, id int64) (Delivery, bool, error) {
+	if s == nil || s.db == nil {
+		return Delivery{}, false, errors.New("webhook delivery store has no database")
+	}
+	if id <= 0 {
+		return Delivery{}, false, ValidationError{Message: "webhook delivery id is required"}
+	}
+	now := s.now().UTC()
+	processingStartedAt := formatDeliveryTime(now)
+	staleBefore := formatDeliveryTime(now.Add(-deliveryProcessingClaimTimeout))
+	update, err := s.db.ExecContext(ctx, `
+UPDATE webhook_deliveries
+SET processing_started_at = ?,
+    error = NULL
+WHERE id = ? AND processed_at IS NULL AND (processing_started_at IS NULL OR processing_started_at < ?)`, processingStartedAt, id, staleBefore)
+	if err != nil {
+		return Delivery{}, false, fmt.Errorf("claim webhook delivery for processing: %w", err)
+	}
+	affected, err := update.RowsAffected()
+	if err != nil {
+		return Delivery{}, false, fmt.Errorf("claim webhook delivery for processing rows: %w", err)
+	}
+	delivery, getErr := s.Get(ctx, id)
+	if getErr != nil {
+		return Delivery{}, false, getErr
+	}
+	return delivery, affected > 0, nil
+}
+
 func (s *DeliveryStore) MarkProcessed(ctx context.Context, id int64, params DeliveryProcessParams) (Delivery, error) {
 	if s == nil || s.db == nil {
 		return Delivery{}, errors.New("webhook delivery store has no database")
@@ -100,13 +134,15 @@ func (s *DeliveryStore) MarkProcessed(ctx context.Context, id int64, params Deli
 		return Delivery{}, err
 	}
 	processedAt := formatDeliveryTime(s.now())
+	processingStartedAt := formatDeliveryTime(*params.ProcessingStartedAt)
 	update, err := s.db.ExecContext(ctx, `
 UPDATE webhook_deliveries
 SET repository_id = COALESCE(?, repository_id),
     action = COALESCE(?, action),
+    processing_started_at = NULL,
     processed_at = ?,
     error = ?
-WHERE id = ?`, nullableDeliveryInt64(params.RepositoryID), nullableDeliveryString(params.Action), processedAt, nullableDeliveryString(params.Error), id)
+WHERE id = ? AND processing_started_at = ?`, nullableDeliveryInt64(params.RepositoryID), nullableDeliveryString(params.Action), processedAt, nullableDeliveryString(params.Error), id, processingStartedAt)
 	if err != nil {
 		return Delivery{}, fmt.Errorf("mark webhook delivery processed: %w", err)
 	}
@@ -120,20 +156,57 @@ WHERE id = ?`, nullableDeliveryInt64(params.RepositoryID), nullableDeliveryStrin
 	return s.Get(ctx, id)
 }
 
+func (s *DeliveryStore) MarkProcessingFailed(ctx context.Context, id int64, message string, processingStartedAt time.Time) (Delivery, error) {
+	if s == nil || s.db == nil {
+		return Delivery{}, errors.New("webhook delivery store has no database")
+	}
+	message = strings.TrimSpace(message)
+	if id <= 0 {
+		return Delivery{}, ValidationError{Message: "webhook delivery id is required"}
+	}
+	if processingStartedAt.IsZero() {
+		return Delivery{}, ValidationError{Message: "webhook delivery processing claim is required"}
+	}
+	if invalidOptionalDeliveryText(message, 1000) {
+		return Delivery{}, ValidationError{Message: "webhook delivery error is invalid"}
+	}
+	processingStartedAtText := formatDeliveryTime(processingStartedAt)
+	update, err := s.db.ExecContext(ctx, `
+UPDATE webhook_deliveries
+SET processing_started_at = NULL,
+    processed_at = NULL,
+    error = ?
+WHERE id = ? AND processing_started_at = ?`, nullableDeliveryString(message), id, processingStartedAtText)
+	if err != nil {
+		return Delivery{}, fmt.Errorf("mark webhook delivery processing failed: %w", err)
+	}
+	affected, err := update.RowsAffected()
+	if err != nil {
+		return Delivery{}, fmt.Errorf("mark webhook delivery processing failed rows: %w", err)
+	}
+	if affected == 0 {
+		return Delivery{}, sql.ErrNoRows
+	}
+	return s.Get(ctx, id)
+}
+
 func (s *DeliveryStore) Get(ctx context.Context, id int64) (Delivery, error) {
 	if s == nil || s.db == nil {
 		return Delivery{}, errors.New("webhook delivery store has no database")
 	}
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, repository_id, delivery_id, event, action, received_at, verified, processed_at, error
+SELECT id, repository_id, delivery_id, event, action, received_at, verified, processing_started_at, processed_at, error
 FROM webhook_deliveries
 WHERE id = ?`, id)
 	return scanDelivery(row)
 }
 
-func (s *DeliveryStore) FindByDeliveryID(ctx context.Context, deliveryID string) (Delivery, bool, error) {
+func (s *DeliveryStore) FindByRepositoryDeliveryID(ctx context.Context, repositoryID int64, deliveryID string) (Delivery, bool, error) {
 	if s == nil || s.db == nil {
 		return Delivery{}, false, errors.New("webhook delivery store has no database")
+	}
+	if repositoryID <= 0 {
+		return Delivery{}, false, ValidationError{Message: "webhook delivery repository is required"}
 	}
 	deliveryID = strings.TrimSpace(deliveryID)
 	if deliveryID == "" {
@@ -143,9 +216,9 @@ func (s *DeliveryStore) FindByDeliveryID(ctx context.Context, deliveryID string)
 		return Delivery{}, false, ValidationError{Message: "webhook delivery id is invalid"}
 	}
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, repository_id, delivery_id, event, action, received_at, verified, processed_at, error
+SELECT id, repository_id, delivery_id, event, action, received_at, verified, processing_started_at, processed_at, error
 FROM webhook_deliveries
-WHERE delivery_id = ?`, deliveryID)
+WHERE repository_id = ? AND delivery_id = ?`, repositoryID, deliveryID)
 	delivery, err := scanDelivery(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Delivery{}, false, nil
@@ -168,7 +241,8 @@ func isDuplicateDeliveryError(err error) bool {
 		return false
 	}
 	message := err.Error()
-	return strings.Contains(message, "UNIQUE constraint failed: webhook_deliveries.delivery_id") ||
+	return strings.Contains(message, "UNIQUE constraint failed: webhook_deliveries.repository_id, webhook_deliveries.delivery_id") ||
+		strings.Contains(message, "UNIQUE constraint failed: webhook_deliveries.delivery_id") ||
 		strings.Contains(message, "constraint failed: UNIQUE constraint failed: webhook_deliveries")
 }
 
@@ -186,8 +260,8 @@ func normalizeDeliveryProcessParams(params DeliveryProcessParams) DeliveryProces
 }
 
 func validateDeliveryRecordParams(params DeliveryRecordParams) error {
-	if params.RepositoryID < 0 {
-		return ValidationError{Message: "webhook delivery repository is invalid"}
+	if params.RepositoryID <= 0 {
+		return ValidationError{Message: "webhook delivery repository is required"}
 	}
 	var missing []string
 	if params.DeliveryID == "" {
@@ -217,6 +291,9 @@ func validateDeliveryProcessParams(id int64, params DeliveryProcessParams) error
 	}
 	if params.RepositoryID < 0 {
 		return ValidationError{Message: "webhook delivery repository is invalid"}
+	}
+	if params.ProcessingStartedAt == nil || params.ProcessingStartedAt.IsZero() {
+		return ValidationError{Message: "webhook delivery processing claim is required"}
 	}
 	if invalidOptionalDeliveryText(params.Action, 100) {
 		return ValidationError{Message: "webhook delivery action is invalid"}
@@ -291,8 +368,9 @@ func scanDelivery(row deliveryScanner) (Delivery, error) {
 	var receivedAt string
 	var verified int
 	var processedAt sql.NullString
+	var processingStartedAt sql.NullString
 	var deliveryError sql.NullString
-	if err := row.Scan(&delivery.ID, &repositoryID, &delivery.DeliveryID, &delivery.Event, &action, &receivedAt, &verified, &processedAt, &deliveryError); err != nil {
+	if err := row.Scan(&delivery.ID, &repositoryID, &delivery.DeliveryID, &delivery.Event, &action, &receivedAt, &verified, &processingStartedAt, &processedAt, &deliveryError); err != nil {
 		return Delivery{}, fmt.Errorf("scan webhook delivery: %w", err)
 	}
 	if repositoryID.Valid {
@@ -307,6 +385,13 @@ func scanDelivery(row deliveryScanner) (Delivery, error) {
 	}
 	delivery.ReceivedAt = parsedReceivedAt
 	delivery.Verified = verified != 0
+	if processingStartedAt.Valid {
+		parsedProcessingStartedAt, err := parseDeliveryTime("processing_started_at", processingStartedAt.String)
+		if err != nil {
+			return Delivery{}, err
+		}
+		delivery.ProcessingStartedAt = &parsedProcessingStartedAt
+	}
 	if processedAt.Valid {
 		parsedProcessedAt, err := parseDeliveryTime("processed_at", processedAt.String)
 		if err != nil {

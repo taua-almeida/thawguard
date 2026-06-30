@@ -121,9 +121,10 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
   action TEXT,
   received_at TEXT NOT NULL,
   verified INTEGER NOT NULL DEFAULT 0,
+  processing_started_at TEXT,
   processed_at TEXT,
   error TEXT,
-  UNIQUE (delivery_id)
+  UNIQUE (repository_id, delivery_id)
 );
 
 CREATE TABLE IF NOT EXISTS jobs (
