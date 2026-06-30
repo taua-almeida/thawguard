@@ -38,6 +38,7 @@ type Publication struct {
 	TargetURL        string
 	DeliveryMode     string
 	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 type ValidationError struct {
@@ -69,22 +70,27 @@ func (s *Store) Publish(ctx context.Context, result statusresult.Result) (Public
 	publication := publicationFromResult(result)
 	publication.DeliveryMode = DeliveryModeLocalRecord
 	publication.CreatedAt = s.now().UTC()
+	publication.UpdatedAt = publication.CreatedAt
 	publication = normalizePublication(publication)
 	if err := validatePublication(publication); err != nil {
 		return Publication{}, err
 	}
 
-	insert, err := s.db.ExecContext(ctx, `
-INSERT INTO status_publication_intents(status_result_id, repository_id, pull_request_index, target_branch, head_sha, context, state, description, target_url, delivery_mode, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, publication.StatusResultID, publication.RepositoryID, publication.PullRequestIndex, publication.TargetBranch, publication.HeadSHA, publication.Context, publication.State, publication.Description, nullableString(publication.TargetURL), publication.DeliveryMode, publication.CreatedAt.Format(time.RFC3339Nano))
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO status_publication_intents(status_result_id, repository_id, pull_request_index, target_branch, head_sha, context, state, description, target_url, delivery_mode, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(repository_id, head_sha, context, delivery_mode) DO UPDATE SET
+  status_result_id = excluded.status_result_id,
+  pull_request_index = excluded.pull_request_index,
+  target_branch = excluded.target_branch,
+  state = excluded.state,
+  description = excluded.description,
+  target_url = excluded.target_url,
+  updated_at = excluded.updated_at`, publication.StatusResultID, publication.RepositoryID, publication.PullRequestIndex, publication.TargetBranch, publication.HeadSHA, publication.Context, publication.State, publication.Description, nullableString(publication.TargetURL), publication.DeliveryMode, publication.CreatedAt.Format(time.RFC3339Nano), publication.UpdatedAt.Format(time.RFC3339Nano))
 	if err != nil {
 		return Publication{}, fmt.Errorf("record status publication intent: %w", err)
 	}
-	id, err := insert.LastInsertId()
-	if err != nil {
-		return Publication{}, fmt.Errorf("recorded status publication intent id: %w", err)
-	}
-	return s.Get(ctx, id)
+	return s.getByIdempotencyKey(ctx, publication)
 }
 
 func (s *Store) Get(ctx context.Context, id int64) (Publication, error) {
@@ -92,7 +98,7 @@ func (s *Store) Get(ctx context.Context, id int64) (Publication, error) {
 		return Publication{}, errors.New("status publication store has no database")
 	}
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, status_result_id, repository_id, pull_request_index, target_branch, head_sha, context, state, description, target_url, delivery_mode, created_at
+SELECT id, status_result_id, repository_id, pull_request_index, target_branch, head_sha, context, state, description, target_url, delivery_mode, created_at, updated_at
 FROM status_publication_intents
 WHERE id = ?`, id)
 	return scanPublication(row)
@@ -106,9 +112,9 @@ func (s *Store) ListRecent(ctx context.Context, limit int) ([]Publication, error
 		limit = 100
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, status_result_id, repository_id, pull_request_index, target_branch, head_sha, context, state, description, target_url, delivery_mode, created_at
+SELECT id, status_result_id, repository_id, pull_request_index, target_branch, head_sha, context, state, description, target_url, delivery_mode, created_at, updated_at
 FROM status_publication_intents
-ORDER BY id DESC
+ORDER BY updated_at DESC, id DESC
 LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list status publication intents: %w", err)
@@ -127,6 +133,14 @@ LIMIT ?`, limit)
 		return nil, fmt.Errorf("list status publication intents rows: %w", err)
 	}
 	return publications, nil
+}
+
+func (s *Store) getByIdempotencyKey(ctx context.Context, publication Publication) (Publication, error) {
+	row := s.db.QueryRowContext(ctx, `
+SELECT id, status_result_id, repository_id, pull_request_index, target_branch, head_sha, context, state, description, target_url, delivery_mode, created_at, updated_at
+FROM status_publication_intents
+WHERE repository_id = ? AND head_sha = ? AND context = ? AND delivery_mode = ?`, publication.RepositoryID, publication.HeadSHA, publication.Context, publication.DeliveryMode)
+	return scanPublication(row)
 }
 
 func publicationFromResult(result statusresult.Result) Publication {
@@ -215,7 +229,8 @@ func scanPublication(row scanner) (Publication, error) {
 	var publication Publication
 	var targetURL sql.NullString
 	var createdAt string
-	if err := row.Scan(&publication.ID, &publication.StatusResultID, &publication.RepositoryID, &publication.PullRequestIndex, &publication.TargetBranch, &publication.HeadSHA, &publication.Context, &publication.State, &publication.Description, &targetURL, &publication.DeliveryMode, &createdAt); err != nil {
+	var updatedAt string
+	if err := row.Scan(&publication.ID, &publication.StatusResultID, &publication.RepositoryID, &publication.PullRequestIndex, &publication.TargetBranch, &publication.HeadSHA, &publication.Context, &publication.State, &publication.Description, &targetURL, &publication.DeliveryMode, &createdAt, &updatedAt); err != nil {
 		return Publication{}, fmt.Errorf("scan status publication intent: %w", err)
 	}
 	if targetURL.Valid {
@@ -226,5 +241,10 @@ func scanPublication(row scanner) (Publication, error) {
 		return Publication{}, fmt.Errorf("parse status publication intent created_at: %w", err)
 	}
 	publication.CreatedAt = parsedCreatedAt
+	parsedUpdatedAt, err := time.Parse(time.RFC3339Nano, updatedAt)
+	if err != nil {
+		return Publication{}, fmt.Errorf("parse status publication intent updated_at: %w", err)
+	}
+	publication.UpdatedAt = parsedUpdatedAt
 	return publication, nil
 }

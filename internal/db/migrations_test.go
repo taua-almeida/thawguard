@@ -55,6 +55,8 @@ func TestOpenAndApplyMigrationsAgainstSQLite(t *testing.T) {
 	assertPragmaInt(t, database, "busy_timeout", int((5 * time.Second).Milliseconds()))
 	assertPragmaText(t, database, "journal_mode", "wal")
 	assertTableExists(t, database, "repository_webhook_secrets")
+	assertColumnExists(t, database, "status_publication_intents", "updated_at")
+	assertIndexExists(t, database, "idx_status_publication_intents_idempotency")
 
 	var applied int
 	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = ?`, "0001_initial").Scan(&applied); err != nil {
@@ -135,6 +137,7 @@ CREATE TABLE audit_events (
 	assertColumnExists(t, database, "status_results", "target_branch")
 	assertTableExists(t, database, "pull_request_cache")
 	assertTableExists(t, database, "status_publication_intents")
+	assertColumnExists(t, database, "status_publication_intents", "updated_at")
 	assertTableExists(t, database, "webhook_deliveries")
 	assertColumnExists(t, database, "webhook_deliveries", "processing_started_at")
 	assertTableExists(t, database, "repository_webhook_secrets")
@@ -182,9 +185,97 @@ CREATE TABLE audit_events (
 	if applied != 1 {
 		t.Fatalf("expected webhook delivery claims migration to be recorded once, got %d", applied)
 	}
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = ?`, "0011_status_publication_idempotency").Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected status publication idempotency migration to be recorded once, got %d", applied)
+	}
 	assertWebhookDeliveriesAreRepositoryScoped(t, database)
 	assertIndexExists(t, database, "idx_branch_freezes_one_active")
 	assertIndexExists(t, database, "idx_audit_events_subject_type_id")
+	assertIndexExists(t, database, "idx_status_publication_intents_idempotency")
+}
+
+func TestApplyMigrationsDedupesStatusPublicationIntents(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-test.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	if _, err := database.ExecContext(ctx, ensureMigrationsTableSQL); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `
+CREATE TABLE repositories (
+  id INTEGER PRIMARY KEY,
+  active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE status_results (
+  id INTEGER PRIMARY KEY,
+  repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE
+);
+CREATE TABLE status_publication_intents (
+  id INTEGER PRIMARY KEY,
+  status_result_id INTEGER NOT NULL REFERENCES status_results(id) ON DELETE CASCADE,
+  repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+  pull_request_index INTEGER NOT NULL,
+  target_branch TEXT NOT NULL,
+  head_sha TEXT NOT NULL,
+  context TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('success', 'failure', 'pending', 'error')),
+  description TEXT NOT NULL,
+  target_url TEXT,
+  delivery_mode TEXT NOT NULL CHECK (delivery_mode IN ('local_record')),
+  created_at TEXT NOT NULL
+);
+INSERT INTO repositories(id, active) VALUES (1, 1);
+INSERT INTO status_results(id, repository_id) VALUES (1, 1), (2, 1), (3, 1);
+INSERT INTO status_publication_intents(id, status_result_id, repository_id, pull_request_index, target_branch, head_sha, context, state, description, target_url, delivery_mode, created_at)
+VALUES
+  (1, 1, 1, 42, 'main', 'abc123', 'thawguard/freeze', 'failure', 'old failure', NULL, 'local_record', '2026-06-30T12:00:00Z'),
+  (2, 2, 1, 43, 'release', 'abc123', 'thawguard/freeze', 'success', 'latest state', NULL, 'local_record', '2026-06-30T12:05:00Z'),
+  (3, 3, 1, 44, 'main', 'def456', 'thawguard/freeze', 'failure', 'other head', NULL, 'local_record', '2026-06-30T12:10:00Z');
+`); err != nil {
+		t.Fatal(err)
+	}
+	for _, version := range []string{"0001_initial", "0002_setup_checks", "0003_active_freeze_uniqueness", "0004_audit_subject_type_index", "0005_status_results", "0006_pull_request_cache", "0007_status_publication_intents", "0008_webhook_deliveries", "0009_repository_webhook_secrets", "0010_webhook_delivery_claims"} {
+		if _, err := database.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)`, version, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+		t.Fatal(err)
+	}
+	assertColumnExists(t, database, "status_publication_intents", "updated_at")
+	assertIndexExists(t, database, "idx_status_publication_intents_idempotency")
+
+	var count int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM status_publication_intents`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("expected duplicate publication intent to be removed, got %d rows", count)
+	}
+	var statusResultID int64
+	var description string
+	var updatedAt string
+	if err := database.QueryRowContext(ctx, `SELECT status_result_id, description, updated_at FROM status_publication_intents WHERE repository_id = 1 AND head_sha = 'abc123' AND context = 'thawguard/freeze' AND delivery_mode = 'local_record'`).Scan(&statusResultID, &description, &updatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if statusResultID != 2 || description != "latest state" || updatedAt != "2026-06-30T12:05:00Z" {
+		t.Fatalf("expected latest duplicate row to win, got status_result_id=%d description=%q updated_at=%q", statusResultID, description, updatedAt)
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO status_publication_intents(status_result_id, repository_id, pull_request_index, target_branch, head_sha, context, state, description, delivery_mode, created_at, updated_at) VALUES (3, 1, 45, 'main', 'abc123', 'thawguard/freeze', 'failure', 'duplicate', 'local_record', '2026-06-30T12:15:00Z', '2026-06-30T12:15:00Z')`); err == nil {
+		t.Fatal("expected unique idempotency key to reject duplicate publication intent")
+	}
 }
 
 func TestApplyMigrationsRebuildsWebhookDeliveriesForRepositoryScopedClaims(t *testing.T) {
@@ -214,6 +305,20 @@ CREATE TABLE webhook_deliveries (
   processed_at TEXT,
   error TEXT,
   UNIQUE (delivery_id)
+);
+CREATE TABLE status_publication_intents (
+  id INTEGER PRIMARY KEY,
+  status_result_id INTEGER NOT NULL,
+  repository_id INTEGER NOT NULL,
+  pull_request_index INTEGER NOT NULL,
+  target_branch TEXT NOT NULL,
+  head_sha TEXT NOT NULL,
+  context TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('success', 'failure', 'pending', 'error')),
+  description TEXT NOT NULL,
+  target_url TEXT,
+  delivery_mode TEXT NOT NULL CHECK (delivery_mode IN ('local_record')),
+  created_at TEXT NOT NULL
 );
 INSERT INTO repositories(id, active) VALUES (1, 1), (2, 1);
 INSERT INTO webhook_deliveries(id, repository_id, delivery_id, event, action, received_at, verified, processed_at, error)

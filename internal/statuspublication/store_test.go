@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/taua-almeida/thawguard/internal/db"
 	"github.com/taua-almeida/thawguard/internal/domain"
@@ -33,6 +34,12 @@ func TestStorePublishesLocalStatusIntent(t *testing.T) {
 	if publication.DeliveryMode != DeliveryModeLocalRecord {
 		t.Fatalf("expected local delivery mode, got %q", publication.DeliveryMode)
 	}
+	if publication.CreatedAt.IsZero() || publication.UpdatedAt.IsZero() {
+		t.Fatalf("expected publication timestamps, got %+v", publication)
+	}
+	if !publication.CreatedAt.Equal(publication.UpdatedAt) {
+		t.Fatalf("expected created and updated timestamps to match on insert, got %+v", publication)
+	}
 
 	publications, err := store.ListRecent(ctx, 10)
 	if err != nil {
@@ -40,6 +47,50 @@ func TestStorePublishesLocalStatusIntent(t *testing.T) {
 	}
 	if len(publications) != 1 || publications[0].ID != publication.ID {
 		t.Fatalf("expected recent publication, got %+v", publications)
+	}
+}
+
+func TestStorePublishUpsertsLocalStatusIntentByStatusKey(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	firstResult := createStatusResultWithParams(t, ctx, database, repo.ID, 42, "main", "abc123", domain.CommitStatusFailure, "Branch is frozen; merge is blocked by Thawguard")
+	store := NewStore(database)
+	firstTime := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return firstTime }
+
+	first, err := store.Publish(ctx, firstResult)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	secondResult := createStatusResultWithParams(t, ctx, database, repo.ID, 43, "release", "abc123", domain.CommitStatusSuccess, "No active freeze applies to this PR")
+	secondTime := firstTime.Add(5 * time.Minute)
+	store.now = func() time.Time { return secondTime }
+	second, err := store.Publish(ctx, secondResult)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if second.ID != first.ID {
+		t.Fatalf("expected publication row to be updated, got first id %d and second id %d", first.ID, second.ID)
+	}
+	if second.StatusResultID != secondResult.ID || second.PullRequestIndex != 43 || second.TargetBranch != "release" || second.State != domain.CommitStatusSuccess || second.Description != "No active freeze applies to this PR" {
+		t.Fatalf("expected latest status publication fields, got %+v", second)
+	}
+	if !second.CreatedAt.Equal(first.CreatedAt) {
+		t.Fatalf("expected created_at to stay first-seen time, got %s want %s", second.CreatedAt, first.CreatedAt)
+	}
+	if !second.UpdatedAt.Equal(secondTime) {
+		t.Fatalf("expected updated_at to be refreshed, got %s want %s", second.UpdatedAt, secondTime)
+	}
+
+	publications, err := store.ListRecent(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(publications) != 1 || publications[0].ID != first.ID || publications[0].StatusResultID != secondResult.ID {
+		t.Fatalf("expected one updated publication intent, got %+v", publications)
 	}
 }
 
@@ -58,7 +109,12 @@ func TestStoreRejectsInvalidPublicationResult(t *testing.T) {
 
 func createStatusResult(t *testing.T, ctx context.Context, database *sql.DB, repositoryID int64) statusresult.Result {
 	t.Helper()
-	result, err := statusresult.NewStore(database).Create(ctx, statusresult.CreateParams{RepositoryID: repositoryID, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "Branch is frozen; merge is blocked by Thawguard"})
+	return createStatusResultWithParams(t, ctx, database, repositoryID, 42, "main", "abc123", domain.CommitStatusFailure, "Branch is frozen; merge is blocked by Thawguard")
+}
+
+func createStatusResultWithParams(t *testing.T, ctx context.Context, database *sql.DB, repositoryID int64, pullRequestIndex int, targetBranch string, headSHA string, state domain.CommitStatusState, description string) statusresult.Result {
+	t.Helper()
+	result, err := statusresult.NewStore(database).Create(ctx, statusresult.CreateParams{RepositoryID: repositoryID, PullRequestIndex: pullRequestIndex, TargetBranch: targetBranch, HeadSHA: headSHA, Context: domain.RequiredStatusContext, State: state, Description: description})
 	if err != nil {
 		t.Fatal(err)
 	}
