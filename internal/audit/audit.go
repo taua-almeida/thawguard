@@ -10,10 +10,11 @@ import (
 )
 
 const (
-	ActionRepositoryCreated     = "repository.created"
-	ActionBranchFreezeCreated   = "branch_freeze.created"
-	ActionBranchFreezeEnded     = "branch_freeze.ended"
-	ActionBranchFreezeCancelled = "branch_freeze.cancelled"
+	ActionRepositoryCreated                 = "repository.created"
+	ActionRepositoryWebhookSecretConfigured = "repository.webhook_secret_configured"
+	ActionBranchFreezeCreated               = "branch_freeze.created"
+	ActionBranchFreezeEnded                 = "branch_freeze.ended"
+	ActionBranchFreezeCancelled             = "branch_freeze.cancelled"
 
 	SubjectTypeRepository   = "repository"
 	SubjectTypeBranchFreeze = "branch_freeze"

@@ -120,6 +120,49 @@ func TestStoreFindsActiveRepositoryByRemote(t *testing.T) {
 	}
 }
 
+func TestStoreSetsAndReadsWebhookSecretCiphertext(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	repo, err := store.Create(ctx, CreateParams{Owner: "example-owner", Name: "example-repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repo.HasWebhookSecret {
+		t.Fatal("expected new repository not to have webhook secret")
+	}
+
+	updated, err := store.SetWebhookSecretCiphertext(ctx, repo.ID, []byte("encrypted-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated.HasWebhookSecret {
+		t.Fatal("expected repository to have webhook secret after update")
+	}
+
+	ciphertext, found, err := store.WebhookSecretCiphertext(ctx, repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || string(ciphertext) != "encrypted-secret" {
+		t.Fatalf("expected stored ciphertext, found=%v ciphertext=%q", found, ciphertext)
+	}
+	ciphertext[0] = 'X'
+	again, found, err := store.WebhookSecretCiphertext(ctx, repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || string(again) != "encrypted-secret" {
+		t.Fatalf("expected ciphertext copy, found=%v ciphertext=%q", found, again)
+	}
+	var stored int
+	if err := store.db.QueryRowContext(ctx, `SELECT count(*) FROM repository_webhook_secrets WHERE repository_id = ?`, repo.ID).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != 1 {
+		t.Fatalf("expected one repository webhook secret row, got %d", stored)
+	}
+}
+
 func newTestStore(t *testing.T, ctx context.Context) *Store {
 	t.Helper()
 	database, err := db.Open(ctx, db.DefaultConfig(filepath.Join(t.TempDir(), "thawguard-test.db")))

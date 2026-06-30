@@ -14,15 +14,16 @@ const (
 )
 
 type Repository struct {
-	ID            int64
-	Forge         string
-	BaseURL       string
-	Owner         string
-	Name          string
-	DefaultBranch string
-	Active        bool
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ID               int64
+	Forge            string
+	BaseURL          string
+	Owner            string
+	Name             string
+	DefaultBranch    string
+	HasWebhookSecret bool
+	Active           bool
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 type Actor struct {

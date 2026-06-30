@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/db"
 	"github.com/taua-almeida/thawguard/internal/freeze"
 	"github.com/taua-almeida/thawguard/internal/repositorysetup"
+	"github.com/taua-almeida/thawguard/internal/secrets"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
 	"github.com/taua-almeida/thawguard/internal/statuspublication"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
@@ -51,7 +53,11 @@ func (a *App) Run(ctx context.Context) error {
 		return err
 	}
 
-	repositoryStore := repositorysetup.NewService(database)
+	secretStore, err := secretStoreFromConfig(a.cfg)
+	if err != nil {
+		return err
+	}
+	repositoryStore := repositorysetup.NewServiceWithSecrets(database, secretStore)
 	setupCheckStore := setupcheck.NewStore(database)
 	setupCheckRunner := localSetupHealthRunner{recorder: setupCheckStore}
 	freezeStore := freeze.NewService(database)
@@ -61,14 +67,15 @@ func (a *App) Run(ctx context.Context) error {
 	server := &http.Server{
 		Addr: a.cfg.HTTPAddr,
 		Handler: web.NewServer(web.Config{
-			AppName:                "Thawguard",
-			RepositoryStore:        repositoryStore,
-			SetupCheckStore:        setupCheckStore,
-			SetupCheckRunner:       setupCheckRunner,
-			FreezeStore:            freezeStore,
-			AuditStore:             auditStore,
-			StatusDecisionStore:    statusDecisionStore,
-			StatusPublicationStore: statusPublicationStore,
+			AppName:                              "Thawguard",
+			RepositoryStore:                      repositoryStore,
+			RepositorySecretEncryptionConfigured: secretStore != nil,
+			SetupCheckStore:                      setupCheckStore,
+			SetupCheckRunner:                     setupCheckRunner,
+			FreezeStore:                          freezeStore,
+			AuditStore:                           auditStore,
+			StatusDecisionStore:                  statusDecisionStore,
+			StatusPublicationStore:               statusPublicationStore,
 		}).Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
@@ -87,4 +94,15 @@ func (a *App) Run(ctx context.Context) error {
 	case err := <-errc:
 		return err
 	}
+}
+
+func secretStoreFromConfig(cfg config.Config) (secrets.Store, error) {
+	if cfg.SecretKey == "" {
+		return nil, nil
+	}
+	store, err := secrets.NewAESGCMStoreFromBase64(cfg.SecretKey)
+	if err != nil {
+		return nil, fmt.Errorf("invalid THAWGUARD_SECRET_KEY: %w", err)
+	}
+	return store, nil
 }

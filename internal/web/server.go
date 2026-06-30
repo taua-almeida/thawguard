@@ -12,25 +12,28 @@ import (
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/freeze"
 	"github.com/taua-almeida/thawguard/internal/repository"
+	"github.com/taua-almeida/thawguard/internal/repositorysetup"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
 	"github.com/taua-almeida/thawguard/internal/statuspublication"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
 )
 
 type Config struct {
-	AppName                string
-	RepositoryStore        RepositoryStore
-	SetupCheckStore        SetupCheckStore
-	SetupCheckRunner       SetupCheckRunner
-	FreezeStore            FreezeStore
-	AuditStore             AuditStore
-	StatusDecisionStore    StatusDecisionStore
-	StatusPublicationStore StatusPublicationStore
+	AppName                              string
+	RepositoryStore                      RepositoryStore
+	RepositorySecretEncryptionConfigured bool
+	SetupCheckStore                      SetupCheckStore
+	SetupCheckRunner                     SetupCheckRunner
+	FreezeStore                          FreezeStore
+	AuditStore                           AuditStore
+	StatusDecisionStore                  StatusDecisionStore
+	StatusPublicationStore               StatusPublicationStore
 }
 
 type RepositoryStore interface {
 	List(ctx context.Context) ([]domain.Repository, error)
 	Create(ctx context.Context, params repository.CreateParams, actor domain.Actor) (domain.Repository, error)
+	SetWebhookSecret(ctx context.Context, repositoryID int64, secret string, actor domain.Actor) (domain.Repository, error)
 }
 
 type SetupCheckStore interface {
@@ -119,6 +122,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /", s.handleDashboard)
 	s.mux.HandleFunc("GET /repositories", s.handleRepositories)
 	s.mux.HandleFunc("POST /repositories", s.handleCreateRepository)
+	s.mux.HandleFunc("POST /repositories/webhook-secret", s.handleSetRepositoryWebhookSecret)
 	s.mux.HandleFunc("POST /repositories/setup-check", s.handleRunRepositorySetupCheck)
 	s.mux.HandleFunc("GET /freezes", s.handleFreezes)
 	s.mux.HandleFunc("POST /freezes", s.handleCreateFreeze)
@@ -268,6 +272,51 @@ func (s *Server) handleCreateRepository(w http.ResponseWriter, r *http.Request) 
 	}, session.auditActor())
 	if err != nil {
 		if !repository.IsValidationError(err) {
+			internalServerError(w)
+			return
+		}
+		repositories, listErr := s.repositories(r.Context())
+		if listErr != nil {
+			internalServerError(w)
+			return
+		}
+		views, viewErr := s.repositoryViews(r.Context(), repositories)
+		if viewErr != nil {
+			internalServerError(w)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusBadRequest)
+		s.renderRepositories(w, views, err.Error(), session.CSRFToken)
+		return
+	}
+	http.Redirect(w, r, "/repositories", http.StatusSeeOther)
+}
+
+func (s *Server) handleSetRepositoryWebhookSecret(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.RepositoryStore == nil {
+		http.Error(w, "repository store is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	if !s.cfg.RepositorySecretEncryptionConfigured {
+		http.Error(w, "webhook secret encryption is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	session, ok := s.requireRepositoryManagerForm(w, r)
+	if !ok {
+		return
+	}
+	repositoryID, err := strconv.ParseInt(strings.TrimSpace(r.PostFormValue("repository_id")), 10, 64)
+	if err != nil {
+		repositoryID = 0
+	}
+	_, err = s.cfg.RepositoryStore.SetWebhookSecret(r.Context(), repositoryID, r.PostFormValue("webhook_secret"), session.auditActor())
+	if err != nil {
+		if repositorysetup.IsConfigurationError(err) {
+			http.Error(w, "webhook secret encryption is not configured", http.StatusServiceUnavailable)
+			return
+		}
+		if !repositorysetup.IsValidationError(err) {
 			internalServerError(w)
 			return
 		}
@@ -675,12 +724,13 @@ func latestSetupChecks(checks []setupcheck.Check) []setupcheck.Check {
 
 func (s *Server) renderRepositories(w http.ResponseWriter, views []repositoryView, formError string, csrfToken string) {
 	s.render(w, repositoriesTemplate, map[string]any{
-		"AppName":         s.cfg.AppName,
-		"RepositoryViews": views,
-		"FormError":       formError,
-		"CSRFToken":       csrfToken,
-		"RequiredContext": domain.RequiredStatusContext,
-		"SetupSteps":      setupcheck.ManualSetupSteps(),
+		"AppName":                           s.cfg.AppName,
+		"RepositoryViews":                   views,
+		"FormError":                         formError,
+		"CSRFToken":                         csrfToken,
+		"RequiredContext":                   domain.RequiredStatusContext,
+		"SetupSteps":                        setupcheck.ManualSetupSteps(),
+		"WebhookSecretEncryptionConfigured": s.cfg.RepositorySecretEncryptionConfigured,
 	})
 }
 
@@ -795,7 +845,8 @@ const repositoriesTemplate = pageHead + `
 	      <p class="eyebrow">Repositories</p>
 	      <h1>Add repository</h1>
 	      <p class="warning">Bootstrap sessions are for local development only. Do not expose this server on a network until real local auth is configured.</p>
-	      <p>Start with Forgejo/Codeberg repositories. Manual setup must require the exact status context <code>{{ .RequiredContext }}</code>.</p>
+	      <p>Start with Forgejo/Codeberg repositories. Manual setup must require the exact status context <code>{{ .RequiredContext }}</code>. Webhook secret storage is preparatory until the signed webhook endpoint is enabled.</p>
+        {{ if not .WebhookSecretEncryptionConfigured }}<p class="warning">Webhook secret storage is disabled until <code>THAWGUARD_SECRET_KEY</code> is configured. Existing repository setup and local freeze flows remain available.</p>{{ end }}
       {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
       <form method="post" action="/repositories" class="form-grid">
         <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
@@ -813,15 +864,16 @@ const repositoriesTemplate = pageHead + `
 	      <p class="muted">Local setup checks are placeholders until live Forgejo/Codeberg verification is configured. They support setup workflow visibility, not hard enforcement.</p>
 	      {{ if .RepositoryViews }}
       <table>
-        <thead><tr><th>Repository</th><th>Forge</th><th>Default branch</th><th>Required context</th><th>Setup health</th><th>Actions</th></tr></thead>
+	        <thead><tr><th>Repository</th><th>Forge</th><th>Default branch</th><th>Required context</th><th>Webhook secret</th><th>Setup health</th><th>Actions</th></tr></thead>
         <tbody>
         {{ range .RepositoryViews }}
           <tr>
             <td>{{ .Repository.FullName }}</td>
             <td>{{ .Repository.Forge }}</td>
-            <td>{{ .Repository.DefaultBranch }}</td>
-            <td><code>` + domain.RequiredStatusContext + `</code></td>
-            <td>
+             <td>{{ .Repository.DefaultBranch }}</td>
+             <td><code>` + domain.RequiredStatusContext + `</code></td>
+             <td>{{ if .Repository.HasWebhookSecret }}<span class="status status-ok">configured</span>{{ else }}<span class="status status-warning">not configured</span>{{ end }}</td>
+             <td>
               {{ if .SetupChecks }}
                 <ul class="setup-checks">
                 {{ range .SetupChecks }}
@@ -832,7 +884,17 @@ const repositoriesTemplate = pageHead + `
                 <span class="muted">No setup checks yet.</span>
               {{ end }}
             </td>
-            <td>
+             <td>
+              {{ if $.WebhookSecretEncryptionConfigured }}
+              <form method="post" action="/repositories/webhook-secret">
+                <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+                <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
+                <label>Set or rotate webhook secret for future signed delivery <input type="password" name="webhook_secret" minlength="16" maxlength="512" autocomplete="new-password" required></label>
+                <button type="submit">Save webhook secret</button>
+              </form>
+              {{ else }}
+              <p class="muted">Set <code>THAWGUARD_SECRET_KEY</code> to save webhook secrets.</p>
+              {{ end }}
               <form method="post" action="/repositories/setup-check">
                 <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
                 <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">

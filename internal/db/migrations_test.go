@@ -54,6 +54,7 @@ func TestOpenAndApplyMigrationsAgainstSQLite(t *testing.T) {
 	assertPragmaInt(t, database, "foreign_keys", 1)
 	assertPragmaInt(t, database, "busy_timeout", int((5 * time.Second).Milliseconds()))
 	assertPragmaText(t, database, "journal_mode", "wal")
+	assertTableExists(t, database, "repository_webhook_secrets")
 
 	var applied int
 	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = ?`, "0001_initial").Scan(&applied); err != nil {
@@ -135,6 +136,7 @@ CREATE TABLE audit_events (
 	assertTableExists(t, database, "pull_request_cache")
 	assertTableExists(t, database, "status_publication_intents")
 	assertTableExists(t, database, "webhook_deliveries")
+	assertTableExists(t, database, "repository_webhook_secrets")
 
 	var applied int
 	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = ?`, "0002_setup_checks").Scan(&applied); err != nil {
@@ -166,6 +168,12 @@ CREATE TABLE audit_events (
 	}
 	if applied != 1 {
 		t.Fatalf("expected webhook deliveries migration to be recorded once, got %d", applied)
+	}
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = ?`, "0009_repository_webhook_secrets").Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected repository webhook secrets migration to be recorded once, got %d", applied)
 	}
 	assertIndexExists(t, database, "idx_branch_freezes_one_active")
 	assertIndexExists(t, database, "idx_audit_events_subject_type_id")

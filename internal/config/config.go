@@ -7,6 +7,7 @@ type Config struct {
 	DatabasePath string
 	PublicURL    string
 	Environment  string
+	SecretKey    string
 }
 
 func FromEnv() Config {
@@ -15,6 +16,7 @@ func FromEnv() Config {
 		DatabasePath: env("THAWGUARD_DB_PATH", "thawguard.db"),
 		PublicURL:    env("THAWGUARD_PUBLIC_URL", "http://localhost:8080"),
 		Environment:  env("THAWGUARD_ENV", "development"),
+		SecretKey:    env("THAWGUARD_SECRET_KEY", ""),
 	}
 }
 

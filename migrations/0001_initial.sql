@@ -33,7 +33,6 @@ CREATE TABLE IF NOT EXISTS repositories (
   name TEXT NOT NULL,
   default_branch TEXT NOT NULL,
   token_ciphertext BLOB,
-  webhook_secret_ciphertext BLOB,
   active INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,

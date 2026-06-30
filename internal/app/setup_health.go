@@ -45,7 +45,7 @@ func localSetupHealthResults() []setupcheck.Result {
 			Name:        "Pull request webhook not verified locally",
 			Status:      setupcheck.StatusWarning,
 			Description: "This local placeholder does not inspect webhook delivery health.",
-			Remediation: "Configure a pull_request webhook with a shared secret and verify deliveries before relying on automation.",
+			Remediation: "After the signed webhook endpoint is enabled, configure a pull_request webhook with a shared secret and verify deliveries before relying on automation.",
 		},
 	}
 }

@@ -16,13 +16,14 @@ import (
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/freeze"
 	"github.com/taua-almeida/thawguard/internal/repository"
+	"github.com/taua-almeida/thawguard/internal/repositorysetup"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
 	"github.com/taua-almeida/thawguard/internal/statuspublication"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
 )
 
 func TestRepositoriesPageShowsManualSetupContext(t *testing.T) {
-	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{{Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}}}})
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{{Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", HasWebhookSecret: true}}}, RepositorySecretEncryptionConfigured: true})
 	recorder := httptest.NewRecorder()
 	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
 
@@ -41,6 +42,30 @@ func TestRepositoriesPageShowsManualSetupContext(t *testing.T) {
 	}
 	if !strings.Contains(body, "taua-almeida/thawguard") {
 		t.Fatalf("expected body to include repository full name, got %q", body)
+	}
+	for _, want := range []string{"Webhook secret", "configured", "Save webhook secret"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected body to contain %q, got %q", want, body)
+		}
+	}
+}
+
+func TestRepositoriesPageDisablesWebhookSecretFormWithoutEncryptionKey(t *testing.T) {
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{{Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}}}})
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{"Webhook secret storage is disabled", "THAWGUARD_SECRET_KEY</code> to save webhook secrets"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected body to contain %q, got %q", want, body)
+		}
+	}
+	if strings.Contains(body, "Save webhook secret") || strings.Contains(body, `name="webhook_secret"`) {
+		t.Fatalf("expected webhook secret form to be hidden, got %q", body)
 	}
 }
 
@@ -110,6 +135,102 @@ func TestCreateRepositoryRejectsInvalidCSRFToken(t *testing.T) {
 	}
 	if len(store.created) != 0 {
 		t.Fatalf("expected no created repositories, got %d", len(store.created))
+	}
+}
+
+func TestSetRepositoryWebhookSecretPostsToStore(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	store := &fakeRepositoryStore{repositories: []domain.Repository{repo}}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: store, RepositorySecretEncryptionConfigured: true})
+	form := url.Values{"repository_id": {"1"}, "webhook_secret": {"super-secret-value"}}
+	cookie, csrfToken := getRepositoryForm(t, server)
+	form.Set(csrfFormField, csrfToken)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/repositories/webhook-secret", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect, got %d", recorder.Code)
+	}
+	if len(store.webhookSecrets) != 1 || store.webhookSecrets[0].repositoryID != repo.ID || store.webhookSecrets[0].secret != "super-secret-value" {
+		t.Fatalf("expected webhook secret update, got %+v", store.webhookSecrets)
+	}
+	if len(store.webhookSecretActors) != 1 || store.webhookSecretActors[0].Kind != domain.ActorKindBootstrapAdmin || store.webhookSecretActors[0].Role != "admin" {
+		t.Fatalf("unexpected actors: %+v", store.webhookSecretActors)
+	}
+}
+
+func TestSetRepositoryWebhookSecretRejectsInvalidCSRFToken(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	store := &fakeRepositoryStore{repositories: []domain.Repository{repo}}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: store, RepositorySecretEncryptionConfigured: true})
+	form := url.Values{"repository_id": {"1"}, "webhook_secret": {"super-secret-value"}}
+	cookie, _ := getRepositoryForm(t, server)
+	form.Set(csrfFormField, "not-the-session-token")
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/repositories/webhook-secret", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected forbidden status, got %d", recorder.Code)
+	}
+	if len(store.webhookSecrets) != 0 {
+		t.Fatalf("expected no webhook secret updates, got %+v", store.webhookSecrets)
+	}
+}
+
+func TestSetRepositoryWebhookSecretDoesNotLeakInvalidSecret(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	store := &fakeRepositoryStore{repositories: []domain.Repository{repo}, webhookSecretErr: repositorysetup.ValidationError{Message: "webhook secret must be at least 16 characters"}}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: store, RepositorySecretEncryptionConfigured: true})
+	form := url.Values{"repository_id": {"1"}, "webhook_secret": {"short-secret"}}
+	cookie, csrfToken := getRepositoryForm(t, server)
+	form.Set(csrfFormField, csrfToken)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/repositories/webhook-secret", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected bad request, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	if strings.Contains(body, "short-secret") {
+		t.Fatalf("expected submitted secret not to be rendered, got %q", body)
+	}
+	if !strings.Contains(body, "webhook secret must be at least 16 characters") {
+		t.Fatalf("expected validation error, got %q", body)
+	}
+}
+
+func TestSetRepositoryWebhookSecretReportsMissingEncryptionKey(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	store := &fakeRepositoryStore{repositories: []domain.Repository{repo}, webhookSecretErr: repositorysetup.ConfigurationError{Message: "webhook secret encryption key is not configured"}}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: store})
+	form := url.Values{"repository_id": {"1"}, "webhook_secret": {"super-secret-value"}}
+	cookie, csrfToken := getRepositoryForm(t, server)
+	form.Set(csrfFormField, csrfToken)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/repositories/webhook-secret", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected service unavailable, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	if strings.Contains(body, "super-secret-value") {
+		t.Fatalf("expected submitted secret not to be rendered, got %q", body)
 	}
 }
 
@@ -859,9 +980,17 @@ func csrfTokenFromBody(t *testing.T, body string) string {
 var csrfInputPattern = regexp.MustCompile(`name="` + csrfFormField + `" value="([^"]+)"`)
 
 type fakeRepositoryStore struct {
-	repositories []domain.Repository
-	created      []repository.CreateParams
-	actors       []domain.Actor
+	repositories        []domain.Repository
+	created             []repository.CreateParams
+	actors              []domain.Actor
+	webhookSecrets      []webhookSecretUpdate
+	webhookSecretActors []domain.Actor
+	webhookSecretErr    error
+}
+
+type webhookSecretUpdate struct {
+	repositoryID int64
+	secret       string
 }
 
 type fakeSetupCheckStore struct {
@@ -1002,4 +1131,19 @@ func (s *fakeRepositoryStore) Create(ctx context.Context, params repository.Crea
 	repo := domain.Repository{ID: int64(len(s.repositories) + 1), Forge: params.Forge, BaseURL: params.BaseURL, Owner: params.Owner, Name: params.Name, DefaultBranch: params.DefaultBranch, Active: true}
 	s.repositories = append(s.repositories, repo)
 	return repo, nil
+}
+
+func (s *fakeRepositoryStore) SetWebhookSecret(ctx context.Context, repositoryID int64, secret string, actor domain.Actor) (domain.Repository, error) {
+	if s.webhookSecretErr != nil {
+		return domain.Repository{}, s.webhookSecretErr
+	}
+	s.webhookSecrets = append(s.webhookSecrets, webhookSecretUpdate{repositoryID: repositoryID, secret: secret})
+	s.webhookSecretActors = append(s.webhookSecretActors, actor)
+	for index, repo := range s.repositories {
+		if repo.ID == repositoryID {
+			s.repositories[index].HasWebhookSecret = true
+			return s.repositories[index], nil
+		}
+	}
+	return domain.Repository{}, repositorysetup.ValidationError{Message: "repository not found"}
 }

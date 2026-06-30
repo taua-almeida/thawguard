@@ -23,6 +23,8 @@ The service listens on `127.0.0.1:8080` by default. Override with `THAWGUARD_HTT
 
 The service creates `thawguard.db` by default. Override with `THAWGUARD_DB_PATH`.
 
+Repository webhook secrets are encrypted before they are stored. To enable preparatory webhook secret setup in local development, set `THAWGUARD_SECRET_KEY` to a stable, high-entropy, base64-encoded 32-byte installation key. Without this key, the rest of the local UI remains usable, but webhook secret setup is disabled. Losing or changing this key makes stored webhook secrets undecryptable.
+
 Current local pages:
 
 - `/` dashboard
