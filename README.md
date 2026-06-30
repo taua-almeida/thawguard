@@ -34,6 +34,7 @@ Current local pages:
 - `/freezes` local active branch-freeze form and list
 - `/decisions` local PR status decision preview; records results locally and does not post to Forgejo/Codeberg
 - `/publications` latest idempotent local status publication intents; shows what would be posted later and does not post to Forgejo/Codeberg
+- `/webhooks` recent signed webhook delivery metadata; shows sanitized local processing history and does not store raw payloads, signatures, or secrets
 
 Current bootstrap sessions are for local development only. Do not expose the server on a network until real local auth is configured.
 

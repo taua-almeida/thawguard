@@ -82,6 +82,7 @@ type WebhookRepositoryStore interface {
 }
 
 type WebhookDeliveryStore interface {
+	ListRecent(ctx context.Context, limit int) ([]webhook.Delivery, error)
 	Record(ctx context.Context, params webhook.DeliveryRecordParams) (webhook.Delivery, error)
 	ClaimForProcessing(ctx context.Context, id int64) (webhook.Delivery, bool, error)
 	MarkProcessed(ctx context.Context, id int64, params webhook.DeliveryProcessParams) (webhook.Delivery, error)
@@ -127,6 +128,18 @@ type statusPublicationView struct {
 	UpdatedAt   string
 }
 
+type webhookDeliveryView struct {
+	Delivery               webhook.Delivery
+	Repository             domain.Repository
+	ReceivedAt             string
+	ProcessingStartedAt    string
+	ProcessedAt            string
+	ProcessingState        string
+	ProcessingStateClass   string
+	VerificationState      string
+	VerificationStateClass string
+}
+
 type Server struct {
 	cfg      Config
 	mux      *http.ServeMux
@@ -160,6 +173,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /decisions", s.handleDecisions)
 	s.mux.HandleFunc("POST /decisions", s.handleCreateDecision)
 	s.mux.HandleFunc("GET /publications", s.handlePublications)
+	s.mux.HandleFunc("GET /webhooks", s.handleWebhooks)
 	s.mux.HandleFunc("POST /webhooks/forgejo", s.handleForgejoWebhook)
 	s.mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.Dir("web/static"))))
 }
@@ -261,6 +275,23 @@ func (s *Server) handlePublications(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.renderPublications(w, s.statusPublicationViews(repositories, publications))
+}
+
+func (s *Server) handleWebhooks(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.WebhookDeliveryStore == nil {
+		http.Error(w, "webhook delivery store is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	if _, err := s.sessions.getOrCreate(w, r); err != nil {
+		http.Error(w, "create session", http.StatusInternalServerError)
+		return
+	}
+	repositories, deliveries, err := s.webhookDeliveryPageData(r.Context())
+	if err != nil {
+		internalServerError(w)
+		return
+	}
+	s.renderWebhookDeliveries(w, s.webhookDeliveryViews(repositories, deliveries))
 }
 
 func (s *Server) handleForgejoWebhook(w http.ResponseWriter, r *http.Request) {
@@ -757,6 +788,25 @@ func (s *Server) statusPublications(ctx context.Context) ([]statuspublication.Pu
 	return s.cfg.StatusPublicationStore.ListRecent(ctx, 25)
 }
 
+func (s *Server) webhookDeliveries(ctx context.Context) ([]webhook.Delivery, error) {
+	if s.cfg.WebhookDeliveryStore == nil {
+		return nil, nil
+	}
+	return s.cfg.WebhookDeliveryStore.ListRecent(ctx, 25)
+}
+
+func (s *Server) webhookDeliveryPageData(ctx context.Context) ([]domain.Repository, []webhook.Delivery, error) {
+	repositories, err := s.repositories(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	deliveries, err := s.webhookDeliveries(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return repositories, deliveries, nil
+}
+
 func (s *Server) publicationPageData(ctx context.Context) ([]domain.Repository, []statuspublication.Publication, error) {
 	repositories, err := s.repositories(ctx)
 	if err != nil {
@@ -801,6 +851,57 @@ func (s *Server) statusPublicationViews(repositories []domain.Repository, public
 		views = append(views, statusPublicationView{Publication: publication, Repository: repositoriesByID[publication.RepositoryID], CreatedAt: publication.CreatedAt.UTC().Format("2006-01-02 15:04 UTC"), UpdatedAt: updatedAt.UTC().Format("2006-01-02 15:04 UTC")})
 	}
 	return views
+}
+
+func (s *Server) webhookDeliveryViews(repositories []domain.Repository, deliveries []webhook.Delivery) []webhookDeliveryView {
+	repositoriesByID := repositoriesByID(repositories)
+	views := make([]webhookDeliveryView, 0, len(deliveries))
+	for _, delivery := range deliveries {
+		state, stateClass := webhookDeliveryProcessingState(delivery)
+		verified, verifiedClass := webhookDeliveryVerificationState(delivery)
+		views = append(views, webhookDeliveryView{
+			Delivery:               delivery,
+			Repository:             repositoriesByID[delivery.RepositoryID],
+			ReceivedAt:             delivery.ReceivedAt.UTC().Format("2006-01-02 15:04 UTC"),
+			ProcessingStartedAt:    optionalWebhookDeliveryTime(delivery.ProcessingStartedAt),
+			ProcessedAt:            optionalWebhookDeliveryTime(delivery.ProcessedAt),
+			ProcessingState:        state,
+			ProcessingStateClass:   stateClass,
+			VerificationState:      verified,
+			VerificationStateClass: verifiedClass,
+		})
+	}
+	return views
+}
+
+func webhookDeliveryProcessingState(delivery webhook.Delivery) (string, string) {
+	if delivery.ProcessedAt != nil {
+		if delivery.Error != "" {
+			return "processed with error", "warning"
+		}
+		return "processed", "ok"
+	}
+	if delivery.ProcessingStartedAt != nil {
+		return "processing", "pending"
+	}
+	if delivery.Error != "" {
+		return "retryable failure", "failed"
+	}
+	return "received", "warning"
+}
+
+func webhookDeliveryVerificationState(delivery webhook.Delivery) (string, string) {
+	if delivery.Verified {
+		return "verified", "ok"
+	}
+	return "not verified", "warning"
+}
+
+func optionalWebhookDeliveryTime(value *time.Time) string {
+	if value == nil || value.IsZero() {
+		return "—"
+	}
+	return value.UTC().Format("2006-01-02 15:04 UTC")
 }
 
 func (s *Server) activeFreezes(ctx context.Context) ([]domain.BranchFreeze, error) {
@@ -990,6 +1091,13 @@ func (s *Server) renderPublications(w http.ResponseWriter, publications []status
 	})
 }
 
+func (s *Server) renderWebhookDeliveries(w http.ResponseWriter, deliveries []webhookDeliveryView) {
+	s.render(w, webhookDeliveriesTemplate, map[string]any{
+		"AppName":    s.cfg.AppName,
+		"Deliveries": deliveries,
+	})
+}
+
 func (s *Server) render(w http.ResponseWriter, source string, data any) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	tpl, err := template.New("page").Parse(source)
@@ -1023,7 +1131,46 @@ const dashboardTemplate = pageHead + `
       <p class="eyebrow">Freeze branches. Thaw exceptions.</p>
       <h1>{{ .AppName }} foundation is running</h1>
       <p>{{ .RepositoryCount }} repositories are configured. {{ .ActiveFreezeCount }} active branch freezes are recorded locally.</p>
-      <p class="actions"><a class="button" href="/repositories">Manage repositories</a> <a class="button" href="/freezes">Manage freezes</a> <a class="button" href="/decisions">Preview decisions</a> <a class="button" href="/publications">Publication intents</a></p>
+      <p class="actions"><a class="button" href="/repositories">Manage repositories</a> <a class="button" href="/freezes">Manage freezes</a> <a class="button" href="/decisions">Preview decisions</a> <a class="button" href="/publications">Publication intents</a> <a class="button" href="/webhooks">Webhook deliveries</a></p>
+    </section>
+  </main>` + pageFoot
+
+const webhookDeliveriesTemplate = pageHead + `
+  <main class="shell stack">
+    <nav class="topnav"><a href="/">Dashboard</a></nav>
+    <section class="panel">
+      <p class="eyebrow">Signed webhook delivery history</p>
+      <h1>Webhook deliveries</h1>
+      <p class="warning">This page shows sanitized local delivery metadata only. Thawguard does not store raw webhook payloads, signatures, or webhook secrets here.</p>
+      <p class="warning">Bootstrap sessions are for local development only. Do not expose webhook delivery visibility on a network until real local auth is configured.</p>
+      <p>Use this page to confirm signed webhook receipt, verification, local recomputation processing, and retryable processing failures before live Forgejo/Codeberg status posting is wired.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Recent webhook deliveries</h2>
+      {{ if .Deliveries }}
+      <table>
+        <thead><tr><th>Received</th><th>Repository</th><th>Delivery ID</th><th>Event</th><th>Action</th><th>Verified</th><th>Processing</th><th>Claimed</th><th>Processed</th><th>Error</th></tr></thead>
+        <tbody>
+        {{ range .Deliveries }}
+          <tr>
+            <td>{{ .ReceivedAt }}</td>
+            <td>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else if .Delivery.RepositoryID }}Repository #{{ .Delivery.RepositoryID }}{{ else }}Unknown repository{{ end }}</td>
+            <td><code>{{ .Delivery.DeliveryID }}</code></td>
+            <td><code>{{ .Delivery.Event }}</code></td>
+            <td>{{ if .Delivery.Action }}<code>{{ .Delivery.Action }}</code>{{ else }}—{{ end }}</td>
+            <td><span class="status status-{{ .VerificationStateClass }}">{{ .VerificationState }}</span></td>
+            <td><span class="status status-{{ .ProcessingStateClass }}">{{ .ProcessingState }}</span></td>
+            <td>{{ .ProcessingStartedAt }}</td>
+            <td>{{ .ProcessedAt }}</td>
+            <td>{{ if .Delivery.Error }}{{ .Delivery.Error }}{{ else }}—{{ end }}</td>
+          </tr>
+        {{ end }}
+        </tbody>
+      </table>
+      {{ else }}
+      <p>No webhook deliveries recorded yet.</p>
+      {{ end }}
     </section>
   </main>` + pageFoot
 

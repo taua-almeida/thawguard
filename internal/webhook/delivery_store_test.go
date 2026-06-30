@@ -224,6 +224,39 @@ func TestDeliveryStoreScopesDeliveryIDsByRepository(t *testing.T) {
 	}
 }
 
+func TestDeliveryStoreListsRecentDeliveries(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createWebhookDeliveryTestRepository(t, ctx, database)
+	store := NewDeliveryStore(database)
+
+	store.now = fixedDeliveryClock(time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC))
+	oldest, err := store.Record(ctx, DeliveryRecordParams{RepositoryID: repo.ID, DeliveryID: "delivery-oldest", Event: "pull_request", Action: "opened", Verified: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.now = fixedDeliveryClock(time.Date(2026, 6, 30, 12, 5, 0, 0, time.UTC))
+	newest, err := store.Record(ctx, DeliveryRecordParams{RepositoryID: repo.ID, DeliveryID: "delivery-newest", Event: "pull_request", Action: "synchronized", Verified: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	deliveries, err := store.ListRecent(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries) != 1 || deliveries[0].ID != newest.ID {
+		t.Fatalf("expected newest delivery only, got %+v", deliveries)
+	}
+	deliveries, err = store.ListRecent(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries) != 2 || deliveries[0].ID != newest.ID || deliveries[1].ID != oldest.ID {
+		t.Fatalf("expected newest-first deliveries, got %+v", deliveries)
+	}
+}
+
 func createWebhookDeliveryTestRepository(t *testing.T, ctx context.Context, database *sql.DB) domain.Repository {
 	t.Helper()
 	repo, err := repository.NewStore(database).Create(ctx, repository.CreateParams{Owner: "example-owner", Name: "example-repo", DefaultBranch: "main"})

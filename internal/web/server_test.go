@@ -900,6 +900,68 @@ func TestPublicationsPageHidesInternalErrorDetails(t *testing.T) {
 	}
 }
 
+func TestWebhooksPageShowsRecentDeliveries(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	receivedAt := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	claimedAt := receivedAt.Add(30 * time.Second)
+	processedAt := receivedAt.Add(time.Minute)
+	deliveries := []webhook.Delivery{
+		{ID: 1, RepositoryID: repo.ID, DeliveryID: "delivery-processed", Event: "pull_request", Action: "opened", ReceivedAt: receivedAt, Verified: true, ProcessedAt: &processedAt},
+		{ID: 2, RepositoryID: repo.ID, DeliveryID: "delivery-retry", Event: "pull_request", Action: "synchronized", ReceivedAt: receivedAt.Add(2 * time.Minute), Verified: true, Error: "webhook processing failed"},
+		{ID: 3, RepositoryID: repo.ID, DeliveryID: "delivery-processing", Event: "pull_request", ReceivedAt: receivedAt.Add(3 * time.Minute), Verified: true, ProcessingStartedAt: &claimedAt},
+	}
+	server := NewServer(Config{
+		AppName:              "Thawguard",
+		RepositoryStore:      &fakeRepositoryStore{repositories: []domain.Repository{repo}},
+		WebhookDeliveryStore: &fakeWebhookDeliveryStore{listed: deliveries},
+	})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/webhooks", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	if sessionCookie := sessionCookieFromRecorder(t, recorder); sessionCookie.Value == "" {
+		t.Fatal("expected session cookie value")
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{"Webhook deliveries", "sanitized local delivery metadata", "taua-almeida/thawguard", "delivery-processed", "pull_request", "opened", "verified", "processed", "delivery-retry", "synchronized", "retryable failure", "webhook processing failed", "delivery-processing", "processing", "2026-06-30 12:00 UTC"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected body to contain %q, got %q", want, body)
+		}
+	}
+	if strings.Contains(body, "raw webhook payload:") || strings.Contains(body, "X-Hub-Signature") {
+		t.Fatalf("expected page not to render raw webhook details, got %q", body)
+	}
+}
+
+func TestWebhooksPageRequiresDeliveryStore(t *testing.T) {
+	server := NewServer(Config{AppName: "Thawguard"})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/webhooks", nil))
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected service unavailable status, got %d", recorder.Code)
+	}
+}
+
+func TestWebhooksPageHidesInternalErrorDetails(t *testing.T) {
+	store := &fakeWebhookDeliveryStore{listErr: errors.New("database failed with secret-token")}
+	server := NewServer(Config{AppName: "Thawguard", WebhookDeliveryStore: store})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/webhooks", nil))
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("expected internal server error status, got %d", recorder.Code)
+	}
+	if strings.Contains(recorder.Body.String(), "secret-token") {
+		t.Fatalf("expected generic error body, got %q", recorder.Body.String())
+	}
+}
+
 func TestForgejoWebhookProcessesValidSignedPullRequest(t *testing.T) {
 	repo := domain.Repository{ID: 1, Forge: "forgejo", BaseURL: "https://codeberg.org", Owner: "example-owner", Name: "example-repo", DefaultBranch: "main", HasWebhookSecret: true}
 	repositoryStore := &fakeWebhookRepositoryStore{repo: repo, secret: "super-secret-value", found: true, secretFound: true}
@@ -1258,6 +1320,8 @@ type fakeWebhookDeliveryStore struct {
 	claims       []int64
 	processed    []fakeWebhookProcessedDelivery
 	failed       []fakeWebhookFailedDelivery
+	listed       []webhook.Delivery
+	listErr      error
 	deliveries   map[int64]webhook.Delivery
 	deliveryByID map[string]int64
 }
@@ -1274,6 +1338,16 @@ type fakeWebhookFailedDelivery struct {
 
 func newFakeWebhookDeliveryStore() *fakeWebhookDeliveryStore {
 	return &fakeWebhookDeliveryStore{deliveries: make(map[int64]webhook.Delivery), deliveryByID: make(map[string]int64)}
+}
+
+func (s *fakeWebhookDeliveryStore) ListRecent(ctx context.Context, limit int) ([]webhook.Delivery, error) {
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+	if limit > 0 && len(s.listed) > limit {
+		return s.listed[:limit], nil
+	}
+	return s.listed, nil
 }
 
 func (s *fakeWebhookDeliveryStore) Record(ctx context.Context, params webhook.DeliveryRecordParams) (webhook.Delivery, error) {

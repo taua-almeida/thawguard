@@ -16,6 +16,7 @@ const (
 
 type deliveryDatabase interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
@@ -227,6 +228,37 @@ WHERE repository_id = ? AND delivery_id = ?`, repositoryID, deliveryID)
 		return Delivery{}, false, err
 	}
 	return delivery, true, nil
+}
+
+func (s *DeliveryStore) ListRecent(ctx context.Context, limit int) ([]Delivery, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("webhook delivery store has no database")
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, repository_id, delivery_id, event, action, received_at, verified, processing_started_at, processed_at, error
+FROM webhook_deliveries
+ORDER BY received_at DESC, id DESC
+LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list webhook deliveries: %w", err)
+	}
+	defer rows.Close()
+
+	deliveries := make([]Delivery, 0)
+	for rows.Next() {
+		delivery, err := scanDelivery(rows)
+		if err != nil {
+			return nil, err
+		}
+		deliveries = append(deliveries, delivery)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list webhook deliveries rows: %w", err)
+	}
+	return deliveries, nil
 }
 
 func recordDeliveryError(err error) error {
