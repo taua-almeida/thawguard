@@ -12,7 +12,11 @@ import (
 	"github.com/taua-almeida/thawguard/internal/statusresult"
 )
 
-const DeliveryModeLocalRecord = "local_record"
+const (
+	DeliveryModeLocalRecord = "local_record"
+	AttemptModeDryRun       = "dry_run"
+	AttemptResultPlanned    = "planned"
+)
 
 type database interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
@@ -39,6 +43,24 @@ type Publication struct {
 	DeliveryMode     string
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
+}
+
+type Attempt struct {
+	ID               int64
+	PublicationID    int64
+	StatusResultID   int64
+	RepositoryID     int64
+	PullRequestIndex int
+	TargetBranch     string
+	HeadSHA          string
+	Context          string
+	State            domain.CommitStatusState
+	Description      string
+	TargetURL        string
+	Mode             string
+	Result           string
+	Error            string
+	AttemptedAt      time.Time
 }
 
 type ValidationError struct {
@@ -135,6 +157,74 @@ LIMIT ?`, limit)
 	return publications, nil
 }
 
+func (s *Store) RecordDryRunAttempt(ctx context.Context, publication Publication) (Attempt, error) {
+	if s == nil || s.db == nil {
+		return Attempt{}, errors.New("status publication store has no database")
+	}
+	attempt := attemptFromPublication(publication)
+	attempt.Mode = AttemptModeDryRun
+	attempt.Result = AttemptResultPlanned
+	attempt.AttemptedAt = s.now().UTC()
+	attempt = normalizeAttempt(attempt)
+	if err := validateAttempt(attempt); err != nil {
+		return Attempt{}, err
+	}
+
+	insert, err := s.db.ExecContext(ctx, `
+INSERT INTO status_publication_attempts(publication_id, status_result_id, repository_id, pull_request_index, target_branch, head_sha, context, state, description, target_url, mode, result, error, attempted_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, attempt.PublicationID, attempt.StatusResultID, attempt.RepositoryID, attempt.PullRequestIndex, attempt.TargetBranch, attempt.HeadSHA, attempt.Context, attempt.State, attempt.Description, nullableString(attempt.TargetURL), attempt.Mode, attempt.Result, nullableString(attempt.Error), attempt.AttemptedAt.Format(time.RFC3339Nano))
+	if err != nil {
+		return Attempt{}, fmt.Errorf("record status publication attempt: %w", err)
+	}
+	id, err := insert.LastInsertId()
+	if err != nil {
+		return Attempt{}, fmt.Errorf("recorded status publication attempt id: %w", err)
+	}
+	return s.GetAttempt(ctx, id)
+}
+
+func (s *Store) GetAttempt(ctx context.Context, id int64) (Attempt, error) {
+	if s == nil || s.db == nil {
+		return Attempt{}, errors.New("status publication store has no database")
+	}
+	row := s.db.QueryRowContext(ctx, `
+SELECT id, publication_id, status_result_id, repository_id, pull_request_index, target_branch, head_sha, context, state, description, target_url, mode, result, error, attempted_at
+FROM status_publication_attempts
+WHERE id = ?`, id)
+	return scanAttempt(row)
+}
+
+func (s *Store) ListRecentAttempts(ctx context.Context, limit int) ([]Attempt, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("status publication store has no database")
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, publication_id, status_result_id, repository_id, pull_request_index, target_branch, head_sha, context, state, description, target_url, mode, result, error, attempted_at
+FROM status_publication_attempts
+ORDER BY attempted_at DESC, id DESC
+LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list status publication attempts: %w", err)
+	}
+	defer rows.Close()
+
+	attempts := make([]Attempt, 0)
+	for rows.Next() {
+		attempt, err := scanAttempt(rows)
+		if err != nil {
+			return nil, err
+		}
+		attempts = append(attempts, attempt)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list status publication attempts rows: %w", err)
+	}
+	return attempts, nil
+}
+
 func (s *Store) getByIdempotencyKey(ctx context.Context, publication Publication) (Publication, error) {
 	row := s.db.QueryRowContext(ctx, `
 SELECT id, status_result_id, repository_id, pull_request_index, target_branch, head_sha, context, state, description, target_url, delivery_mode, created_at, updated_at
@@ -157,6 +247,21 @@ func publicationFromResult(result statusresult.Result) Publication {
 	}
 }
 
+func attemptFromPublication(publication Publication) Attempt {
+	return Attempt{
+		PublicationID:    publication.ID,
+		StatusResultID:   publication.StatusResultID,
+		RepositoryID:     publication.RepositoryID,
+		PullRequestIndex: publication.PullRequestIndex,
+		TargetBranch:     publication.TargetBranch,
+		HeadSHA:          publication.HeadSHA,
+		Context:          publication.Context,
+		State:            publication.State,
+		Description:      publication.Description,
+		TargetURL:        publication.TargetURL,
+	}
+}
+
 func normalizePublication(publication Publication) Publication {
 	publication.TargetBranch = strings.TrimSpace(publication.TargetBranch)
 	publication.HeadSHA = strings.ToLower(strings.TrimSpace(publication.HeadSHA))
@@ -165,6 +270,18 @@ func normalizePublication(publication Publication) Publication {
 	publication.TargetURL = strings.TrimSpace(publication.TargetURL)
 	publication.DeliveryMode = strings.TrimSpace(publication.DeliveryMode)
 	return publication
+}
+
+func normalizeAttempt(attempt Attempt) Attempt {
+	attempt.TargetBranch = strings.TrimSpace(attempt.TargetBranch)
+	attempt.HeadSHA = strings.ToLower(strings.TrimSpace(attempt.HeadSHA))
+	attempt.Context = strings.TrimSpace(attempt.Context)
+	attempt.Description = strings.TrimSpace(attempt.Description)
+	attempt.TargetURL = strings.TrimSpace(attempt.TargetURL)
+	attempt.Mode = strings.TrimSpace(attempt.Mode)
+	attempt.Result = strings.TrimSpace(attempt.Result)
+	attempt.Error = strings.TrimSpace(attempt.Error)
+	return attempt
 }
 
 func validatePublication(publication Publication) error {
@@ -201,6 +318,56 @@ func validatePublication(publication Publication) error {
 	}
 	if !validState(publication.State) {
 		return ValidationError{Message: "status publication state is invalid"}
+	}
+	return nil
+}
+
+func validateAttempt(attempt Attempt) error {
+	var missing []string
+	if attempt.PublicationID <= 0 {
+		missing = append(missing, "publication")
+	}
+	if attempt.StatusResultID <= 0 {
+		missing = append(missing, "status result")
+	}
+	if attempt.RepositoryID <= 0 {
+		missing = append(missing, "repository")
+	}
+	if attempt.PullRequestIndex <= 0 {
+		missing = append(missing, "pull request")
+	}
+	if attempt.TargetBranch == "" {
+		missing = append(missing, "target branch")
+	}
+	if attempt.HeadSHA == "" {
+		missing = append(missing, "head SHA")
+	}
+	if attempt.Context == "" {
+		missing = append(missing, "context")
+	}
+	if attempt.Description == "" {
+		missing = append(missing, "description")
+	}
+	if attempt.Mode == "" {
+		missing = append(missing, "mode")
+	}
+	if attempt.Result == "" {
+		missing = append(missing, "result")
+	}
+	if attempt.AttemptedAt.IsZero() {
+		missing = append(missing, "attempted at")
+	}
+	if len(missing) > 0 {
+		return ValidationError{Message: fmt.Sprintf("missing required status publication attempt fields: %s", strings.Join(missing, ", "))}
+	}
+	if attempt.Mode != AttemptModeDryRun {
+		return ValidationError{Message: "status publication attempt mode is invalid"}
+	}
+	if attempt.Result != AttemptResultPlanned {
+		return ValidationError{Message: "status publication attempt result is invalid"}
+	}
+	if !validState(attempt.State) {
+		return ValidationError{Message: "status publication attempt state is invalid"}
 	}
 	return nil
 }
@@ -247,4 +414,26 @@ func scanPublication(row scanner) (Publication, error) {
 	}
 	publication.UpdatedAt = parsedUpdatedAt
 	return publication, nil
+}
+
+func scanAttempt(row scanner) (Attempt, error) {
+	var attempt Attempt
+	var targetURL sql.NullString
+	var attemptError sql.NullString
+	var attemptedAt string
+	if err := row.Scan(&attempt.ID, &attempt.PublicationID, &attempt.StatusResultID, &attempt.RepositoryID, &attempt.PullRequestIndex, &attempt.TargetBranch, &attempt.HeadSHA, &attempt.Context, &attempt.State, &attempt.Description, &targetURL, &attempt.Mode, &attempt.Result, &attemptError, &attemptedAt); err != nil {
+		return Attempt{}, fmt.Errorf("scan status publication attempt: %w", err)
+	}
+	if targetURL.Valid {
+		attempt.TargetURL = targetURL.String
+	}
+	if attemptError.Valid {
+		attempt.Error = attemptError.String
+	}
+	parsedAttemptedAt, err := time.Parse(time.RFC3339Nano, attemptedAt)
+	if err != nil {
+		return Attempt{}, fmt.Errorf("parse status publication attempt attempted_at: %w", err)
+	}
+	attempt.AttemptedAt = parsedAttemptedAt
+	return attempt, nil
 }

@@ -25,7 +25,7 @@ The service creates `thawguard.db` by default. Override with `THAWGUARD_DB_PATH`
 
 Repository webhook secrets are encrypted before they are stored. To enable webhook secret setup in local development, set `THAWGUARD_SECRET_KEY` to a stable, high-entropy, base64-encoded 32-byte installation key. Without this key, the rest of the local UI remains usable, but webhook secret setup is disabled. Losing or changing this key makes stored webhook secrets undecryptable.
 
-The local signed webhook receiver is `POST /webhooks/forgejo`. It verifies configured repository webhook secrets, records sanitized delivery results, updates the local PR cache, and recomputes local status/publication-intent records. It does not post live statuses to Forgejo/Codeberg yet.
+The local signed webhook receiver is `POST /webhooks/forgejo`. It verifies configured repository webhook secrets, records sanitized delivery results, updates the local PR cache, and recomputes local status/publication-intent records plus dry-run publication attempts. It does not post live statuses to Forgejo/Codeberg yet.
 
 Current local pages:
 
@@ -33,7 +33,7 @@ Current local pages:
 - `/repositories` repository setup form and manual setup checklist
 - `/freezes` local active branch-freeze form and list
 - `/decisions` local PR status decision preview; records results locally and does not post to Forgejo/Codeberg
-- `/publications` latest idempotent local status publication intents; shows what would be posted later and does not post to Forgejo/Codeberg
+- `/publications` latest idempotent local status publication intents and dry-run publication attempts; shows what would be posted later and does not post to Forgejo/Codeberg
 - `/webhooks` recent signed webhook delivery metadata; shows sanitized local processing history and does not store raw payloads, signatures, or secrets
 
 Current bootstrap sessions are for local development only. Do not expose the server on a network until real local auth is configured.

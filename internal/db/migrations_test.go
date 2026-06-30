@@ -57,6 +57,8 @@ func TestOpenAndApplyMigrationsAgainstSQLite(t *testing.T) {
 	assertTableExists(t, database, "repository_webhook_secrets")
 	assertColumnExists(t, database, "status_publication_intents", "updated_at")
 	assertIndexExists(t, database, "idx_status_publication_intents_idempotency")
+	assertTableExists(t, database, "status_publication_attempts")
+	assertIndexExists(t, database, "idx_status_publication_attempts_recent")
 
 	var applied int
 	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = ?`, "0001_initial").Scan(&applied); err != nil {
@@ -138,6 +140,7 @@ CREATE TABLE audit_events (
 	assertTableExists(t, database, "pull_request_cache")
 	assertTableExists(t, database, "status_publication_intents")
 	assertColumnExists(t, database, "status_publication_intents", "updated_at")
+	assertTableExists(t, database, "status_publication_attempts")
 	assertTableExists(t, database, "webhook_deliveries")
 	assertColumnExists(t, database, "webhook_deliveries", "processing_started_at")
 	assertTableExists(t, database, "repository_webhook_secrets")
@@ -191,10 +194,17 @@ CREATE TABLE audit_events (
 	if applied != 1 {
 		t.Fatalf("expected status publication idempotency migration to be recorded once, got %d", applied)
 	}
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = ?`, "0012_status_publication_attempts").Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected status publication attempts migration to be recorded once, got %d", applied)
+	}
 	assertWebhookDeliveriesAreRepositoryScoped(t, database)
 	assertIndexExists(t, database, "idx_branch_freezes_one_active")
 	assertIndexExists(t, database, "idx_audit_events_subject_type_id")
 	assertIndexExists(t, database, "idx_status_publication_intents_idempotency")
+	assertIndexExists(t, database, "idx_status_publication_attempts_recent")
 }
 
 func TestApplyMigrationsDedupesStatusPublicationIntents(t *testing.T) {

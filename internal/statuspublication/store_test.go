@@ -94,6 +94,52 @@ func TestStorePublishUpsertsLocalStatusIntentByStatusKey(t *testing.T) {
 	}
 }
 
+func TestStoreRecordsDryRunPublicationAttempt(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	result := createStatusResult(t, ctx, database, repo.ID)
+	store := NewStore(database)
+	publication, err := store.Publish(ctx, result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attemptedAt := time.Date(2026, 6, 30, 15, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return attemptedAt }
+
+	attempt, err := store.RecordDryRunAttempt(ctx, publication)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempt.ID == 0 || attempt.PublicationID != publication.ID || attempt.StatusResultID != result.ID || attempt.RepositoryID != repo.ID {
+		t.Fatalf("unexpected attempt identity: %+v", attempt)
+	}
+	if attempt.PullRequestIndex != publication.PullRequestIndex || attempt.TargetBranch != publication.TargetBranch || attempt.HeadSHA != publication.HeadSHA || attempt.Context != publication.Context || attempt.State != publication.State || attempt.Description != publication.Description {
+		t.Fatalf("expected attempt snapshot to match publication, publication=%+v attempt=%+v", publication, attempt)
+	}
+	if attempt.Mode != AttemptModeDryRun || attempt.Result != AttemptResultPlanned || !attempt.AttemptedAt.Equal(attemptedAt) {
+		t.Fatalf("unexpected attempt mode/result/time: %+v", attempt)
+	}
+
+	attempts, err := store.ListRecentAttempts(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 1 || attempts[0].ID != attempt.ID {
+		t.Fatalf("expected recent dry-run attempt, got %+v", attempts)
+	}
+}
+
+func TestStoreRejectsInvalidDryRunPublicationAttempt(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	store := NewStore(database)
+
+	if _, err := store.RecordDryRunAttempt(ctx, Publication{}); !IsValidationError(err) {
+		t.Fatalf("expected validation error, got %v", err)
+	}
+}
+
 func TestStoreRejectsInvalidPublicationResult(t *testing.T) {
 	ctx := context.Background()
 	database := newTestDB(t, ctx)

@@ -17,6 +17,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/secrets"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
 	"github.com/taua-almeida/thawguard/internal/statuspublication"
+	"github.com/taua-almeida/thawguard/internal/statuspublisher"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
 	"github.com/taua-almeida/thawguard/internal/web"
 	"github.com/taua-almeida/thawguard/internal/webhook"
@@ -67,9 +68,10 @@ func (a *App) Run(ctx context.Context) error {
 	auditStore := audit.NewStore(database)
 	statusDecisionStore := statusresult.NewService(statusresult.NewStore(database), freezeStore)
 	statusPublicationStore := statuspublication.NewStore(database)
+	dryRunStatusPublisher := statuspublisher.NewDryRunPublisher(statusPublicationStore, statusPublicationStore)
 	pullRequestStore := pullrequest.NewStore(database)
 	webhookDeliveryStore := webhook.NewDeliveryStore(database)
-	pullRequestWebhookProcessor := webhook.NewPullRequestProcessor(repository.NewStore(database), pullRequestStore, statusDecisionStore, statusPublicationStore)
+	pullRequestWebhookProcessor := webhook.NewPullRequestProcessor(repository.NewStore(database), pullRequestStore, statusDecisionStore, dryRunStatusPublisher)
 	server := &http.Server{
 		Addr: a.cfg.HTTPAddr,
 		Handler: web.NewServer(web.Config{

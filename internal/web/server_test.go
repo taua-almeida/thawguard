@@ -850,11 +850,12 @@ func TestCreateDecisionHidesInternalErrorDetails(t *testing.T) {
 func TestPublicationsPageShowsRecentPublicationIntents(t *testing.T) {
 	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
 	createdAt := time.Date(2026, 6, 29, 17, 30, 0, 0, time.UTC)
-	publication := statuspublication.Publication{ID: 1, StatusResultID: 7, RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "Branch is frozen; merge is blocked by Thawguard", DeliveryMode: statuspublication.DeliveryModeLocalRecord, CreatedAt: createdAt}
+	publication := statuspublication.Publication{ID: 1, StatusResultID: 7, RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "Branch is frozen; merge is blocked by Thawguard", DeliveryMode: statuspublication.DeliveryModeLocalRecord, CreatedAt: createdAt, UpdatedAt: createdAt}
+	attempt := statuspublication.Attempt{ID: 1, PublicationID: publication.ID, StatusResultID: publication.StatusResultID, RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "Branch is frozen; merge is blocked by Thawguard", Mode: statuspublication.AttemptModeDryRun, Result: statuspublication.AttemptResultPlanned, AttemptedAt: createdAt.Add(time.Minute)}
 	server := NewServer(Config{
 		AppName:                "Thawguard",
 		RepositoryStore:        &fakeRepositoryStore{repositories: []domain.Repository{repo}},
-		StatusPublicationStore: &fakeStatusPublicationStore{publications: []statuspublication.Publication{publication}},
+		StatusPublicationStore: &fakeStatusPublicationStore{publications: []statuspublication.Publication{publication}, attempts: []statuspublication.Attempt{attempt}},
 	})
 
 	recorder := httptest.NewRecorder()
@@ -867,7 +868,7 @@ func TestPublicationsPageShowsRecentPublicationIntents(t *testing.T) {
 		t.Fatal("expected session cookie value")
 	}
 	body := recorder.Body.String()
-	for _, want := range []string{"Status publication intents", "No status has been posted", "taua-almeida/thawguard", "#42", "main", "abc123", "thawguard/freeze", "failure", "local_record", "Branch is frozen", "2026-06-29 17:30 UTC"} {
+	for _, want := range []string{"Status publication intents", "No status has been posted", "Recent dry-run publication attempts", "do not call Forgejo/Codeberg", "taua-almeida/thawguard", "#42", "main", "abc123", "thawguard/freeze", "failure", "local_record", "dry_run", "planned", "Branch is frozen", "2026-06-29 17:30 UTC", "2026-06-29 17:31 UTC"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
@@ -1468,7 +1469,9 @@ func (s *fakeStatusDecisionStore) RunLocal(ctx context.Context, params statusres
 
 type fakeStatusPublicationStore struct {
 	publications []statuspublication.Publication
+	attempts     []statuspublication.Attempt
 	err          error
+	attemptErr   error
 }
 
 func (s *fakeStatusPublicationStore) ListRecent(ctx context.Context, limit int) ([]statuspublication.Publication, error) {
@@ -1479,6 +1482,19 @@ func (s *fakeStatusPublicationStore) ListRecent(ctx context.Context, limit int) 
 		return s.publications[:limit], nil
 	}
 	return s.publications, nil
+}
+
+func (s *fakeStatusPublicationStore) ListRecentAttempts(ctx context.Context, limit int) ([]statuspublication.Attempt, error) {
+	if s.attemptErr != nil {
+		return nil, s.attemptErr
+	}
+	if s.err != nil {
+		return nil, s.err
+	}
+	if limit > 0 && len(s.attempts) > limit {
+		return s.attempts[:limit], nil
+	}
+	return s.attempts, nil
 }
 
 type fakeAuditStore struct {

@@ -15,6 +15,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/pullrequest"
 	"github.com/taua-almeida/thawguard/internal/repository"
 	"github.com/taua-almeida/thawguard/internal/statuspublication"
+	"github.com/taua-almeida/thawguard/internal/statuspublisher"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
 )
 
@@ -51,7 +52,8 @@ func TestPullRequestProcessorCachesAndRecomputesLocalDecision(t *testing.T) {
 	prStore := pullrequest.NewStore(database)
 	statusStore := statusresult.NewStore(database)
 	publicationStore := statuspublication.NewStore(database)
-	processor := NewPullRequestProcessor(repository.NewStore(database), prStore, statusresult.NewService(statusStore, freezeService), publicationStore)
+	dryRunPublisher := statuspublisher.NewDryRunPublisher(publicationStore, publicationStore)
+	processor := NewPullRequestProcessor(repository.NewStore(database), prStore, statusresult.NewService(statusStore, freezeService), dryRunPublisher)
 
 	processed, err := processor.Process(ctx, readFixture(t, "codeberg_pull_request_opened.json"))
 	if err != nil {
@@ -93,6 +95,13 @@ func TestPullRequestProcessorCachesAndRecomputesLocalDecision(t *testing.T) {
 	}
 	if len(publications) != 1 || publications[0].StatusResultID != recent[0].ID || publications[0].HeadSHA != recent[0].HeadSHA {
 		t.Fatalf("expected persisted publication intent, got %+v", publications)
+	}
+	attempts, err := publicationStore.ListRecentAttempts(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 1 || attempts[0].PublicationID != publications[0].ID || attempts[0].StatusResultID != recent[0].ID || attempts[0].Mode != statuspublication.AttemptModeDryRun || attempts[0].Result != statuspublication.AttemptResultPlanned {
+		t.Fatalf("expected persisted dry-run publication attempt, got %+v", attempts)
 	}
 }
 
