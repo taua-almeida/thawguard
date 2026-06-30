@@ -13,17 +13,19 @@ import (
 	"github.com/taua-almeida/thawguard/internal/freeze"
 	"github.com/taua-almeida/thawguard/internal/repository"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
+	"github.com/taua-almeida/thawguard/internal/statuspublication"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
 )
 
 type Config struct {
-	AppName             string
-	RepositoryStore     RepositoryStore
-	SetupCheckStore     SetupCheckStore
-	SetupCheckRunner    SetupCheckRunner
-	FreezeStore         FreezeStore
-	AuditStore          AuditStore
-	StatusDecisionStore StatusDecisionStore
+	AppName                string
+	RepositoryStore        RepositoryStore
+	SetupCheckStore        SetupCheckStore
+	SetupCheckRunner       SetupCheckRunner
+	FreezeStore            FreezeStore
+	AuditStore             AuditStore
+	StatusDecisionStore    StatusDecisionStore
+	StatusPublicationStore StatusPublicationStore
 }
 
 type RepositoryStore interface {
@@ -55,6 +57,10 @@ type StatusDecisionStore interface {
 	RunLocal(ctx context.Context, params statusresult.LocalDecisionParams) (statusresult.Result, error)
 }
 
+type StatusPublicationStore interface {
+	ListRecent(ctx context.Context, limit int) ([]statuspublication.Publication, error)
+}
+
 type repositoryView struct {
 	Repository  domain.Repository
 	SetupChecks []setupcheck.Check
@@ -81,6 +87,12 @@ type statusResultView struct {
 	Result     statusresult.Result
 	Repository domain.Repository
 	CreatedAt  string
+}
+
+type statusPublicationView struct {
+	Publication statuspublication.Publication
+	Repository  domain.Repository
+	CreatedAt   string
 }
 
 type Server struct {
@@ -114,6 +126,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /freezes/cancel", s.handleCancelFreeze)
 	s.mux.HandleFunc("GET /decisions", s.handleDecisions)
 	s.mux.HandleFunc("POST /decisions", s.handleCreateDecision)
+	s.mux.HandleFunc("GET /publications", s.handlePublications)
 	s.mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.Dir("web/static"))))
 }
 
@@ -197,6 +210,23 @@ func (s *Server) handleCreateDecision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/decisions", http.StatusSeeOther)
+}
+
+func (s *Server) handlePublications(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.StatusPublicationStore == nil {
+		http.Error(w, "status publication store is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	if _, err := s.sessions.getOrCreate(w, r); err != nil {
+		http.Error(w, "create session", http.StatusInternalServerError)
+		return
+	}
+	repositories, publications, err := s.publicationPageData(r.Context())
+	if err != nil {
+		internalServerError(w)
+		return
+	}
+	s.renderPublications(w, s.statusPublicationViews(repositories, publications))
 }
 
 func (s *Server) handleRepositories(w http.ResponseWriter, r *http.Request) {
@@ -448,6 +478,25 @@ func (s *Server) statusResults(ctx context.Context) ([]statusresult.Result, erro
 	return s.cfg.StatusDecisionStore.ListRecent(ctx, 25)
 }
 
+func (s *Server) statusPublications(ctx context.Context) ([]statuspublication.Publication, error) {
+	if s.cfg.StatusPublicationStore == nil {
+		return nil, nil
+	}
+	return s.cfg.StatusPublicationStore.ListRecent(ctx, 25)
+}
+
+func (s *Server) publicationPageData(ctx context.Context) ([]domain.Repository, []statuspublication.Publication, error) {
+	repositories, err := s.repositories(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	publications, err := s.statusPublications(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return repositories, publications, nil
+}
+
 func (s *Server) decisionPageData(ctx context.Context) ([]domain.Repository, []statusresult.Result, error) {
 	repositories, err := s.repositories(ctx)
 	if err != nil {
@@ -465,6 +514,15 @@ func (s *Server) statusResultViews(repositories []domain.Repository, results []s
 	views := make([]statusResultView, 0, len(results))
 	for _, result := range results {
 		views = append(views, statusResultView{Result: result, Repository: repositoriesByID[result.RepositoryID], CreatedAt: result.CreatedAt.UTC().Format("2006-01-02 15:04 UTC")})
+	}
+	return views
+}
+
+func (s *Server) statusPublicationViews(repositories []domain.Repository, publications []statuspublication.Publication) []statusPublicationView {
+	repositoriesByID := repositoriesByID(repositories)
+	views := make([]statusPublicationView, 0, len(publications))
+	for _, publication := range publications {
+		views = append(views, statusPublicationView{Publication: publication, Repository: repositoriesByID[publication.RepositoryID], CreatedAt: publication.CreatedAt.UTC().Format("2006-01-02 15:04 UTC")})
 	}
 	return views
 }
@@ -648,6 +706,13 @@ func (s *Server) renderDecisions(w http.ResponseWriter, repositories []domain.Re
 	})
 }
 
+func (s *Server) renderPublications(w http.ResponseWriter, publications []statusPublicationView) {
+	s.render(w, publicationsTemplate, map[string]any{
+		"AppName":      s.cfg.AppName,
+		"Publications": publications,
+	})
+}
+
 func (s *Server) render(w http.ResponseWriter, source string, data any) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	tpl, err := template.New("page").Parse(source)
@@ -681,7 +746,45 @@ const dashboardTemplate = pageHead + `
       <p class="eyebrow">Freeze branches. Thaw exceptions.</p>
       <h1>{{ .AppName }} foundation is running</h1>
       <p>{{ .RepositoryCount }} repositories are configured. {{ .ActiveFreezeCount }} active branch freezes are recorded locally.</p>
-      <p class="actions"><a class="button" href="/repositories">Manage repositories</a> <a class="button" href="/freezes">Manage freezes</a> <a class="button" href="/decisions">Preview decisions</a></p>
+      <p class="actions"><a class="button" href="/repositories">Manage repositories</a> <a class="button" href="/freezes">Manage freezes</a> <a class="button" href="/decisions">Preview decisions</a> <a class="button" href="/publications">Publication intents</a></p>
+    </section>
+  </main>` + pageFoot
+
+const publicationsTemplate = pageHead + `
+  <main class="shell stack">
+    <nav class="topnav"><a href="/">Dashboard</a></nav>
+    <section class="panel">
+      <p class="eyebrow">Local publication intents</p>
+      <h1>Status publication intents</h1>
+      <p class="warning">These are local records of statuses Thawguard would publish later. No status has been posted to Forgejo/Codeberg from this page or from the current local publisher.</p>
+      <p class="warning">Bootstrap sessions are for local development only. Do not expose publication-intent visibility on a network until real local auth is configured.</p>
+      <p>Use this page to inspect the status context, state, head SHA, and description generated by the local recomputation pipeline before live posting or a public webhook endpoint is wired.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Recent local publication intents</h2>
+      {{ if .Publications }}
+      <table>
+        <thead><tr><th>When</th><th>Repository</th><th>PR</th><th>Target branch</th><th>Head SHA</th><th>Context</th><th>State</th><th>Mode</th><th>Description</th></tr></thead>
+        <tbody>
+        {{ range .Publications }}
+          <tr>
+            <td>{{ .CreatedAt }}</td>
+            <td>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Publication.RepositoryID }}{{ end }}</td>
+            <td>#{{ .Publication.PullRequestIndex }}</td>
+            <td>{{ .Publication.TargetBranch }}</td>
+            <td><code>{{ .Publication.HeadSHA }}</code></td>
+            <td><code>{{ .Publication.Context }}</code></td>
+            <td><span class="status status-{{ .Publication.State }}">{{ .Publication.State }}</span></td>
+            <td><code>{{ .Publication.DeliveryMode }}</code></td>
+            <td>{{ .Publication.Description }}</td>
+          </tr>
+        {{ end }}
+        </tbody>
+      </table>
+      {{ else }}
+      <p>No local publication intents yet.</p>
+      {{ end }}
     </section>
   </main>` + pageFoot
 

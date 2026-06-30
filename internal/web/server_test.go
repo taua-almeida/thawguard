@@ -17,6 +17,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/freeze"
 	"github.com/taua-almeida/thawguard/internal/repository"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
+	"github.com/taua-almeida/thawguard/internal/statuspublication"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
 )
 
@@ -721,6 +722,59 @@ func TestCreateDecisionHidesInternalErrorDetails(t *testing.T) {
 	}
 }
 
+func TestPublicationsPageShowsRecentPublicationIntents(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	createdAt := time.Date(2026, 6, 29, 17, 30, 0, 0, time.UTC)
+	publication := statuspublication.Publication{ID: 1, StatusResultID: 7, RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "Branch is frozen; merge is blocked by Thawguard", DeliveryMode: statuspublication.DeliveryModeLocalRecord, CreatedAt: createdAt}
+	server := NewServer(Config{
+		AppName:                "Thawguard",
+		RepositoryStore:        &fakeRepositoryStore{repositories: []domain.Repository{repo}},
+		StatusPublicationStore: &fakeStatusPublicationStore{publications: []statuspublication.Publication{publication}},
+	})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/publications", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	if sessionCookie := sessionCookieFromRecorder(t, recorder); sessionCookie.Value == "" {
+		t.Fatal("expected session cookie value")
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{"Status publication intents", "No status has been posted", "taua-almeida/thawguard", "#42", "main", "abc123", "thawguard/freeze", "failure", "local_record", "Branch is frozen", "2026-06-29 17:30 UTC"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected body to contain %q, got %q", want, body)
+		}
+	}
+}
+
+func TestPublicationsPageRequiresStatusPublicationStore(t *testing.T) {
+	server := NewServer(Config{AppName: "Thawguard"})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/publications", nil))
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected service unavailable status, got %d", recorder.Code)
+	}
+}
+
+func TestPublicationsPageHidesInternalErrorDetails(t *testing.T) {
+	store := &fakeStatusPublicationStore{err: errors.New("database failed with secret-token")}
+	server := NewServer(Config{AppName: "Thawguard", StatusPublicationStore: store})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/publications", nil))
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("expected internal server error status, got %d", recorder.Code)
+	}
+	if strings.Contains(recorder.Body.String(), "secret-token") {
+		t.Fatalf("expected generic error body, got %q", recorder.Body.String())
+	}
+}
+
 func decisionCreateForm() url.Values {
 	return url.Values{
 		"repository_id":      {"1"},
@@ -848,6 +902,21 @@ func (s *fakeStatusDecisionStore) RunLocal(ctx context.Context, params statusres
 	result := statusresult.Result{ID: int64(len(s.results) + 1), RepositoryID: params.RepositoryID, PullRequestIndex: params.PullRequestIndex, TargetBranch: params.TargetBranch, HeadSHA: params.HeadSHA, Context: domain.RequiredStatusContext, State: domain.CommitStatusSuccess, Description: "No active freeze applies to this PR", CreatedAt: time.Now().UTC()}
 	s.results = append(s.results, result)
 	return result, nil
+}
+
+type fakeStatusPublicationStore struct {
+	publications []statuspublication.Publication
+	err          error
+}
+
+func (s *fakeStatusPublicationStore) ListRecent(ctx context.Context, limit int) ([]statuspublication.Publication, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if limit > 0 && len(s.publications) > limit {
+		return s.publications[:limit], nil
+	}
+	return s.publications, nil
 }
 
 type fakeAuditStore struct {

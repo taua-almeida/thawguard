@@ -29,6 +29,7 @@ Current local pages:
 - `/repositories` repository setup form and manual setup checklist
 - `/freezes` local active branch-freeze form and list
 - `/decisions` local PR status decision preview; records results locally and does not post to Forgejo/Codeberg
+- `/publications` recent local status publication intents; shows what would be posted later and does not post to Forgejo/Codeberg
 
 Current bootstrap sessions are for local development only. Do not expose the server on a network until real local auth is configured.
 
