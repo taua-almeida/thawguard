@@ -99,6 +99,13 @@ type repositoryView struct {
 	SetupChecks []setupcheck.Check
 }
 
+type repositoryOverview struct {
+	RepositoryCount             int
+	WebhookConfiguredCount      int
+	SetupCheckRepositoryCount   int
+	WebhookSecretStorageEnabled bool
+}
+
 type freezeView struct {
 	Freeze     domain.BranchFreeze
 	Repository domain.Repository
@@ -203,8 +210,10 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	s.render(w, dashboardTemplate, map[string]any{
 		"AppName":           s.cfg.AppName,
+		"ActivePage":        "dashboard",
 		"RepositoryCount":   len(repositories),
 		"ActiveFreezeCount": len(freezes),
+		"Freezes":           s.freezeViews(repositories, freezes),
 	})
 }
 
@@ -1078,8 +1087,19 @@ func latestSetupChecks(checks []setupcheck.Check) []setupcheck.Check {
 }
 
 func (s *Server) renderRepositories(w http.ResponseWriter, views []repositoryView, formError string, csrfToken string) {
+	overview := repositoryOverview{RepositoryCount: len(views), WebhookSecretStorageEnabled: s.cfg.RepositorySecretEncryptionConfigured}
+	for _, view := range views {
+		if view.Repository.HasWebhookSecret {
+			overview.WebhookConfiguredCount++
+		}
+		if len(view.SetupChecks) > 0 {
+			overview.SetupCheckRepositoryCount++
+		}
+	}
 	s.render(w, repositoriesTemplate, map[string]any{
 		"AppName":                           s.cfg.AppName,
+		"ActivePage":                        "repositories",
+		"Overview":                          overview,
 		"RepositoryViews":                   views,
 		"FormError":                         formError,
 		"CSRFToken":                         csrfToken,
@@ -1092,6 +1112,7 @@ func (s *Server) renderRepositories(w http.ResponseWriter, views []repositoryVie
 func (s *Server) renderFreezes(w http.ResponseWriter, repositories []domain.Repository, freezes []freezeView, auditEvents []freezeAuditView, formError string, csrfToken string) {
 	s.render(w, freezesTemplate, map[string]any{
 		"AppName":      s.cfg.AppName,
+		"ActivePage":   "freezes",
 		"Repositories": repositories,
 		"Freezes":      freezes,
 		"AuditEvents":  auditEvents,
@@ -1103,6 +1124,7 @@ func (s *Server) renderFreezes(w http.ResponseWriter, repositories []domain.Repo
 func (s *Server) renderDecisions(w http.ResponseWriter, repositories []domain.Repository, results []statusResultView, formError string, csrfToken string) {
 	s.render(w, decisionsTemplate, map[string]any{
 		"AppName":         s.cfg.AppName,
+		"ActivePage":      "thaws",
 		"Repositories":    repositories,
 		"Results":         results,
 		"FormError":       formError,
@@ -1114,6 +1136,7 @@ func (s *Server) renderDecisions(w http.ResponseWriter, repositories []domain.Re
 func (s *Server) renderPublications(w http.ResponseWriter, publications []statusPublicationView, attempts []statusPublicationAttemptView) {
 	s.render(w, publicationsTemplate, map[string]any{
 		"AppName":      s.cfg.AppName,
+		"ActivePage":   "activity",
 		"Publications": publications,
 		"Attempts":     attempts,
 	})
@@ -1122,6 +1145,7 @@ func (s *Server) renderPublications(w http.ResponseWriter, publications []status
 func (s *Server) renderWebhookDeliveries(w http.ResponseWriter, deliveries []webhookDeliveryView) {
 	s.render(w, webhookDeliveriesTemplate, map[string]any{
 		"AppName":    s.cfg.AppName,
+		"ActivePage": "audit",
 		"Deliveries": deliveries,
 	})
 }
@@ -1148,18 +1172,154 @@ const pageHead = `<!doctype html>
   <title>{{ .AppName }}</title>
   <link rel="stylesheet" href="/static/thawguard.css">
 </head>
-<body>`
+<body>
+  <svg class="tg-icon-sprite" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">
+    <symbol id="tg-i-icy-shield" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M12 21.7c4.5-2.2 7-5.7 7-9.7V5.3L12 2.6 5 5.3V12c0 4 2.5 7.5 7 9.7z M12 8v8 M8.5 10l7 4 M15.5 10l-7 4"/></symbol>
+    <symbol id="tg-i-freeze-branch" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M6 3v12 M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0z M18 9a9 9 0 0 1-9 9 M18 3v6 M15.4 4.5l5.2 3 M20.6 4.5l-5.2 3"/></symbol>
+    <symbol id="tg-i-thaw-drop" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M12 3v6 M9.4 4.5l5.2 3 M14.6 4.5l-5.2 3 M12 13c-2 3-3 4.2-3 5.8a3 3 0 0 0 6 0c0-1.6-1-2.8-3-5.8z"/></symbol>
+    <symbol id="tg-i-dashboard" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M10 3H4a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4a1 1 0 0 0-1-1z M20 3h-6a1 1 0 0 0-1 1v2a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4a1 1 0 0 0-1-1z M20 11h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-6a1 1 0 0 0-1-1z M10 15H4a1 1 0 0 0-1 1v2a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-2a1 1 0 0 0-1-1z"/></symbol>
+    <symbol id="tg-i-repositories" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20 M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z M9 7h7"/></symbol>
+    <symbol id="tg-i-schedule" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M21 7.5V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h4.5 M16 2v4 M8 2v4 M3 10h6 M17.5 22a5.5 5.5 0 1 0 0-11 5.5 5.5 0 0 0 0 11z M17.5 14v2.5l1.5 1"/></symbol>
+    <symbol id="tg-i-activity" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M22 12h-4l-3 9L9 3l-3 9H2"/></symbol>
+    <symbol id="tg-i-audit" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z M14 2v6h6 M8 13h8 M8 17h5"/></symbol>
+    <symbol id="tg-i-users" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z M22 21v-2a4 4 0 0 0-3-3.87 M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+    <symbol id="tg-i-warning" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M21.73 18l-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3z M12 9v4 M12 17h.01"/></symbol>
+    <symbol id="tg-i-check" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M20 6L9 17l-5-5"/></symbol>
+    <symbol id="tg-i-play" viewBox="0 0 24 24"><path fill="currentColor" stroke="none" d="M7 4.5v15l12-7.5z"/></symbol>
+    <symbol id="tg-i-close" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M18 6L6 18 M6 6l12 12"/></symbol>
+    <symbol id="tg-i-plus" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M12 5v14 M5 12h14"/></symbol>
+    <symbol id="tg-i-key" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M7.5 14.5a4.5 4.5 0 1 1 3.18-7.68A4.5 4.5 0 0 1 12 10l8-8 M15.5 6.5l2 2 M17.5 4.5l2 2"/></symbol>
+    <symbol id="tg-i-git-branch" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M6 4v10 M18 6a6 6 0 0 1-6 6H6 M8 18a2 2 0 1 1-4 0 2 2 0 0 1 4 0z M20 6a2 2 0 1 1-4 0 2 2 0 0 1 4 0z"/></symbol>
+    <symbol id="tg-i-health-check" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M12 21a9 9 0 1 1 0-18 9 9 0 0 1 0 18z M5.8 12h3l1.4-3.8 2.7 7.6 1.5-3.8h3.8 M15.8 8.2l1.2 1.2 2.2-2.4"/></symbol>
+    <symbol id="tg-i-branch-impact" viewBox="0 0 12 16"><path fill="currentColor" fill-rule="evenodd" d="M11 11.28V5c-.03-.78-.34-1.47-.94-2.06C9.46 2.35 8.78 2.03 8 2H7V0L4 3l3 3V4h1c.27.02.48.11.69.31.21.2.3.42.31.69v6.28A1.993 1.993 0 0 0 10 15a1.993 1.993 0 0 0 1-3.72zm-1 2.92c-.66 0-1.2-.55-1.2-1.2 0-.65.55-1.2 1.2-1.2.65 0 1.2.55 1.2 1.2 0 .65-.55 1.2-1.2 1.2zM4 3c0-1.11-.89-2-2-2a1.993 1.993 0 0 0-1 3.72v6.56A1.993 1.993 0 0 0 2 15a1.993 1.993 0 0 0 1-3.72V4.72c.59-.34 1-.98 1-1.72zm-.8 10c0 .66-.55 1.2-1.2 1.2-.65 0-1.2-.55-1.2-1.2 0-.65.55-1.2 1.2-1.2.65 0 1.2.55 1.2 1.2zM2 4.2C1.34 4.2.8 3.65.8 3c0-.65.55-1.2 1.2-1.2.65 0 1.2.55 1.2 1.2 0 .65-.55 1.2-1.2 1.2z"/></symbol>
+  </svg>
+  <div class="tg-app">
+    <aside class="tg-sidebar" aria-label="Primary navigation">
+      <a class="tg-logo" href="/" aria-label="{{ .AppName }} dashboard">
+        <span class="tg-logo-mark" aria-hidden="true"><svg class="tg-brand-icon"><use href="#tg-i-icy-shield"></use></svg></span>
+        <span>{{ .AppName }}</span>
+      </a>
+      <nav class="tg-nav">
+        <a class="tg-nav-item{{ if eq .ActivePage "dashboard" }} is-active{{ end }}" href="/"><svg class="tg-icon"><use href="#tg-i-dashboard"></use></svg>Dashboard</a>
+        <a class="tg-nav-item{{ if eq .ActivePage "repositories" }} is-active{{ end }}" href="/repositories"><svg class="tg-icon"><use href="#tg-i-repositories"></use></svg>Repositories</a>
+        <a class="tg-nav-item{{ if eq .ActivePage "freezes" }} is-active{{ end }}" href="/freezes"><svg class="tg-icon"><use href="#tg-i-freeze-branch"></use></svg>Freezes</a>
+        <a class="tg-nav-item is-disabled" href="#"><svg class="tg-icon"><use href="#tg-i-schedule"></use></svg>Scheduled Freezes</a>
+        <a class="tg-nav-item{{ if eq .ActivePage "thaws" }} is-active{{ end }}" href="/decisions"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg>Thaw Requests</a>
+        <a class="tg-nav-item{{ if eq .ActivePage "audit" }} is-active{{ end }}" href="/webhooks"><svg class="tg-icon"><use href="#tg-i-audit"></use></svg>Audit Log</a>
+        <a class="tg-nav-item is-disabled" href="#"><svg class="tg-icon"><use href="#tg-i-users"></use></svg>Users & Roles</a>
+      </nav>
+      <div class="tg-sidebar-note">
+        <span class="tg-status-dot"></span>
+        <span>Shadow mode</span>
+      </div>
+    </aside>
+    <div class="tg-content">`
 
-const pageFoot = `</body></html>`
+const pageFoot = `</div></div></body></html>`
 
 const dashboardTemplate = pageHead + `
-  <main class="shell">
-    <section class="hero">
-      <div class="pixel-shield" aria-hidden="true"></div>
-      <p class="eyebrow">Freeze branches. Thaw exceptions.</p>
-      <h1>{{ .AppName }} foundation is running</h1>
-      <p>{{ .RepositoryCount }} repositories are configured. {{ .ActiveFreezeCount }} active branch freezes are recorded locally.</p>
-      <p class="actions"><a class="button" href="/repositories">Manage repositories</a> <a class="button" href="/freezes">Manage freezes</a> <a class="button" href="/decisions">Preview decisions</a> <a class="button" href="/publications">Publication intents</a> <a class="button" href="/webhooks">Webhook deliveries</a></p>
+  <main class="tg-main tg-dashboard">
+    <header class="tg-header">
+      <div>
+        <h1 class="tg-title">Dashboard</h1>
+        <p class="tg-subtitle">Freeze branches. Thaw exceptions. Keep release flow auditable.</p>
+      </div>
+      <div class="tg-header-actions">
+        <a class="tg-btn tg-btn-primary" href="/freezes"><svg class="tg-icon"><use href="#tg-i-freeze-branch"></use></svg>Freeze Branch</a>
+        <a class="tg-btn tg-btn-secondary" href="/decisions"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg>Thaw PR</a>
+      </div>
+    </header>
+
+    <section class="tg-stats" aria-label="Dashboard summary">
+      <article class="tg-stat">
+        <span class="tg-stat-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-freeze-branch"></use></svg></span>
+        <span><span class="tg-stat-label">Active Freezes</span><strong class="tg-stat-value">{{ .ActiveFreezeCount }}</strong></span>
+      </article>
+      <article class="tg-stat">
+        <span class="tg-stat-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg></span>
+        <span><span class="tg-stat-label">Active Thaws</span><strong class="tg-stat-value">0</strong></span>
+      </article>
+      <article class="tg-stat">
+        <span class="tg-stat-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-activity"></use></svg></span>
+        <span><span class="tg-stat-label">Events Today</span><strong class="tg-stat-value">0</strong></span>
+      </article>
+      <article class="tg-stat">
+        <span class="tg-stat-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-repositories"></use></svg></span>
+        <span><span class="tg-stat-label">Repos Monitored</span><strong class="tg-stat-value">{{ .RepositoryCount }}</strong></span>
+      </article>
+      <article class="tg-stat tg-stat-scheduled">
+        <span class="tg-stat-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-schedule"></use></svg></span>
+        <span><span class="tg-stat-label">Scheduled</span><strong class="tg-stat-value">0</strong></span>
+      </article>
+    </section>
+
+    <section class="tg-columns">
+      <article class="tg-panel">
+        <div class="tg-panel-head"><h2>Active Freezes</h2><span class="tg-badge">{{ .ActiveFreezeCount }} active</span></div>
+        {{ if .Freezes }}
+          {{ range .Freezes }}
+          <div class="tg-freeze-row">
+            <div class="tg-freeze-main"><span class="tg-lock" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-freeze-branch"></use></svg></span><code>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Freeze.RepositoryID }}{{ end }}</code><span class="tg-arrow">→</span><code class="tg-branch">{{ .Freeze.Branch }}</code></div>
+            <div class="tg-freeze-meta"><span>{{ .Freeze.Reason }}</span><span class="tg-dot">·</span><span>bootstrap admin</span><span class="tg-dot">·</span><span class="tg-muted">recorded locally</span></div>
+          </div>
+          {{ end }}
+        {{ else }}
+          <div class="tg-empty-row">
+            <strong>No active freezes yet</strong>
+            <span>Create a local freeze to see branch cards here.</span>
+          </div>
+        {{ end }}
+      </article>
+
+      <article class="tg-panel">
+        <div class="tg-panel-head"><h2>Recent Events</h2><a class="tg-btn tg-btn-secondary tg-btn-sm" href="/webhooks">View All</a></div>
+        <div class="tg-event-row"><span class="tg-event-icon tg-event-freeze"><svg class="tg-icon"><use href="#tg-i-freeze-branch"></use></svg></span><span>Branch freeze workflow is ready for local records</span><span class="tg-muted">local</span></div>
+        <div class="tg-event-row"><span class="tg-event-icon tg-event-ok"><svg class="tg-icon"><use href="#tg-i-check"></use></svg></span><span>Dry-run publisher records what would publish later</span><span class="tg-muted">dry-run</span></div>
+        <div class="tg-event-row"><span class="tg-event-icon tg-event-fail"><svg class="tg-icon"><use href="#tg-i-warning"></use></svg></span><span>Signed webhook receiver stores sanitized delivery metadata only</span><span class="tg-muted">safe</span></div>
+        <div class="tg-event-row"><span class="tg-event-icon tg-event-ok"><svg class="tg-icon"><use href="#tg-i-check"></use></svg></span><span>Required status context is <code>` + domain.RequiredStatusContext + `</code></span><span class="tg-muted">future</span></div>
+      </article>
+    </section>
+
+    <section class="tg-panel tg-scheduled-panel">
+      <div class="tg-panel-head tg-scheduled-head">
+        <h2>Scheduled Windows</h2>
+        <span class="tg-badge tg-badge-scheduled">2 upcoming</span>
+        <a class="tg-btn tg-btn-secondary tg-btn-sm" href="#">View Schedules</a>
+      </div>
+      <div class="tg-schedule-row">
+        <div class="tg-schedule-main"><span class="tg-scheduled-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-schedule"></use></svg></span><code>acme/shop-api</code><span class="tg-arrow">→</span><code class="tg-branch tg-branch-scheduled">main</code></div>
+        <div class="tg-schedule-meta"><span><span class="tg-caps">Starts</span> Fri 18:00</span><span><span class="tg-caps">Ends</span> Mon 09:00</span><span class="tg-dot">·</span><span>Weekend release freeze</span></div>
+        <div class="tg-schedule-actions"><a class="tg-btn tg-btn-primary tg-btn-sm" href="#"><svg class="tg-icon"><use href="#tg-i-play"></use></svg>Start Now</a><a class="tg-btn tg-btn-secondary tg-btn-sm" href="#">Cancel</a><a class="tg-btn tg-btn-secondary tg-btn-sm" href="#schedule-weekend-details">View</a></div>
+      </div>
+      <div class="tg-schedule-row">
+        <div class="tg-schedule-main"><span class="tg-scheduled-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg></span><code>acme/frontend</code><span class="tg-arrow">→</span><code class="tg-branch tg-branch-scheduled">release/2026-07</code></div>
+        <div class="tg-schedule-meta"><span><span class="tg-caps">Window</span> Tomorrow 10:00-11:00</span><span class="tg-dot">·</span><span>Emergency thaw review mock</span></div>
+        <div class="tg-schedule-actions"><a class="tg-btn tg-btn-secondary tg-btn-sm" href="#schedule-thaw-details">View</a></div>
+      </div>
+    </section>
+
+    <section id="schedule-weekend-details" class="tg-modal" aria-labelledby="schedule-weekend-title">
+      <a class="tg-modal-backdrop" href="#" aria-label="Close schedule details"></a>
+      <div class="tg-modal-card" role="dialog" aria-modal="true">
+        <div class="tg-modal-head"><h2 id="schedule-weekend-title">Weekend release freeze</h2><a href="#" class="tg-modal-close" aria-label="Close">×</a></div>
+        <dl class="tg-detail-grid"><dt>Repository</dt><dd><code>acme/shop-api</code></dd><dt>Branch</dt><dd><code class="tg-branch tg-branch-scheduled">main</code></dd><dt>Starts</dt><dd>Friday 18:00</dd><dt>Ends</dt><dd>Monday 09:00</dd><dt>Mode</dt><dd>Mocked scheduled freeze preview</dd></dl>
+        <p>This dashboard modal is a preview target only. The dedicated Scheduled Freezes page will own editing and full lifecycle actions later.</p>
+      </div>
+    </section>
+
+    <section id="schedule-thaw-details" class="tg-modal" aria-labelledby="schedule-thaw-title">
+      <a class="tg-modal-backdrop" href="#" aria-label="Close schedule details"></a>
+      <div class="tg-modal-card" role="dialog" aria-modal="true">
+        <div class="tg-modal-head"><h2 id="schedule-thaw-title">Emergency thaw review</h2><a href="#" class="tg-modal-close" aria-label="Close">×</a></div>
+        <dl class="tg-detail-grid"><dt>Repository</dt><dd><code>acme/frontend</code></dd><dt>Branch</dt><dd><code class="tg-branch tg-branch-scheduled">release/2026-07</code></dd><dt>Window</dt><dd>Tomorrow 10:00-11:00</dd><dt>Mode</dt><dd>Mocked thaw review preview</dd></dl>
+        <p>Thaw exceptions are not live yet. This modal shows where dashboard-level schedule details will appear.</p>
+      </div>
+    </section>
+
+    <section class="tg-warning-callout">
+      <span aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-warning"></use></svg></span>
+      <span>Shadow mode alpha: Thawguard records decisions and dry-run publication attempts. It does not post live Forgejo/Codeberg statuses yet.</span>
+      <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/repositories">View Setup</a>
     </section>
   </main>` + pageFoot
 
@@ -1182,16 +1342,16 @@ const webhookDeliveriesTemplate = pageHead + `
         <tbody>
         {{ range .Deliveries }}
           <tr>
-            <td>{{ .ReceivedAt }}</td>
-            <td>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else if .Delivery.RepositoryID }}Repository #{{ .Delivery.RepositoryID }}{{ else }}Unknown repository{{ end }}</td>
-            <td><code>{{ .Delivery.DeliveryID }}</code></td>
-            <td><code>{{ .Delivery.Event }}</code></td>
-            <td>{{ if .Delivery.Action }}<code>{{ .Delivery.Action }}</code>{{ else }}—{{ end }}</td>
-            <td><span class="status status-{{ .VerificationStateClass }}">{{ .VerificationState }}</span></td>
-            <td><span class="status status-{{ .ProcessingStateClass }}">{{ .ProcessingState }}</span></td>
-            <td>{{ .ProcessingStartedAt }}</td>
-            <td>{{ .ProcessedAt }}</td>
-            <td>{{ if .Delivery.Error }}{{ .Delivery.Error }}{{ else }}—{{ end }}</td>
+            <td data-label="Received">{{ .ReceivedAt }}</td>
+            <td data-label="Repository">{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else if .Delivery.RepositoryID }}Repository #{{ .Delivery.RepositoryID }}{{ else }}Unknown repository{{ end }}</td>
+            <td data-label="Delivery ID"><code>{{ .Delivery.DeliveryID }}</code></td>
+            <td data-label="Event"><code>{{ .Delivery.Event }}</code></td>
+            <td data-label="Action">{{ if .Delivery.Action }}<code>{{ .Delivery.Action }}</code>{{ else }}—{{ end }}</td>
+            <td data-label="Verified"><span class="status status-{{ .VerificationStateClass }}">{{ .VerificationState }}</span></td>
+            <td data-label="Processing"><span class="status status-{{ .ProcessingStateClass }}">{{ .ProcessingState }}</span></td>
+            <td data-label="Claimed">{{ .ProcessingStartedAt }}</td>
+            <td data-label="Processed">{{ .ProcessedAt }}</td>
+            <td data-label="Error">{{ if .Delivery.Error }}{{ .Delivery.Error }}{{ else }}—{{ end }}</td>
           </tr>
         {{ end }}
         </tbody>
@@ -1221,15 +1381,15 @@ const publicationsTemplate = pageHead + `
         <tbody>
         {{ range .Publications }}
           <tr>
-            <td>{{ .UpdatedAt }}</td>
-            <td>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Publication.RepositoryID }}{{ end }}</td>
-            <td>#{{ .Publication.PullRequestIndex }}</td>
-            <td>{{ .Publication.TargetBranch }}</td>
-            <td><code>{{ .Publication.HeadSHA }}</code></td>
-            <td><code>{{ .Publication.Context }}</code></td>
-            <td><span class="status status-{{ .Publication.State }}">{{ .Publication.State }}</span></td>
-            <td><code>{{ .Publication.DeliveryMode }}</code></td>
-            <td>{{ .Publication.Description }}</td>
+            <td data-label="Last updated">{{ .UpdatedAt }}</td>
+            <td data-label="Repository">{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Publication.RepositoryID }}{{ end }}</td>
+            <td data-label="PR">#{{ .Publication.PullRequestIndex }}</td>
+            <td data-label="Target branch">{{ .Publication.TargetBranch }}</td>
+            <td data-label="Head SHA"><code>{{ .Publication.HeadSHA }}</code></td>
+            <td data-label="Context"><code>{{ .Publication.Context }}</code></td>
+            <td data-label="State"><span class="status status-{{ .Publication.State }}">{{ .Publication.State }}</span></td>
+            <td data-label="Mode"><code>{{ .Publication.DeliveryMode }}</code></td>
+            <td data-label="Description">{{ .Publication.Description }}</td>
           </tr>
         {{ end }}
         </tbody>
@@ -1248,17 +1408,17 @@ const publicationsTemplate = pageHead + `
         <tbody>
         {{ range .Attempts }}
           <tr>
-            <td>{{ .AttemptedAt }}</td>
-            <td>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Attempt.RepositoryID }}{{ end }}</td>
-            <td>#{{ .Attempt.PullRequestIndex }}</td>
-            <td>{{ .Attempt.TargetBranch }}</td>
-            <td><code>{{ .Attempt.HeadSHA }}</code></td>
-            <td><code>{{ .Attempt.Context }}</code></td>
-            <td><span class="status status-{{ .Attempt.State }}">{{ .Attempt.State }}</span></td>
-            <td><code>{{ .Attempt.Mode }}</code></td>
-            <td><code>{{ .Attempt.Result }}</code></td>
-            <td>{{ .Attempt.Description }}</td>
-            <td>{{ if .Attempt.Error }}{{ .Attempt.Error }}{{ else }}—{{ end }}</td>
+            <td data-label="Attempted">{{ .AttemptedAt }}</td>
+            <td data-label="Repository">{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Attempt.RepositoryID }}{{ end }}</td>
+            <td data-label="PR">#{{ .Attempt.PullRequestIndex }}</td>
+            <td data-label="Target branch">{{ .Attempt.TargetBranch }}</td>
+            <td data-label="Head SHA"><code>{{ .Attempt.HeadSHA }}</code></td>
+            <td data-label="Context"><code>{{ .Attempt.Context }}</code></td>
+            <td data-label="State"><span class="status status-{{ .Attempt.State }}">{{ .Attempt.State }}</span></td>
+            <td data-label="Mode"><code>{{ .Attempt.Mode }}</code></td>
+            <td data-label="Result"><code>{{ .Attempt.Result }}</code></td>
+            <td data-label="Description">{{ .Attempt.Description }}</td>
+            <td data-label="Error">{{ if .Attempt.Error }}{{ .Attempt.Error }}{{ else }}—{{ end }}</td>
           </tr>
         {{ end }}
         </tbody>
@@ -1270,219 +1430,388 @@ const publicationsTemplate = pageHead + `
   </main>` + pageFoot
 
 const repositoriesTemplate = pageHead + `
-  <main class="shell stack">
-    <nav class="topnav"><a href="/">Dashboard</a></nav>
-	    <section class="panel">
-	      <p class="eyebrow">Repositories</p>
-	      <h1>Add repository</h1>
-	      <p class="warning">Bootstrap sessions are for local development only. Do not expose this server on a network until real local auth is configured.</p>
-	      <p>Start with Forgejo/Codeberg repositories. Manual setup must require the exact status context <code>{{ .RequiredContext }}</code>. The signed webhook receiver is <code>/webhooks/forgejo</code>; current delivery handling recomputes local records and does not post live forge statuses.</p>
-        {{ if not .WebhookSecretEncryptionConfigured }}<p class="warning">Webhook secret storage is disabled until <code>THAWGUARD_SECRET_KEY</code> is configured. Existing repository setup and local freeze flows remain available.</p>{{ end }}
-      {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
-      <form method="post" action="/repositories" class="form-grid">
-        <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
-        <label>Forge <input name="forge" value="forgejo"></label>
-        <label>Base URL <input name="base_url" value="https://codeberg.org"></label>
-        <label>Owner <input name="owner" required></label>
-        <label>Repository <input name="name" required></label>
-        <label>Default branch <input name="default_branch" value="main"></label>
-        <button type="submit">Add repository</button>
-      </form>
+  <main class="tg-main tg-setup-page">
+    <header class="tg-header">
+      <div>
+        <h1 class="tg-title">Repositories</h1>
+        <p class="tg-subtitle">Connect Forgejo/Codeberg repositories and verify freeze setup.</p>
+      </div>
+      <div class="tg-header-actions">
+        <a class="tg-btn tg-btn-primary" href="#connect-repository"><svg class="tg-icon"><use href="#tg-i-plus"></use></svg>Add Repository</a>
+      </div>
+    </header>
+
+    {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
+
+    <section class="tg-stats tg-setup-stats" aria-label="Repository setup summary">
+      <article class="tg-stat">
+        <span class="tg-stat-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-repositories"></use></svg></span>
+        <span><span class="tg-stat-label">Repos</span><strong class="tg-stat-value">{{ .Overview.RepositoryCount }}</strong></span>
+      </article>
+      <article class="tg-stat">
+        <span class="tg-stat-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-check"></use></svg></span>
+        <span><span class="tg-stat-label">Webhooks</span><strong class="tg-stat-value">{{ .Overview.WebhookConfiguredCount }}</strong></span>
+      </article>
+      <article class="tg-stat tg-stat-info">
+        <span class="tg-stat-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-schedule"></use></svg></span>
+        <span><span class="tg-stat-label">Checks</span><strong class="tg-stat-value">Local</strong></span>
+      </article>
+      <article class="tg-stat tg-stat-scheduled">
+        <span class="tg-stat-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-icy-shield"></use></svg></span>
+        <span><span class="tg-stat-label">Mode</span><strong class="tg-stat-value">Shadow</strong></span>
+      </article>
     </section>
 
-	    <section class="panel">
-	      <h2>Configured repositories</h2>
-	      <p class="muted">Local setup checks are placeholders until live Forgejo/Codeberg verification is configured. They support setup workflow visibility, not hard enforcement.</p>
-	      {{ if .RepositoryViews }}
-      <table>
-	        <thead><tr><th>Repository</th><th>Forge</th><th>Default branch</th><th>Required context</th><th>Webhook secret</th><th>Setup health</th><th>Actions</th></tr></thead>
-        <tbody>
-        {{ range .RepositoryViews }}
-          <tr>
-            <td>{{ .Repository.FullName }}</td>
-            <td>{{ .Repository.Forge }}</td>
-             <td>{{ .Repository.DefaultBranch }}</td>
-             <td><code>` + domain.RequiredStatusContext + `</code></td>
-             <td>{{ if .Repository.HasWebhookSecret }}<span class="status status-ok">configured</span>{{ else }}<span class="status status-warning">not configured</span>{{ end }}</td>
-             <td>
-              {{ if .SetupChecks }}
-                <ul class="setup-checks">
-                {{ range .SetupChecks }}
-                  <li><strong>{{ .Result.Name }}</strong>: <span class="status status-{{ .Result.Status }}">{{ .Result.Status }}</span><br><small>{{ .Result.Description }}{{ if .Result.Remediation }} {{ .Result.Remediation }}{{ end }}</small></li>
-                {{ end }}
-                </ul>
-              {{ else }}
-                <span class="muted">No setup checks yet.</span>
-              {{ end }}
-            </td>
-             <td>
-              {{ if $.WebhookSecretEncryptionConfigured }}
-              <form method="post" action="/repositories/webhook-secret">
-                <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
-                <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
-                <label>Set or rotate webhook secret for signed delivery <input type="password" name="webhook_secret" minlength="16" maxlength="512" autocomplete="new-password" required></label>
-                <button type="submit">Save webhook secret</button>
-              </form>
-              {{ else }}
-              <p class="muted">Set <code>THAWGUARD_SECRET_KEY</code> to save webhook secrets.</p>
-              {{ end }}
-              <form method="post" action="/repositories/setup-check">
-                <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
-                <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
-				<button type="submit">Record local setup placeholder</button>
-			  </form>
-            </td>
-          </tr>
-        {{ end }}
-        </tbody>
-      </table>
-      {{ else }}
-      <p>No repositories configured yet.</p>
+    <section id="connect-repository" class="tg-modal tg-connect-modal" aria-labelledby="connect-repository-title">
+      <a class="tg-modal-backdrop" href="#" aria-label="Close connect repository"></a>
+      <div class="tg-modal-card" role="dialog" aria-modal="true">
+        <div class="tg-modal-head">
+          <h2 id="connect-repository-title">Connect a repository</h2>
+          <a href="#" class="tg-modal-close" aria-label="Close"><svg class="tg-icon"><use href="#tg-i-close"></use></svg></a>
+        </div>
+        <p class="tg-setup-copy">Add the Forgejo or Codeberg repository Thawguard should watch. The required status context stays fixed as <code>{{ .RequiredContext }}</code>.</p>
+        <form method="post" action="/repositories" class="tg-setup-form tg-connect-form">
+          <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
+          <label>Forge
+            <select name="forge">
+              <option value="forgejo">Forgejo</option>
+              <option value="codeberg">Codeberg</option>
+            </select>
+          </label>
+          <label>Base URL <input name="base_url" value="https://codeberg.org"></label>
+          <label>Owner <input name="owner" placeholder="acme" required></label>
+          <label>Repository <input name="name" placeholder="shop-api" required></label>
+          <label>Default branch <input name="default_branch" value="main"></label>
+          <div class="tg-form-submit"><button type="submit" class="tg-btn tg-btn-primary">Connect</button></div>
+        </form>
+        <p class="tg-local-note"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-warning"></use></svg><span>Local bootstrap session active. Keep this UI on loopback until real auth is configured.</span></p>
+      </div>
+    </section>
+
+    <div class="tg-section-heading tg-section-heading-compact">
+      <div>
+        <h2>Configured repositories</h2>
+        <p>Configure signed webhooks, record local setup checks, and confirm each repository is ready for freeze workflows.</p>
+      </div>
+    </div>
+
+    {{ if .RepositoryViews }}
+    <section class="tg-repo-grid" aria-label="Configured repositories">
+      {{ range .RepositoryViews }}
+      <article class="tg-repo-card">
+        <div class="tg-repo-card-head">
+          <div>
+            <p class="tg-repo-kicker">{{ .Repository.Forge }}</p>
+            <h3>{{ .Repository.FullName }}</h3>
+          </div>
+          {{ if .Repository.HasWebhookSecret }}<span class="tg-badge status-ok">webhook configured</span>{{ else }}<span class="tg-badge status-warning">webhook missing</span>{{ end }}
+        </div>
+        <dl class="tg-repo-meta">
+          <div><span class="tg-meta-icon"><svg class="tg-icon"><use href="#tg-i-git-branch"></use></svg></span><dt>Default branch</dt><dd><code>{{ .Repository.DefaultBranch }}</code></dd></div>
+          <div><span class="tg-meta-icon"><svg class="tg-icon"><use href="#tg-i-check"></use></svg></span><dt>Required context</dt><dd><code>` + domain.RequiredStatusContext + `</code></dd></div>
+          <div><span class="tg-meta-icon"><svg class="tg-icon"><use href="#tg-i-schedule"></use></svg></span><dt>Setup checks</dt><dd>{{ if .SetupChecks }}<span class="tg-badge tg-badge-info">local batch recorded</span>{{ else }}<span class="tg-badge status-warning">not run</span>{{ end }}</dd></div>
+        </dl>
+        <div class="tg-repo-checks">
+          {{ if .SetupChecks }}
+            {{ range .SetupChecks }}
+            <div class="tg-repo-check"><span class="status status-{{ .Result.Status }}">{{ .Result.Status }}</span><div><strong>{{ .Result.Name }}</strong><small>{{ .Result.Description }}{{ if .Result.Remediation }} {{ .Result.Remediation }}{{ end }}</small></div></div>
+            {{ end }}
+          {{ else }}
+            <p class="tg-muted">Run a local setup check to record placeholder readiness results. Live forge verification is not wired yet.</p>
+          {{ end }}
+        </div>
+        <div class="tg-repo-actions">
+          {{ if $.WebhookSecretEncryptionConfigured }}
+          <form method="post" action="/repositories/webhook-secret" class="tg-secret-form">
+            <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+            <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
+            <input type="password" name="webhook_secret" minlength="16" maxlength="512" autocomplete="new-password" placeholder="Webhook secret" aria-label="Webhook secret for {{ .Repository.FullName }}" required>
+            <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-key"></use></svg>{{ if .Repository.HasWebhookSecret }}Rotate secret{{ else }}Set secret{{ end }}</button>
+          </form>
+          {{ else }}
+          <p class="tg-muted">Set <code>THAWGUARD_SECRET_KEY</code> to save webhook secrets.</p>
+          {{ end }}
+          <form method="post" action="/repositories/setup-check">
+            <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+            <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
+            <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-health-check"></use></svg>Run setup check</button>
+          </form>
+        </div>
+      </article>
       {{ end }}
     </section>
+    {{ else }}
+    <section class="tg-panel tg-empty-row">
+      <strong>No repositories configured yet</strong>
+      <span>Add your first Forgejo or Codeberg repository to start setup.</span>
+    </section>
+    {{ end }}
 
-    <section class="panel">
-      <h2>Manual setup checklist</h2>
-      <ol>{{ range .SetupSteps }}<li>{{ . }}</li>{{ end }}</ol>
+    <section class="tg-panel tg-setup-checklist">
+      <div class="tg-panel-head"><h2>Manual setup checklist</h2><span class="tg-badge tg-badge-info">local guidance</span></div>
+      <div class="tg-checklist-grid">
+        <article><span>1</span><div><strong>Required status context</strong><p>Configure branch protection to require <code>{{ .RequiredContext }}</code> once live status posting is configured.</p></div></article>
+        <article><span>2</span><div><strong>Signed webhook receiver</strong><p>Point pull request webhooks at <code>/webhooks/forgejo</code> with the repository webhook secret.</p></div></article>
+        <article><span>3</span><div><strong>Local setup checks</strong><p>Current checks are local placeholders for setup visibility, not live Forgejo/Codeberg verification.</p></div></article>
+      </div>
     </section>
   </main>` + pageFoot
 
 const freezesTemplate = pageHead + `
-  <main class="shell stack">
-    <nav class="topnav"><a href="/">Dashboard</a></nav>
-    <section class="panel">
-      <p class="eyebrow">Branch freezes</p>
-      <h1>Create active freeze</h1>
-      <p class="warning">Bootstrap sessions are for local development only. Do not expose freeze controls on a network until real local auth is configured.</p>
-      <p>Record a cooperative branch freeze locally. Signed webhook recomputation updates local records; live forge status posting will be wired in a later slice.</p>
-      {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
-      {{ if .Repositories }}
-      <form method="post" action="/freezes" class="form-grid">
-        <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
-        <label>Repository
-          <select name="repository_id" required>
-          {{ range .Repositories }}<option value="{{ .ID }}">{{ .FullName }} — default {{ .DefaultBranch }}</option>{{ end }}
-          </select>
-        </label>
-        <label>Branch <input name="branch" placeholder="main" required></label>
-        <label>Reason <input name="reason" placeholder="QA freeze, release window, incident response" required></label>
-        <button type="submit">Freeze branch</button>
-      </form>
-      {{ else }}
-      <p>No repositories configured yet. Add a repository before creating a freeze.</p>
-      <p><a class="button" href="/repositories">Add repository</a></p>
-      {{ end }}
+  <main class="tg-main tg-setup-page tg-freezes-page">
+    <header class="tg-header">
+      <div>
+        <h1 class="tg-title">Branch Freezes</h1>
+        <p class="tg-subtitle">Freeze a branch to block merges, then review and lift active freezes.</p>
+      </div>
+      <span class="tg-badge tg-badge-info"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-warning"></use></svg>Cooperative enforcement — auditable, not a hard security gate</span>
+    </header>
+
+    {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
+
+    <section class="tg-freeze-workbench" aria-label="Create branch freeze and preview impact">
+      <section class="tg-panel tg-freeze-form-panel">
+        <div class="tg-panel-head tg-panel-head-stacked">
+          <div>
+            <h2>Create a freeze</h2>
+            <p class="tg-panel-subtitle">Open PRs on the branch receive a failing <code>` + domain.RequiredStatusContext + `</code> status check.</p>
+          </div>
+        </div>
+        {{ if .Repositories }}
+        <form method="post" action="/freezes" class="tg-setup-form tg-freeze-form" data-freeze-form>
+          <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
+          <label>Repository
+            <select name="repository_id" required data-freeze-repository>
+            {{ range .Repositories }}<option value="{{ .ID }}">{{ .FullName }}</option>{{ end }}
+            </select>
+          </label>
+          <label>Branch <input name="branch" placeholder="main" value="main" required data-freeze-branch></label>
+          <label class="tg-field-wide">Reason <input name="reason" placeholder="Release cut 2026-07 — QA verification in progress" required></label>
+          <div class="tg-freeze-form-footer tg-field-wide">
+            <span class="tg-muted"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-audit"></use></svg>Every freeze is written to the audit log.</span>
+            <div class="tg-freeze-form-actions">
+              <button type="reset" class="tg-btn tg-btn-secondary tg-btn-sm">Reset</button>
+              <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-freeze-branch"></use></svg>Freeze Branch</button>
+            </div>
+          </div>
+        </form>
+        {{ else }}
+        <div class="tg-empty-row">
+          <strong>No repositories configured yet</strong>
+          <span>Add a repository before creating a freeze.</span>
+          <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/repositories"><svg class="tg-icon"><use href="#tg-i-plus"></use></svg>Add repository</a>
+        </div>
+        {{ end }}
+      </section>
+
+      <aside class="tg-panel tg-impact-card">
+        <div class="tg-panel-head tg-impact-head">
+          <div class="tg-impact-title-row">
+            <h2><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-branch-impact"></use></svg>Preview impact</h2>
+          <span class="tg-badge status-warning">3 open PRs</span>
+          </div>
+          <p class="tg-panel-subtitle">Live preview of PRs blocked by this freeze. Updates on repo/branch change; real lookup is wired later.</p>
+        </div>
+        <div class="tg-impact-context"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-git-branch"></use></svg><code data-preview-repository>Selected repository</code><span class="tg-arrow">→</span><code class="tg-branch" data-preview-branch>main</code></div>
+        <div class="tg-pr-preview-list">
+          <div class="tg-pr-preview-row"><a href="#">#248</a><div><strong>Fix checkout tax rounding</strong><small>Ivo · a3f7c2d</small></div></div>
+          <div class="tg-pr-preview-row"><a href="#">#245</a><div><strong>Add coupon validation endpoint</strong><small>Priya · 7be9f1d</small></div></div>
+          <div class="tg-pr-preview-row"><a href="#">#241</a><div><strong>Update shipping rate calculator</strong><small>Lena · c02de84</small></div></div>
+        </div>
+        <p class="tg-impact-warning"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-warning"></use></svg>These PRs will get a failing <code>` + domain.RequiredStatusContext + `</code> check until the freeze is lifted.</p>
+      </aside>
     </section>
 
-    <section class="panel">
-      <h2>Active freezes</h2>
+    <section class="tg-panel tg-active-freezes-panel">
+      <div class="tg-panel-head"><h2>Active Freezes</h2><span class="tg-badge">{{ len .Freezes }} active</span></div>
       {{ if .Freezes }}
-      <table>
-        <thead><tr><th>Repository</th><th>Branch</th><th>Status</th><th>Reason</th><th>Actions</th></tr></thead>
-        <tbody>
-        {{ range .Freezes }}
-          <tr>
-            <td>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Freeze.RepositoryID }}{{ end }}</td>
-            <td>{{ .Freeze.Branch }}</td>
-            <td><span class="status status-frozen">{{ .Freeze.Status }}</span></td>
-            <td>{{ .Freeze.Reason }}</td>
-            <td class="actions">
-              <form method="post" action="/freezes/end">
-                <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
-                <input type="hidden" name="freeze_id" value="{{ .Freeze.ID }}">
-                <button type="submit">End freeze</button>
-              </form>
-              <form method="post" action="/freezes/cancel">
-                <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
-                <input type="hidden" name="freeze_id" value="{{ .Freeze.ID }}">
-                <button type="submit" class="secondary">Cancel</button>
-              </form>
-            </td>
-          </tr>
-        {{ end }}
-        </tbody>
-      </table>
+      <div class="tg-table-wrap">
+        <table class="tg-data-table tg-freezes-table">
+          <thead><tr><th>Repository / branch</th><th>Reason</th><th>Created by</th><th>Expiry</th><th>PRs</th><th>Status</th><th></th></tr></thead>
+          <tbody>
+          {{ range .Freezes }}
+            <tr>
+              <td><span class="tg-table-repo"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-freeze-branch"></use></svg><code>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Freeze.RepositoryID }}{{ end }}</code><span class="tg-arrow">→</span><code class="tg-branch">{{ .Freeze.Branch }}</code></span></td>
+              <td>{{ .Freeze.Reason }}</td>
+              <td>bootstrap admin</td>
+              <td><span class="tg-muted">Manual</span></td>
+              <td><span class="tg-muted">preview</span></td>
+              <td><span class="status status-frozen">{{ .Freeze.Status }}</span></td>
+              <td class="tg-table-actions">
+                <form method="post" action="/freezes/end">
+                  <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+                  <input type="hidden" name="freeze_id" value="{{ .Freeze.ID }}">
+                  <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg>Lift</button>
+                </form>
+                <form method="post" action="/freezes/cancel">
+                  <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+                  <input type="hidden" name="freeze_id" value="{{ .Freeze.ID }}">
+                  <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-close"></use></svg>Cancel</button>
+                </form>
+              </td>
+            </tr>
+          {{ end }}
+          </tbody>
+        </table>
+      </div>
       {{ else }}
-      <p>No active freezes yet.</p>
+        <div class="tg-empty-row">
+          <strong>No active freezes yet</strong>
+          <span>Freeze a repository branch to see it listed here.</span>
+        </div>
       {{ end }}
     </section>
-
-    <section class="panel">
-      <h2>Recent freeze audit events</h2>
-      {{ if .AuditEvents }}
-      <table>
-        <thead><tr><th>When</th><th>Action</th><th>Repository</th><th>Branch</th><th>Status</th><th>Actor</th><th>Reason</th></tr></thead>
-        <tbody>
-        {{ range .AuditEvents }}
-          <tr>
-            <td>{{ .CreatedAt }}</td>
-            <td><code>{{ .Action }}</code></td>
-            <td>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .RepositoryID }}{{ end }}</td>
-            <td>{{ .Branch }}</td>
-            <td>{{ .Status }}</td>
-            <td>{{ .Actor }}</td>
-            <td>{{ .Reason }}</td>
-          </tr>
-        {{ end }}
-        </tbody>
-      </table>
-      {{ else }}
-      <p>No freeze audit events yet.</p>
-      {{ end }}
-    </section>
-  </main>` + pageFoot
+  </main>
+  <script>
+    (() => {
+      const form = document.querySelector('[data-freeze-form]');
+      if (!form) return;
+      const repo = form.querySelector('[data-freeze-repository]');
+      const branch = form.querySelector('[data-freeze-branch]');
+      const repoOut = document.querySelector('[data-preview-repository]');
+      const branchOut = document.querySelector('[data-preview-branch]');
+      const update = () => {
+        if (repoOut && repo) repoOut.textContent = repo.options[repo.selectedIndex]?.textContent?.trim() || 'Selected repository';
+        if (branchOut && branch) branchOut.textContent = branch.value.trim() || 'branch';
+      };
+      repo.addEventListener('change', update);
+      branch.addEventListener('input', update);
+      update();
+    })();
+  </script>
+` + pageFoot
 
 const decisionsTemplate = pageHead + `
-  <main class="shell stack">
-    <nav class="topnav"><a href="/">Dashboard</a></nav>
-    <section class="panel">
-      <p class="eyebrow">Local status preview</p>
-      <h1>Compute PR decision</h1>
-      <p class="warning">This is a local preview only. Thawguard records the computed status result locally and does not post to Forgejo/Codeberg.</p>
-      <p class="warning">Bootstrap sessions are for local development only. Do not expose decision previews on a network until real local auth is configured.</p>
-      <p>Use this to verify the policy result for the required status context <code>{{ .RequiredContext }}</code> before live status posting is wired.</p>
-      {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
-      {{ if .Repositories }}
-      <form method="post" action="/decisions" class="form-grid">
-        <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
-        <label>Repository
-          <select name="repository_id" required>
-          {{ range .Repositories }}<option value="{{ .ID }}">{{ .FullName }}</option>{{ end }}
-          </select>
-        </label>
-        <label>PR number <input name="pull_request_index" inputmode="numeric" placeholder="42" required></label>
-        <label>Target branch <input name="target_branch" placeholder="main" required></label>
-        <label>Head SHA <input name="head_sha" placeholder="abc123" required></label>
-        <button type="submit">Compute local decision</button>
-      </form>
-      {{ else }}
-      <p>No repositories configured yet. Add a repository before computing decisions.</p>
-      <p><a class="button" href="/repositories">Add repository</a></p>
-      {{ end }}
+  <main class="tg-main tg-setup-page tg-thaws-page">
+    <header class="tg-header">
+      <div>
+        <h1 class="tg-title">Thaw Requests</h1>
+        <p class="tg-subtitle">Review exceptions for PRs that need to land during an active branch freeze. Every decision should be auditable — this is cooperative workflow for trusted teams, not a hard security gate.</p>
+      </div>
+      <span class="tg-badge tg-badge-info"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-icy-shield"></use></svg>Auditable exceptions — not a hard security gate</span>
+    </header>
+
+    {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
+
+    <section class="tg-thaw-workbench" aria-label="Request a thaw exception and preview eligibility">
+      <section class="tg-panel tg-thaw-form-panel">
+        <div class="tg-panel-head tg-panel-head-stacked">
+          <div class="tg-thaw-panel-title">
+            <span class="tg-thaw-panel-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg></span>
+            <div>
+              <h2>Request a thaw exception</h2>
+              <p class="tg-panel-subtitle">Nominate a PR candidate for a thaw exception. This alpha records a local <code>{{ .RequiredContext }}</code> status result; request details and approval persistence are wired later.</p>
+            </div>
+          </div>
+        </div>
+        {{ if .Repositories }}
+        <form method="post" action="/decisions" class="tg-setup-form tg-thaw-form" data-thaw-form>
+          <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
+          <label>Repository
+            <select name="repository_id" required data-thaw-repository>
+            {{ range .Repositories }}<option value="{{ .ID }}">{{ .FullName }}</option>{{ end }}
+            </select>
+          </label>
+          <label>Pull request <input name="pull_request_index" inputmode="numeric" placeholder="251" required data-thaw-pr></label>
+          <label>Target branch <input name="target_branch" placeholder="main" value="main" required data-thaw-branch></label>
+          <label>Head SHA <input name="head_sha" placeholder="abc123" required></label>
+          <label class="tg-field-wide">Reason for exception <input name="reason" placeholder="Reason capture lands with request persistence" aria-describedby="thaw-alpha-note" disabled></label>
+          <label>Exception expires
+            <select name="expires_after" disabled>
+              <option>24 hours after approval</option>
+            </select>
+          </label>
+          <label>Notify channel (optional) <input name="notify_channel" placeholder="#releases" disabled></label>
+          <div class="tg-form-footer tg-thaw-form-footer tg-field-wide">
+            <span id="thaw-alpha-note" class="tg-muted"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-audit"></use></svg>Only repository, PR number, target branch, and head SHA are saved as a local status result today.</span>
+            <div class="tg-form-actions">
+              <button type="reset" class="tg-btn tg-btn-secondary tg-btn-sm">Reset</button>
+              <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg>Evaluate request</button>
+            </div>
+          </div>
+        </form>
+        {{ else }}
+        <div class="tg-empty-row">
+          <strong>No repositories configured yet</strong>
+          <span>Add a repository before requesting a thaw exception.</span>
+          <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/repositories"><svg class="tg-icon"><use href="#tg-i-plus"></use></svg>Add repository</a>
+        </div>
+        {{ end }}
+      </section>
+
+      <aside class="tg-panel tg-eligibility-card">
+        <div class="tg-panel-head tg-panel-head-stacked">
+          <div class="tg-impact-title-row">
+            <h2><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-health-check"></use></svg>Eligibility preview</h2>
+            <span class="tg-badge tg-badge-info">local only</span>
+          </div>
+          <p class="tg-panel-subtitle">How the local status evaluation will be recorded for the target branch.</p>
+        </div>
+        <div class="tg-thaw-freeze-card">
+          <div class="tg-thaw-freeze-main"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-freeze-branch"></use></svg><code data-thaw-preview-repository>Selected repository</code><span class="tg-arrow">→</span><code class="tg-branch" data-thaw-preview-branch>main</code><span class="status status-pending">Preview</span></div>
+          <p>After submission, the latest result below shows whether the local policy check would pass or fail for this PR candidate.</p>
+        </div>
+        <ul class="tg-eligibility-list">
+          <li><span class="tg-event-ok"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-check"></use></svg></span><span>Repository, PR number, target branch, and head SHA are captured for local evaluation.</span></li>
+          <li><span class="tg-event-ok"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-check"></use></svg></span><span><code>{{ .RequiredContext }}</code> would be recomputed for the supplied head SHA.</span></li>
+          <li><span class="tg-event-ok"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-check"></use></svg></span><span>Future approvals should be scoped to one PR and one head SHA.</span></li>
+          <li><span class="tg-event-fail"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-warning"></use></svg></span><span>Reviewer approval is not persisted yet; this page records local status results only.</span></li>
+        </ul>
+        <div class="tg-review-actions">
+          <span class="tg-caps">Reviewer decision</span>
+          <div>
+            <button type="button" class="tg-btn tg-btn-secondary tg-btn-sm" disabled>Deny later</button>
+            <button type="button" class="tg-btn tg-btn-primary tg-btn-sm" disabled><svg class="tg-icon"><use href="#tg-i-check"></use></svg>Approve later</button>
+          </div>
+        </div>
+      </aside>
     </section>
 
-    <section class="panel">
-      <h2>Recent local status results</h2>
+    <section class="tg-panel tg-open-thaws-panel">
+      <div class="tg-panel-head"><h2>Thaw request evaluations</h2><span class="tg-badge tg-badge-info">{{ len .Results }} local results</span></div>
       {{ if .Results }}
-      <table>
-        <thead><tr><th>When</th><th>Repository</th><th>PR</th><th>Target branch</th><th>Head SHA</th><th>Context</th><th>State</th><th>Description</th></tr></thead>
-        <tbody>
-        {{ range .Results }}
-          <tr>
-            <td>{{ .CreatedAt }}</td>
-            <td>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Result.RepositoryID }}{{ end }}</td>
-            <td>#{{ .Result.PullRequestIndex }}</td>
-            <td>{{ .Result.TargetBranch }}</td>
-            <td><code>{{ .Result.HeadSHA }}</code></td>
-            <td><code>{{ .Result.Context }}</code></td>
-            <td><span class="status status-{{ .Result.State }}">{{ .Result.State }}</span></td>
-            <td>{{ .Result.Description }}</td>
-          </tr>
-        {{ end }}
-        </tbody>
-      </table>
+      <div class="tg-table-wrap">
+        <table class="tg-data-table tg-thaws-table">
+          <thead><tr><th>Request candidate</th><th>Source</th><th>Policy result</th><th>Status context</th><th>Expiry</th><th>Status</th><th>Workflow</th></tr></thead>
+          <tbody>
+          {{ range .Results }}
+            <tr>
+              <td><div class="tg-thaw-request-main"><a href="#">#{{ .Result.PullRequestIndex }}</a><span><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-git-branch"></use></svg><code>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Result.RepositoryID }}{{ end }}</code><span class="tg-arrow">→</span><code class="tg-branch">{{ .Result.TargetBranch }}</code></span><small><code>{{ .Result.HeadSHA }}</code> · {{ .CreatedAt }}</small></div></td>
+              <td><span>bootstrap admin</span><small class="tg-muted">local preview</small></td>
+              <td>{{ .Result.Description }}</td>
+              <td><span class="tg-table-repo"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-freeze-branch"></use></svg><code>{{ .Result.Context }}</code></span><small class="tg-muted">{{ if eq .Result.State "failure" }}freeze · failing{{ else }}freeze · passing{{ end }}</small></td>
+              <td><span class="tg-muted">Not persisted</span></td>
+              <td><span class="status status-{{ .Result.State }}">{{ if eq .Result.State "success" }}Eligible{{ else if eq .Result.State "failure" }}Blocked{{ else }}{{ .Result.State }}{{ end }}</span></td>
+              <td class="tg-table-actions"><button type="button" class="tg-btn tg-btn-secondary tg-btn-sm" disabled>Not wired</button></td>
+            </tr>
+          {{ end }}
+          </tbody>
+        </table>
+      </div>
       {{ else }}
-      <p>No local status results yet.</p>
+        <div class="tg-empty-row">
+          <strong>No local thaw evaluations yet</strong>
+          <span>Evaluate a PR above to record the local status result that the approval workflow will build on later.</span>
+        </div>
       {{ end }}
     </section>
-  </main>` + pageFoot
+  </main>
+  <script>
+    (() => {
+      const form = document.querySelector('[data-thaw-form]');
+      if (!form) return;
+      const repo = form.querySelector('[data-thaw-repository]');
+      const branch = form.querySelector('[data-thaw-branch]');
+      const repoOut = document.querySelector('[data-thaw-preview-repository]');
+      const branchOut = document.querySelector('[data-thaw-preview-branch]');
+      const update = () => {
+        if (repoOut && repo) repoOut.textContent = repo.options[repo.selectedIndex]?.textContent?.trim() || 'Selected repository';
+        if (branchOut && branch) branchOut.textContent = branch.value.trim() || 'branch';
+      };
+      repo.addEventListener('change', update);
+      branch.addEventListener('input', update);
+      form.addEventListener('reset', () => window.setTimeout(update, 0));
+      update();
+    })();
+  </script>
+` + pageFoot

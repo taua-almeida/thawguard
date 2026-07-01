@@ -54,7 +54,7 @@ func TestRepositoriesPageShowsManualSetupContext(t *testing.T) {
 	if !strings.Contains(body, "taua-almeida/thawguard") {
 		t.Fatalf("expected body to include repository full name, got %q", body)
 	}
-	for _, want := range []string{"Webhook secret", "configured", "Save webhook secret"} {
+	for _, want := range []string{"webhook configured", "Rotate secret", "Connect a repository"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
@@ -70,12 +70,12 @@ func TestRepositoriesPageDisablesWebhookSecretFormWithoutEncryptionKey(t *testin
 		t.Fatalf("expected status 200, got %d", recorder.Code)
 	}
 	body := recorder.Body.String()
-	for _, want := range []string{"Webhook secret storage is disabled", "THAWGUARD_SECRET_KEY</code> to save webhook secrets"} {
+	for _, want := range []string{"webhook missing", "THAWGUARD_SECRET_KEY</code> to save webhook secrets"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
 	}
-	if strings.Contains(body, "Save webhook secret") || strings.Contains(body, `name="webhook_secret"`) {
+	if strings.Contains(body, "Set secret") || strings.Contains(body, "Rotate secret") || strings.Contains(body, `name="webhook_secret"`) {
 		t.Fatalf("expected webhook secret form to be hidden, got %q", body)
 	}
 }
@@ -265,7 +265,7 @@ func TestRepositoriesPageShowsSetupHealthResults(t *testing.T) {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
 	}
 	body := recorder.Body.String()
-	for _, want := range []string{"Bot can post statuses", "ok", "Pull request webhook configured", "failed", "Record local setup placeholder", "placeholders until live Forgejo/Codeberg verification"} {
+	for _, want := range []string{"Bot can post statuses", "ok", "Pull request webhook configured", "failed", "Run setup check", "local placeholders for setup visibility"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
@@ -383,7 +383,7 @@ func TestFreezesPageShowsRepositoriesAndActiveFreezes(t *testing.T) {
 	if token := csrfTokenFromBody(t, body); token == "" {
 		t.Fatal("expected CSRF token in freeze form")
 	}
-	for _, want := range []string{"Create active freeze", "taua-almeida/thawguard", "default dev", "QA freeze", "Freeze branch", "End freeze", "Cancel", "Recent freeze audit events", "branch_freeze.created", "bootstrap_admin (admin)", "2026-06-29 15:30 UTC"} {
+	for _, want := range []string{"Create a freeze", "Preview impact", "3 open PRs", "Active Freezes", "taua-almeida/thawguard", "dev", "QA freeze", "Freeze Branch", "Lift", "Cancel"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
@@ -410,8 +410,8 @@ func TestFreezesPageHidesNonFreezeAuditEvents(t *testing.T) {
 	if strings.Contains(body, audit.ActionRepositoryCreated) {
 		t.Fatalf("expected repository audit events to be hidden, got %q", body)
 	}
-	if !strings.Contains(body, "No freeze audit events yet.") {
-		t.Fatalf("expected empty freeze audit state, got %q", body)
+	if !strings.Contains(body, "No active freezes yet") {
+		t.Fatalf("expected empty active freeze state, got %q", body)
 	}
 }
 
@@ -433,8 +433,8 @@ func TestFreezesPageHidesUnknownFreezeAuditActions(t *testing.T) {
 	if strings.Contains(body, "branch_freeze.internal") {
 		t.Fatalf("expected unknown freeze action to be hidden, got %q", body)
 	}
-	if !strings.Contains(body, "No freeze audit events yet.") {
-		t.Fatalf("expected empty freeze audit state, got %q", body)
+	if !strings.Contains(body, "No active freezes yet") {
+		t.Fatalf("expected empty active freeze state, got %q", body)
 	}
 }
 
@@ -456,8 +456,8 @@ func TestFreezesPageDoesNotRenderRawAuditJSON(t *testing.T) {
 	if strings.Contains(body, "secret-token") || strings.Contains(body, "not-json") {
 		t.Fatalf("expected raw audit JSON to be hidden, got %q", body)
 	}
-	if !strings.Contains(body, audit.ActionBranchFreezeCreated) {
-		t.Fatalf("expected audit action to still render, got %q", body)
+	if strings.Contains(body, audit.ActionBranchFreezeCreated) {
+		t.Fatalf("expected freeze audit action not to render on freezes page, got %q", body)
 	}
 }
 
@@ -726,7 +726,7 @@ func TestDecisionsPageShowsFormAndRecentResults(t *testing.T) {
 	if token := csrfTokenFromBody(t, body); token == "" {
 		t.Fatal("expected CSRF token in decision form")
 	}
-	for _, want := range []string{"Compute PR decision", "local preview only", "taua-almeida/thawguard", "Target branch", "main", "thawguard/freeze", "failure", "Branch is frozen", "2026-06-29 16:30 UTC"} {
+	for _, want := range []string{"Thaw Requests", "Request a thaw exception", "Auditable exceptions", "local status result", "taua-almeida/thawguard", "Target branch", "main", "thawguard/freeze", "Blocked", "Branch is frozen", "2026-06-29 16:30 UTC"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
