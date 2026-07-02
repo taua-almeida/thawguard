@@ -10,6 +10,7 @@ type Config struct {
 	SecretKey           string
 	StatusPublisherMode string
 	LiveStatusPosting   string
+	LiveStatusRepos     string
 }
 
 func FromEnv() Config {
@@ -21,6 +22,7 @@ func FromEnv() Config {
 		SecretKey:           env("THAWGUARD_SECRET_KEY", ""),
 		StatusPublisherMode: env("THAWGUARD_STATUS_PUBLISHER", "dry_run"),
 		LiveStatusPosting:   env("THAWGUARD_LIVE_STATUS_POSTING", ""),
+		LiveStatusRepos:     env("THAWGUARD_LIVE_STATUS_REPOSITORIES", ""),
 	}
 }
 

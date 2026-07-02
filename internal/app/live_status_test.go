@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"testing"
 
+	"github.com/taua-almeida/thawguard/internal/config"
 	"github.com/taua-almeida/thawguard/internal/db"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/repository"
@@ -46,7 +47,7 @@ func TestStatusPublisherFromConfigPostsWithDecryptedRepositoryToken(t *testing.T
 		t.Fatal(err)
 	}
 	publications := statuspublication.NewStore(database)
-	publisher, err := statusPublisherFromConfig(statuspublication.DeliveryModeForgejoStatus, publications, repository.NewStore(database), repositorySetup)
+	publisher, err := statusPublisherFromConfig(config.Config{LiveStatusRepos: "taua-almeida/thawguard"}, statuspublication.DeliveryModeForgejoStatus, publications, repository.NewStore(database), repositorySetup)
 	if err != nil {
 		t.Fatal(err)
 	}

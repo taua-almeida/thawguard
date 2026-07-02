@@ -31,7 +31,7 @@ Repository webhook secrets and future status-posting tokens are encrypted before
 
 The local signed webhook receiver is `POST /webhooks/forgejo`. It verifies configured repository webhook secrets, records sanitized delivery results, updates the local PR cache, and recomputes local status/publication-intent records plus dry-run publication attempts. `THAWGUARD_STATUS_PUBLISHER` defaults to `dry_run`.
 
-Live Forgejo/Codeberg commit-status posting is a guarded pilot mode, not the default. To start in live mode, `THAWGUARD_STATUS_PUBLISHER=forgejo_status` must be paired with `THAWGUARD_LIVE_STATUS_POSTING=enabled`, a valid `THAWGUARD_SECRET_KEY`, and a configured encrypted status token on each repository that should post statuses. Missing repository tokens are recorded as failed publication attempts rather than falling back silently. Keep this mode limited to throwaway or explicitly approved repositories until the rest of the live-pilot process is reviewed.
+Live Forgejo/Codeberg commit-status posting is a guarded pilot mode, not the default. To start in live mode, `THAWGUARD_STATUS_PUBLISHER=forgejo_status` must be paired with `THAWGUARD_LIVE_STATUS_POSTING=enabled`, `THAWGUARD_LIVE_STATUS_REPOSITORIES=owner/name` for the specific repositories allowed to post, a valid `THAWGUARD_SECRET_KEY`, and a configured encrypted status token on each allowed repository. Repositories not on the allowlist and repositories missing tokens are recorded as failed publication attempts rather than falling back silently. Keep this mode limited to throwaway or explicitly approved repositories until the rest of the live-pilot process is reviewed.
 
 Current local pages:
 

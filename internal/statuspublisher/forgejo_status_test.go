@@ -21,7 +21,7 @@ func TestForgejoStatusPublisherPostsAndRecordsAttempt(t *testing.T) {
 	repositories := &fakeRepositoryGetter{repository: domain.Repository{ID: result.RepositoryID, Forge: "forgejo", BaseURL: "https://codeberg.org", Owner: "taua-almeida", Name: "thawguard"}}
 	tokens := &fakeRepositoryStatusTokenGetter{token: "live-status-token", found: true}
 	client := &fakeForgeStatusClient{}
-	publisher := NewForgejoStatusPublisher(intents, attempts, repositories, tokens, func(repository domain.Repository, token string) (ForgeStatusClient, error) {
+	publisher := NewForgejoStatusPublisher(intents, attempts, repositories, tokens, []string{"TAUA-ALMEIDA/thawguard"}, func(repository domain.Repository, token string) (ForgeStatusClient, error) {
 		if token != "live-status-token" {
 			t.Fatalf("expected decrypted status token, got %q", token)
 		}
@@ -57,7 +57,7 @@ func TestForgejoStatusPublisherRecordsFailedAttempt(t *testing.T) {
 	repositories := &fakeRepositoryGetter{repository: domain.Repository{ID: result.RepositoryID, Forge: "forgejo", BaseURL: "https://codeberg.org", Owner: "taua-almeida", Name: "thawguard"}}
 	tokens := &fakeRepositoryStatusTokenGetter{token: "live-status-token", found: true}
 	client := &fakeForgeStatusClient{err: postErr}
-	publisher := NewForgejoStatusPublisher(intents, attempts, repositories, tokens, func(repository domain.Repository, token string) (ForgeStatusClient, error) { return client, nil })
+	publisher := NewForgejoStatusPublisher(intents, attempts, repositories, tokens, []string{"taua-almeida/thawguard"}, func(repository domain.Repository, token string) (ForgeStatusClient, error) { return client, nil })
 
 	got, err := publisher.Publish(ctx, result)
 	if err == nil || !strings.Contains(err.Error(), postErr.Error()) {
@@ -72,8 +72,56 @@ func TestForgejoStatusPublisherRecordsFailedAttempt(t *testing.T) {
 }
 
 func TestForgejoStatusPublisherRequiresConfiguration(t *testing.T) {
-	if _, err := NewForgejoStatusPublisher(nil, nil, nil, nil, nil).Publish(context.Background(), statusresult.Result{}); err == nil {
+	if _, err := NewForgejoStatusPublisher(nil, nil, nil, nil, nil, nil).Publish(context.Background(), statusresult.Result{}); err == nil {
 		t.Fatal("expected configuration error")
+	}
+}
+
+func TestForgejoStatusPublisherRecordsBlockedRepository(t *testing.T) {
+	ctx := context.Background()
+	result := forgejoPublisherResult()
+	publication := forgejoPublisherPublication(result)
+	intents := &fakeForgejoIntentPublisher{publication: publication}
+	attempts := &fakeForgejoAttemptRecorder{}
+	repositories := &fakeRepositoryGetter{repository: domain.Repository{ID: result.RepositoryID, Forge: "forgejo", BaseURL: "https://codeberg.org", Owner: "taua-almeida", Name: "thawguard"}}
+	tokens := &fakeRepositoryStatusTokenGetter{token: "live-status-token", found: true}
+	client := &fakeForgeStatusClient{}
+	publisher := NewForgejoStatusPublisher(intents, attempts, repositories, tokens, []string{"taua-almeida/allowed-repo"}, func(repository domain.Repository, token string) (ForgeStatusClient, error) { return client, nil })
+
+	got, err := publisher.Publish(ctx, result)
+	if !errors.Is(err, ErrRepositoryNotAllowed) {
+		t.Fatalf("expected repository allowlist error, got %v", err)
+	}
+	if got.ID != publication.ID {
+		t.Fatalf("expected publication returned with error, got %+v", got)
+	}
+	if len(client.calls) != 0 {
+		t.Fatalf("expected no forge status post for blocked repository, got %+v", client.calls)
+	}
+	if len(tokens.calls) != 0 {
+		t.Fatalf("expected no token lookup for blocked repository, got %+v", tokens.calls)
+	}
+	if len(attempts.attempts) != 1 || attempts.attempts[0].result != statuspublication.AttemptResultFailed || attempts.attempts[0].errorMessage != ErrRepositoryNotAllowed.Error() {
+		t.Fatalf("expected failed blocked-repository attempt, got %+v", attempts.attempts)
+	}
+}
+
+func TestForgejoStatusPublisherFailsClosedWithEmptyAllowlist(t *testing.T) {
+	ctx := context.Background()
+	result := forgejoPublisherResult()
+	publication := forgejoPublisherPublication(result)
+	intents := &fakeForgejoIntentPublisher{publication: publication}
+	attempts := &fakeForgejoAttemptRecorder{}
+	repositories := &fakeRepositoryGetter{repository: domain.Repository{ID: result.RepositoryID, Forge: "forgejo", BaseURL: "https://codeberg.org", Owner: "taua-almeida", Name: "thawguard"}}
+	tokens := &fakeRepositoryStatusTokenGetter{token: "live-status-token", found: true}
+	client := &fakeForgeStatusClient{}
+	publisher := NewForgejoStatusPublisher(intents, attempts, repositories, tokens, nil, func(repository domain.Repository, token string) (ForgeStatusClient, error) { return client, nil })
+
+	if _, err := publisher.Publish(ctx, result); !errors.Is(err, ErrRepositoryNotAllowed) {
+		t.Fatalf("expected repository allowlist error, got %v", err)
+	}
+	if len(client.calls) != 0 {
+		t.Fatalf("expected no forge status post with empty allowlist, got %+v", client.calls)
 	}
 }
 
@@ -86,7 +134,7 @@ func TestForgejoStatusPublisherRecordsMissingStatusToken(t *testing.T) {
 	repositories := &fakeRepositoryGetter{repository: domain.Repository{ID: result.RepositoryID, Forge: "forgejo", BaseURL: "https://codeberg.org", Owner: "taua-almeida", Name: "thawguard"}}
 	tokens := &fakeRepositoryStatusTokenGetter{found: false}
 	client := &fakeForgeStatusClient{}
-	publisher := NewForgejoStatusPublisher(intents, attempts, repositories, tokens, func(repository domain.Repository, token string) (ForgeStatusClient, error) { return client, nil })
+	publisher := NewForgejoStatusPublisher(intents, attempts, repositories, tokens, []string{"taua-almeida/thawguard"}, func(repository domain.Repository, token string) (ForgeStatusClient, error) { return client, nil })
 
 	got, err := publisher.Publish(ctx, result)
 	if !errors.Is(err, ErrRepositoryStatusTokenMissing) {
@@ -112,7 +160,7 @@ func TestForgejoStatusPublisherRecordsEmptyStatusTokenAsMissing(t *testing.T) {
 	repositories := &fakeRepositoryGetter{repository: domain.Repository{ID: result.RepositoryID, Forge: "forgejo", BaseURL: "https://codeberg.org", Owner: "taua-almeida", Name: "thawguard"}}
 	tokens := &fakeRepositoryStatusTokenGetter{token: "   ", found: true}
 	client := &fakeForgeStatusClient{}
-	publisher := NewForgejoStatusPublisher(intents, attempts, repositories, tokens, func(repository domain.Repository, token string) (ForgeStatusClient, error) { return client, nil })
+	publisher := NewForgejoStatusPublisher(intents, attempts, repositories, tokens, []string{"taua-almeida/thawguard"}, func(repository domain.Repository, token string) (ForgeStatusClient, error) { return client, nil })
 
 	if _, err := publisher.Publish(ctx, result); !errors.Is(err, ErrRepositoryStatusTokenMissing) {
 		t.Fatalf("expected missing status token error, got %v", err)
@@ -134,7 +182,7 @@ func TestForgejoStatusPublisherRedactsStatusTokenFromFailedAttempt(t *testing.T)
 	repositories := &fakeRepositoryGetter{repository: domain.Repository{ID: result.RepositoryID, Forge: "forgejo", BaseURL: "https://codeberg.org", Owner: "taua-almeida", Name: "thawguard"}}
 	tokens := &fakeRepositoryStatusTokenGetter{token: "live-status-token", found: true}
 	client := &fakeForgeStatusClient{err: errors.New("forge response mentioned live-status-token")}
-	publisher := NewForgejoStatusPublisher(intents, attempts, repositories, tokens, func(repository domain.Repository, token string) (ForgeStatusClient, error) { return client, nil })
+	publisher := NewForgejoStatusPublisher(intents, attempts, repositories, tokens, []string{"taua-almeida/thawguard"}, func(repository domain.Repository, token string) (ForgeStatusClient, error) { return client, nil })
 
 	if _, err := publisher.Publish(ctx, result); err == nil {
 		t.Fatal("expected post error")
@@ -202,9 +250,11 @@ type fakeRepositoryStatusTokenGetter struct {
 	token string
 	found bool
 	err   error
+	calls []int64
 }
 
 func (g *fakeRepositoryStatusTokenGetter) StatusToken(ctx context.Context, repositoryID int64) (string, bool, error) {
+	g.calls = append(g.calls, repositoryID)
 	if g.err != nil {
 		return "", false, g.err
 	}

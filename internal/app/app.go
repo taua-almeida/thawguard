@@ -79,7 +79,7 @@ func (a *App) Run(ctx context.Context) error {
 	if err := validateStatusPublisherConfig(a.cfg, publisherMode, secretStore != nil); err != nil {
 		return err
 	}
-	statusPublisher, err := statusPublisherFromConfig(publisherMode, statusPublicationStore, repositoryStore, repositorySetup)
+	statusPublisher, err := statusPublisherFromConfig(a.cfg, publisherMode, statusPublicationStore, repositoryStore, repositorySetup)
 	if err != nil {
 		return err
 	}
@@ -145,6 +145,9 @@ func validateStatusPublisherConfig(cfg config.Config, mode string, secretStoreCo
 	if !secretStoreConfigured {
 		return fmt.Errorf("THAWGUARD_STATUS_PUBLISHER=%s requires THAWGUARD_SECRET_KEY so repository status tokens can be decrypted", mode)
 	}
+	if len(liveStatusRepositories(cfg.LiveStatusRepos)) == 0 {
+		return fmt.Errorf("THAWGUARD_STATUS_PUBLISHER=%s requires THAWGUARD_LIVE_STATUS_REPOSITORIES to allow specific owner/name repositories", mode)
+	}
 	return nil
 }
 
@@ -152,12 +155,37 @@ func liveStatusPostingEnabled(raw string) bool {
 	return strings.EqualFold(strings.TrimSpace(raw), "enabled")
 }
 
-func statusPublisherFromConfig(mode string, publications *statuspublication.Store, repositories *repository.Store, repositorySetup *repositorysetup.Service) (webhook.StatusPublisher, error) {
+func liveStatusRepositories(raw string) []string {
+	fields := strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == '\n' || r == '\t' || r == ' ' })
+	repositories := make([]string, 0, len(fields))
+	for _, field := range fields {
+		field = normalizeLiveStatusRepository(field)
+		if field != "" {
+			repositories = append(repositories, field)
+		}
+	}
+	return repositories
+}
+
+func normalizeLiveStatusRepository(fullName string) string {
+	parts := strings.Split(strings.ToLower(strings.TrimSpace(fullName)), "/")
+	if len(parts) != 2 {
+		return ""
+	}
+	owner := strings.TrimSpace(parts[0])
+	name := strings.TrimSpace(parts[1])
+	if owner == "" || name == "" {
+		return ""
+	}
+	return owner + "/" + name
+}
+
+func statusPublisherFromConfig(cfg config.Config, mode string, publications *statuspublication.Store, repositories *repository.Store, repositorySetup *repositorysetup.Service) (webhook.StatusPublisher, error) {
 	switch mode {
 	case statuspublication.AttemptModeDryRun:
 		return statuspublisher.NewDryRunPublisher(publications, publications), nil
 	case statuspublication.DeliveryModeForgejoStatus:
-		return statuspublisher.NewForgejoStatusPublisher(publications, publications, repositories, repositorySetup, forgejoStatusClientForRepository), nil
+		return statuspublisher.NewForgejoStatusPublisher(publications, publications, repositories, repositorySetup, liveStatusRepositories(cfg.LiveStatusRepos), forgejoStatusClientForRepository), nil
 	default:
 		return nil, fmt.Errorf("unsupported status publisher mode %q", mode)
 	}

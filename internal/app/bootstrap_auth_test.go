@@ -62,10 +62,31 @@ func TestValidateStatusPublisherConfigRequiresSecretKeyForLiveMode(t *testing.T)
 	}
 }
 
+func TestValidateStatusPublisherConfigRequiresRepositoryAllowlistForLiveMode(t *testing.T) {
+	mode := statuspublication.DeliveryModeForgejoStatus
+	if err := validateStatusPublisherConfig(config.Config{StatusPublisherMode: mode, LiveStatusPosting: "enabled"}, mode, true); err == nil {
+		t.Fatal("expected forgejo status mode to require repository allowlist")
+	}
+}
+
 func TestValidateStatusPublisherConfigAcceptsExplicitLiveMode(t *testing.T) {
 	mode := statuspublication.DeliveryModeForgejoStatus
-	if err := validateStatusPublisherConfig(config.Config{StatusPublisherMode: mode, LiveStatusPosting: " ENABLED "}, mode, true); err != nil {
+	if err := validateStatusPublisherConfig(config.Config{StatusPublisherMode: mode, LiveStatusPosting: " ENABLED ", LiveStatusRepos: "taua-almeida/thawguard"}, mode, true); err != nil {
 		t.Fatalf("expected explicit live mode to pass guardrails: %v", err)
+	}
+}
+
+func TestLiveStatusRepositoriesParsesList(t *testing.T) {
+	repositories := liveStatusRepositories("taua-almeida/thawguard, acme/api\nEXAMPLE/repo")
+	if len(repositories) != 3 || repositories[0] != "taua-almeida/thawguard" || repositories[1] != "acme/api" || repositories[2] != "example/repo" {
+		t.Fatalf("unexpected repository allowlist parse: %+v", repositories)
+	}
+}
+
+func TestLiveStatusRepositoriesIgnoresMalformedEntries(t *testing.T) {
+	repositories := liveStatusRepositories("not-a-full-name, /missing-owner, missing-name/")
+	if len(repositories) != 0 {
+		t.Fatalf("expected malformed allowlist entries to be ignored, got %+v", repositories)
 	}
 }
 
