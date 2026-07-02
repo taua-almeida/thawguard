@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
@@ -32,7 +33,38 @@ func (c *Client) GetPullRequest(ctx context.Context, owner, repo string, index i
 }
 
 func (c *Client) ListOpenPullRequests(ctx context.Context, owner, repo, targetBranch string) ([]domain.PullRequest, error) {
-	return nil, ErrNotImplemented
+	if err := validateListOpenPullRequests(owner, repo, targetBranch); err != nil {
+		return nil, err
+	}
+	const limit = 50
+	prs := make([]domain.PullRequest, 0)
+	for page := 1; ; page++ {
+		endpoint, err := c.pullRequestsEndpoint(owner, repo, targetBranch, page, limit)
+		if err != nil {
+			return nil, err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, fmt.Errorf("create list pull requests request: %w", err)
+		}
+		req.Header.Set("Accept", "application/json")
+		if strings.TrimSpace(c.Token) != "" {
+			req.Header.Set("Authorization", "token "+strings.TrimSpace(c.Token))
+		}
+		resp, err := c.httpClient().Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("list open pull requests: %w", err)
+		}
+		pagePRs, payloadCount, err := decodePullRequestsPage(resp, strings.TrimSpace(targetBranch))
+		if err != nil {
+			return nil, err
+		}
+		prs = append(prs, pagePRs...)
+		if payloadCount < limit {
+			break
+		}
+	}
+	return prs, nil
 }
 
 func (c *Client) PostCommitStatus(ctx context.Context, owner, repo string, status forge.CommitStatus) error {
@@ -93,6 +125,19 @@ type commitStatusRequest struct {
 	Context     string `json:"context"`
 }
 
+type pullRequestResponse struct {
+	Number  int    `json:"number"`
+	Title   string `json:"title"`
+	State   string `json:"state"`
+	HTMLURL string `json:"html_url"`
+	Base    struct {
+		Ref string `json:"ref"`
+	} `json:"base"`
+	Head struct {
+		SHA string `json:"sha"`
+	} `json:"head"`
+}
+
 func validatePostCommitStatus(owner string, repo string, status forge.CommitStatus) error {
 	var missing []string
 	if strings.TrimSpace(owner) == "" {
@@ -116,6 +161,23 @@ func validatePostCommitStatus(owner string, repo string, status forge.CommitStat
 	return nil
 }
 
+func validateListOpenPullRequests(owner string, repo string, targetBranch string) error {
+	var missing []string
+	if strings.TrimSpace(owner) == "" {
+		missing = append(missing, "owner")
+	}
+	if strings.TrimSpace(repo) == "" {
+		missing = append(missing, "repository")
+	}
+	if strings.TrimSpace(targetBranch) == "" {
+		missing = append(missing, "target branch")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("missing required pull request list fields: %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
 func validCommitStatusState(state domain.CommitStatusState) bool {
 	switch state {
 	case domain.CommitStatusSuccess, domain.CommitStatusFailure, domain.CommitStatusPending, domain.CommitStatusError:
@@ -134,6 +196,50 @@ func (c *Client) statusEndpoint(owner string, repo string, sha string) (string, 
 		return "", fmt.Errorf("forgejo base URL is invalid")
 	}
 	return base.JoinPath("api", "v1", "repos", owner, repo, "statuses", strings.ToLower(strings.TrimSpace(sha))).String(), nil
+}
+
+func (c *Client) pullRequestsEndpoint(owner string, repo string, targetBranch string, page int, limit int) (string, error) {
+	if c == nil {
+		return "", errors.New("forgejo client is nil")
+	}
+	base, err := url.Parse(strings.TrimSpace(c.BaseURL))
+	if err != nil || base.Scheme == "" || base.Host == "" {
+		return "", fmt.Errorf("forgejo base URL is invalid")
+	}
+	endpoint := base.JoinPath("api", "v1", "repos", owner, repo, "pulls")
+	query := endpoint.Query()
+	query.Set("state", "open")
+	query.Set("base", strings.TrimSpace(targetBranch))
+	query.Set("page", strconv.Itoa(page))
+	query.Set("limit", strconv.Itoa(limit))
+	endpoint.RawQuery = query.Encode()
+	return endpoint.String(), nil
+}
+
+func decodePullRequestsPage(resp *http.Response, targetBranch string) ([]domain.PullRequest, int, error) {
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, 0, fmt.Errorf("list open pull requests: forge returned %s: %s", resp.Status, responseSnippet(resp.Body))
+	}
+	var payload []pullRequestResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, 0, fmt.Errorf("decode pull requests response: %w", err)
+	}
+	prs := make([]domain.PullRequest, 0, len(payload))
+	for _, item := range payload {
+		if strings.TrimSpace(item.Base.Ref) != targetBranch {
+			continue
+		}
+		pr := domain.PullRequest{Index: item.Number, Title: strings.TrimSpace(item.Title), State: strings.ToLower(strings.TrimSpace(item.State)), TargetBranch: strings.TrimSpace(item.Base.Ref), HeadSHA: strings.ToLower(strings.TrimSpace(item.Head.SHA)), URL: strings.TrimSpace(item.HTMLURL)}
+		if pr.State == "" {
+			pr.State = "open"
+		}
+		if pr.Index <= 0 || pr.TargetBranch == "" || pr.HeadSHA == "" {
+			return nil, 0, fmt.Errorf("pull request response is missing required fields")
+		}
+		prs = append(prs, pr)
+	}
+	return prs, len(payload), nil
 }
 
 func (c *Client) httpClient() *http.Client {

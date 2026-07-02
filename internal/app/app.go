@@ -84,7 +84,11 @@ func (a *App) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	freezeStoreForWeb := newFreezeRecomputingStore(freezeStore, pullRequestStore, statusDecisionStore, statusPublisher)
+	openPullRequestSyncer, err := openPullRequestSyncerFromConfig(a.cfg, publisherMode, repositoryStore, pullRequestStore, repositorySetup)
+	if err != nil {
+		return err
+	}
+	freezeStoreForWeb := newFreezeRecomputingStore(freezeStore, pullRequestStore, statusDecisionStore, statusPublisher, openPullRequestSyncer)
 	webhookDeliveryStore := webhook.NewDeliveryStore(database)
 	pullRequestWebhookProcessor := webhook.NewPullRequestProcessor(repositoryStore, pullRequestStore, statusDecisionStore, statusPublisher)
 	server := &http.Server{
@@ -192,6 +196,17 @@ func statusPublisherFromConfig(cfg config.Config, mode string, publications *sta
 	}
 }
 
+func openPullRequestSyncerFromConfig(cfg config.Config, mode string, repositories *repository.Store, pullRequests *pullrequest.Store, repositorySetup *repositorysetup.Service) (openPullRequestSyncer, error) {
+	switch mode {
+	case statuspublication.AttemptModeDryRun:
+		return nil, nil
+	case statuspublication.DeliveryModeForgejoStatus:
+		return newForgeOpenPullRequestSyncer(repositories, repositorySetup, pullRequests, liveStatusRepositories(cfg.LiveStatusRepos), forgejoPullRequestClientForRepository), nil
+	default:
+		return nil, fmt.Errorf("unsupported status publisher mode %q", mode)
+	}
+}
+
 func forgejoStatusClientForRepository(repo domain.Repository, token string) (statuspublisher.ForgeStatusClient, error) {
 	switch strings.ToLower(strings.TrimSpace(repo.Forge)) {
 	case "forgejo", "codeberg", "":
@@ -200,6 +215,17 @@ func forgejoStatusClientForRepository(repo domain.Repository, token string) (sta
 		return client, nil
 	default:
 		return nil, fmt.Errorf("repository forge %q is not supported for live status posting", repo.Forge)
+	}
+}
+
+func forgejoPullRequestClientForRepository(repo domain.Repository, token string) (openPullRequestForgeClient, error) {
+	switch strings.ToLower(strings.TrimSpace(repo.Forge)) {
+	case "forgejo", "codeberg", "":
+		client := forgejo.New(repo.BaseURL, token)
+		client.HTTPClient = &http.Client{Timeout: 10 * time.Second}
+		return client, nil
+	default:
+		return nil, fmt.Errorf("repository forge %q is not supported for open pull request sync", repo.Forge)
 	}
 }
 

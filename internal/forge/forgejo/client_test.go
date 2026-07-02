@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
@@ -57,6 +58,90 @@ func TestClientRejectsInvalidCommitStatus(t *testing.T) {
 	}
 }
 
+func TestClientListsOpenPullRequests(t *testing.T) {
+	var gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("expected GET, got %s", r.Method)
+		}
+		if r.URL.Path != "/api/v1/repos/taua-almeida/thawguard/pulls" {
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+		query := r.URL.Query()
+		if query.Get("state") != "open" || query.Get("base") != "main" || query.Get("page") != "1" || query.Get("limit") != "50" {
+			t.Fatalf("unexpected query %s", r.URL.RawQuery)
+		}
+		gotAuth = r.Header.Get("Authorization")
+		writePullRequests(t, w, []pullRequestResponse{
+			newPullRequestResponse(12, "Release fix", "open", "main", "ABCDEF123456", "https://codeberg.org/taua-almeida/thawguard/pulls/12"),
+			newPullRequestResponse(13, "Other branch", "open", "develop", "123456ABCDEF", "https://codeberg.org/taua-almeida/thawguard/pulls/13"),
+		})
+	}))
+	defer server.Close()
+	client := New(server.URL, "read-token")
+
+	prs, err := client.ListOpenPullRequests(context.Background(), "taua-almeida", "thawguard", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotAuth != "token read-token" {
+		t.Fatalf("unexpected auth header %q", gotAuth)
+	}
+	if len(prs) != 1 {
+		t.Fatalf("expected one pull request for target branch, got %+v", prs)
+	}
+	pr := prs[0]
+	if pr.Index != 12 || pr.Title != "Release fix" || pr.State != "open" || pr.TargetBranch != "main" || pr.HeadSHA != "abcdef123456" || pr.URL == "" {
+		t.Fatalf("unexpected pull request %+v", pr)
+	}
+}
+
+func TestClientListOpenPullRequestsPaginatesBeforeClientSideBranchFilter(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		page, err := strconv.Atoi(r.URL.Query().Get("page"))
+		if err != nil {
+			t.Fatalf("page query is not an integer: %v", err)
+		}
+		switch page {
+		case 1:
+			payload := make([]pullRequestResponse, 50)
+			for i := range payload {
+				payload[i] = newPullRequestResponse(i+1, "Non-target", "open", "develop", "abcdef123456", "")
+			}
+			writePullRequests(t, w, payload)
+		case 2:
+			writePullRequests(t, w, []pullRequestResponse{newPullRequestResponse(51, "Target", "open", "main", "bbbbbb123456", "")})
+		default:
+			t.Fatalf("unexpected page %d", page)
+		}
+	}))
+	defer server.Close()
+	client := New(server.URL, "")
+
+	prs, err := client.ListOpenPullRequests(context.Background(), "owner", "repo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests != 2 {
+		t.Fatalf("expected two page requests, got %d", requests)
+	}
+	if len(prs) != 1 || prs[0].Index != 51 {
+		t.Fatalf("expected target PR from second page, got %+v", prs)
+	}
+}
+
+func TestClientRejectsInvalidPullRequestList(t *testing.T) {
+	client := New("https://codeberg.org", "token")
+	if _, err := client.ListOpenPullRequests(context.Background(), "", "repo", "main"); err == nil {
+		t.Fatal("expected missing owner error")
+	}
+	if _, err := client.ListOpenPullRequests(context.Background(), "owner", "repo", ""); err == nil {
+		t.Fatal("expected missing target branch error")
+	}
+}
+
 func TestClientReturnsForgeErrors(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no token", http.StatusUnauthorized)
@@ -67,5 +152,24 @@ func TestClientReturnsForgeErrors(t *testing.T) {
 	err := client.PostCommitStatus(context.Background(), "owner", "repo", forge.CommitStatus{SHA: "abc123", State: domain.CommitStatusSuccess, Context: domain.RequiredStatusContext})
 	if err == nil {
 		t.Fatal("expected forge error")
+	}
+}
+
+func newPullRequestResponse(number int, title string, state string, baseRef string, headSHA string, htmlURL string) pullRequestResponse {
+	var pr pullRequestResponse
+	pr.Number = number
+	pr.Title = title
+	pr.State = state
+	pr.HTMLURL = htmlURL
+	pr.Base.Ref = baseRef
+	pr.Head.SHA = headSHA
+	return pr
+}
+
+func writePullRequests(t *testing.T, w http.ResponseWriter, payload []pullRequestResponse) {
+	t.Helper()
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		t.Fatal(err)
 	}
 }

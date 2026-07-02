@@ -27,13 +27,13 @@ Runtime configuration is environment-variable based. The binary does not current
 
 For a Docker-based shadow-mode alpha with mock Codeberg repositories, see [`docs/local-alpha.md`](docs/local-alpha.md).
 
-Repository webhook secrets and future status-posting tokens are encrypted before they are stored. To enable secret/token setup in local development, set `THAWGUARD_SECRET_KEY` to a stable, high-entropy, base64-encoded 32-byte installation key. Without this key, the rest of the local UI remains usable, but webhook secret and status token setup are disabled. Losing or changing this key makes stored secrets and tokens undecryptable.
+Repository webhook secrets and status-posting tokens are encrypted before they are stored. To enable secret/token setup in local development, set `THAWGUARD_SECRET_KEY` to a stable, high-entropy, base64-encoded 32-byte installation key. Without this key, the rest of the local UI remains usable, but webhook secret and status token setup are disabled. Losing or changing this key makes stored secrets and tokens undecryptable.
 
 The local signed webhook receiver is `POST /webhooks/forgejo`. It verifies configured repository webhook secrets, records sanitized delivery results, updates the local PR cache, and recomputes local status/publication-intent records plus dry-run publication attempts. `THAWGUARD_STATUS_PUBLISHER` defaults to `dry_run`.
 
 Live Forgejo/Codeberg commit-status posting is a guarded pilot mode, not the default. To start in live mode, `THAWGUARD_STATUS_PUBLISHER=forgejo_status` must be paired with `THAWGUARD_LIVE_STATUS_POSTING=enabled`, `THAWGUARD_LIVE_STATUS_REPOSITORIES=owner/name` for the specific repositories allowed to post, a valid `THAWGUARD_SECRET_KEY`, and a configured encrypted status token on each allowed repository. Repositories not on the allowlist and repositories missing tokens are recorded as failed publication attempts rather than falling back silently. Keep this mode limited to throwaway or explicitly approved repositories until the rest of the live-pilot process is reviewed.
 
-Freeze, lift, and cancel actions recompute statuses for cached open PRs on the affected repository and branch. PRs that existed before webhooks were configured are not synced from the forge yet.
+Freeze, lift, and cancel actions recompute statuses for cached open PRs on the affected repository and branch. In guarded `forgejo_status` live mode, creating a freeze first syncs open PRs for the target branch from the forge using the repository's encrypted status token; lift and cancel actions continue to use the local PR cache.
 
 Current local pages:
 

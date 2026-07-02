@@ -33,12 +33,17 @@ type statusPublisher interface {
 type freezeRecomputingStore struct {
 	freezes      freezeOperations
 	pullRequests openPullRequestBranchLister
+	syncer       openPullRequestSyncer
 	statuses     sharedHeadStatusRunner
 	publisher    statusPublisher
 }
 
-func newFreezeRecomputingStore(freezes freezeOperations, pullRequests openPullRequestBranchLister, statuses sharedHeadStatusRunner, publisher statusPublisher) *freezeRecomputingStore {
-	return &freezeRecomputingStore{freezes: freezes, pullRequests: pullRequests, statuses: statuses, publisher: publisher}
+func newFreezeRecomputingStore(freezes freezeOperations, pullRequests openPullRequestBranchLister, statuses sharedHeadStatusRunner, publisher statusPublisher, syncers ...openPullRequestSyncer) *freezeRecomputingStore {
+	var syncer openPullRequestSyncer
+	if len(syncers) > 0 {
+		syncer = syncers[0]
+	}
+	return &freezeRecomputingStore{freezes: freezes, pullRequests: pullRequests, syncer: syncer, statuses: statuses, publisher: publisher}
 }
 
 func (s *freezeRecomputingStore) ListActive(ctx context.Context) ([]domain.BranchFreeze, error) {
@@ -56,8 +61,15 @@ func (s *freezeRecomputingStore) CreateActive(ctx context.Context, params freeze
 	if err != nil {
 		return domain.BranchFreeze{}, err
 	}
+	var syncErr error
+	if s.syncer != nil {
+		syncErr = s.syncer.SyncOpenPullRequests(ctx, created.RepositoryID, created.Branch)
+	}
 	if err := s.recomputeBranch(ctx, created.RepositoryID, created.Branch); err != nil {
-		return created, err
+		return created, errors.Join(syncErr, err)
+	}
+	if syncErr != nil {
+		return created, syncErr
 	}
 	return created, nil
 }
