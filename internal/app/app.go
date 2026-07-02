@@ -69,6 +69,7 @@ func (a *App) Run(ctx context.Context) error {
 	setupCheckStore := setupcheck.NewStore(database)
 	setupCheckRunner := localSetupHealthRunner{recorder: setupCheckStore}
 	freezeStore := freeze.NewService(database)
+	pullRequestStore := pullrequest.NewStore(database)
 	auditStore := audit.NewStore(database)
 	statusDecisionStore := statusresult.NewService(statusresult.NewStore(database), freezeStore)
 	statusPublicationStore := statuspublication.NewStore(database)
@@ -83,7 +84,7 @@ func (a *App) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	pullRequestStore := pullrequest.NewStore(database)
+	freezeStoreForWeb := newFreezeRecomputingStore(freezeStore, pullRequestStore, statusDecisionStore, statusPublisher)
 	webhookDeliveryStore := webhook.NewDeliveryStore(database)
 	pullRequestWebhookProcessor := webhook.NewPullRequestProcessor(repositoryStore, pullRequestStore, statusDecisionStore, statusPublisher)
 	server := &http.Server{
@@ -94,7 +95,7 @@ func (a *App) Run(ctx context.Context) error {
 			RepositorySecretEncryptionConfigured: secretStore != nil,
 			SetupCheckStore:                      setupCheckStore,
 			SetupCheckRunner:                     setupCheckRunner,
-			FreezeStore:                          freezeStore,
+			FreezeStore:                          freezeStoreForWeb,
 			AuditStore:                           auditStore,
 			StatusDecisionStore:                  statusDecisionStore,
 			StatusPublicationStore:               statusPublicationStore,

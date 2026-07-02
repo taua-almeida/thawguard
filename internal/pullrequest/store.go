@@ -113,6 +113,38 @@ ORDER BY pull_request_index`, repositoryID, headSHA)
 	return prs, nil
 }
 
+func (s *Store) ListOpenByTargetBranch(ctx context.Context, repositoryID int64, targetBranch string) ([]domain.PullRequest, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("pull request store has no database")
+	}
+	targetBranch = strings.TrimSpace(targetBranch)
+	if repositoryID <= 0 || targetBranch == "" {
+		return nil, ValidationError{Message: "missing required pull request branch lookup fields"}
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, repository_id, pull_request_index, state, target_branch, head_sha, title, url
+FROM pull_request_cache
+WHERE repository_id = ? AND target_branch = ? AND state = 'open'
+ORDER BY pull_request_index`, repositoryID, targetBranch)
+	if err != nil {
+		return nil, fmt.Errorf("list open pull requests by target branch: %w", err)
+	}
+	defer rows.Close()
+
+	prs := make([]domain.PullRequest, 0)
+	for rows.Next() {
+		pr, err := scanPullRequest(rows)
+		if err != nil {
+			return nil, err
+		}
+		prs = append(prs, pr)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list open pull requests by target branch rows: %w", err)
+	}
+	return prs, nil
+}
+
 func normalizePullRequest(pr domain.PullRequest) domain.PullRequest {
 	pr.State = strings.ToLower(strings.TrimSpace(pr.State))
 	pr.TargetBranch = strings.TrimSpace(pr.TargetBranch)

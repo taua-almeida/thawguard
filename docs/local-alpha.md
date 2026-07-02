@@ -114,6 +114,7 @@ Expected alpha behavior:
 - Frozen-branch PRs should produce a local failure decision.
 - Publication attempts should show `dry_run` / `planned`.
 - Codeberg will not show a Thawguard commit status yet.
+- Freeze, lift, and cancel actions recompute statuses for open PRs already known in Thawguard's local PR cache. PRs that existed before webhook setup may need a new webhook event until open-PR sync from the forge is added.
 
 ## Live-pilot guardrails
 
@@ -128,6 +129,8 @@ To make Thawguard start with live posting, all of these must be true:
 - each allowed repository that should post statuses has an encrypted status token configured in `/repositories`
 
 If a repository is not on the allowlist or is missing its status token, Thawguard records a failed `forgejo_status` attempt and does not post a status for that result. Dry-run remains the recommended mode for this local alpha runbook.
+
+In live mode, freeze, lift, and cancel actions publish updated statuses for cached open PRs on the affected repository and branch. Full first-use coverage for PRs not yet present in the cache will require the planned open-PR sync from the forge.
 
 ## Troubleshooting
 

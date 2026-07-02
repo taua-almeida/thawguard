@@ -61,6 +61,32 @@ func TestStoreListsOpenPullRequestsByHead(t *testing.T) {
 	}
 }
 
+func TestStoreListsOpenPullRequestsByTargetBranch(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	store := NewStore(database)
+
+	for _, pr := range []domain.PullRequest{
+		{RepositoryID: repo.ID, Index: 1, State: "open", TargetBranch: "main", HeadSHA: "abc123"},
+		{RepositoryID: repo.ID, Index: 2, State: "open", TargetBranch: "release", HeadSHA: "abc123"},
+		{RepositoryID: repo.ID, Index: 3, State: "closed", TargetBranch: "main", HeadSHA: "def456"},
+		{RepositoryID: repo.ID, Index: 4, State: "open", TargetBranch: "main", HeadSHA: "def456"},
+	} {
+		if _, err := store.Upsert(ctx, pr); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	prs, err := store.ListOpenByTargetBranch(ctx, repo.ID, " main ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prs) != 2 || prs[0].Index != 1 || prs[1].Index != 4 {
+		t.Fatalf("unexpected open PRs: %+v", prs)
+	}
+}
+
 func TestStoreRejectsInvalidPullRequestCacheParams(t *testing.T) {
 	ctx := context.Background()
 	database := newTestDB(t, ctx)
