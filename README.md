@@ -23,11 +23,13 @@ The service listens on `127.0.0.1:8080` by default. Override with `THAWGUARD_HTT
 
 The service creates `thawguard.db` by default. Override with `THAWGUARD_DB_PATH`.
 
+Runtime configuration is environment-variable based. The binary does not currently parse CLI flags such as `--db` or `--addr`; use `THAWGUARD_DB_PATH` and `THAWGUARD_HTTP_ADDR` instead.
+
 For a Docker-based shadow-mode alpha with mock Codeberg repositories, see [`docs/local-alpha.md`](docs/local-alpha.md).
 
 Repository webhook secrets are encrypted before they are stored. To enable webhook secret setup in local development, set `THAWGUARD_SECRET_KEY` to a stable, high-entropy, base64-encoded 32-byte installation key. Without this key, the rest of the local UI remains usable, but webhook secret setup is disabled. Losing or changing this key makes stored webhook secrets undecryptable.
 
-The local signed webhook receiver is `POST /webhooks/forgejo`. It verifies configured repository webhook secrets, records sanitized delivery results, updates the local PR cache, and recomputes local status/publication-intent records plus dry-run publication attempts. It does not post live statuses to Forgejo/Codeberg yet.
+The local signed webhook receiver is `POST /webhooks/forgejo`. It verifies configured repository webhook secrets, records sanitized delivery results, updates the local PR cache, and recomputes local status/publication-intent records plus dry-run publication attempts. `THAWGUARD_STATUS_PUBLISHER` defaults to `dry_run`. Live `forgejo_status` publishing foundations exist behind tests, but runtime live posting and token storage are not wired yet.
 
 Current local pages:
 

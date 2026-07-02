@@ -94,6 +94,33 @@ func TestStorePublishUpsertsLocalStatusIntentByStatusKey(t *testing.T) {
 	}
 }
 
+func TestStorePublishesForgejoStatusIntent(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	result := createStatusResult(t, ctx, database, repo.ID)
+	store := NewStore(database)
+
+	publication, err := store.PublishForgejoStatus(ctx, result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if publication.DeliveryMode != DeliveryModeForgejoStatus {
+		t.Fatalf("expected forgejo delivery mode, got %q", publication.DeliveryMode)
+	}
+	if publication.StatusResultID != result.ID || publication.RepositoryID != repo.ID || publication.HeadSHA != result.HeadSHA {
+		t.Fatalf("unexpected publication: %+v", publication)
+	}
+
+	local, err := store.Publish(ctx, result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if local.ID == publication.ID {
+		t.Fatalf("expected local and forgejo delivery modes to keep separate intents, got id %d", local.ID)
+	}
+}
+
 func TestStoreRecordsDryRunPublicationAttempt(t *testing.T) {
 	ctx := context.Background()
 	database := newTestDB(t, ctx)
@@ -130,6 +157,34 @@ func TestStoreRecordsDryRunPublicationAttempt(t *testing.T) {
 	}
 }
 
+func TestStoreRecordsForgejoStatusPublicationAttempts(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	result := createStatusResult(t, ctx, database, repo.ID)
+	store := NewStore(database)
+	publication, err := store.PublishForgejoStatus(ctx, result)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	posted, err := store.RecordForgejoStatusAttempt(ctx, publication, AttemptResultPosted, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if posted.Mode != AttemptModeForgejoStatus || posted.Result != AttemptResultPosted || posted.Error != "" {
+		t.Fatalf("unexpected posted attempt: %+v", posted)
+	}
+
+	failed, err := store.RecordForgejoStatusAttempt(ctx, publication, AttemptResultFailed, "forge returned 500")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed.Mode != AttemptModeForgejoStatus || failed.Result != AttemptResultFailed || failed.Error != "forge returned 500" {
+		t.Fatalf("unexpected failed attempt: %+v", failed)
+	}
+}
+
 func TestStoreRejectsInvalidDryRunPublicationAttempt(t *testing.T) {
 	ctx := context.Background()
 	database := newTestDB(t, ctx)
@@ -137,6 +192,13 @@ func TestStoreRejectsInvalidDryRunPublicationAttempt(t *testing.T) {
 
 	if _, err := store.RecordDryRunAttempt(ctx, Publication{}); !IsValidationError(err) {
 		t.Fatalf("expected validation error, got %v", err)
+	}
+	publication := Publication{ID: 1, StatusResultID: 1, RepositoryID: 1, PullRequestIndex: 1, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "blocked", DeliveryMode: DeliveryModeForgejoStatus}
+	if _, err := store.RecordForgejoStatusAttempt(ctx, publication, AttemptResultPlanned, ""); !IsValidationError(err) {
+		t.Fatalf("expected invalid forgejo attempt result validation error, got %v", err)
+	}
+	if _, err := store.RecordForgejoStatusAttempt(ctx, publication, AttemptResultFailed, ""); !IsValidationError(err) {
+		t.Fatalf("expected failed forgejo attempt error validation, got %v", err)
 	}
 }
 

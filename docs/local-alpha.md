@@ -18,6 +18,7 @@ THAWGUARD_SECRET_KEY=$(openssl rand -base64 32)
 cat > .env <<EOF
 THAWGUARD_SECRET_KEY=$THAWGUARD_SECRET_KEY
 THAWGUARD_PUBLIC_URL=http://127.0.0.1:8080
+THAWGUARD_STATUS_PUBLISHER=dry_run
 EOF
 ```
 
@@ -30,6 +31,8 @@ docker compose up --build
 ```
 
 Open <http://127.0.0.1:8080>.
+
+Thawguard runtime configuration is environment-variable based. The Docker Compose file sets `THAWGUARD_DB_PATH=/data/thawguard.db` and `THAWGUARD_STATUS_PUBLISHER=dry_run`; the binary does not parse `--db` or `--addr` CLI flags.
 
 The compose file is Linux-oriented. It uses host networking so Thawguard can keep its bootstrap-only bind on `127.0.0.1:8080`. Host networking has lower network isolation than the default Docker bridge, so treat this as a local-alpha convenience only. Do not change the container to bind `0.0.0.0` while bootstrap sessions are still the only local auth.
 
@@ -119,6 +122,7 @@ Expected alpha behavior:
 ## What Alpha A does not do
 
 - It does not post commit statuses.
+- It does not enable `THAWGUARD_STATUS_PUBLISHER=forgejo_status`; live token storage/runtime posting is not wired yet.
 - It does not configure Codeberg branch protection.
 - It does not require or store Codeberg API tokens.
 - It does not provide production-ready local user authentication.

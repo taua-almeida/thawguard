@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/taua-almeida/thawguard/internal/audit"
@@ -68,6 +69,13 @@ func (a *App) Run(ctx context.Context) error {
 	auditStore := audit.NewStore(database)
 	statusDecisionStore := statusresult.NewService(statusresult.NewStore(database), freezeStore)
 	statusPublicationStore := statuspublication.NewStore(database)
+	publisherMode, err := statusPublisherMode(a.cfg.StatusPublisherMode)
+	if err != nil {
+		return err
+	}
+	if publisherMode == statuspublication.DeliveryModeForgejoStatus {
+		return fmt.Errorf("THAWGUARD_STATUS_PUBLISHER=%s requires live forge token storage and is not wired yet; use dry_run", publisherMode)
+	}
 	dryRunStatusPublisher := statuspublisher.NewDryRunPublisher(statusPublicationStore, statusPublicationStore)
 	pullRequestStore := pullrequest.NewStore(database)
 	webhookDeliveryStore := webhook.NewDeliveryStore(database)
@@ -94,7 +102,7 @@ func (a *App) Run(ctx context.Context) error {
 
 	errc := make(chan error, 1)
 	go func() {
-		a.logger.Info("starting thawguard", "addr", a.cfg.HTTPAddr, "db", a.cfg.DatabasePath)
+		a.logger.Info("starting thawguard", "addr", a.cfg.HTTPAddr, "db", a.cfg.DatabasePath, "public_url", a.cfg.PublicURL, "status_publisher", publisherMode)
 		errc <- server.ListenAndServe()
 	}()
 
@@ -105,6 +113,19 @@ func (a *App) Run(ctx context.Context) error {
 		return server.Shutdown(shutdownCtx)
 	case err := <-errc:
 		return err
+	}
+}
+
+func statusPublisherMode(raw string) (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(raw))
+	if mode == "" {
+		mode = statuspublication.AttemptModeDryRun
+	}
+	switch mode {
+	case statuspublication.AttemptModeDryRun, statuspublication.DeliveryModeForgejoStatus:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("THAWGUARD_STATUS_PUBLISHER must be %q or %q", statuspublication.AttemptModeDryRun, statuspublication.DeliveryModeForgejoStatus)
 	}
 }
 

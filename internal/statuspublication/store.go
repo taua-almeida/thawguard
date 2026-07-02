@@ -13,9 +13,13 @@ import (
 )
 
 const (
-	DeliveryModeLocalRecord = "local_record"
-	AttemptModeDryRun       = "dry_run"
-	AttemptResultPlanned    = "planned"
+	DeliveryModeLocalRecord   = "local_record"
+	DeliveryModeForgejoStatus = "forgejo_status"
+	AttemptModeDryRun         = "dry_run"
+	AttemptModeForgejoStatus  = "forgejo_status"
+	AttemptResultPlanned      = "planned"
+	AttemptResultPosted       = "posted"
+	AttemptResultFailed       = "failed"
 )
 
 type database interface {
@@ -86,11 +90,19 @@ func newStore(db database) *Store {
 }
 
 func (s *Store) Publish(ctx context.Context, result statusresult.Result) (Publication, error) {
+	return s.publish(ctx, result, DeliveryModeLocalRecord)
+}
+
+func (s *Store) PublishForgejoStatus(ctx context.Context, result statusresult.Result) (Publication, error) {
+	return s.publish(ctx, result, DeliveryModeForgejoStatus)
+}
+
+func (s *Store) publish(ctx context.Context, result statusresult.Result, deliveryMode string) (Publication, error) {
 	if s == nil || s.db == nil {
 		return Publication{}, errors.New("status publication store has no database")
 	}
 	publication := publicationFromResult(result)
-	publication.DeliveryMode = DeliveryModeLocalRecord
+	publication.DeliveryMode = deliveryMode
 	publication.CreatedAt = s.now().UTC()
 	publication.UpdatedAt = publication.CreatedAt
 	publication = normalizePublication(publication)
@@ -158,12 +170,21 @@ LIMIT ?`, limit)
 }
 
 func (s *Store) RecordDryRunAttempt(ctx context.Context, publication Publication) (Attempt, error) {
+	return s.recordAttempt(ctx, publication, AttemptModeDryRun, AttemptResultPlanned, "")
+}
+
+func (s *Store) RecordForgejoStatusAttempt(ctx context.Context, publication Publication, result string, errorMessage string) (Attempt, error) {
+	return s.recordAttempt(ctx, publication, AttemptModeForgejoStatus, result, errorMessage)
+}
+
+func (s *Store) recordAttempt(ctx context.Context, publication Publication, mode string, result string, errorMessage string) (Attempt, error) {
 	if s == nil || s.db == nil {
 		return Attempt{}, errors.New("status publication store has no database")
 	}
 	attempt := attemptFromPublication(publication)
-	attempt.Mode = AttemptModeDryRun
-	attempt.Result = AttemptResultPlanned
+	attempt.Mode = mode
+	attempt.Result = result
+	attempt.Error = errorMessage
 	attempt.AttemptedAt = s.now().UTC()
 	attempt = normalizeAttempt(attempt)
 	if err := validateAttempt(attempt); err != nil {
@@ -313,7 +334,7 @@ func validatePublication(publication Publication) error {
 	if len(missing) > 0 {
 		return ValidationError{Message: fmt.Sprintf("missing required status publication fields: %s", strings.Join(missing, ", "))}
 	}
-	if publication.DeliveryMode != DeliveryModeLocalRecord {
+	if !validDeliveryMode(publication.DeliveryMode) {
 		return ValidationError{Message: "status publication delivery mode is invalid"}
 	}
 	if !validState(publication.State) {
@@ -360,16 +381,48 @@ func validateAttempt(attempt Attempt) error {
 	if len(missing) > 0 {
 		return ValidationError{Message: fmt.Sprintf("missing required status publication attempt fields: %s", strings.Join(missing, ", "))}
 	}
-	if attempt.Mode != AttemptModeDryRun {
+	if !validAttemptMode(attempt.Mode) {
 		return ValidationError{Message: "status publication attempt mode is invalid"}
 	}
-	if attempt.Result != AttemptResultPlanned {
+	if !validAttemptResult(attempt.Mode, attempt.Result) {
 		return ValidationError{Message: "status publication attempt result is invalid"}
+	}
+	if attempt.Mode == AttemptModeForgejoStatus && attempt.Result == AttemptResultFailed && attempt.Error == "" {
+		return ValidationError{Message: "status publication attempt error is required for failed forgejo status attempts"}
 	}
 	if !validState(attempt.State) {
 		return ValidationError{Message: "status publication attempt state is invalid"}
 	}
 	return nil
+}
+
+func validDeliveryMode(mode string) bool {
+	switch mode {
+	case DeliveryModeLocalRecord, DeliveryModeForgejoStatus:
+		return true
+	default:
+		return false
+	}
+}
+
+func validAttemptMode(mode string) bool {
+	switch mode {
+	case AttemptModeDryRun, AttemptModeForgejoStatus:
+		return true
+	default:
+		return false
+	}
+}
+
+func validAttemptResult(mode string, result string) bool {
+	switch mode {
+	case AttemptModeDryRun:
+		return result == AttemptResultPlanned
+	case AttemptModeForgejoStatus:
+		return result == AttemptResultPosted || result == AttemptResultFailed
+	default:
+		return false
+	}
 }
 
 func validState(state domain.CommitStatusState) bool {

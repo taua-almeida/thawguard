@@ -11,6 +11,7 @@ services:
       THAWGUARD_DB_PATH: /data/thawguard.db
       THAWGUARD_PUBLIC_URL: ${THAWGUARD_PUBLIC_URL:-http://127.0.0.1:8080}
       THAWGUARD_SECRET_KEY: ${THAWGUARD_SECRET_KEY:?set THAWGUARD_SECRET_KEY in .env}
+      THAWGUARD_STATUS_PUBLISHER: ${THAWGUARD_STATUS_PUBLISHER:-dry_run}
     volumes:
       - thawguard-data:/data
     restart: unless-stopped

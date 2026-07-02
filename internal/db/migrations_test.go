@@ -59,6 +59,7 @@ func TestOpenAndApplyMigrationsAgainstSQLite(t *testing.T) {
 	assertIndexExists(t, database, "idx_status_publication_intents_idempotency")
 	assertTableExists(t, database, "status_publication_attempts")
 	assertIndexExists(t, database, "idx_status_publication_attempts_recent")
+	assertStatusPublicationLiveModesAllowed(t, database)
 
 	var applied int
 	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = ?`, "0001_initial").Scan(&applied); err != nil {
@@ -200,11 +201,18 @@ CREATE TABLE audit_events (
 	if applied != 1 {
 		t.Fatalf("expected status publication attempts migration to be recorded once, got %d", applied)
 	}
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = ?`, "0013_status_publication_live_modes").Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected status publication live modes migration to be recorded once, got %d", applied)
+	}
 	assertWebhookDeliveriesAreRepositoryScoped(t, database)
 	assertIndexExists(t, database, "idx_branch_freezes_one_active")
 	assertIndexExists(t, database, "idx_audit_events_subject_type_id")
 	assertIndexExists(t, database, "idx_status_publication_intents_idempotency")
 	assertIndexExists(t, database, "idx_status_publication_attempts_recent")
+	assertStatusPublicationLiveModesAllowed(t, database)
 }
 
 func TestApplyMigrationsDedupesStatusPublicationIntents(t *testing.T) {
@@ -316,6 +324,10 @@ CREATE TABLE webhook_deliveries (
   error TEXT,
   UNIQUE (delivery_id)
 );
+CREATE TABLE status_results (
+  id INTEGER PRIMARY KEY,
+  repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE
+);
 CREATE TABLE status_publication_intents (
   id INTEGER PRIMARY KEY,
   status_result_id INTEGER NOT NULL,
@@ -389,6 +401,37 @@ func assertWebhookDeliveriesAreRepositoryScoped(t *testing.T, database *sql.DB) 
 	}
 }
 
+func assertStatusPublicationLiveModesAllowed(t *testing.T, database *sql.DB) {
+	t.Helper()
+	insertStatusPublicationTestRepository(t, database)
+	if _, err := database.Exec(`INSERT OR IGNORE INTO status_results(id, repository_id, pull_request_index, target_branch, head_sha, context, state, description, created_at) VALUES (9001, 9001, 1, 'main', 'abc123', 'thawguard/freeze', 'failure', 'blocked', '2026-07-01T00:00:00.000000000Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO status_publication_intents(status_result_id, repository_id, pull_request_index, target_branch, head_sha, context, state, description, delivery_mode, created_at, updated_at) VALUES (9001, 9001, 1, 'main', 'abc123', 'thawguard/freeze', 'failure', 'blocked', 'forgejo_status', '2026-07-01T00:00:00.000000000Z', '2026-07-01T00:00:00.000000000Z')`); err != nil {
+		t.Fatalf("expected forgejo status publication intent mode to be allowed: %v", err)
+	}
+	var publicationID int64
+	if err := database.QueryRow(`SELECT id FROM status_publication_intents WHERE repository_id = 9001 AND delivery_mode = 'forgejo_status'`).Scan(&publicationID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO status_publication_attempts(publication_id, status_result_id, repository_id, pull_request_index, target_branch, head_sha, context, state, description, mode, result, error, attempted_at) VALUES (?, 9001, 9001, 1, 'main', 'abc123', 'thawguard/freeze', 'failure', 'blocked', 'forgejo_status', 'failed', 'forge returned 500', '2026-07-01T00:00:01.000000000Z')`, publicationID); err != nil {
+		t.Fatalf("expected forgejo status publication attempt mode/result to be allowed: %v", err)
+	}
+}
+
+func insertStatusPublicationTestRepository(t *testing.T, database *sql.DB) {
+	t.Helper()
+	if tableHasColumn(t, database, "repositories", "forge") {
+		if _, err := database.Exec(`INSERT OR IGNORE INTO repositories(id, forge, base_url, owner, name, default_branch, active, created_at, updated_at) VALUES (9001, 'forgejo', 'https://codeberg.org', 'example-owner', 'example-repo', 'main', 1, '2026-07-01T00:00:00.000000000Z', '2026-07-01T00:00:00.000000000Z')`); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if _, err := database.Exec(`INSERT OR IGNORE INTO repositories(id, active) VALUES (9001, 1)`); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func projectMigrationsDir(t *testing.T) string {
 	t.Helper()
 	_, file, _, ok := runtime.Caller(0)
@@ -438,6 +481,14 @@ func assertIndexExists(t *testing.T, database *sql.DB, name string) {
 
 func assertColumnExists(t *testing.T, database *sql.DB, table string, column string) {
 	t.Helper()
+	if tableHasColumn(t, database, table, column) {
+		return
+	}
+	t.Fatalf("expected column %s.%s to exist", table, column)
+}
+
+func tableHasColumn(t *testing.T, database *sql.DB, table string, column string) bool {
+	t.Helper()
 	rows, err := database.Query(`PRAGMA table_info(` + table + `)`)
 	if err != nil {
 		t.Fatal(err)
@@ -455,11 +506,11 @@ func assertColumnExists(t *testing.T, database *sql.DB, table string, column str
 			t.Fatal(err)
 		}
 		if name == column {
-			return
+			return true
 		}
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	t.Fatalf("expected column %s.%s to exist", table, column)
+	return false
 }
