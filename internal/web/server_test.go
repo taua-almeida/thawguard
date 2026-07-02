@@ -61,6 +61,22 @@ func TestRepositoriesPageShowsManualSetupContext(t *testing.T) {
 	}
 }
 
+func TestRepositoriesPageShowsSetTokenActionWithoutStoredToken(t *testing.T) {
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{{Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", HasWebhookSecret: true}}}, RepositorySecretEncryptionConfigured: true})
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{"webhook configured", "status token missing", "Rotate secret", "Set token", `name="status_token"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected body to contain %q, got %q", want, body)
+		}
+	}
+}
+
 func TestRepositoriesPageDisablesWebhookSecretFormWithoutEncryptionKey(t *testing.T) {
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{{Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}}}})
 	recorder := httptest.NewRecorder()
@@ -479,7 +495,7 @@ func TestFreezesPageShowsRepositoriesAndActiveFreezes(t *testing.T) {
 	if token := csrfTokenFromBody(t, body); token == "" {
 		t.Fatal("expected CSRF token in freeze form")
 	}
-	for _, want := range []string{"Create a freeze", "Preview impact", "3 open PRs", "Active Freezes", "taua-almeida/thawguard", "dev", "QA freeze", "Freeze Branch", "Lift", "Cancel"} {
+	for _, want := range []string{"Create a freeze", "Preview impact", "3 open PRs", "Active Freezes", "taua-almeida/thawguard", "dev", "QA freeze", "Freeze Branch", "Lift", "Cancel", `<form method="post" action="/freezes/end" data-confirm="Lift this freeze? Future status recomputation can pass if no other freeze applies.">`, `<button type="submit" class="tg-btn tg-btn-primary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg>Lift</button>`, "Cancel this freeze? This removes the local active freeze without completing it or recording it as ended."} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}

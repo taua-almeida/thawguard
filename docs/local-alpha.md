@@ -134,6 +134,7 @@ If a repository is not on the allowlist or is missing its status token, Thawguar
 - No row on `/webhooks`: check the public webhook URL, event type, and whether the tunnel is forwarding `POST /webhooks/forgejo`.
 - Delivery row with an error: check repository owner/name/base URL and whether the webhook secret in Thawguard matches Codeberg.
 - Thawguard cannot decrypt a stored webhook secret or status token: restore the original `THAWGUARD_SECRET_KEY` or recreate the local database volume.
+- Inspecting the live SQLite database requires copying the WAL files too: copy `/data/thawguard.db`, `/data/thawguard.db-wal`, and `/data/thawguard.db-shm` to the same local directory before opening the database.
 - Docker cannot reach the app on non-Linux hosts: run `go run ./cmd/thawguard` locally for now. The compose file intentionally uses Linux host networking to preserve loopback-only bootstrap safety.
 
 ## What Alpha A does not do

@@ -1389,16 +1389,25 @@ code,
 
 .tg-secret-form {
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 8px;
-  flex: 1;
-  min-width: 0;
+  flex: 1 1 360px;
+  max-width: 100%;
+  min-width: min(100%, 360px);
 }
 
 .tg-secret-form input {
+  width: 100%;
+  min-width: 0;
   min-height: 34px;
   padding: 7px 10px;
   font-size: 13px;
+}
+
+.tg-repo-actions .tg-muted {
+  flex: 1 1 100%;
+  margin: 0;
+  text-align: right;
 }
 
 .tg-setup-checklist {

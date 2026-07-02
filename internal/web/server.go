@@ -1704,12 +1704,12 @@ const freezesTemplate = pageHead + `
               <td><span class="tg-muted">preview</span></td>
               <td><span class="status status-frozen">{{ .Freeze.Status }}</span></td>
               <td class="tg-table-actions">
-                <form method="post" action="/freezes/end">
+                <form method="post" action="/freezes/end" data-confirm="Lift this freeze? Future status recomputation can pass if no other freeze applies.">
                   <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
                   <input type="hidden" name="freeze_id" value="{{ .Freeze.ID }}">
-                  <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg>Lift</button>
+                  <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg>Lift</button>
                 </form>
-                <form method="post" action="/freezes/cancel">
+                <form method="post" action="/freezes/cancel" data-confirm="Cancel this freeze? This removes the local active freeze without completing it or recording it as ended.">
                   <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
                   <input type="hidden" name="freeze_id" value="{{ .Freeze.ID }}">
                   <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-close"></use></svg>Cancel</button>
@@ -1730,6 +1730,13 @@ const freezesTemplate = pageHead + `
   </main>
   <script>
     (() => {
+      document.querySelectorAll('[data-confirm]').forEach((confirmForm) => {
+        confirmForm.addEventListener('submit', (event) => {
+          const message = confirmForm.getAttribute('data-confirm');
+          if (message && !window.confirm(message)) event.preventDefault();
+        });
+      });
+
       const form = document.querySelector('[data-freeze-form]');
       if (!form) return;
       const repo = form.querySelector('[data-freeze-repository]');

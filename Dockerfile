@@ -16,6 +16,10 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM debian:bookworm-slim
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=build /out/thawguard /usr/local/bin/thawguard
 COPY migrations ./migrations
 COPY web ./web
