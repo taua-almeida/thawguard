@@ -1266,7 +1266,109 @@ const pageHead = `<!doctype html>
     </aside>
     <div class="tg-content">`
 
-const pageFoot = `</div></div></body></html>`
+const pageFoot = `
+    <div class="tg-alert-dialog" data-alert-dialog hidden role="dialog" aria-modal="true" aria-labelledby="tg-confirm-title" aria-describedby="tg-confirm-message">
+      <button type="button" class="tg-alert-backdrop" data-alert-cancel aria-label="Close confirmation"></button>
+      <div class="tg-alert-card">
+        <h2 id="tg-confirm-title" data-alert-title>Confirm action</h2>
+        <p id="tg-confirm-message" data-alert-message>Continue?</p>
+        <div class="tg-alert-actions">
+          <button type="button" class="tg-btn tg-btn-secondary" data-alert-cancel>Cancel</button>
+          <button type="button" class="tg-btn tg-btn-primary" data-alert-confirm>Continue</button>
+        </div>
+      </div>
+    </div>
+  </div></div>
+  <script>
+    (() => {
+      const dialog = document.querySelector('[data-alert-dialog]');
+      if (!dialog) return;
+      const title = dialog.querySelector('[data-alert-title]');
+      const message = dialog.querySelector('[data-alert-message]');
+      const confirm = dialog.querySelector('[data-alert-confirm]');
+      let pendingConfirm = null;
+
+      const closeDialog = () => {
+        dialog.hidden = true;
+        pendingConfirm = null;
+      };
+
+      const openDialog = (trigger, onConfirm) => {
+        pendingConfirm = onConfirm;
+        title.textContent = trigger.getAttribute('data-confirm-title') || 'Confirm action';
+        message.textContent = trigger.getAttribute('data-confirm-message') || 'Continue?';
+        confirm.textContent = trigger.getAttribute('data-confirm-action') || 'Continue';
+        dialog.hidden = false;
+        confirm.focus();
+      };
+
+      document.querySelectorAll('[data-alert-cancel]').forEach((button) => {
+        button.addEventListener('click', closeDialog);
+      });
+
+      document.querySelectorAll('[data-confirm-submit]').forEach((form) => {
+        form.addEventListener('submit', (event) => {
+          if (form.dataset.confirmed === 'true') {
+            delete form.dataset.confirmed;
+            return;
+          }
+          event.preventDefault();
+          openDialog(form, () => {
+            form.dataset.confirmed = 'true';
+            if (typeof form.requestSubmit === 'function') {
+              form.requestSubmit();
+              return;
+            }
+            form.submit();
+          });
+        });
+      });
+
+      document.querySelectorAll('[data-credential-reveal]').forEach((button) => {
+        button.addEventListener('click', () => {
+          openDialog(button, () => {
+            const target = document.getElementById(button.getAttribute('data-credential-target'));
+            if (target) {
+              target.hidden = false;
+              target.querySelectorAll('[data-credential-input]').forEach((input) => { input.disabled = false; });
+              target.querySelector('[data-credential-input]')?.focus();
+            }
+            button.hidden = true;
+            button.setAttribute('aria-expanded', 'true');
+          });
+        });
+      });
+
+      document.querySelectorAll('[data-credential-cancel]').forEach((button) => {
+        button.addEventListener('click', () => {
+          const form = button.closest('[data-credential-form]');
+          const block = button.closest('[data-credential-block]');
+          const trigger = block?.querySelector('[data-credential-reveal]');
+          if (form) {
+            form.reset();
+            form.hidden = true;
+            form.querySelectorAll('[data-credential-input]').forEach((input) => { input.disabled = true; });
+          }
+          if (trigger) {
+            trigger.hidden = false;
+            trigger.setAttribute('aria-expanded', 'false');
+            trigger.focus();
+          }
+        });
+      });
+
+      confirm.addEventListener('click', () => {
+        const callback = pendingConfirm;
+        closeDialog();
+        if (callback) callback();
+      });
+
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && !dialog.hidden) closeDialog();
+      });
+    })();
+  </script>
+</body></html>`
 
 const dashboardTemplate = pageHead + `
   <main class="tg-main tg-dashboard">
@@ -1674,83 +1776,7 @@ const repositoriesTemplate = pageHead + `
         <article><span>3</span><div><strong>Local setup checks</strong><p>Current checks are local placeholders for setup visibility, not live Forgejo/Codeberg verification.</p></div></article>
       </div>
     </section>
-    <div class="tg-alert-dialog" data-alert-dialog hidden role="dialog" aria-modal="true" aria-labelledby="credential-confirm-title" aria-describedby="credential-confirm-message">
-      <button type="button" class="tg-alert-backdrop" data-alert-cancel aria-label="Close confirmation"></button>
-      <div class="tg-alert-card">
-        <h2 id="credential-confirm-title" data-alert-title>Confirm credential rotation</h2>
-        <p id="credential-confirm-message" data-alert-message>Reveal credential input?</p>
-        <div class="tg-alert-actions">
-          <button type="button" class="tg-btn tg-btn-secondary" data-alert-cancel>Keep hidden</button>
-          <button type="button" class="tg-btn tg-btn-primary" data-alert-confirm>Reveal input</button>
-        </div>
-      </div>
-    </div>
-  </main>
-  <script>
-    (() => {
-      const dialog = document.querySelector('[data-alert-dialog]');
-      if (!dialog) return;
-      const title = dialog.querySelector('[data-alert-title]');
-      const message = dialog.querySelector('[data-alert-message]');
-      const confirm = dialog.querySelector('[data-alert-confirm]');
-      let pendingTrigger = null;
-
-      const closeDialog = () => {
-        dialog.hidden = true;
-        pendingTrigger = null;
-      };
-
-      document.querySelectorAll('[data-alert-cancel]').forEach((button) => {
-        button.addEventListener('click', closeDialog);
-      });
-
-      document.querySelectorAll('[data-credential-reveal]').forEach((button) => {
-        button.addEventListener('click', () => {
-          pendingTrigger = button;
-          title.textContent = button.getAttribute('data-confirm-title') || 'Confirm credential rotation';
-          message.textContent = button.getAttribute('data-confirm-message') || 'Reveal credential input?';
-          confirm.textContent = button.getAttribute('data-confirm-action') || 'Reveal input';
-          dialog.hidden = false;
-          confirm.focus();
-        });
-      });
-
-      confirm.addEventListener('click', () => {
-        if (!pendingTrigger) return closeDialog();
-        const target = document.getElementById(pendingTrigger.getAttribute('data-credential-target'));
-        if (target) {
-          target.hidden = false;
-          target.querySelectorAll('[data-credential-input]').forEach((input) => { input.disabled = false; });
-          target.querySelector('[data-credential-input]')?.focus();
-        }
-        pendingTrigger.hidden = true;
-        pendingTrigger.setAttribute('aria-expanded', 'true');
-        closeDialog();
-      });
-
-      document.querySelectorAll('[data-credential-cancel]').forEach((button) => {
-        button.addEventListener('click', () => {
-          const form = button.closest('[data-credential-form]');
-          const block = button.closest('[data-credential-block]');
-          const trigger = block?.querySelector('[data-credential-reveal]');
-          if (form) {
-            form.reset();
-            form.hidden = true;
-            form.querySelectorAll('[data-credential-input]').forEach((input) => { input.disabled = true; });
-          }
-          if (trigger) {
-            trigger.hidden = false;
-            trigger.setAttribute('aria-expanded', 'false');
-            trigger.focus();
-          }
-        });
-      });
-
-      document.addEventListener('keydown', (event) => {
-        if (event.key === 'Escape' && !dialog.hidden) closeDialog();
-      });
-    })();
-  </script>` + pageFoot
+  </main>` + pageFoot
 
 const freezesTemplate = pageHead + `
   <main class="tg-main tg-setup-page tg-freezes-page">
@@ -1833,12 +1859,12 @@ const freezesTemplate = pageHead + `
               <td><span class="tg-muted">preview</span></td>
               <td><span class="status status-frozen">{{ .Freeze.Status }}</span></td>
               <td class="tg-table-actions">
-                <form method="post" action="/freezes/end" data-confirm="Lift this freeze? Future status recomputation can pass if no other freeze applies.">
+                <form method="post" action="/freezes/end" data-confirm-submit data-confirm-title="Lift freeze?" data-confirm-message="Future status recomputation can pass if no other freeze applies. This action is auditable and may publish updated statuses for known open PRs." data-confirm-action="Lift freeze">
                   <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
                   <input type="hidden" name="freeze_id" value="{{ .Freeze.ID }}">
                   <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg>Lift</button>
                 </form>
-                <form method="post" action="/freezes/cancel" data-confirm="Cancel this freeze? This removes the local active freeze without completing it or recording it as ended.">
+                <form method="post" action="/freezes/cancel" data-confirm-submit data-confirm-title="Cancel freeze?" data-confirm-message="This removes the local active freeze without completing it or recording it as ended. Thawguard will recompute statuses for known open PRs after the freeze changes." data-confirm-action="Cancel freeze">
                   <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
                   <input type="hidden" name="freeze_id" value="{{ .Freeze.ID }}">
                   <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-close"></use></svg>Cancel</button>
@@ -1859,13 +1885,6 @@ const freezesTemplate = pageHead + `
   </main>
   <script>
     (() => {
-      document.querySelectorAll('[data-confirm]').forEach((confirmForm) => {
-        confirmForm.addEventListener('submit', (event) => {
-          const message = confirmForm.getAttribute('data-confirm');
-          if (message && !window.confirm(message)) event.preventDefault();
-        });
-      });
-
       const form = document.querySelector('[data-freeze-form]');
       if (!form) return;
       const repo = form.querySelector('[data-freeze-repository]');
