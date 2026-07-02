@@ -34,7 +34,7 @@ import (
 )
 
 func TestRepositoriesPageShowsManualSetupContext(t *testing.T) {
-	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{{Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", HasWebhookSecret: true}}}, RepositorySecretEncryptionConfigured: true})
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{{Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", HasWebhookSecret: true, HasStatusToken: true}}}, RepositorySecretEncryptionConfigured: true})
 	recorder := httptest.NewRecorder()
 	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
 
@@ -54,7 +54,7 @@ func TestRepositoriesPageShowsManualSetupContext(t *testing.T) {
 	if !strings.Contains(body, "taua-almeida/thawguard") {
 		t.Fatalf("expected body to include repository full name, got %q", body)
 	}
-	for _, want := range []string{"webhook configured", "Rotate secret", "Connect a repository"} {
+	for _, want := range []string{"webhook configured", "status token configured", "Rotate secret", "Rotate token", "Connect a repository", "future live commit-status posting"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
@@ -70,13 +70,13 @@ func TestRepositoriesPageDisablesWebhookSecretFormWithoutEncryptionKey(t *testin
 		t.Fatalf("expected status 200, got %d", recorder.Code)
 	}
 	body := recorder.Body.String()
-	for _, want := range []string{"webhook missing", "THAWGUARD_SECRET_KEY</code> to save webhook secrets"} {
+	for _, want := range []string{"webhook missing", "status token missing", "THAWGUARD_SECRET_KEY</code> to save webhook secrets and status tokens"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
 	}
-	if strings.Contains(body, "Set secret") || strings.Contains(body, "Rotate secret") || strings.Contains(body, `name="webhook_secret"`) {
-		t.Fatalf("expected webhook secret form to be hidden, got %q", body)
+	if strings.Contains(body, "Set secret") || strings.Contains(body, "Rotate secret") || strings.Contains(body, `name="webhook_secret"`) || strings.Contains(body, "Set token") || strings.Contains(body, "Rotate token") || strings.Contains(body, `name="status_token"`) {
+		t.Fatalf("expected secret/token forms to be hidden, got %q", body)
 	}
 }
 
@@ -242,6 +242,102 @@ func TestSetRepositoryWebhookSecretReportsMissingEncryptionKey(t *testing.T) {
 	body := recorder.Body.String()
 	if strings.Contains(body, "super-secret-value") {
 		t.Fatalf("expected submitted secret not to be rendered, got %q", body)
+	}
+}
+
+func TestSetRepositoryStatusTokenPostsToStore(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	store := &fakeRepositoryStore{repositories: []domain.Repository{repo}}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: store, RepositorySecretEncryptionConfigured: true})
+	form := url.Values{"repository_id": {"1"}, "status_token": {"super-status-token"}}
+	cookie, csrfToken := getRepositoryForm(t, server)
+	form.Set(csrfFormField, csrfToken)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/repositories/status-token", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect, got %d", recorder.Code)
+	}
+	if len(store.statusTokens) != 1 || store.statusTokens[0].repositoryID != repo.ID || store.statusTokens[0].token != "super-status-token" {
+		t.Fatalf("expected status token update, got %+v", store.statusTokens)
+	}
+	if len(store.statusTokenActors) != 1 || store.statusTokenActors[0].Kind != domain.ActorKindBootstrapAdmin || store.statusTokenActors[0].Role != "admin" {
+		t.Fatalf("unexpected actors: %+v", store.statusTokenActors)
+	}
+}
+
+func TestSetRepositoryStatusTokenRejectsInvalidCSRFToken(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	store := &fakeRepositoryStore{repositories: []domain.Repository{repo}}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: store, RepositorySecretEncryptionConfigured: true})
+	form := url.Values{"repository_id": {"1"}, "status_token": {"super-status-token"}}
+	cookie, _ := getRepositoryForm(t, server)
+	form.Set(csrfFormField, "not-the-session-token")
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/repositories/status-token", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected forbidden status, got %d", recorder.Code)
+	}
+	if len(store.statusTokens) != 0 {
+		t.Fatalf("expected no status token updates, got %+v", store.statusTokens)
+	}
+}
+
+func TestSetRepositoryStatusTokenDoesNotLeakInvalidToken(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	store := &fakeRepositoryStore{repositories: []domain.Repository{repo}, statusTokenErr: repositorysetup.ValidationError{Message: "status token must be at least 16 characters"}}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: store, RepositorySecretEncryptionConfigured: true})
+	form := url.Values{"repository_id": {"1"}, "status_token": {"short-token"}}
+	cookie, csrfToken := getRepositoryForm(t, server)
+	form.Set(csrfFormField, csrfToken)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/repositories/status-token", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected bad request, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	if strings.Contains(body, "short-token") {
+		t.Fatalf("expected submitted token not to be rendered, got %q", body)
+	}
+	if !strings.Contains(body, "status token must be at least 16 characters") {
+		t.Fatalf("expected validation error, got %q", body)
+	}
+}
+
+func TestSetRepositoryStatusTokenReportsMissingEncryptionKey(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	store := &fakeRepositoryStore{repositories: []domain.Repository{repo}}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: store})
+	form := url.Values{"repository_id": {"1"}, "status_token": {"super-status-token"}}
+	cookie, csrfToken := getRepositoryForm(t, server)
+	form.Set(csrfFormField, csrfToken)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/repositories/status-token", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected service unavailable, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	if strings.Contains(body, "super-status-token") {
+		t.Fatalf("expected submitted token not to be rendered, got %q", body)
 	}
 }
 
@@ -1545,11 +1641,19 @@ type fakeRepositoryStore struct {
 	webhookSecrets      []webhookSecretUpdate
 	webhookSecretActors []domain.Actor
 	webhookSecretErr    error
+	statusTokens        []statusTokenUpdate
+	statusTokenActors   []domain.Actor
+	statusTokenErr      error
 }
 
 type webhookSecretUpdate struct {
 	repositoryID int64
 	secret       string
+}
+
+type statusTokenUpdate struct {
+	repositoryID int64
+	token        string
 }
 
 type fakeSetupCheckStore struct {
@@ -1716,6 +1820,21 @@ func (s *fakeRepositoryStore) SetWebhookSecret(ctx context.Context, repositoryID
 	for index, repo := range s.repositories {
 		if repo.ID == repositoryID {
 			s.repositories[index].HasWebhookSecret = true
+			return s.repositories[index], nil
+		}
+	}
+	return domain.Repository{}, repositorysetup.ValidationError{Message: "repository not found"}
+}
+
+func (s *fakeRepositoryStore) SetStatusToken(ctx context.Context, repositoryID int64, token string, actor domain.Actor) (domain.Repository, error) {
+	if s.statusTokenErr != nil {
+		return domain.Repository{}, s.statusTokenErr
+	}
+	s.statusTokens = append(s.statusTokens, statusTokenUpdate{repositoryID: repositoryID, token: token})
+	s.statusTokenActors = append(s.statusTokenActors, actor)
+	for index, repo := range s.repositories {
+		if repo.ID == repositoryID {
+			s.repositories[index].HasStatusToken = true
 			return s.repositories[index], nil
 		}
 	}

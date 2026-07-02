@@ -22,7 +22,7 @@ THAWGUARD_STATUS_PUBLISHER=dry_run
 EOF
 ```
 
-Keep this key stable for a local alpha database. If it changes, stored webhook secrets become undecryptable.
+Keep this key stable for a local alpha database. If it changes, stored webhook secrets and status-posting tokens become undecryptable.
 
 ## 2. Start the local Docker alpha
 
@@ -62,8 +62,9 @@ Use a throwaway Codeberg repository, not a production repository.
    - Repository: your mock repository name
    - Default branch: usually `main`
 3. Set a webhook secret. Use a high-entropy value and save it somewhere local temporarily.
+4. Optionally set a status token to exercise encrypted token storage. The alpha still uses dry-run publication and will not post statuses with this token.
 
-No Codeberg token is needed for Alpha A shadow mode.
+No Codeberg token is needed for Alpha A shadow mode unless you want to exercise encrypted token storage in the setup UI.
 
 ## 4. Create a local freeze
 
@@ -116,13 +117,13 @@ Expected alpha behavior:
 
 - No row on `/webhooks`: check the public webhook URL, event type, and whether the tunnel is forwarding `POST /webhooks/forgejo`.
 - Delivery row with an error: check repository owner/name/base URL and whether the webhook secret in Thawguard matches Codeberg.
-- Thawguard cannot decrypt a stored webhook secret: restore the original `THAWGUARD_SECRET_KEY` or recreate the local database volume.
+- Thawguard cannot decrypt a stored webhook secret or status token: restore the original `THAWGUARD_SECRET_KEY` or recreate the local database volume.
 - Docker cannot reach the app on non-Linux hosts: run `go run ./cmd/thawguard` locally for now. The compose file intentionally uses Linux host networking to preserve loopback-only bootstrap safety.
 
 ## What Alpha A does not do
 
 - It does not post commit statuses.
-- It does not enable `THAWGUARD_STATUS_PUBLISHER=forgejo_status`; live token storage/runtime posting is not wired yet.
+- It does not enable `THAWGUARD_STATUS_PUBLISHER=forgejo_status`; runtime live posting is not wired yet.
 - It does not configure Codeberg branch protection.
-- It does not require or store Codeberg API tokens.
+- It does not require Codeberg API tokens for shadow mode. Stored status tokens are encrypted setup data for future live posting.
 - It does not provide production-ready local user authentication.

@@ -114,6 +114,7 @@ func (s *Store) Get(ctx context.Context, id int64) (domain.Repository, error) {
 	row := s.db.QueryRowContext(ctx, `
 SELECT id, forge, base_url, owner, name, default_branch, active,
   EXISTS(SELECT 1 FROM repository_webhook_secrets WHERE repository_id = repositories.id),
+  EXISTS(SELECT 1 FROM repository_status_tokens WHERE repository_id = repositories.id),
   created_at, updated_at
 FROM repositories
 WHERE id = ?`, id)
@@ -127,6 +128,7 @@ func (s *Store) List(ctx context.Context) ([]domain.Repository, error) {
 	rows, err := s.db.QueryContext(ctx, `
 SELECT id, forge, base_url, owner, name, default_branch, active,
   EXISTS(SELECT 1 FROM repository_webhook_secrets WHERE repository_id = repositories.id),
+  EXISTS(SELECT 1 FROM repository_status_tokens WHERE repository_id = repositories.id),
   created_at, updated_at
 FROM repositories
 ORDER BY owner, name`)
@@ -160,6 +162,7 @@ func (s *Store) FindActiveByRemote(ctx context.Context, params RemoteParams) (do
 	row := s.db.QueryRowContext(ctx, `
 SELECT id, forge, base_url, owner, name, default_branch, active,
   EXISTS(SELECT 1 FROM repository_webhook_secrets WHERE repository_id = repositories.id),
+  EXISTS(SELECT 1 FROM repository_status_tokens WHERE repository_id = repositories.id),
   created_at, updated_at
 FROM repositories
 	WHERE forge = ? AND base_url = ? AND owner = ? AND name = ? AND active = 1`, params.Forge, params.BaseURL, params.Owner, params.Name)
@@ -240,6 +243,73 @@ WHERE repository_webhook_secrets.repository_id = ? AND repositories.active = 1`,
 	return copyCiphertext, true, nil
 }
 
+func (s *Store) SetStatusTokenCiphertext(ctx context.Context, repositoryID int64, ciphertext []byte) (domain.Repository, error) {
+	if s == nil || s.db == nil {
+		return domain.Repository{}, errors.New("repository store has no database")
+	}
+	if repositoryID <= 0 {
+		return domain.Repository{}, ValidationError{Message: "repository id is required"}
+	}
+	if len(ciphertext) == 0 {
+		return domain.Repository{}, ValidationError{Message: "status token ciphertext is required"}
+	}
+	if len(ciphertext) > 4096 {
+		return domain.Repository{}, ValidationError{Message: "status token ciphertext is too large"}
+	}
+	updatedAt := s.now().UTC().Format(time.RFC3339Nano)
+	result, err := s.db.ExecContext(ctx, `
+UPDATE repositories
+SET updated_at = ?
+WHERE id = ?`, updatedAt, repositoryID)
+	if err != nil {
+		return domain.Repository{}, fmt.Errorf("touch repository status token updated_at: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return domain.Repository{}, fmt.Errorf("touch repository status token updated_at rows: %w", err)
+	}
+	if affected == 0 {
+		return domain.Repository{}, sql.ErrNoRows
+	}
+	_, err = s.db.ExecContext(ctx, `
+INSERT INTO repository_status_tokens(repository_id, ciphertext, updated_at)
+VALUES (?, ?, ?)
+ON CONFLICT(repository_id) DO UPDATE SET
+  ciphertext = excluded.ciphertext,
+  updated_at = excluded.updated_at`, repositoryID, ciphertext, updatedAt)
+	if err != nil {
+		return domain.Repository{}, fmt.Errorf("set repository status token ciphertext: %w", err)
+	}
+	return s.Get(ctx, repositoryID)
+}
+
+func (s *Store) StatusTokenCiphertext(ctx context.Context, repositoryID int64) ([]byte, bool, error) {
+	if s == nil || s.db == nil {
+		return nil, false, errors.New("repository store has no database")
+	}
+	if repositoryID <= 0 {
+		return nil, false, ValidationError{Message: "repository id is required"}
+	}
+	row := s.db.QueryRowContext(ctx, `
+SELECT repository_status_tokens.ciphertext
+FROM repository_status_tokens
+JOIN repositories ON repositories.id = repository_status_tokens.repository_id
+WHERE repository_status_tokens.repository_id = ? AND repositories.active = 1`, repositoryID)
+	var ciphertext []byte
+	if err := row.Scan(&ciphertext); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("scan repository status token ciphertext: %w", err)
+	}
+	if len(ciphertext) == 0 {
+		return nil, false, nil
+	}
+	copyCiphertext := make([]byte, len(ciphertext))
+	copy(copyCiphertext, ciphertext)
+	return copyCiphertext, true, nil
+}
+
 func normalizeCreateParams(params CreateParams) CreateParams {
 	params.Forge = strings.ToLower(strings.TrimSpace(params.Forge))
 	params.BaseURL = strings.TrimRight(strings.TrimSpace(params.BaseURL), "/")
@@ -290,13 +360,14 @@ type scanner interface {
 
 func scanRepository(row scanner) (domain.Repository, error) {
 	var repo domain.Repository
-	var active, hasWebhookSecret int
+	var active, hasWebhookSecret, hasStatusToken int
 	var createdAt, updatedAt string
-	if err := row.Scan(&repo.ID, &repo.Forge, &repo.BaseURL, &repo.Owner, &repo.Name, &repo.DefaultBranch, &active, &hasWebhookSecret, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&repo.ID, &repo.Forge, &repo.BaseURL, &repo.Owner, &repo.Name, &repo.DefaultBranch, &active, &hasWebhookSecret, &hasStatusToken, &createdAt, &updatedAt); err != nil {
 		return domain.Repository{}, fmt.Errorf("scan repository: %w", err)
 	}
 	repo.Active = active != 0
 	repo.HasWebhookSecret = hasWebhookSecret != 0
+	repo.HasStatusToken = hasStatusToken != 0
 
 	parsedCreatedAt, err := time.Parse(time.RFC3339Nano, createdAt)
 	if err != nil {

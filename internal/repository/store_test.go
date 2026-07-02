@@ -163,6 +163,49 @@ func TestStoreSetsAndReadsWebhookSecretCiphertext(t *testing.T) {
 	}
 }
 
+func TestStoreSetsAndReadsStatusTokenCiphertext(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	repo, err := store.Create(ctx, CreateParams{Owner: "example-owner", Name: "example-repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repo.HasStatusToken {
+		t.Fatal("expected new repository not to have status token")
+	}
+
+	updated, err := store.SetStatusTokenCiphertext(ctx, repo.ID, []byte("encrypted-token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated.HasStatusToken {
+		t.Fatal("expected repository to have status token after update")
+	}
+
+	ciphertext, found, err := store.StatusTokenCiphertext(ctx, repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || string(ciphertext) != "encrypted-token" {
+		t.Fatalf("expected stored ciphertext, found=%v ciphertext=%q", found, ciphertext)
+	}
+	ciphertext[0] = 'X'
+	again, found, err := store.StatusTokenCiphertext(ctx, repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || string(again) != "encrypted-token" {
+		t.Fatalf("expected ciphertext copy, found=%v ciphertext=%q", found, again)
+	}
+	var stored int
+	if err := store.db.QueryRowContext(ctx, `SELECT count(*) FROM repository_status_tokens WHERE repository_id = ?`, repo.ID).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != 1 {
+		t.Fatalf("expected one repository status token row, got %d", stored)
+	}
+}
+
 func newTestStore(t *testing.T, ctx context.Context) *Store {
 	t.Helper()
 	database, err := db.Open(ctx, db.DefaultConfig(filepath.Join(t.TempDir(), "thawguard-test.db")))

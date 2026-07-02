@@ -27,9 +27,9 @@ Runtime configuration is environment-variable based. The binary does not current
 
 For a Docker-based shadow-mode alpha with mock Codeberg repositories, see [`docs/local-alpha.md`](docs/local-alpha.md).
 
-Repository webhook secrets are encrypted before they are stored. To enable webhook secret setup in local development, set `THAWGUARD_SECRET_KEY` to a stable, high-entropy, base64-encoded 32-byte installation key. Without this key, the rest of the local UI remains usable, but webhook secret setup is disabled. Losing or changing this key makes stored webhook secrets undecryptable.
+Repository webhook secrets and future status-posting tokens are encrypted before they are stored. To enable secret/token setup in local development, set `THAWGUARD_SECRET_KEY` to a stable, high-entropy, base64-encoded 32-byte installation key. Without this key, the rest of the local UI remains usable, but webhook secret and status token setup are disabled. Losing or changing this key makes stored secrets and tokens undecryptable.
 
-The local signed webhook receiver is `POST /webhooks/forgejo`. It verifies configured repository webhook secrets, records sanitized delivery results, updates the local PR cache, and recomputes local status/publication-intent records plus dry-run publication attempts. `THAWGUARD_STATUS_PUBLISHER` defaults to `dry_run`. Live `forgejo_status` publishing foundations exist behind tests, but runtime live posting and token storage are not wired yet.
+The local signed webhook receiver is `POST /webhooks/forgejo`. It verifies configured repository webhook secrets, records sanitized delivery results, updates the local PR cache, and recomputes local status/publication-intent records plus dry-run publication attempts. `THAWGUARD_STATUS_PUBLISHER` defaults to `dry_run`. Live `forgejo_status` publishing foundations and encrypted token storage exist behind local UI/service seams, but runtime live posting remains disabled.
 
 Current local pages:
 

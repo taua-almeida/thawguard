@@ -200,6 +200,118 @@ func TestServiceRejectsInvalidWebhookSecretParams(t *testing.T) {
 	}
 }
 
+func TestServiceSetsEncryptedStatusTokenAndAuditEvent(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	secretStore := newTestSecretStore(t)
+	service := NewServiceWithSecrets(database, secretStore)
+	repo, err := service.Create(ctx, repository.CreateParams{Owner: "taua-almeida", Name: "thawguard"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := service.SetStatusToken(ctx, repo.ID, "first-status-token", domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated.HasStatusToken {
+		t.Fatal("expected repository to report configured status token")
+	}
+
+	var ciphertext []byte
+	if err := database.QueryRowContext(ctx, `SELECT ciphertext FROM repository_status_tokens WHERE repository_id = ?`, repo.ID).Scan(&ciphertext); err != nil {
+		t.Fatal(err)
+	}
+	if len(ciphertext) == 0 || bytes.Contains(ciphertext, []byte("first-status-token")) {
+		t.Fatalf("expected encrypted status token, got %q", ciphertext)
+	}
+	decrypted, found, err := service.StatusToken(ctx, repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || decrypted != "first-status-token" {
+		t.Fatalf("expected decrypted status token, found=%v value=%q", found, decrypted)
+	}
+
+	if _, err := service.SetStatusToken(ctx, repo.ID, "second-status-token", domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); err != nil {
+		t.Fatal(err)
+	}
+	rotated, found, err := service.StatusToken(ctx, repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || rotated != "second-status-token" {
+		t.Fatalf("expected rotated status token, found=%v value=%q", found, rotated)
+	}
+
+	events, err := audit.NewStore(database).List(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("expected repository create plus two status token audit events, got %d", len(events))
+	}
+	latest := events[0]
+	if latest.Action != audit.ActionRepositoryStatusTokenConfigured {
+		t.Fatalf("unexpected latest action: %q", latest.Action)
+	}
+	if bytes.Contains([]byte(latest.DetailsJSON), []byte("second-status-token")) || bytes.Contains([]byte(latest.DetailsJSON), []byte("first-status-token")) {
+		t.Fatalf("expected audit details not to contain status tokens, got %s", latest.DetailsJSON)
+	}
+	var details map[string]string
+	if err := json.Unmarshal([]byte(latest.DetailsJSON), &details); err != nil {
+		t.Fatal(err)
+	}
+	if details["status_token_was_configured"] != "true" {
+		t.Fatalf("expected rotation audit flag, got %s", latest.DetailsJSON)
+	}
+}
+
+func TestServiceRejectsStatusTokenWithoutEncryptionStore(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	service := NewService(database)
+	repo, err := service.Create(ctx, repository.CreateParams{Owner: "taua-almeida", Name: "thawguard"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := service.SetStatusToken(ctx, repo.ID, "first-status-token", domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); !IsConfigurationError(err) {
+		t.Fatalf("expected configuration error, got %v", err)
+	}
+	if _, found, err := service.StatusToken(ctx, repo.ID); !IsConfigurationError(err) || found {
+		t.Fatalf("expected configuration error and no token, found=%v err=%v", found, err)
+	}
+}
+
+func TestServiceRejectsInvalidStatusTokenParams(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	service := NewServiceWithSecrets(database, newTestSecretStore(t))
+	repo, err := service.Create(ctx, repository.CreateParams{Owner: "taua-almeida", Name: "thawguard"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name         string
+		repositoryID int64
+		token        string
+	}{
+		{name: "missing repository", repositoryID: 0, token: "first-status-token"},
+		{name: "short token", repositoryID: repo.ID, token: "short"},
+		{name: "leading whitespace", repositoryID: repo.ID, token: " first-status-token"},
+		{name: "trailing whitespace", repositoryID: repo.ID, token: "first-status-token "},
+		{name: "control character", repositoryID: repo.ID, token: "first\nstatus-token"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := service.SetStatusToken(ctx, test.repositoryID, test.token, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); !IsValidationError(err) {
+				t.Fatalf("expected validation error, got %v", err)
+			}
+		})
+	}
+}
+
 func TestRedactURLUserInfoFailsClosedOnInvalidURL(t *testing.T) {
 	if got := redactURLUserInfo("https://%zz.example.test?access_token=secret"); got != "[invalid URL]" {
 		t.Fatalf("expected invalid URL placeholder, got %q", got)

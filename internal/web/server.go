@@ -46,6 +46,7 @@ type RepositoryStore interface {
 	List(ctx context.Context) ([]domain.Repository, error)
 	Create(ctx context.Context, params repository.CreateParams, actor domain.Actor) (domain.Repository, error)
 	SetWebhookSecret(ctx context.Context, repositoryID int64, secret string, actor domain.Actor) (domain.Repository, error)
+	SetStatusToken(ctx context.Context, repositoryID int64, token string, actor domain.Actor) (domain.Repository, error)
 }
 
 type SetupCheckStore interface {
@@ -102,6 +103,7 @@ type repositoryView struct {
 type repositoryOverview struct {
 	RepositoryCount             int
 	WebhookConfiguredCount      int
+	StatusTokenConfiguredCount  int
 	SetupCheckRepositoryCount   int
 	WebhookSecretStorageEnabled bool
 }
@@ -179,6 +181,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /repositories", s.handleRepositories)
 	s.mux.HandleFunc("POST /repositories", s.handleCreateRepository)
 	s.mux.HandleFunc("POST /repositories/webhook-secret", s.handleSetRepositoryWebhookSecret)
+	s.mux.HandleFunc("POST /repositories/status-token", s.handleSetRepositoryStatusToken)
 	s.mux.HandleFunc("POST /repositories/setup-check", s.handleRunRepositorySetupCheck)
 	s.mux.HandleFunc("GET /freezes", s.handleFreezes)
 	s.mux.HandleFunc("POST /freezes", s.handleCreateFreeze)
@@ -584,6 +587,51 @@ func (s *Server) handleSetRepositoryWebhookSecret(w http.ResponseWriter, r *http
 	if err != nil {
 		if repositorysetup.IsConfigurationError(err) {
 			http.Error(w, "webhook secret encryption is not configured", http.StatusServiceUnavailable)
+			return
+		}
+		if !repositorysetup.IsValidationError(err) {
+			internalServerError(w)
+			return
+		}
+		repositories, listErr := s.repositories(r.Context())
+		if listErr != nil {
+			internalServerError(w)
+			return
+		}
+		views, viewErr := s.repositoryViews(r.Context(), repositories)
+		if viewErr != nil {
+			internalServerError(w)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusBadRequest)
+		s.renderRepositories(w, views, err.Error(), session.CSRFToken)
+		return
+	}
+	http.Redirect(w, r, "/repositories", http.StatusSeeOther)
+}
+
+func (s *Server) handleSetRepositoryStatusToken(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.RepositoryStore == nil {
+		http.Error(w, "repository store is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	if !s.cfg.RepositorySecretEncryptionConfigured {
+		http.Error(w, "status token encryption is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	session, ok := s.requireRepositoryManagerForm(w, r)
+	if !ok {
+		return
+	}
+	repositoryID, err := strconv.ParseInt(strings.TrimSpace(r.PostFormValue("repository_id")), 10, 64)
+	if err != nil {
+		repositoryID = 0
+	}
+	_, err = s.cfg.RepositoryStore.SetStatusToken(r.Context(), repositoryID, r.PostFormValue("status_token"), session.auditActor())
+	if err != nil {
+		if repositorysetup.IsConfigurationError(err) {
+			http.Error(w, "status token encryption is not configured", http.StatusServiceUnavailable)
 			return
 		}
 		if !repositorysetup.IsValidationError(err) {
@@ -1092,6 +1140,9 @@ func (s *Server) renderRepositories(w http.ResponseWriter, views []repositoryVie
 		if view.Repository.HasWebhookSecret {
 			overview.WebhookConfiguredCount++
 		}
+		if view.Repository.HasStatusToken {
+			overview.StatusTokenConfiguredCount++
+		}
 		if len(view.SetupChecks) > 0 {
 			overview.SetupCheckRepositoryCount++
 		}
@@ -1452,6 +1503,10 @@ const repositoriesTemplate = pageHead + `
         <span class="tg-stat-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-check"></use></svg></span>
         <span><span class="tg-stat-label">Webhooks</span><strong class="tg-stat-value">{{ .Overview.WebhookConfiguredCount }}</strong></span>
       </article>
+      <article class="tg-stat">
+        <span class="tg-stat-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-key"></use></svg></span>
+        <span><span class="tg-stat-label">Status tokens</span><strong class="tg-stat-value">{{ .Overview.StatusTokenConfiguredCount }}</strong></span>
+      </article>
       <article class="tg-stat tg-stat-info">
         <span class="tg-stat-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-schedule"></use></svg></span>
         <span><span class="tg-stat-label">Checks</span><strong class="tg-stat-value">Local</strong></span>
@@ -1491,7 +1546,7 @@ const repositoriesTemplate = pageHead + `
     <div class="tg-section-heading tg-section-heading-compact">
       <div>
         <h2>Configured repositories</h2>
-        <p>Configure signed webhooks, record local setup checks, and confirm each repository is ready for freeze workflows.</p>
+        <p>Configure signed webhooks, store future status-posting tokens, record local setup checks, and confirm each repository is ready for freeze workflows.</p>
       </div>
     </div>
 
@@ -1504,11 +1559,15 @@ const repositoriesTemplate = pageHead + `
             <p class="tg-repo-kicker">{{ .Repository.Forge }}</p>
             <h3>{{ .Repository.FullName }}</h3>
           </div>
-          {{ if .Repository.HasWebhookSecret }}<span class="tg-badge status-ok">webhook configured</span>{{ else }}<span class="tg-badge status-warning">webhook missing</span>{{ end }}
+          <div class="tg-repo-badges">
+            {{ if .Repository.HasWebhookSecret }}<span class="tg-badge status-ok">webhook configured</span>{{ else }}<span class="tg-badge status-warning">webhook missing</span>{{ end }}
+            {{ if .Repository.HasStatusToken }}<span class="tg-badge status-ok">status token configured</span>{{ else }}<span class="tg-badge status-warning">status token missing</span>{{ end }}
+          </div>
         </div>
         <dl class="tg-repo-meta">
           <div><span class="tg-meta-icon"><svg class="tg-icon"><use href="#tg-i-git-branch"></use></svg></span><dt>Default branch</dt><dd><code>{{ .Repository.DefaultBranch }}</code></dd></div>
           <div><span class="tg-meta-icon"><svg class="tg-icon"><use href="#tg-i-check"></use></svg></span><dt>Required context</dt><dd><code>` + domain.RequiredStatusContext + `</code></dd></div>
+          <div><span class="tg-meta-icon"><svg class="tg-icon"><use href="#tg-i-key"></use></svg></span><dt>Status token</dt><dd>{{ if .Repository.HasStatusToken }}<span class="tg-badge status-ok">stored encrypted</span>{{ else }}<span class="tg-badge status-warning">not stored</span>{{ end }}</dd></div>
           <div><span class="tg-meta-icon"><svg class="tg-icon"><use href="#tg-i-schedule"></use></svg></span><dt>Setup checks</dt><dd>{{ if .SetupChecks }}<span class="tg-badge tg-badge-info">local batch recorded</span>{{ else }}<span class="tg-badge status-warning">not run</span>{{ end }}</dd></div>
         </dl>
         <div class="tg-repo-checks">
@@ -1528,8 +1587,15 @@ const repositoriesTemplate = pageHead + `
             <input type="password" name="webhook_secret" minlength="16" maxlength="512" autocomplete="new-password" placeholder="Webhook secret" aria-label="Webhook secret for {{ .Repository.FullName }}" required>
             <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-key"></use></svg>{{ if .Repository.HasWebhookSecret }}Rotate secret{{ else }}Set secret{{ end }}</button>
           </form>
+          <form method="post" action="/repositories/status-token" class="tg-secret-form">
+            <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+            <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
+            <input type="password" name="status_token" minlength="16" maxlength="1024" autocomplete="new-password" placeholder="Status token" aria-label="Status token for {{ .Repository.FullName }}" required>
+            <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-key"></use></svg>{{ if .Repository.HasStatusToken }}Rotate token{{ else }}Set token{{ end }}</button>
+          </form>
+          <p class="tg-muted">Status tokens are stored encrypted for future live commit-status posting. Dry-run remains the default.</p>
           {{ else }}
-          <p class="tg-muted">Set <code>THAWGUARD_SECRET_KEY</code> to save webhook secrets.</p>
+          <p class="tg-muted">Set <code>THAWGUARD_SECRET_KEY</code> to save webhook secrets and status tokens.</p>
           {{ end }}
           <form method="post" action="/repositories/setup-check">
             <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">

@@ -21,6 +21,7 @@ type Repository struct {
 	Name             string
 	DefaultBranch    string
 	HasWebhookSecret bool
+	HasStatusToken   bool
 	Active           bool
 	CreatedAt        time.Time
 	UpdatedAt        time.Time

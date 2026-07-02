@@ -161,6 +161,72 @@ func (s *Service) WebhookSecret(ctx context.Context, repositoryID int64) (string
 	return string(plaintext), true, nil
 }
 
+func (s *Service) SetStatusToken(ctx context.Context, repositoryID int64, token string, actor domain.Actor) (domain.Repository, error) {
+	if s == nil || s.db == nil {
+		return domain.Repository{}, errors.New("repository setup service has no database")
+	}
+	if s.secrets == nil {
+		return domain.Repository{}, ConfigurationError{Message: "status token encryption key is not configured"}
+	}
+	if err := validateStatusTokenParams(repositoryID, token); err != nil {
+		return domain.Repository{}, err
+	}
+	ciphertext, err := s.secrets.Encrypt(ctx, []byte(token))
+	if err != nil {
+		return domain.Repository{}, fmt.Errorf("encrypt status token: %w", err)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.Repository{}, fmt.Errorf("begin status token setup: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	repositoryStore := repository.NewStoreTx(tx)
+	existing, err := repositoryStore.Get(ctx, repositoryID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return domain.Repository{}, ValidationError{Message: "repository not found"}
+		}
+		return domain.Repository{}, err
+	}
+	updated, err := repositoryStore.SetStatusTokenCiphertext(ctx, repositoryID, ciphertext)
+	if err != nil {
+		return domain.Repository{}, err
+	}
+	if err := audit.NewStoreTx(tx).Record(ctx, repositoryStatusTokenConfiguredEvent(updated, actor, existing.HasStatusToken)); err != nil {
+		return domain.Repository{}, fmt.Errorf("record repository.status_token_configured audit event: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.Repository{}, fmt.Errorf("commit status token setup: %w", err)
+	}
+	committed = true
+	return updated, nil
+}
+
+func (s *Service) StatusToken(ctx context.Context, repositoryID int64) (string, bool, error) {
+	if s == nil || s.db == nil {
+		return "", false, errors.New("repository setup service has no database")
+	}
+	if s.secrets == nil {
+		return "", false, ConfigurationError{Message: "status token encryption key is not configured"}
+	}
+	ciphertext, found, err := repository.NewStore(s.db).StatusTokenCiphertext(ctx, repositoryID)
+	if err != nil || !found {
+		return "", found, err
+	}
+	plaintext, err := s.secrets.Decrypt(ctx, ciphertext)
+	if err != nil {
+		return "", false, fmt.Errorf("decrypt status token: %w", err)
+	}
+	return string(plaintext), true, nil
+}
+
 func repositoryCreatedEvent(repo domain.Repository, actor domain.Actor) audit.Event {
 	details := map[string]string{
 		"actor_kind":     actor.Kind,
@@ -210,6 +276,31 @@ func repositoryWebhookSecretConfiguredEvent(repo domain.Repository, actor domain
 	}
 }
 
+func repositoryStatusTokenConfiguredEvent(repo domain.Repository, actor domain.Actor, wasConfigured bool) audit.Event {
+	details := map[string]string{
+		"actor_kind":                  actor.Kind,
+		"actor_role":                  actor.Role,
+		"repository_id":               strconv.FormatInt(repo.ID, 10),
+		"forge":                       repo.Forge,
+		"base_url":                    redactURLUserInfo(repo.BaseURL),
+		"owner":                       repo.Owner,
+		"name":                        repo.Name,
+		"full_name":                   repo.FullName(),
+		"status_token_was_configured": strconv.FormatBool(wasConfigured),
+	}
+	detailsJSON, err := json.Marshal(details)
+	if err != nil {
+		detailsJSON = []byte(`{}`)
+	}
+	return audit.Event{
+		ActorUserID: actor.UserID,
+		Action:      audit.ActionRepositoryStatusTokenConfigured,
+		SubjectType: audit.SubjectTypeRepository,
+		SubjectID:   strconv.FormatInt(repo.ID, 10),
+		DetailsJSON: string(detailsJSON),
+	}
+}
+
 func validateWebhookSecretParams(repositoryID int64, secret string) error {
 	if repositoryID <= 0 {
 		return ValidationError{Message: "repository id is required"}
@@ -230,6 +321,31 @@ func validateWebhookSecretParams(repositoryID int64, secret string) error {
 	for _, r := range secret {
 		if r < 0x20 || r == 0x7f {
 			return ValidationError{Message: "webhook secret contains invalid characters"}
+		}
+	}
+	return nil
+}
+
+func validateStatusTokenParams(repositoryID int64, token string) error {
+	if repositoryID <= 0 {
+		return ValidationError{Message: "repository id is required"}
+	}
+	trimmed := strings.TrimSpace(token)
+	if trimmed == "" {
+		return ValidationError{Message: "status token is required"}
+	}
+	if trimmed != token {
+		return ValidationError{Message: "status token must not include leading or trailing whitespace"}
+	}
+	if len(token) < 16 {
+		return ValidationError{Message: "status token must be at least 16 characters"}
+	}
+	if len(token) > 1024 {
+		return ValidationError{Message: "status token is too long"}
+	}
+	for _, r := range token {
+		if r < 0x20 || r == 0x7f {
+			return ValidationError{Message: "status token contains invalid characters"}
 		}
 	}
 	return nil

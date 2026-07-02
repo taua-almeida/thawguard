@@ -12,6 +12,7 @@ import (
 const (
 	ActionRepositoryCreated                 = "repository.created"
 	ActionRepositoryWebhookSecretConfigured = "repository.webhook_secret_configured"
+	ActionRepositoryStatusTokenConfigured   = "repository.status_token_configured"
 	ActionBranchFreezeCreated               = "branch_freeze.created"
 	ActionBranchFreezeEnded                 = "branch_freeze.ended"
 	ActionBranchFreezeCancelled             = "branch_freeze.cancelled"
