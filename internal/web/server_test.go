@@ -54,7 +54,34 @@ func TestRepositoriesPageShowsManualSetupContext(t *testing.T) {
 	if !strings.Contains(body, "taua-almeida/thawguard") {
 		t.Fatalf("expected body to include repository full name, got %q", body)
 	}
-	for _, want := range []string{"webhook configured", "status token configured", "Rotate secret", "Rotate token", "Connect a repository", "future live commit-status posting"} {
+	for _, want := range []string{"webhook configured", "status token configured", "Rotate secret", "Rotate token", "Connect a repository", "Credential values are write-only", "data-alert-dialog"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected body to contain %q, got %q", want, body)
+		}
+	}
+}
+
+func TestRepositoriesPageKeepsConfiguredCredentialsHiddenByDefault(t *testing.T) {
+	repo := domain.Repository{ID: 7, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", HasWebhookSecret: true, HasStatusToken: true}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, RepositorySecretEncryptionConfigured: true})
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{
+		`data-confirm-title="Rotate webhook secret?"`,
+		`data-confirm-action="Reveal secret input"`,
+		`data-confirm-title="Rotate status token?"`,
+		`data-confirm-action="Reveal token input"`,
+		`id="webhook-secret-7" class="tg-secret-form tg-credential-form" hidden data-credential-form`,
+		`id="status-token-7" class="tg-secret-form tg-credential-form" hidden data-credential-form`,
+		`name="webhook_secret" minlength="16" maxlength="512" autocomplete="new-password" placeholder="New webhook secret" aria-label="New webhook secret for taua-almeida/thawguard" required disabled data-credential-input`,
+		`name="status_token" minlength="16" maxlength="1024" autocomplete="new-password" placeholder="New status token" aria-label="New status token for taua-almeida/thawguard" required disabled data-credential-input`,
+		`data-alert-dialog hidden`,
+	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}

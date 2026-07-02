@@ -1581,19 +1581,72 @@ const repositoriesTemplate = pageHead + `
         </div>
         <div class="tg-repo-actions">
           {{ if $.WebhookSecretEncryptionConfigured }}
-          <form method="post" action="/repositories/webhook-secret" class="tg-secret-form">
-            <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
-            <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
-            <input type="password" name="webhook_secret" minlength="16" maxlength="512" autocomplete="new-password" placeholder="Webhook secret" aria-label="Webhook secret for {{ .Repository.FullName }}" required>
-            <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-key"></use></svg>{{ if .Repository.HasWebhookSecret }}Rotate secret{{ else }}Set secret{{ end }}</button>
-          </form>
-          <form method="post" action="/repositories/status-token" class="tg-secret-form">
-            <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
-            <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
-            <input type="password" name="status_token" minlength="16" maxlength="1024" autocomplete="new-password" placeholder="Status token" aria-label="Status token for {{ .Repository.FullName }}" required>
-            <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-key"></use></svg>{{ if .Repository.HasStatusToken }}Rotate token{{ else }}Set token{{ end }}</button>
-          </form>
-          <p class="tg-muted">Status tokens are stored encrypted for future live commit-status posting. Dry-run remains the default.</p>
+          <div class="tg-credential-grid">
+            <section class="tg-credential-card" data-credential-block>
+              <div class="tg-credential-summary">
+                <span class="tg-credential-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-key"></use></svg></span>
+                <div>
+                  <strong>Webhook secret</strong>
+                  <span>{{ if .Repository.HasWebhookSecret }}Stored encrypted. Hidden until you intentionally rotate it.{{ else }}Required to verify signed pull_request webhooks.{{ end }}</span>
+                </div>
+                {{ if .Repository.HasWebhookSecret }}<span class="tg-badge status-ok">stored encrypted</span>{{ else }}<span class="tg-badge status-warning">missing</span>{{ end }}
+              </div>
+              {{ if .Repository.HasWebhookSecret }}
+              <button type="button" class="tg-btn tg-btn-secondary tg-btn-sm tg-repo-action-btn" data-credential-reveal data-credential-target="webhook-secret-{{ .Repository.ID }}" data-confirm-title="Rotate webhook secret?" data-confirm-message="The current encrypted webhook secret stays active until you submit a replacement. Reveal this input only when you are ready to update the matching forge webhook secret." data-confirm-action="Reveal secret input" aria-controls="webhook-secret-{{ .Repository.ID }}" aria-expanded="false"><svg class="tg-icon"><use href="#tg-i-key"></use></svg>Rotate secret</button>
+              <form method="post" action="/repositories/webhook-secret" id="webhook-secret-{{ .Repository.ID }}" class="tg-secret-form tg-credential-form" hidden data-credential-form>
+                <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+                <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
+                <input type="password" name="webhook_secret" minlength="16" maxlength="512" autocomplete="new-password" placeholder="New webhook secret" aria-label="New webhook secret for {{ .Repository.FullName }}" required disabled data-credential-input>
+                <div class="tg-credential-form-actions">
+                  <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-check"></use></svg>Save new secret</button>
+                  <button type="button" class="tg-btn tg-btn-secondary tg-btn-sm tg-repo-action-btn" data-credential-cancel>Cancel</button>
+                </div>
+              </form>
+              {{ else }}
+              <form method="post" action="/repositories/webhook-secret" class="tg-secret-form tg-credential-form is-visible">
+                <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+                <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
+                <input type="password" name="webhook_secret" minlength="16" maxlength="512" autocomplete="new-password" placeholder="Webhook secret" aria-label="Webhook secret for {{ .Repository.FullName }}" required>
+                <div class="tg-credential-form-actions">
+                  <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-key"></use></svg>Set secret</button>
+                </div>
+              </form>
+              {{ end }}
+            </section>
+
+            <section class="tg-credential-card" data-credential-block>
+              <div class="tg-credential-summary">
+                <span class="tg-credential-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-key"></use></svg></span>
+                <div>
+                  <strong>Status token</strong>
+                  <span>{{ if .Repository.HasStatusToken }}Stored encrypted for guarded live status posting. Hidden until rotation.{{ else }}Needed only for explicit guarded live commit-status posting.{{ end }}</span>
+                </div>
+                {{ if .Repository.HasStatusToken }}<span class="tg-badge status-ok">stored encrypted</span>{{ else }}<span class="tg-badge status-warning">missing</span>{{ end }}
+              </div>
+              {{ if .Repository.HasStatusToken }}
+              <button type="button" class="tg-btn tg-btn-secondary tg-btn-sm tg-repo-action-btn" data-credential-reveal data-credential-target="status-token-{{ .Repository.ID }}" data-confirm-title="Rotate status token?" data-confirm-message="The current encrypted status token stays active until you submit a replacement. Reveal this input only when you are ready to update live posting credentials for this repository." data-confirm-action="Reveal token input" aria-controls="status-token-{{ .Repository.ID }}" aria-expanded="false"><svg class="tg-icon"><use href="#tg-i-key"></use></svg>Rotate token</button>
+              <form method="post" action="/repositories/status-token" id="status-token-{{ .Repository.ID }}" class="tg-secret-form tg-credential-form" hidden data-credential-form>
+                <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+                <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
+                <input type="password" name="status_token" minlength="16" maxlength="1024" autocomplete="new-password" placeholder="New status token" aria-label="New status token for {{ .Repository.FullName }}" required disabled data-credential-input>
+                <div class="tg-credential-form-actions">
+                  <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-check"></use></svg>Save new token</button>
+                  <button type="button" class="tg-btn tg-btn-secondary tg-btn-sm tg-repo-action-btn" data-credential-cancel>Cancel</button>
+                </div>
+              </form>
+              {{ else }}
+              <form method="post" action="/repositories/status-token" class="tg-secret-form tg-credential-form is-visible">
+                <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+                <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
+                <input type="password" name="status_token" minlength="16" maxlength="1024" autocomplete="new-password" placeholder="Status token" aria-label="Status token for {{ .Repository.FullName }}" required>
+                <div class="tg-credential-form-actions">
+                  <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-key"></use></svg>Set token</button>
+                </div>
+              </form>
+              {{ end }}
+            </section>
+          </div>
+          <p class="tg-muted">Credential values are write-only and stored encrypted. Dry-run remains the default; live status posting still requires explicit guardrails.</p>
           {{ else }}
           <p class="tg-muted">Set <code>THAWGUARD_SECRET_KEY</code> to save webhook secrets and status tokens.</p>
           {{ end }}
@@ -1621,7 +1674,83 @@ const repositoriesTemplate = pageHead + `
         <article><span>3</span><div><strong>Local setup checks</strong><p>Current checks are local placeholders for setup visibility, not live Forgejo/Codeberg verification.</p></div></article>
       </div>
     </section>
-  </main>` + pageFoot
+    <div class="tg-alert-dialog" data-alert-dialog hidden role="dialog" aria-modal="true" aria-labelledby="credential-confirm-title" aria-describedby="credential-confirm-message">
+      <button type="button" class="tg-alert-backdrop" data-alert-cancel aria-label="Close confirmation"></button>
+      <div class="tg-alert-card">
+        <h2 id="credential-confirm-title" data-alert-title>Confirm credential rotation</h2>
+        <p id="credential-confirm-message" data-alert-message>Reveal credential input?</p>
+        <div class="tg-alert-actions">
+          <button type="button" class="tg-btn tg-btn-secondary" data-alert-cancel>Keep hidden</button>
+          <button type="button" class="tg-btn tg-btn-primary" data-alert-confirm>Reveal input</button>
+        </div>
+      </div>
+    </div>
+  </main>
+  <script>
+    (() => {
+      const dialog = document.querySelector('[data-alert-dialog]');
+      if (!dialog) return;
+      const title = dialog.querySelector('[data-alert-title]');
+      const message = dialog.querySelector('[data-alert-message]');
+      const confirm = dialog.querySelector('[data-alert-confirm]');
+      let pendingTrigger = null;
+
+      const closeDialog = () => {
+        dialog.hidden = true;
+        pendingTrigger = null;
+      };
+
+      document.querySelectorAll('[data-alert-cancel]').forEach((button) => {
+        button.addEventListener('click', closeDialog);
+      });
+
+      document.querySelectorAll('[data-credential-reveal]').forEach((button) => {
+        button.addEventListener('click', () => {
+          pendingTrigger = button;
+          title.textContent = button.getAttribute('data-confirm-title') || 'Confirm credential rotation';
+          message.textContent = button.getAttribute('data-confirm-message') || 'Reveal credential input?';
+          confirm.textContent = button.getAttribute('data-confirm-action') || 'Reveal input';
+          dialog.hidden = false;
+          confirm.focus();
+        });
+      });
+
+      confirm.addEventListener('click', () => {
+        if (!pendingTrigger) return closeDialog();
+        const target = document.getElementById(pendingTrigger.getAttribute('data-credential-target'));
+        if (target) {
+          target.hidden = false;
+          target.querySelectorAll('[data-credential-input]').forEach((input) => { input.disabled = false; });
+          target.querySelector('[data-credential-input]')?.focus();
+        }
+        pendingTrigger.hidden = true;
+        pendingTrigger.setAttribute('aria-expanded', 'true');
+        closeDialog();
+      });
+
+      document.querySelectorAll('[data-credential-cancel]').forEach((button) => {
+        button.addEventListener('click', () => {
+          const form = button.closest('[data-credential-form]');
+          const block = button.closest('[data-credential-block]');
+          const trigger = block?.querySelector('[data-credential-reveal]');
+          if (form) {
+            form.reset();
+            form.hidden = true;
+            form.querySelectorAll('[data-credential-input]').forEach((input) => { input.disabled = true; });
+          }
+          if (trigger) {
+            trigger.hidden = false;
+            trigger.setAttribute('aria-expanded', 'false');
+            trigger.focus();
+          }
+        });
+      });
+
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && !dialog.hidden) closeDialog();
+      });
+    })();
+  </script>` + pageFoot
 
 const freezesTemplate = pageHead + `
   <main class="tg-main tg-setup-page tg-freezes-page">
