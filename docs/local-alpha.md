@@ -6,7 +6,7 @@ Alpha scope:
 
 - Thawguard receives signed pull-request webhooks.
 - Thawguard records local delivery metadata, PR cache rows, status decisions, publication intents, and dry-run publication attempts.
-- Thawguard does **not** post live commit statuses to Codeberg/Forgejo yet.
+- This default shadow-mode runbook does **not** post live commit statuses to Codeberg/Forgejo.
 - Thawguard is cooperative enforcement for trusted teams and is not a hard security boundary.
 
 ## 1. Generate a local secret key
@@ -19,6 +19,7 @@ cat > .env <<EOF
 THAWGUARD_SECRET_KEY=$THAWGUARD_SECRET_KEY
 THAWGUARD_PUBLIC_URL=http://127.0.0.1:8080
 THAWGUARD_STATUS_PUBLISHER=dry_run
+THAWGUARD_LIVE_STATUS_POSTING=
 EOF
 ```
 
@@ -32,7 +33,7 @@ docker compose up --build
 
 Open <http://127.0.0.1:8080>.
 
-Thawguard runtime configuration is environment-variable based. The Docker Compose file sets `THAWGUARD_DB_PATH=/data/thawguard.db` and `THAWGUARD_STATUS_PUBLISHER=dry_run`; the binary does not parse `--db` or `--addr` CLI flags.
+Thawguard runtime configuration is environment-variable based. The Docker Compose file sets `THAWGUARD_DB_PATH=/data/thawguard.db`, defaults `THAWGUARD_STATUS_PUBLISHER=dry_run`, and leaves `THAWGUARD_LIVE_STATUS_POSTING` empty; the binary does not parse `--db` or `--addr` CLI flags.
 
 The compose file is Linux-oriented. It uses host networking so Thawguard can keep its bootstrap-only bind on `127.0.0.1:8080`. Host networking has lower network isolation than the default Docker bridge, so treat this as a local-alpha convenience only. Do not change the container to bind `0.0.0.0` while bootstrap sessions are still the only local auth.
 
@@ -113,6 +114,19 @@ Expected alpha behavior:
 - Publication attempts should show `dry_run` / `planned`.
 - Codeberg will not show a Thawguard commit status yet.
 
+## Live-pilot guardrails
+
+This runbook defaults to shadow mode. Live commit-status posting is only for throwaway or explicitly approved repositories.
+
+To make Thawguard start with live posting, all of these must be true:
+
+- `THAWGUARD_STATUS_PUBLISHER=forgejo_status`
+- `THAWGUARD_LIVE_STATUS_POSTING=enabled`
+- `THAWGUARD_SECRET_KEY` is set to the same stable key used when status tokens were saved
+- each repository that should post statuses has an encrypted status token configured in `/repositories`
+
+If a repository is missing its status token, Thawguard records a failed `forgejo_status` attempt and does not post a status for that result. Dry-run remains the recommended mode for this local alpha runbook.
+
 ## Troubleshooting
 
 - No row on `/webhooks`: check the public webhook URL, event type, and whether the tunnel is forwarding `POST /webhooks/forgejo`.
@@ -122,8 +136,8 @@ Expected alpha behavior:
 
 ## What Alpha A does not do
 
-- It does not post commit statuses.
-- It does not enable `THAWGUARD_STATUS_PUBLISHER=forgejo_status`; runtime live posting is not wired yet.
+- It does not post commit statuses in the default dry-run configuration.
+- It does not enable `THAWGUARD_STATUS_PUBLISHER=forgejo_status` unless the explicit live-pilot opt-in is set.
 - It does not configure Codeberg branch protection.
 - It does not require Codeberg API tokens for shadow mode. Stored status tokens are encrypted setup data for future live posting.
 - It does not provide production-ready local user authentication.

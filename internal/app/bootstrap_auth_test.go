@@ -3,6 +3,7 @@ package app
 import (
 	"testing"
 
+	"github.com/taua-almeida/thawguard/internal/config"
 	"github.com/taua-almeida/thawguard/internal/statuspublication"
 )
 
@@ -41,5 +42,35 @@ func TestStatusPublisherMode(t *testing.T) {
 	}
 	if _, err := statusPublisherMode("live"); err == nil {
 		t.Fatal("expected invalid publisher mode error")
+	}
+}
+
+func TestValidateStatusPublisherConfigRequiresLiveOptIn(t *testing.T) {
+	mode := statuspublication.DeliveryModeForgejoStatus
+	if err := validateStatusPublisherConfig(config.Config{StatusPublisherMode: mode}, mode, true); err == nil {
+		t.Fatal("expected forgejo status mode to require explicit live opt-in")
+	}
+	if err := validateStatusPublisherConfig(config.Config{StatusPublisherMode: mode, LiveStatusPosting: "disabled"}, mode, true); err == nil {
+		t.Fatal("expected invalid live opt-in value to be rejected")
+	}
+}
+
+func TestValidateStatusPublisherConfigRequiresSecretKeyForLiveMode(t *testing.T) {
+	mode := statuspublication.DeliveryModeForgejoStatus
+	if err := validateStatusPublisherConfig(config.Config{StatusPublisherMode: mode, LiveStatusPosting: "enabled"}, mode, false); err == nil {
+		t.Fatal("expected forgejo status mode to require secret key")
+	}
+}
+
+func TestValidateStatusPublisherConfigAcceptsExplicitLiveMode(t *testing.T) {
+	mode := statuspublication.DeliveryModeForgejoStatus
+	if err := validateStatusPublisherConfig(config.Config{StatusPublisherMode: mode, LiveStatusPosting: " ENABLED "}, mode, true); err != nil {
+		t.Fatalf("expected explicit live mode to pass guardrails: %v", err)
+	}
+}
+
+func TestValidateStatusPublisherConfigAllowsDryRun(t *testing.T) {
+	if err := validateStatusPublisherConfig(config.Config{}, statuspublication.AttemptModeDryRun, false); err != nil {
+		t.Fatalf("expected dry-run mode without live guardrails to pass: %v", err)
 	}
 }

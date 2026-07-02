@@ -11,6 +11,8 @@ import (
 	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/config"
 	"github.com/taua-almeida/thawguard/internal/db"
+	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/forge/forgejo"
 	"github.com/taua-almeida/thawguard/internal/freeze"
 	"github.com/taua-almeida/thawguard/internal/pullrequest"
 	"github.com/taua-almeida/thawguard/internal/repository"
@@ -62,7 +64,8 @@ func (a *App) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	repositoryStore := repositorysetup.NewServiceWithSecrets(database, secretStore)
+	repositorySetup := repositorysetup.NewServiceWithSecrets(database, secretStore)
+	repositoryStore := repository.NewStore(database)
 	setupCheckStore := setupcheck.NewStore(database)
 	setupCheckRunner := localSetupHealthRunner{recorder: setupCheckStore}
 	freezeStore := freeze.NewService(database)
@@ -73,18 +76,21 @@ func (a *App) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if publisherMode == statuspublication.DeliveryModeForgejoStatus {
-		return fmt.Errorf("THAWGUARD_STATUS_PUBLISHER=%s requires live forge token storage and is not wired yet; use dry_run", publisherMode)
+	if err := validateStatusPublisherConfig(a.cfg, publisherMode, secretStore != nil); err != nil {
+		return err
 	}
-	dryRunStatusPublisher := statuspublisher.NewDryRunPublisher(statusPublicationStore, statusPublicationStore)
+	statusPublisher, err := statusPublisherFromConfig(publisherMode, statusPublicationStore, repositoryStore, repositorySetup)
+	if err != nil {
+		return err
+	}
 	pullRequestStore := pullrequest.NewStore(database)
 	webhookDeliveryStore := webhook.NewDeliveryStore(database)
-	pullRequestWebhookProcessor := webhook.NewPullRequestProcessor(repository.NewStore(database), pullRequestStore, statusDecisionStore, dryRunStatusPublisher)
+	pullRequestWebhookProcessor := webhook.NewPullRequestProcessor(repositoryStore, pullRequestStore, statusDecisionStore, statusPublisher)
 	server := &http.Server{
 		Addr: a.cfg.HTTPAddr,
 		Handler: web.NewServer(web.Config{
 			AppName:                              "Thawguard",
-			RepositoryStore:                      repositoryStore,
+			RepositoryStore:                      repositorySetup,
 			RepositorySecretEncryptionConfigured: secretStore != nil,
 			SetupCheckStore:                      setupCheckStore,
 			SetupCheckRunner:                     setupCheckRunner,
@@ -92,7 +98,7 @@ func (a *App) Run(ctx context.Context) error {
 			AuditStore:                           auditStore,
 			StatusDecisionStore:                  statusDecisionStore,
 			StatusPublicationStore:               statusPublicationStore,
-			WebhookRepositoryStore:               repositoryStore,
+			WebhookRepositoryStore:               repositorySetup,
 			WebhookDeliveryStore:                 webhookDeliveryStore,
 			PullRequestWebhookProcessor:          pullRequestWebhookProcessor,
 		}).Routes(),
@@ -126,6 +132,45 @@ func statusPublisherMode(raw string) (string, error) {
 		return mode, nil
 	default:
 		return "", fmt.Errorf("THAWGUARD_STATUS_PUBLISHER must be %q or %q", statuspublication.AttemptModeDryRun, statuspublication.DeliveryModeForgejoStatus)
+	}
+}
+
+func validateStatusPublisherConfig(cfg config.Config, mode string, secretStoreConfigured bool) error {
+	if mode != statuspublication.DeliveryModeForgejoStatus {
+		return nil
+	}
+	if !liveStatusPostingEnabled(cfg.LiveStatusPosting) {
+		return fmt.Errorf("THAWGUARD_STATUS_PUBLISHER=%s requires THAWGUARD_LIVE_STATUS_POSTING=enabled; use dry_run for shadow mode", mode)
+	}
+	if !secretStoreConfigured {
+		return fmt.Errorf("THAWGUARD_STATUS_PUBLISHER=%s requires THAWGUARD_SECRET_KEY so repository status tokens can be decrypted", mode)
+	}
+	return nil
+}
+
+func liveStatusPostingEnabled(raw string) bool {
+	return strings.EqualFold(strings.TrimSpace(raw), "enabled")
+}
+
+func statusPublisherFromConfig(mode string, publications *statuspublication.Store, repositories *repository.Store, repositorySetup *repositorysetup.Service) (webhook.StatusPublisher, error) {
+	switch mode {
+	case statuspublication.AttemptModeDryRun:
+		return statuspublisher.NewDryRunPublisher(publications, publications), nil
+	case statuspublication.DeliveryModeForgejoStatus:
+		return statuspublisher.NewForgejoStatusPublisher(publications, publications, repositories, repositorySetup, forgejoStatusClientForRepository), nil
+	default:
+		return nil, fmt.Errorf("unsupported status publisher mode %q", mode)
+	}
+}
+
+func forgejoStatusClientForRepository(repo domain.Repository, token string) (statuspublisher.ForgeStatusClient, error) {
+	switch strings.ToLower(strings.TrimSpace(repo.Forge)) {
+	case "forgejo", "codeberg", "":
+		client := forgejo.New(repo.BaseURL, token)
+		client.HTTPClient = &http.Client{Timeout: 10 * time.Second}
+		return client, nil
+	default:
+		return nil, fmt.Errorf("repository forge %q is not supported for live status posting", repo.Forge)
 	}
 }
 
