@@ -1076,13 +1076,49 @@ func TestWebhooksPageShowsRecentDeliveries(t *testing.T) {
 		t.Fatal("expected session cookie value")
 	}
 	body := recorder.Body.String()
-	for _, want := range []string{"Webhook deliveries", "sanitized local delivery metadata", "taua-almeida/thawguard", "delivery-processed", "pull_request", "opened", "verified", "processed", "delivery-retry", "synchronized", "retryable failure", "webhook processing failed", "delivery-processing", "processing", "2026-06-30 12:00 UTC"} {
+	for _, want := range []string{"Audit Log", "Recent webhook deliveries", "Sanitized local metadata only", "tg-table-toolbar", "tg-responsive-table", "tg-mobile-card-list", "Rows per page", "Filter audit log", "aria-sort=\"descending\"", "Showing 3 of 3 matching rows", "3 total rows loaded", "sanitized webhook delivery metadata", "taua-almeida/thawguard", "delivery-processed", "pull_request", "opened", "verified", "processed", "delivery-retry", "synchronized", "retryable failure", "webhook processing failed", "delivery-processing", "processing", "2026-06-30 12:00 UTC"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
 	}
+	for _, unwanted := range []string{"Latest 25", "Local records", ">Details</a>", "Clear controls", "Processed <span class=\"tg-sort-indicator\"", ">Sort by\n", ">Direction\n"} {
+		if strings.Contains(body, unwanted) {
+			t.Fatalf("expected body not to contain %q, got %q", unwanted, body)
+		}
+	}
 	if strings.Contains(body, "raw webhook payload:") || strings.Contains(body, "X-Hub-Signature") {
 		t.Fatalf("expected page not to render raw webhook details, got %q", body)
+	}
+}
+
+func TestWebhooksPageFiltersSortsAndLimitsDeliveries(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	receivedAt := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	processedAt := receivedAt.Add(time.Minute)
+	deliveries := []webhook.Delivery{
+		{ID: 1, RepositoryID: repo.ID, DeliveryID: "delivery-processed", Event: "pull_request", Action: "opened", ReceivedAt: receivedAt, Verified: true, ProcessedAt: &processedAt},
+		{ID: 2, RepositoryID: repo.ID, DeliveryID: "delivery-retry", Event: "pull_request", Action: "synchronized", ReceivedAt: receivedAt.Add(2 * time.Minute), Verified: true, Error: "webhook processing failed"},
+	}
+	server := NewServer(Config{
+		AppName:              "Thawguard",
+		RepositoryStore:      &fakeRepositoryStore{repositories: []domain.Repository{repo}},
+		WebhookDeliveryStore: &fakeWebhookDeliveryStore{listed: deliveries},
+	})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/webhooks?processing=retryable_failure&sort=processed&direction=asc&limit=50", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{"Filters active", "selected>50", "aria-sort=\"ascending\"", "Showing 1 of 1 matching rows", "2 total rows loaded", "delivery-retry", "retryable failure", "webhook processing failed"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected body to contain %q, got %q", want, body)
+		}
+	}
+	if strings.Contains(body, "delivery-processed") {
+		t.Fatalf("expected processed delivery to be filtered out, got %q", body)
 	}
 }
 
