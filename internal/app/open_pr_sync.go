@@ -26,6 +26,7 @@ type openPullRequestStatusTokenGetter interface {
 
 type openPullRequestUpserter interface {
 	Upsert(ctx context.Context, pr domain.PullRequest) (domain.PullRequest, error)
+	MarkAbsentOpenByTargetBranchClosed(ctx context.Context, repositoryID int64, targetBranch string, openIndexes []int) (int64, error)
 }
 
 type openPullRequestForgeClient interface {
@@ -80,6 +81,7 @@ func (s *forgeOpenPullRequestSyncer) SyncOpenPullRequests(ctx context.Context, r
 	if err != nil {
 		return safeOpenPullRequestSyncError(fmt.Errorf("list open pull requests from forge: %w", err), token)
 	}
+	openIndexes := make([]int, 0, len(prs))
 	for _, pr := range prs {
 		pr.RepositoryID = repositoryID
 		if pr.TargetBranch == "" {
@@ -88,6 +90,10 @@ func (s *forgeOpenPullRequestSyncer) SyncOpenPullRequests(ctx context.Context, r
 		if _, err := s.pullRequests.Upsert(ctx, pr); err != nil {
 			return safeOpenPullRequestSyncError(fmt.Errorf("cache open pull request %d from forge: %w", pr.Index, err), token)
 		}
+		openIndexes = append(openIndexes, pr.Index)
+	}
+	if _, err := s.pullRequests.MarkAbsentOpenByTargetBranchClosed(ctx, repositoryID, targetBranch, openIndexes); err != nil {
+		return safeOpenPullRequestSyncError(fmt.Errorf("close cached pull requests absent from forge open list: %w", err), token)
 	}
 	return nil
 }

@@ -145,6 +145,41 @@ ORDER BY pull_request_index`, repositoryID, targetBranch)
 	return prs, nil
 }
 
+func (s *Store) MarkAbsentOpenByTargetBranchClosed(ctx context.Context, repositoryID int64, targetBranch string, openIndexes []int) (int64, error) {
+	if s == nil || s.db == nil {
+		return 0, errors.New("pull request store has no database")
+	}
+	targetBranch = strings.TrimSpace(targetBranch)
+	if repositoryID <= 0 || targetBranch == "" {
+		return 0, ValidationError{Message: "missing required pull request branch reconciliation fields"}
+	}
+	args := []any{s.now().UTC().Format(time.RFC3339Nano), repositoryID, targetBranch}
+	query := `
+UPDATE pull_request_cache
+SET state = 'closed', updated_from_forge_at = ?
+WHERE repository_id = ? AND target_branch = ? AND state = 'open'`
+	if len(openIndexes) > 0 {
+		placeholders := make([]string, 0, len(openIndexes))
+		for _, index := range openIndexes {
+			if index <= 0 || index > 1_000_000 {
+				return 0, ValidationError{Message: "pull request number is invalid"}
+			}
+			placeholders = append(placeholders, "?")
+			args = append(args, index)
+		}
+		query += " AND pull_request_index NOT IN (" + strings.Join(placeholders, ",") + ")"
+	}
+	result, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("mark absent open pull requests closed: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("mark absent open pull requests closed rows affected: %w", err)
+	}
+	return rows, nil
+}
+
 func normalizePullRequest(pr domain.PullRequest) domain.PullRequest {
 	pr.State = strings.ToLower(strings.TrimSpace(pr.State))
 	pr.TargetBranch = strings.TrimSpace(pr.TargetBranch)

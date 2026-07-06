@@ -34,6 +34,9 @@ func TestForgeOpenPullRequestSyncerCachesOpenPullRequests(t *testing.T) {
 	if len(upserter.prs) != 2 {
 		t.Fatalf("expected two cached PRs, got %+v", upserter.prs)
 	}
+	if len(upserter.closedAbsent) != 1 || upserter.closedAbsent[0].repositoryID != 7 || upserter.closedAbsent[0].targetBranch != "main" || len(upserter.closedAbsent[0].openIndexes) != 2 || upserter.closedAbsent[0].openIndexes[0] != 11 || upserter.closedAbsent[0].openIndexes[1] != 12 {
+		t.Fatalf("expected branch cache to reconcile to current forge open PR list, got %+v", upserter.closedAbsent)
+	}
 	for _, pr := range upserter.prs {
 		if pr.RepositoryID != 7 || pr.TargetBranch != "main" {
 			t.Fatalf("expected synced repository and branch on cached PR, got %+v", pr)
@@ -120,8 +123,15 @@ func (g *fakeOpenPRStatusTokenGetter) StatusToken(ctx context.Context, repositor
 }
 
 type fakeOpenPRUpserter struct {
-	prs []domain.PullRequest
-	err error
+	prs          []domain.PullRequest
+	closedAbsent []fakeClosedAbsentOpenPRs
+	err          error
+}
+
+type fakeClosedAbsentOpenPRs struct {
+	repositoryID int64
+	targetBranch string
+	openIndexes  []int
 }
 
 func (u *fakeOpenPRUpserter) Upsert(ctx context.Context, pr domain.PullRequest) (domain.PullRequest, error) {
@@ -130,6 +140,14 @@ func (u *fakeOpenPRUpserter) Upsert(ctx context.Context, pr domain.PullRequest) 
 	}
 	u.prs = append(u.prs, pr)
 	return pr, nil
+}
+
+func (u *fakeOpenPRUpserter) MarkAbsentOpenByTargetBranchClosed(ctx context.Context, repositoryID int64, targetBranch string, openIndexes []int) (int64, error) {
+	if u.err != nil {
+		return 0, u.err
+	}
+	u.closedAbsent = append(u.closedAbsent, fakeClosedAbsentOpenPRs{repositoryID: repositoryID, targetBranch: targetBranch, openIndexes: append([]int(nil), openIndexes...)})
+	return 0, nil
 }
 
 type fakeOpenPRForgeClient struct {

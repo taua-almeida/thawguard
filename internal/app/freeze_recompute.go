@@ -61,15 +61,8 @@ func (s *freezeRecomputingStore) CreateActive(ctx context.Context, params freeze
 	if err != nil {
 		return domain.BranchFreeze{}, err
 	}
-	var syncErr error
-	if s.syncer != nil {
-		syncErr = s.syncer.SyncOpenPullRequests(ctx, created.RepositoryID, created.Branch)
-	}
-	if err := s.recomputeBranch(ctx, created.RepositoryID, created.Branch); err != nil {
-		return created, errors.Join(syncErr, err)
-	}
-	if syncErr != nil {
-		return created, syncErr
+	if err := s.syncAndRecomputeBranch(ctx, created.RepositoryID, created.Branch); err != nil {
+		return created, err
 	}
 	return created, nil
 }
@@ -82,7 +75,7 @@ func (s *freezeRecomputingStore) End(ctx context.Context, id int64, actor domain
 	if err != nil {
 		return domain.BranchFreeze{}, err
 	}
-	if err := s.recomputeBranch(ctx, ended.RepositoryID, ended.Branch); err != nil {
+	if err := s.syncAndRecomputeBranch(ctx, ended.RepositoryID, ended.Branch); err != nil {
 		return ended, err
 	}
 	return ended, nil
@@ -96,10 +89,21 @@ func (s *freezeRecomputingStore) Cancel(ctx context.Context, id int64, actor dom
 	if err != nil {
 		return domain.BranchFreeze{}, err
 	}
-	if err := s.recomputeBranch(ctx, cancelled.RepositoryID, cancelled.Branch); err != nil {
+	if err := s.syncAndRecomputeBranch(ctx, cancelled.RepositoryID, cancelled.Branch); err != nil {
 		return cancelled, err
 	}
 	return cancelled, nil
+}
+
+func (s *freezeRecomputingStore) syncAndRecomputeBranch(ctx context.Context, repositoryID int64, branch string) error {
+	var syncErr error
+	if s.syncer != nil {
+		syncErr = s.syncer.SyncOpenPullRequests(ctx, repositoryID, branch)
+	}
+	if err := s.recomputeBranch(ctx, repositoryID, branch); err != nil {
+		return errors.Join(syncErr, err)
+	}
+	return syncErr
 }
 
 func (s *freezeRecomputingStore) recomputeBranch(ctx context.Context, repositoryID int64, branch string) error {

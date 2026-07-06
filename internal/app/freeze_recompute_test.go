@@ -89,8 +89,7 @@ func TestFreezeRecomputingStorePublishesCachedPRHeadsOnEndAndCancel(t *testing.T
 			pulls := &fakeOpenPullRequestBranchLister{prs: []domain.PullRequest{{RepositoryID: 7, Index: 4, State: "open", TargetBranch: "main", HeadSHA: "ccc333"}}}
 			statuses := &fakeSharedHeadStatusRunner{}
 			publisher := &fakeStatusPublisher{}
-			syncer := &fakeOpenPullRequestSyncer{}
-			store := newFreezeRecomputingStore(freezes, pulls, statuses, publisher, syncer)
+			store := newFreezeRecomputingStore(freezes, pulls, statuses, publisher)
 
 			closed, err := test.close(ctx, store)
 			if err != nil {
@@ -102,8 +101,49 @@ func TestFreezeRecomputingStorePublishesCachedPRHeadsOnEndAndCancel(t *testing.T
 			if len(statuses.calls) != 1 || len(publisher.results) != 1 || publisher.results[0].HeadSHA != "ccc333" {
 				t.Fatalf("expected one recompute/publish for close, calls=%+v results=%+v", statuses.calls, publisher.results)
 			}
-			if len(syncer.calls) != 0 {
-				t.Fatalf("expected no open PR sync on %s, got %+v", test.name, syncer.calls)
+		})
+	}
+}
+
+func TestFreezeRecomputingStoreSyncsOpenPRsBeforeEndAndCancelRecompute(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		close  func(context.Context, *freezeRecomputingStore) (domain.BranchFreeze, error)
+		status domain.BranchFreezeStatus
+	}{
+		{name: "end", status: domain.BranchFreezeStatusEnded, close: func(ctx context.Context, store *freezeRecomputingStore) (domain.BranchFreeze, error) {
+			return store.End(ctx, 9, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+		}},
+		{name: "cancel", status: domain.BranchFreezeStatusCancelled, close: func(ctx context.Context, store *freezeRecomputingStore) (domain.BranchFreeze, error) {
+			return store.Cancel(ctx, 9, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			freezes := &fakeFreezeOperations{closed: domain.BranchFreeze{ID: 9, RepositoryID: 7, Branch: "main", Status: test.status}}
+			pulls := &fakeOpenPullRequestBranchLister{}
+			syncer := &fakeOpenPullRequestSyncer{afterSync: func() {
+				pulls.prs = []domain.PullRequest{{RepositoryID: 7, Index: 10, State: "open", TargetBranch: "main", HeadSHA: "eee555"}}
+			}}
+			statuses := &fakeSharedHeadStatusRunner{}
+			publisher := &fakeStatusPublisher{}
+			store := newFreezeRecomputingStore(freezes, pulls, statuses, publisher, syncer)
+
+			closed, err := test.close(ctx, store)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if closed.Status != test.status {
+				t.Fatalf("unexpected close status %+v", closed)
+			}
+			if len(syncer.calls) != 1 || syncer.calls[0].repositoryID != 7 || syncer.calls[0].targetBranch != "main" {
+				t.Fatalf("expected %s sync call, got %+v", test.name, syncer.calls)
+			}
+			if len(statuses.calls) != 1 || statuses.calls[0].prs[0].Index != 10 {
+				t.Fatalf("expected close recompute to use synced PR cache, got %+v", statuses.calls)
+			}
+			if len(publisher.results) != 1 || publisher.results[0].HeadSHA != "eee555" {
+				t.Fatalf("expected one synced PR publication, got %+v", publisher.results)
 			}
 		})
 	}
