@@ -22,6 +22,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/statuspublication"
 	"github.com/taua-almeida/thawguard/internal/statuspublisher"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
+	"github.com/taua-almeida/thawguard/internal/thawexception"
 	"github.com/taua-almeida/thawguard/internal/web"
 	"github.com/taua-almeida/thawguard/internal/webhook"
 )
@@ -71,7 +72,8 @@ func (a *App) Run(ctx context.Context) error {
 	freezeStore := freeze.NewService(database)
 	pullRequestStore := pullrequest.NewStore(database)
 	auditStore := audit.NewStore(database)
-	statusDecisionStore := statusresult.NewService(statusresult.NewStore(database), freezeStore)
+	thawExceptionStore := thawexception.NewStore(database)
+	statusDecisionStore := statusresult.NewServiceWithThawExceptions(statusresult.NewStore(database), freezeStore, thawExceptionStore, pullRequestStore)
 	statusPublicationStore := statuspublication.NewStore(database)
 	publisherMode, err := statusPublisherMode(a.cfg.StatusPublisherMode)
 	if err != nil {
@@ -89,6 +91,7 @@ func (a *App) Run(ctx context.Context) error {
 		return err
 	}
 	freezeStoreForWeb := newFreezeRecomputingStore(freezeStore, pullRequestStore, statusDecisionStore, statusPublisher, openPullRequestSyncer)
+	thawApprovalStore := newThawApprovalService(repositoryStore, repositorySetup, pullRequestStore, thawExceptionStore, statusDecisionStore, statusPublisher, openPullRequestSyncer, liveStatusRepositories(a.cfg.LiveStatusRepos), forgejoThawApprovalClientForRepository)
 	webhookDeliveryStore := webhook.NewDeliveryStore(database)
 	pullRequestWebhookProcessor := webhook.NewPullRequestProcessor(repositoryStore, pullRequestStore, statusDecisionStore, statusPublisher)
 	server := &http.Server{
@@ -101,7 +104,7 @@ func (a *App) Run(ctx context.Context) error {
 			SetupCheckRunner:                     setupCheckRunner,
 			FreezeStore:                          freezeStoreForWeb,
 			AuditStore:                           auditStore,
-			StatusDecisionStore:                  statusDecisionStore,
+			StatusDecisionStore:                  thawApprovalStore,
 			StatusPublicationStore:               statusPublicationStore,
 			WebhookRepositoryStore:               repositorySetup,
 			WebhookDeliveryStore:                 webhookDeliveryStore,
@@ -226,6 +229,17 @@ func forgejoPullRequestClientForRepository(repo domain.Repository, token string)
 		return client, nil
 	default:
 		return nil, fmt.Errorf("repository forge %q is not supported for open pull request sync", repo.Forge)
+	}
+}
+
+func forgejoThawApprovalClientForRepository(repo domain.Repository, token string) (thawApprovalForgeClient, error) {
+	switch strings.ToLower(strings.TrimSpace(repo.Forge)) {
+	case "forgejo", "codeberg", "":
+		client := forgejo.New(repo.BaseURL, token)
+		client.HTTPClient = &http.Client{Timeout: 10 * time.Second}
+		return client, nil
+	default:
+		return nil, fmt.Errorf("repository forge %q is not supported for thaw approvals", repo.Forge)
 	}
 }
 

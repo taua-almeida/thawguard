@@ -74,7 +74,7 @@ type AuditStore interface {
 
 type StatusDecisionStore interface {
 	ListRecent(ctx context.Context, limit int) ([]statusresult.Result, error)
-	RunLocal(ctx context.Context, params statusresult.LocalDecisionParams) (statusresult.Result, error)
+	ApproveThaw(ctx context.Context, params statusresult.ThawApprovalParams, actor domain.Actor) (statusresult.Result, error)
 }
 
 type StatusPublicationStore interface {
@@ -310,12 +310,13 @@ func (s *Server) handleCreateDecision(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		pullRequestIndex = 0
 	}
-	_, err = s.cfg.StatusDecisionStore.RunLocal(r.Context(), statusresult.LocalDecisionParams{
+	_, err = s.cfg.StatusDecisionStore.ApproveThaw(r.Context(), statusresult.ThawApprovalParams{
 		RepositoryID:     repositoryID,
 		PullRequestIndex: pullRequestIndex,
 		TargetBranch:     r.PostFormValue("target_branch"),
 		HeadSHA:          r.PostFormValue("head_sha"),
-	})
+		Reason:           r.PostFormValue("reason"),
+	}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
 	if err != nil {
 		if !statusresult.IsValidationError(err) {
 			internalServerError(w)
@@ -2341,14 +2342,14 @@ const decisionsTemplate = pageHead + `
 
     {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
 
-    <section class="tg-thaw-workbench" aria-label="Request a thaw exception and preview eligibility">
+    <section class="tg-thaw-workbench" aria-label="Approve a thaw exception">
       <section class="tg-panel tg-thaw-form-panel">
         <div class="tg-panel-head tg-panel-head-stacked">
           <div class="tg-thaw-panel-title">
             <span class="tg-thaw-panel-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg></span>
             <div>
-              <h2>Request a thaw exception</h2>
-              <p class="tg-panel-subtitle">Nominate a PR candidate for a thaw exception. This alpha records a local <code>{{ .RequiredContext }}</code> status result; request details and approval persistence are wired later.</p>
+              <h2>Approve a thaw exception</h2>
+              <p class="tg-panel-subtitle">Approve one open PR for its current forge head SHA. Thawguard records the exception, recomputes <code>{{ .RequiredContext }}</code>, and publishes only that status context.</p>
             </div>
           </div>
         </div>
@@ -2362,8 +2363,7 @@ const decisionsTemplate = pageHead + `
           </label>
           <label>Pull request <input name="pull_request_index" inputmode="numeric" placeholder="251" required data-thaw-pr></label>
           <label>Target branch <input name="target_branch" placeholder="main" value="main" required data-thaw-branch></label>
-          <label>Head SHA <input name="head_sha" placeholder="abc123" required></label>
-          <label class="tg-field-wide">Reason for exception <input name="reason" placeholder="Reason capture lands with request persistence" aria-describedby="thaw-alpha-note" disabled></label>
+          <label class="tg-field-wide">Reason for exception <input name="reason" placeholder="Production fix needed during release freeze" aria-describedby="thaw-alpha-note" required></label>
           <label>Exception expires
             <select name="expires_after" disabled>
               <option>24 hours after approval</option>
@@ -2371,17 +2371,17 @@ const decisionsTemplate = pageHead + `
           </label>
           <label>Notify channel (optional) <input name="notify_channel" placeholder="#releases" disabled></label>
           <div class="tg-form-footer tg-thaw-form-footer tg-field-wide">
-            <span id="thaw-alpha-note" class="tg-muted"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-audit"></use></svg>Only repository, PR number, target branch, and head SHA are saved as a local status result today.</span>
+            <span id="thaw-alpha-note" class="tg-muted"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-audit"></use></svg>The current head SHA is fetched from the forge at approval time, so new commits invalidate this thaw.</span>
             <div class="tg-form-actions">
               <button type="reset" class="tg-btn tg-btn-secondary tg-btn-sm">Reset</button>
-              <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg>Evaluate request</button>
+              <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg>Approve thaw</button>
             </div>
           </div>
         </form>
         {{ else }}
         <div class="tg-empty-row">
           <strong>No repositories configured yet</strong>
-          <span>Add a repository before requesting a thaw exception.</span>
+          <span>Add a repository before approving a thaw exception.</span>
           <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/repositories"><svg class="tg-icon"><use href="#tg-i-plus"></use></svg>Add repository</a>
         </div>
         {{ end }}
@@ -2391,32 +2391,32 @@ const decisionsTemplate = pageHead + `
         <div class="tg-panel-head tg-panel-head-stacked">
           <div class="tg-impact-title-row">
             <h2><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-health-check"></use></svg>Eligibility preview</h2>
-            <span class="tg-badge tg-badge-info">local only</span>
+            <span class="tg-badge tg-badge-info">head-SHA scoped</span>
           </div>
-          <p class="tg-panel-subtitle">How the local status evaluation will be recorded for the target branch.</p>
+          <p class="tg-panel-subtitle">How the approval is constrained before the forge status is published.</p>
         </div>
         <div class="tg-thaw-freeze-card">
           <div class="tg-thaw-freeze-main"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-freeze-branch"></use></svg><code data-thaw-preview-repository>Selected repository</code><span class="tg-arrow">→</span><code class="tg-branch" data-thaw-preview-branch>main</code><span class="status status-pending">Preview</span></div>
-          <p>After submission, the latest result below shows whether the local policy check would pass or fail for this PR candidate.</p>
+          <p>After approval, the latest result below shows the actual <code>{{ .RequiredContext }}</code> decision posted for this PR head.</p>
         </div>
         <ul class="tg-eligibility-list">
-          <li><span class="tg-event-ok"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-check"></use></svg></span><span>Repository, PR number, target branch, and head SHA are captured for local evaluation.</span></li>
-          <li><span class="tg-event-ok"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-check"></use></svg></span><span><code>{{ .RequiredContext }}</code> would be recomputed for the supplied head SHA.</span></li>
-          <li><span class="tg-event-ok"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-check"></use></svg></span><span>Future approvals should be scoped to one PR and one head SHA.</span></li>
-          <li><span class="tg-event-fail"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-warning"></use></svg></span><span>Reviewer approval is not persisted yet; this page records local status results only.</span></li>
+          <li><span class="tg-event-ok"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-check"></use></svg></span><span>Repository, PR number, target branch, and reason are captured for the approval.</span></li>
+          <li><span class="tg-event-ok"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-check"></use></svg></span><span>The current PR head SHA is fetched from the configured Forgejo/Codeberg repository.</span></li>
+          <li><span class="tg-event-ok"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-check"></use></svg></span><span>The thaw applies to one PR and one head SHA only.</span></li>
+          <li><span class="tg-event-fail"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-warning"></use></svg></span><span>Another open PR with the same head SHA still blocks the thaw status.</span></li>
         </ul>
         <div class="tg-review-actions">
           <span class="tg-caps">Reviewer decision</span>
           <div>
-            <button type="button" class="tg-btn tg-btn-secondary tg-btn-sm" disabled>Deny later</button>
-            <button type="button" class="tg-btn tg-btn-primary tg-btn-sm" disabled><svg class="tg-icon"><use href="#tg-i-check"></use></svg>Approve later</button>
+            <button type="button" class="tg-btn tg-btn-secondary tg-btn-sm" disabled>Deny</button>
+            <button type="button" class="tg-btn tg-btn-primary tg-btn-sm" disabled><svg class="tg-icon"><use href="#tg-i-check"></use></svg>Approved by form</button>
           </div>
         </div>
       </aside>
     </section>
 
     <section class="tg-panel tg-open-thaws-panel">
-      <div class="tg-panel-head"><h2>Thaw request evaluations</h2><span class="tg-badge tg-badge-info">{{ len .Results }} local results</span></div>
+      <div class="tg-panel-head"><h2>Thaw approval results</h2><span class="tg-badge tg-badge-info">{{ len .Results }} status results</span></div>
       {{ if .Results }}
       <div class="tg-table-wrap">
         <table class="tg-data-table tg-thaws-table">
@@ -2425,12 +2425,12 @@ const decisionsTemplate = pageHead + `
           {{ range .Results }}
             <tr>
               <td><div class="tg-thaw-request-main"><a href="#">#{{ .Result.PullRequestIndex }}</a><span><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-git-branch"></use></svg><code>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Result.RepositoryID }}{{ end }}</code><span class="tg-arrow">→</span><code class="tg-branch">{{ .Result.TargetBranch }}</code></span><small><code>{{ .Result.HeadSHA }}</code> · {{ .CreatedAt }}</small></div></td>
-              <td><span>bootstrap admin</span><small class="tg-muted">local preview</small></td>
+              <td><span>bootstrap admin</span><small class="tg-muted">immediate approval</small></td>
               <td>{{ .Result.Description }}</td>
               <td><span class="tg-table-repo"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-freeze-branch"></use></svg><code>{{ .Result.Context }}</code></span><small class="tg-muted">{{ if eq .Result.State "failure" }}freeze · failing{{ else }}freeze · passing{{ end }}</small></td>
-              <td><span class="tg-muted">Not persisted</span></td>
+              <td><span class="tg-muted">Head SHA scoped</span></td>
               <td><span class="status status-{{ .Result.State }}">{{ if eq .Result.State "success" }}Eligible{{ else if eq .Result.State "failure" }}Blocked{{ else }}{{ .Result.State }}{{ end }}</span></td>
-              <td class="tg-table-actions"><button type="button" class="tg-btn tg-btn-secondary tg-btn-sm" disabled>Not wired</button></td>
+              <td class="tg-table-actions"><button type="button" class="tg-btn tg-btn-secondary tg-btn-sm" disabled>Recorded</button></td>
             </tr>
           {{ end }}
           </tbody>
@@ -2438,8 +2438,8 @@ const decisionsTemplate = pageHead + `
       </div>
       {{ else }}
         <div class="tg-empty-row">
-          <strong>No local thaw evaluations yet</strong>
-          <span>Evaluate a PR above to record the local status result that the approval workflow will build on later.</span>
+          <strong>No thaw approvals yet</strong>
+          <span>Approve a PR above to record a head-SHA-scoped thaw and publish the resulting status.</span>
         </div>
       {{ end }}
     </section>

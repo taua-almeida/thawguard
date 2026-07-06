@@ -29,7 +29,26 @@ func New(baseURL, token string) *Client {
 }
 
 func (c *Client) GetPullRequest(ctx context.Context, owner, repo string, index int) (domain.PullRequest, error) {
-	return domain.PullRequest{}, ErrNotImplemented
+	if err := validateGetPullRequest(owner, repo, index); err != nil {
+		return domain.PullRequest{}, err
+	}
+	endpoint, err := c.pullRequestEndpoint(owner, repo, index)
+	if err != nil {
+		return domain.PullRequest{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return domain.PullRequest{}, fmt.Errorf("create get pull request request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	if strings.TrimSpace(c.Token) != "" {
+		req.Header.Set("Authorization", "token "+strings.TrimSpace(c.Token))
+	}
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return domain.PullRequest{}, fmt.Errorf("get pull request: %w", err)
+	}
+	return decodePullRequest(resp)
 }
 
 func (c *Client) ListOpenPullRequests(ctx context.Context, owner, repo, targetBranch string) ([]domain.PullRequest, error) {
@@ -161,6 +180,26 @@ func validatePostCommitStatus(owner string, repo string, status forge.CommitStat
 	return nil
 }
 
+func validateGetPullRequest(owner string, repo string, index int) error {
+	var missing []string
+	if strings.TrimSpace(owner) == "" {
+		missing = append(missing, "owner")
+	}
+	if strings.TrimSpace(repo) == "" {
+		missing = append(missing, "repository")
+	}
+	if index <= 0 {
+		missing = append(missing, "pull request")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("missing required pull request fields: %s", strings.Join(missing, ", "))
+	}
+	if index > 1_000_000 {
+		return fmt.Errorf("pull request number is too large")
+	}
+	return nil
+}
+
 func validateListOpenPullRequests(owner string, repo string, targetBranch string) error {
 	var missing []string
 	if strings.TrimSpace(owner) == "" {
@@ -216,6 +255,33 @@ func (c *Client) pullRequestsEndpoint(owner string, repo string, targetBranch st
 	return endpoint.String(), nil
 }
 
+func (c *Client) pullRequestEndpoint(owner string, repo string, index int) (string, error) {
+	if c == nil {
+		return "", errors.New("forgejo client is nil")
+	}
+	base, err := url.Parse(strings.TrimSpace(c.BaseURL))
+	if err != nil || base.Scheme == "" || base.Host == "" {
+		return "", fmt.Errorf("forgejo base URL is invalid")
+	}
+	return base.JoinPath("api", "v1", "repos", owner, repo, "pulls", strconv.Itoa(index)).String(), nil
+}
+
+func decodePullRequest(resp *http.Response) (domain.PullRequest, error) {
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return domain.PullRequest{}, fmt.Errorf("get pull request: forge returned %s: %s", resp.Status, responseSnippet(resp.Body))
+	}
+	var payload pullRequestResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return domain.PullRequest{}, fmt.Errorf("decode pull request response: %w", err)
+	}
+	pr := pullRequestFromResponse(payload)
+	if pr.Index <= 0 || pr.TargetBranch == "" || pr.HeadSHA == "" {
+		return domain.PullRequest{}, fmt.Errorf("pull request response is missing required fields")
+	}
+	return pr, nil
+}
+
 func decodePullRequestsPage(resp *http.Response, targetBranch string) ([]domain.PullRequest, int, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -230,16 +296,21 @@ func decodePullRequestsPage(resp *http.Response, targetBranch string) ([]domain.
 		if strings.TrimSpace(item.Base.Ref) != targetBranch {
 			continue
 		}
-		pr := domain.PullRequest{Index: item.Number, Title: strings.TrimSpace(item.Title), State: strings.ToLower(strings.TrimSpace(item.State)), TargetBranch: strings.TrimSpace(item.Base.Ref), HeadSHA: strings.ToLower(strings.TrimSpace(item.Head.SHA)), URL: strings.TrimSpace(item.HTMLURL)}
-		if pr.State == "" {
-			pr.State = "open"
-		}
+		pr := pullRequestFromResponse(item)
 		if pr.Index <= 0 || pr.TargetBranch == "" || pr.HeadSHA == "" {
 			return nil, 0, fmt.Errorf("pull request response is missing required fields")
 		}
 		prs = append(prs, pr)
 	}
 	return prs, len(payload), nil
+}
+
+func pullRequestFromResponse(item pullRequestResponse) domain.PullRequest {
+	pr := domain.PullRequest{Index: item.Number, Title: strings.TrimSpace(item.Title), State: strings.ToLower(strings.TrimSpace(item.State)), TargetBranch: strings.TrimSpace(item.Base.Ref), HeadSHA: strings.ToLower(strings.TrimSpace(item.Head.SHA)), URL: strings.TrimSpace(item.HTMLURL)}
+	if pr.State == "" {
+		pr.State = "open"
+	}
+	return pr
 }
 
 func (c *Client) httpClient() *http.Client {

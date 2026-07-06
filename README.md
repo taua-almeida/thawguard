@@ -33,14 +33,14 @@ The local signed webhook receiver is `POST /webhooks/forgejo`. It verifies confi
 
 Live Forgejo/Codeberg commit-status posting is a guarded pilot mode, not the default. To start in live mode, `THAWGUARD_STATUS_PUBLISHER=forgejo_status` must be paired with `THAWGUARD_LIVE_STATUS_POSTING=enabled`, `THAWGUARD_LIVE_STATUS_REPOSITORIES=owner/name` for the specific repositories allowed to post, a valid `THAWGUARD_SECRET_KEY`, and a configured encrypted status token on each allowed repository. Repositories not on the allowlist and repositories missing tokens are recorded as failed publication attempts rather than falling back silently. Keep this mode limited to throwaway or explicitly approved repositories until the rest of the live-pilot process is reviewed.
 
-Freeze, lift, and cancel actions recompute statuses for cached open PRs on the affected repository and branch. In guarded `forgejo_status` live mode, creating a freeze first syncs open PRs for the target branch from the forge using the repository's encrypted status token; lift and cancel actions continue to use the local PR cache.
+Freeze, lift, and cancel actions recompute statuses for open PRs on the affected repository and branch. In guarded `forgejo_status` live mode, each freeze change first syncs current open PRs for the target branch from the forge using the repository's encrypted status token, then publishes only the `thawguard/freeze` status context.
 
 Current local pages:
 
 - `/` dashboard
 - `/repositories` repository setup form and manual setup checklist
 - `/freezes` local active branch-freeze form and list
-- `/decisions` local PR status decision preview; records results locally and does not post to Forgejo/Codeberg
+- `/decisions` immediate bootstrap-admin thaw approval; fetches the current PR head from the forge in live mode and scopes the thaw to that PR/head SHA
 - `/publications` latest idempotent local status publication intents and dry-run publication attempts; shows what would be posted later and does not post to Forgejo/Codeberg
 - `/webhooks` recent signed webhook delivery metadata; shows sanitized local processing history and does not store raw payloads, signatures, or secrets
 

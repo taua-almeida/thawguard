@@ -80,12 +80,19 @@ type BranchFreeze struct {
 }
 
 type ThawException struct {
-	ID            int64
-	PullRequestID int64
-	HeadSHA       string
-	Active        bool
-	Reason        string
-	ExpiresAt     *time.Time
+	ID               int64
+	RepositoryID     int64
+	PullRequestID    int64
+	PullRequestIndex int
+	PullRequestURL   string
+	HeadSHA          string
+	TargetBranch     string
+	Status           string
+	Active           bool
+	Reason           string
+	ExpiresAt        *time.Time
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 func (t ThawException) IsActive(now time.Time) bool {

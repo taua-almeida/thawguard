@@ -14,9 +14,19 @@ type FreezeLister interface {
 	ListActive(ctx context.Context) ([]domain.BranchFreeze, error)
 }
 
+type ThawExceptionGetter interface {
+	ActiveForPullRequest(ctx context.Context, pr domain.PullRequest) (*domain.ThawException, error)
+}
+
+type OpenPullRequestHeadLister interface {
+	ListOpenByHead(ctx context.Context, repositoryID int64, headSHA string) ([]domain.PullRequest, error)
+}
+
 type Service struct {
-	store   *Store
-	freezes FreezeLister
+	store          *Store
+	freezes        FreezeLister
+	thawExceptions ThawExceptionGetter
+	pullRequests   OpenPullRequestHeadLister
 }
 
 type LocalDecisionParams struct {
@@ -26,8 +36,20 @@ type LocalDecisionParams struct {
 	HeadSHA          string
 }
 
+type ThawApprovalParams struct {
+	RepositoryID     int64
+	PullRequestIndex int
+	TargetBranch     string
+	HeadSHA          string
+	Reason           string
+}
+
 func NewService(store *Store, freezes FreezeLister) *Service {
 	return &Service{store: store, freezes: freezes}
+}
+
+func NewServiceWithThawExceptions(store *Store, freezes FreezeLister, thawExceptions ThawExceptionGetter, pullRequests OpenPullRequestHeadLister) *Service {
+	return &Service{store: store, freezes: freezes, thawExceptions: thawExceptions, pullRequests: pullRequests}
 }
 
 func (s *Service) RunLocal(ctx context.Context, params LocalDecisionParams) (Result, error) {
@@ -56,7 +78,11 @@ func (s *Service) RunForPullRequest(ctx context.Context, pr domain.PullRequest) 
 	if err := validatePullRequest(pr); err != nil {
 		return Result{}, err
 	}
-	decision, err := s.evaluate(ctx, pr)
+	openPRs, err := s.openPullRequests(ctx, pr)
+	if err != nil {
+		return Result{}, err
+	}
+	decision, err := s.evaluate(ctx, pr, openPRs)
 	if err != nil {
 		return Result{}, err
 	}
@@ -72,12 +98,12 @@ func (s *Service) RunForSharedHead(ctx context.Context, prs []domain.PullRequest
 		return Result{}, err
 	}
 	selected := preferredPullRequest(normalized, preferredIndex)
-	selectedDecision, err := s.evaluate(ctx, selected)
+	selectedDecision, err := s.evaluate(ctx, selected, normalized)
 	if err != nil {
 		return Result{}, err
 	}
 	for _, pr := range normalized {
-		decision, err := s.evaluate(ctx, pr)
+		decision, err := s.evaluate(ctx, pr, normalized)
 		if err != nil {
 			return Result{}, err
 		}
@@ -90,12 +116,16 @@ func (s *Service) RunForSharedHead(ctx context.Context, prs []domain.PullRequest
 	return s.create(ctx, selected, selectedDecision)
 }
 
-func (s *Service) evaluate(ctx context.Context, pr domain.PullRequest) (policy.Decision, error) {
+func (s *Service) evaluate(ctx context.Context, pr domain.PullRequest, openPRs []domain.PullRequest) (policy.Decision, error) {
 	activeFreeze, err := s.activeFreeze(ctx, pr.RepositoryID, pr.TargetBranch)
 	if err != nil {
 		return policy.Decision{}, err
 	}
-	return policy.Evaluate(policy.Input{PullRequest: pr, ActiveFreeze: activeFreeze}), nil
+	activeThaw, err := s.activeThawException(ctx, pr)
+	if err != nil {
+		return policy.Decision{}, err
+	}
+	return policy.Evaluate(policy.Input{PullRequest: pr, ActiveFreeze: activeFreeze, ThawException: activeThaw, OpenPullRequests: openPRs}), nil
 }
 
 func (s *Service) create(ctx context.Context, pr domain.PullRequest, decision policy.Decision) (Result, error) {
@@ -136,6 +166,36 @@ func (s *Service) activeFreeze(ctx context.Context, repositoryID int64, targetBr
 		}
 	}
 	return nil, nil
+}
+
+func (s *Service) activeThawException(ctx context.Context, pr domain.PullRequest) (*domain.ThawException, error) {
+	if s.thawExceptions == nil {
+		return nil, nil
+	}
+	thaw, err := s.thawExceptions.ActiveForPullRequest(ctx, pr)
+	if err != nil {
+		return nil, fmt.Errorf("load active thaw exception for status decision: %w", err)
+	}
+	return thaw, nil
+}
+
+func (s *Service) openPullRequests(ctx context.Context, pr domain.PullRequest) ([]domain.PullRequest, error) {
+	if s.pullRequests == nil {
+		return nil, nil
+	}
+	prs, err := s.pullRequests.ListOpenByHead(ctx, pr.RepositoryID, pr.HeadSHA)
+	if err != nil {
+		return nil, fmt.Errorf("list open pull requests for status decision: %w", err)
+	}
+	for _, existing := range prs {
+		if existing.Index == pr.Index {
+			return prs, nil
+		}
+	}
+	if pr.IsOpen() {
+		prs = append(prs, pr)
+	}
+	return prs, nil
 }
 
 func normalizeLocalDecisionParams(params LocalDecisionParams) LocalDecisionParams {

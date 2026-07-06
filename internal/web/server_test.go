@@ -868,7 +868,7 @@ func TestDecisionsPageShowsFormAndRecentResults(t *testing.T) {
 	if token := csrfTokenFromBody(t, body); token == "" {
 		t.Fatal("expected CSRF token in decision form")
 	}
-	for _, want := range []string{"Thaw Requests", "Request a thaw exception", "Auditable exceptions", "local status result", "taua-almeida/thawguard", "Target branch", "main", "thawguard/freeze", "Blocked", "Branch is frozen", "2026-06-29 16:30 UTC"} {
+	for _, want := range []string{"Thaw Requests", "Approve a thaw exception", "Auditable exceptions", "current forge head SHA", "taua-almeida/thawguard", "Target branch", "main", "thawguard/freeze", "Blocked", "Branch is frozen", "2026-06-29 16:30 UTC"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
@@ -904,11 +904,14 @@ func TestCreateDecisionPostsToStore(t *testing.T) {
 		t.Fatalf("expected redirect, got %d", recorder.Code)
 	}
 	if len(store.runs) != 1 {
-		t.Fatalf("expected 1 local decision run, got %d", len(store.runs))
+		t.Fatalf("expected 1 thaw approval, got %d", len(store.runs))
 	}
 	run := store.runs[0]
-	if run.RepositoryID != repo.ID || run.PullRequestIndex != 42 || run.TargetBranch != "main" || run.HeadSHA != "abc123" {
-		t.Fatalf("unexpected local decision params: %+v", run)
+	if run.RepositoryID != repo.ID || run.PullRequestIndex != 42 || run.TargetBranch != "main" || run.Reason != "production fix" {
+		t.Fatalf("unexpected thaw approval params: %+v", run)
+	}
+	if len(store.actors) != 1 || store.actors[0].Kind != domain.ActorKindBootstrapAdmin || store.actors[0].Role != "admin" {
+		t.Fatalf("unexpected thaw approval actor: %+v", store.actors)
 	}
 }
 
@@ -926,7 +929,7 @@ func TestCreateDecisionRejectsMissingCSRFSession(t *testing.T) {
 		t.Fatalf("expected forbidden status, got %d", recorder.Code)
 	}
 	if len(store.runs) != 0 {
-		t.Fatalf("expected no local decision runs, got %d", len(store.runs))
+		t.Fatalf("expected no thaw approvals, got %d", len(store.runs))
 	}
 }
 
@@ -948,13 +951,13 @@ func TestCreateDecisionRejectsInvalidCSRFToken(t *testing.T) {
 		t.Fatalf("expected forbidden status, got %d", recorder.Code)
 	}
 	if len(store.runs) != 0 {
-		t.Fatalf("expected no local decision runs, got %d", len(store.runs))
+		t.Fatalf("expected no thaw approvals, got %d", len(store.runs))
 	}
 }
 
 func TestCreateDecisionShowsValidationError(t *testing.T) {
 	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
-	store := &fakeStatusDecisionStore{err: statusresult.ValidationError{Message: "missing required local decision fields: head SHA"}}
+	store := &fakeStatusDecisionStore{err: statusresult.ValidationError{Message: "missing required thaw approval fields: reason"}}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, StatusDecisionStore: store})
 	form := decisionCreateForm()
 	cookie, csrfToken := getDecisionForm(t, server)
@@ -969,7 +972,7 @@ func TestCreateDecisionShowsValidationError(t *testing.T) {
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("expected bad request status, got %d", recorder.Code)
 	}
-	if !strings.Contains(recorder.Body.String(), "missing required local decision fields") {
+	if !strings.Contains(recorder.Body.String(), "missing required thaw approval fields") {
 		t.Fatalf("expected validation message in body, got %q", recorder.Body.String())
 	}
 }
@@ -1436,7 +1439,7 @@ func decisionCreateForm() url.Values {
 		"repository_id":      {"1"},
 		"pull_request_index": {"42"},
 		"target_branch":      {"main"},
-		"head_sha":           {"abc123"},
+		"reason":             {"production fix"},
 	}
 }
 
@@ -1753,7 +1756,8 @@ type fakeSetupCheckRunner struct {
 
 type fakeStatusDecisionStore struct {
 	results []statusresult.Result
-	runs    []statusresult.LocalDecisionParams
+	runs    []statusresult.ThawApprovalParams
+	actors  []domain.Actor
 	err     error
 	listErr error
 }
@@ -1768,12 +1772,17 @@ func (s *fakeStatusDecisionStore) ListRecent(ctx context.Context, limit int) ([]
 	return s.results, nil
 }
 
-func (s *fakeStatusDecisionStore) RunLocal(ctx context.Context, params statusresult.LocalDecisionParams) (statusresult.Result, error) {
+func (s *fakeStatusDecisionStore) ApproveThaw(ctx context.Context, params statusresult.ThawApprovalParams, actor domain.Actor) (statusresult.Result, error) {
 	if s.err != nil {
 		return statusresult.Result{}, s.err
 	}
 	s.runs = append(s.runs, params)
-	result := statusresult.Result{ID: int64(len(s.results) + 1), RepositoryID: params.RepositoryID, PullRequestIndex: params.PullRequestIndex, TargetBranch: params.TargetBranch, HeadSHA: params.HeadSHA, Context: domain.RequiredStatusContext, State: domain.CommitStatusSuccess, Description: "No active freeze applies to this PR", CreatedAt: time.Now().UTC()}
+	s.actors = append(s.actors, actor)
+	headSHA := params.HeadSHA
+	if headSHA == "" {
+		headSHA = "abc123"
+	}
+	result := statusresult.Result{ID: int64(len(s.results) + 1), RepositoryID: params.RepositoryID, PullRequestIndex: params.PullRequestIndex, TargetBranch: params.TargetBranch, HeadSHA: headSHA, Context: domain.RequiredStatusContext, State: domain.CommitStatusSuccess, Description: "PR is explicitly thawed during an active freeze", CreatedAt: time.Now().UTC()}
 	s.results = append(s.results, result)
 	return result, nil
 }

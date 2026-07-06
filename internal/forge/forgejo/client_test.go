@@ -58,6 +58,43 @@ func TestClientRejectsInvalidCommitStatus(t *testing.T) {
 	}
 }
 
+func TestClientGetsPullRequest(t *testing.T) {
+	var gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("expected GET, got %s", r.Method)
+		}
+		if r.URL.Path != "/api/v1/repos/taua-almeida/thawguard/pulls/42" {
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+		gotAuth = r.Header.Get("Authorization")
+		_ = json.NewEncoder(w).Encode(newPullRequestResponse(42, "Release fix", "open", "main", "ABCDEF123456", "https://codeberg.org/taua-almeida/thawguard/pulls/42"))
+	}))
+	defer server.Close()
+	client := New(server.URL, "read-token")
+
+	pr, err := client.GetPullRequest(context.Background(), "taua-almeida", "thawguard", 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotAuth != "token read-token" {
+		t.Fatalf("unexpected auth header %q", gotAuth)
+	}
+	if pr.Index != 42 || pr.Title != "Release fix" || pr.State != "open" || pr.TargetBranch != "main" || pr.HeadSHA != "abcdef123456" || pr.URL == "" {
+		t.Fatalf("unexpected pull request %+v", pr)
+	}
+}
+
+func TestClientRejectsInvalidPullRequestGet(t *testing.T) {
+	client := New("https://codeberg.org", "token")
+	if _, err := client.GetPullRequest(context.Background(), "", "repo", 1); err == nil {
+		t.Fatal("expected missing owner error")
+	}
+	if _, err := client.GetPullRequest(context.Background(), "owner", "repo", 0); err == nil {
+		t.Fatal("expected missing pull request error")
+	}
+}
+
 func TestClientListsOpenPullRequests(t *testing.T) {
 	var gotAuth string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

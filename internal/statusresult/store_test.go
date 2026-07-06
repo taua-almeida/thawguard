@@ -10,7 +10,9 @@ import (
 	"github.com/taua-almeida/thawguard/internal/db"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/freeze"
+	"github.com/taua-almeida/thawguard/internal/pullrequest"
 	"github.com/taua-almeida/thawguard/internal/repository"
+	"github.com/taua-almeida/thawguard/internal/thawexception"
 )
 
 func TestStoreCreatesAndListsStatusResults(t *testing.T) {
@@ -135,6 +137,62 @@ func TestServiceRunForPullRequestPersistsDecision(t *testing.T) {
 	}
 }
 
+func TestServiceRunForPullRequestAllowsApprovedThaw(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	freezeService := freeze.NewService(database)
+	if _, err := freezeService.CreateActive(ctx, freeze.CreateParams{RepositoryID: repo.ID, Branch: "main", Reason: "release"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); err != nil {
+		t.Fatal(err)
+	}
+	prStore := pullrequest.NewStore(database)
+	cached, err := prStore.Upsert(ctx, domain.PullRequest{RepositoryID: repo.ID, Index: 42, State: "open", TargetBranch: "main", HeadSHA: "abc123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	thawStore := thawexception.NewStore(database)
+	if _, err := thawStore.Approve(ctx, thawexception.ApproveParams{RepositoryID: repo.ID, PullRequestIndex: cached.Index, TargetBranch: cached.TargetBranch, HeadSHA: cached.HeadSHA, Reason: "production fix"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); err != nil {
+		t.Fatal(err)
+	}
+	service := NewServiceWithThawExceptions(NewStore(database), freezeService, thawStore, prStore)
+
+	result, err := service.RunForPullRequest(ctx, cached)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State != domain.CommitStatusSuccess || result.Description != "PR is explicitly thawed during an active freeze" {
+		t.Fatalf("expected approved thaw success, got %+v", result)
+	}
+}
+
+func TestServiceRunForPullRequestBlocksChangedHeadAfterThaw(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	freezeService := freeze.NewService(database)
+	if _, err := freezeService.CreateActive(ctx, freeze.CreateParams{RepositoryID: repo.ID, Branch: "main", Reason: "release"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); err != nil {
+		t.Fatal(err)
+	}
+	prStore := pullrequest.NewStore(database)
+	cached, err := prStore.Upsert(ctx, domain.PullRequest{RepositoryID: repo.ID, Index: 42, State: "open", TargetBranch: "main", HeadSHA: "abc123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	thawStore := thawexception.NewStore(database)
+	if _, err := thawStore.Approve(ctx, thawexception.ApproveParams{RepositoryID: repo.ID, PullRequestIndex: cached.Index, TargetBranch: cached.TargetBranch, HeadSHA: cached.HeadSHA, Reason: "production fix"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); err != nil {
+		t.Fatal(err)
+	}
+	service := NewServiceWithThawExceptions(NewStore(database), freezeService, thawStore, prStore)
+
+	result, err := service.RunForPullRequest(ctx, domain.PullRequest{RepositoryID: repo.ID, Index: 42, State: "open", TargetBranch: "main", HeadSHA: "def456"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State != domain.CommitStatusFailure || result.Description != "Branch is frozen; merge is blocked by Thawguard" {
+		t.Fatalf("expected changed head to ignore stale thaw, got %+v", result)
+	}
+}
+
 func TestServiceRunForSharedHeadFailsIfAnyOpenPullRequestIsFrozen(t *testing.T) {
 	ctx := context.Background()
 	database := newTestDB(t, ctx)
@@ -154,6 +212,38 @@ func TestServiceRunForSharedHeadFailsIfAnyOpenPullRequestIsFrozen(t *testing.T) 
 	}
 	if result.State != domain.CommitStatusFailure || result.PullRequestIndex != 2 || result.TargetBranch != "release" {
 		t.Fatalf("expected shared-head failure on frozen PR, got %+v", result)
+	}
+}
+
+func TestServiceRunForSharedHeadBlocksApprovedThawWithDuplicateOpenHead(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	freezeService := freeze.NewService(database)
+	if _, err := freezeService.CreateActive(ctx, freeze.CreateParams{RepositoryID: repo.ID, Branch: "main", Reason: "release"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); err != nil {
+		t.Fatal(err)
+	}
+	prStore := pullrequest.NewStore(database)
+	pr1, err := prStore.Upsert(ctx, domain.PullRequest{RepositoryID: repo.ID, Index: 1, State: "open", TargetBranch: "main", HeadSHA: "abc123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr2, err := prStore.Upsert(ctx, domain.PullRequest{RepositoryID: repo.ID, Index: 2, State: "open", TargetBranch: "main", HeadSHA: "abc123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	thawStore := thawexception.NewStore(database)
+	if _, err := thawStore.Approve(ctx, thawexception.ApproveParams{RepositoryID: repo.ID, PullRequestIndex: pr1.Index, TargetBranch: pr1.TargetBranch, HeadSHA: pr1.HeadSHA, Reason: "production fix"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); err != nil {
+		t.Fatal(err)
+	}
+	service := NewServiceWithThawExceptions(NewStore(database), freezeService, thawStore, prStore)
+
+	result, err := service.RunForSharedHead(ctx, []domain.PullRequest{pr1, pr2}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State != domain.CommitStatusFailure || result.PullRequestIndex != 1 || result.Description != "Thaw blocked because another open PR shares this head SHA" {
+		t.Fatalf("expected duplicate head to block thaw, got %+v", result)
 	}
 }
 

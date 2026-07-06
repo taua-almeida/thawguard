@@ -37,7 +37,7 @@ func Evaluate(input Input) Decision {
 		return success("No active freeze applies to this PR", "not_frozen")
 	}
 
-	if thaw := input.ThawException; thaw != nil && thaw.PullRequestID == pr.ID && thaw.HeadSHA == pr.HeadSHA && thaw.IsActive(now) {
+	if thaw := input.ThawException; thaw != nil && thawMatchesPullRequest(*thaw, pr) && thaw.IsActive(now) {
 		if duplicate := duplicateOpenHead(pr, input.OpenPullRequests); duplicate != nil {
 			return failure("Thaw blocked because another open PR shares this head SHA", "duplicate_head_sha")
 		}
@@ -45,6 +45,16 @@ func Evaluate(input Input) Decision {
 	}
 
 	return failure("Branch is frozen; merge is blocked by Thawguard", "active_freeze")
+}
+
+func thawMatchesPullRequest(thaw domain.ThawException, pr domain.PullRequest) bool {
+	if thaw.HeadSHA != pr.HeadSHA {
+		return false
+	}
+	if thaw.PullRequestID > 0 && pr.ID > 0 {
+		return thaw.PullRequestID == pr.ID
+	}
+	return thaw.RepositoryID == pr.RepositoryID && thaw.PullRequestIndex == pr.Index && thaw.TargetBranch == pr.TargetBranch
 }
 
 func duplicateOpenHead(pr domain.PullRequest, openPRs []domain.PullRequest) *domain.PullRequest {
