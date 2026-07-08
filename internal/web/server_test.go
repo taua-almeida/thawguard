@@ -1094,6 +1094,39 @@ func TestWebhooksPageShowsRecentDeliveries(t *testing.T) {
 	}
 }
 
+func TestWebhooksPageShowsSystemActivityAndStatusAttempts(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	createdAt := time.Date(2026, 7, 6, 12, 0, 0, 0, time.UTC)
+	events := []audit.Event{
+		{Action: audit.ActionThawExceptionApproved, SubjectType: audit.SubjectTypeThawException, SubjectID: "5", DetailsJSON: `{"actor_kind":"bootstrap_admin","actor_role":"admin","repository_id":"1","pull_request_index":"42","target_branch":"main","head_sha":"abc123","reason":"production fix"}`, CreatedAt: createdAt},
+		{Action: audit.ActionRepositoryOpenPullRequestsSynced, SubjectType: audit.SubjectTypeRepository, SubjectID: "1", DetailsJSON: `{"repository_id":"1","full_name":"taua-almeida/thawguard","target_branch":"main","open_count":"2","closed_absent_count":"1"}`, CreatedAt: createdAt.Add(-time.Minute)},
+	}
+	attempt := statuspublication.Attempt{ID: 9, PublicationID: 8, StatusResultID: 7, RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: domain.CommitStatusSuccess, Description: "PR is explicitly thawed during an active freeze", Mode: statuspublication.AttemptModeForgejoStatus, Result: statuspublication.AttemptResultPosted, AttemptedAt: createdAt.Add(time.Minute)}
+	server := NewServer(Config{
+		AppName:                "Thawguard",
+		RepositoryStore:        &fakeRepositoryStore{repositories: []domain.Repository{repo}},
+		WebhookDeliveryStore:   &fakeWebhookDeliveryStore{},
+		AuditStore:             &fakeAuditStore{events: events},
+		StatusPublicationStore: &fakeStatusPublicationStore{attempts: []statuspublication.Attempt{attempt}},
+	})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/webhooks", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{"System activity", "Status publication attempts", "Thaw approved", "Open PRs synced", "taua-almeida/thawguard PR #42", "Head abc123 on main", "production fix", "2 open from forge, 1 cached closed", "forgejo_status", "posted", "PR is explicitly thawed during an active freeze"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected body to contain %q, got %q", want, body)
+		}
+	}
+	if strings.Contains(body, "secret-token") || strings.Contains(body, "X-Hub-Signature") {
+		t.Fatalf("expected activity page not to render sensitive details, got %q", body)
+	}
+}
+
 func TestWebhooksPageFiltersSortsAndLimitsDeliveries(t *testing.T) {
 	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
 	receivedAt := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
@@ -1821,6 +1854,16 @@ type fakeAuditStore struct {
 	events               []audit.Event
 	err                  error
 	requestedSubjectType string
+}
+
+func (s *fakeAuditStore) List(ctx context.Context, limit int) ([]audit.Event, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if limit > 0 && len(s.events) > limit {
+		return s.events[:limit], nil
+	}
+	return s.events, nil
 }
 
 func (s *fakeAuditStore) ListBySubjectType(ctx context.Context, subjectType string, limit int) ([]audit.Event, error) {

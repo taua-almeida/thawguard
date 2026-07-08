@@ -2,10 +2,12 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 
+	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/domain"
 )
 
@@ -41,6 +43,36 @@ func TestForgeOpenPullRequestSyncerCachesOpenPullRequests(t *testing.T) {
 		if pr.RepositoryID != 7 || pr.TargetBranch != "main" {
 			t.Fatalf("expected synced repository and branch on cached PR, got %+v", pr)
 		}
+	}
+}
+
+func TestForgeOpenPullRequestSyncerRecordsAuditEvent(t *testing.T) {
+	ctx := context.Background()
+	repositories := &fakeOpenPRRepositoryGetter{repo: domain.Repository{ID: 7, Forge: "codeberg", BaseURL: "https://codeberg.org", Owner: "taua-almeida", Name: "thawguard"}}
+	tokens := &fakeOpenPRStatusTokenGetter{token: "sync-token", found: true}
+	upserter := &fakeOpenPRUpserter{closedAbsentCount: 3}
+	client := &fakeOpenPRForgeClient{prs: []domain.PullRequest{{Index: 11, State: "open", TargetBranch: "main", HeadSHA: "abcdef123456"}}}
+	auditor := &fakeOpenPRAuditRecorder{}
+	syncer := newForgeOpenPullRequestSyncer(repositories, tokens, upserter, []string{"taua-almeida/thawguard"}, func(repo domain.Repository, token string) (openPullRequestForgeClient, error) {
+		return client, nil
+	}, auditor)
+
+	if err := syncer.SyncOpenPullRequests(ctx, 7, "main"); err != nil {
+		t.Fatal(err)
+	}
+	if len(auditor.events) != 1 {
+		t.Fatalf("expected one audit event, got %+v", auditor.events)
+	}
+	event := auditor.events[0]
+	if event.Action != audit.ActionRepositoryOpenPullRequestsSynced || event.SubjectType != audit.SubjectTypeRepository || event.SubjectID != "7" {
+		t.Fatalf("unexpected audit event: %+v", event)
+	}
+	var details map[string]string
+	if err := json.Unmarshal([]byte(event.DetailsJSON), &details); err != nil {
+		t.Fatal(err)
+	}
+	if details["full_name"] != "taua-almeida/thawguard" || details["target_branch"] != "main" || details["open_count"] != "1" || details["closed_absent_count"] != "3" {
+		t.Fatalf("unexpected audit details: %+v", details)
 	}
 }
 
@@ -123,9 +155,10 @@ func (g *fakeOpenPRStatusTokenGetter) StatusToken(ctx context.Context, repositor
 }
 
 type fakeOpenPRUpserter struct {
-	prs          []domain.PullRequest
-	closedAbsent []fakeClosedAbsentOpenPRs
-	err          error
+	prs               []domain.PullRequest
+	closedAbsent      []fakeClosedAbsentOpenPRs
+	closedAbsentCount int64
+	err               error
 }
 
 type fakeClosedAbsentOpenPRs struct {
@@ -147,7 +180,17 @@ func (u *fakeOpenPRUpserter) MarkAbsentOpenByTargetBranchClosed(ctx context.Cont
 		return 0, u.err
 	}
 	u.closedAbsent = append(u.closedAbsent, fakeClosedAbsentOpenPRs{repositoryID: repositoryID, targetBranch: targetBranch, openIndexes: append([]int(nil), openIndexes...)})
-	return 0, nil
+	return u.closedAbsentCount, nil
+}
+
+type fakeOpenPRAuditRecorder struct {
+	events []audit.Event
+	err    error
+}
+
+func (r *fakeOpenPRAuditRecorder) Record(ctx context.Context, event audit.Event) error {
+	r.events = append(r.events, event)
+	return r.err
 }
 
 type fakeOpenPRForgeClient struct {

@@ -3,11 +3,13 @@ package thawexception
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
 
+	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/db"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/repository"
@@ -88,6 +90,39 @@ func TestStoreRejectsInvalidApproveParams(t *testing.T) {
 	}
 	if _, err := store.Approve(ctx, ApproveParams{RepositoryID: 999, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "abc123", Reason: "production fix"}, domain.Actor{}); !IsValidationError(err) {
 		t.Fatalf("expected missing repository validation error, got %v", err)
+	}
+}
+
+func TestServiceApprovesAndRecordsAuditEvent(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	service := NewService(database)
+
+	approved, err := service.Approve(ctx, ApproveParams{RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "abc123", Reason: "production fix"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if approved.ID == 0 || !approved.Active {
+		t.Fatalf("expected approved thaw exception, got %+v", approved)
+	}
+	events, err := audit.NewStore(database).List(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected one audit event, got %+v", events)
+	}
+	event := events[0]
+	if event.Action != audit.ActionThawExceptionApproved || event.SubjectType != audit.SubjectTypeThawException || event.SubjectID != "1" {
+		t.Fatalf("unexpected audit event: %+v", event)
+	}
+	var details map[string]string
+	if err := json.Unmarshal([]byte(event.DetailsJSON), &details); err != nil {
+		t.Fatal(err)
+	}
+	if details["repository_id"] != "1" || details["pull_request_index"] != "42" || details["target_branch"] != "main" || details["head_sha"] != "abc123" || details["reason"] != "production fix" {
+		t.Fatalf("unexpected audit details: %+v", details)
 	}
 }
 

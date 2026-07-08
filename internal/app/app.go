@@ -72,7 +72,7 @@ func (a *App) Run(ctx context.Context) error {
 	freezeStore := freeze.NewService(database)
 	pullRequestStore := pullrequest.NewStore(database)
 	auditStore := audit.NewStore(database)
-	thawExceptionStore := thawexception.NewStore(database)
+	thawExceptionStore := thawexception.NewService(database)
 	statusDecisionStore := statusresult.NewServiceWithThawExceptions(statusresult.NewStore(database), freezeStore, thawExceptionStore, pullRequestStore)
 	statusPublicationStore := statuspublication.NewStore(database)
 	publisherMode, err := statusPublisherMode(a.cfg.StatusPublisherMode)
@@ -86,7 +86,7 @@ func (a *App) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	openPullRequestSyncer, err := openPullRequestSyncerFromConfig(a.cfg, publisherMode, repositoryStore, pullRequestStore, repositorySetup)
+	openPullRequestSyncer, err := openPullRequestSyncerFromConfig(a.cfg, publisherMode, repositoryStore, pullRequestStore, repositorySetup, auditStore)
 	if err != nil {
 		return err
 	}
@@ -199,12 +199,12 @@ func statusPublisherFromConfig(cfg config.Config, mode string, publications *sta
 	}
 }
 
-func openPullRequestSyncerFromConfig(cfg config.Config, mode string, repositories *repository.Store, pullRequests *pullrequest.Store, repositorySetup *repositorysetup.Service) (openPullRequestSyncer, error) {
+func openPullRequestSyncerFromConfig(cfg config.Config, mode string, repositories *repository.Store, pullRequests *pullrequest.Store, repositorySetup *repositorysetup.Service, auditStore *audit.Store) (openPullRequestSyncer, error) {
 	switch mode {
 	case statuspublication.AttemptModeDryRun:
 		return nil, nil
 	case statuspublication.DeliveryModeForgejoStatus:
-		return newForgeOpenPullRequestSyncer(repositories, repositorySetup, pullRequests, liveStatusRepositories(cfg.LiveStatusRepos), forgejoPullRequestClientForRepository), nil
+		return newForgeOpenPullRequestSyncer(repositories, repositorySetup, pullRequests, liveStatusRepositories(cfg.LiveStatusRepos), forgejoPullRequestClientForRepository, auditStore), nil
 	default:
 		return nil, fmt.Errorf("unsupported status publisher mode %q", mode)
 	}

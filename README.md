@@ -42,7 +42,7 @@ Current local pages:
 - `/freezes` local active branch-freeze form and list
 - `/decisions` immediate bootstrap-admin thaw approval; fetches the current PR head from the forge in live mode and scopes the thaw to that PR/head SHA
 - `/publications` latest idempotent local status publication intents and dry-run publication attempts; shows what would be posted later and does not post to Forgejo/Codeberg
-- `/webhooks` recent signed webhook delivery metadata; shows sanitized local processing history and does not store raw payloads, signatures, or secrets
+- `/webhooks` system activity, status publication attempts, and recent signed webhook delivery metadata; shows sanitized local processing history and does not store raw payloads, signatures, or secrets
 
 Current bootstrap sessions are for local development only. Do not expose the server on a network until real local auth is configured.
 

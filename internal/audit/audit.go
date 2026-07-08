@@ -13,12 +13,15 @@ const (
 	ActionRepositoryCreated                 = "repository.created"
 	ActionRepositoryWebhookSecretConfigured = "repository.webhook_secret_configured"
 	ActionRepositoryStatusTokenConfigured   = "repository.status_token_configured"
+	ActionRepositoryOpenPullRequestsSynced  = "repository.open_pull_requests_synced"
 	ActionBranchFreezeCreated               = "branch_freeze.created"
 	ActionBranchFreezeEnded                 = "branch_freeze.ended"
 	ActionBranchFreezeCancelled             = "branch_freeze.cancelled"
+	ActionThawExceptionApproved             = "thaw_exception.approved"
 
-	SubjectTypeRepository   = "repository"
-	SubjectTypeBranchFreeze = "branch_freeze"
+	SubjectTypeRepository    = "repository"
+	SubjectTypeBranchFreeze  = "branch_freeze"
+	SubjectTypeThawException = "thaw_exception"
 )
 
 type Event struct {

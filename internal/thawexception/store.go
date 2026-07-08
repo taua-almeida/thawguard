@@ -49,6 +49,13 @@ func NewStore(db *sql.DB) *Store {
 	return newStore(db)
 }
 
+func NewStoreTx(tx *sql.Tx) *Store {
+	if tx == nil {
+		return newStore(nil)
+	}
+	return newStore(tx)
+}
+
 func newStore(db database) *Store {
 	return &Store{db: db, now: func() time.Time { return time.Now().UTC() }}
 }

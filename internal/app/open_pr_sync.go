@@ -2,10 +2,13 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
+	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/domain"
 )
 
@@ -35,16 +38,25 @@ type openPullRequestForgeClient interface {
 
 type openPullRequestForgeClientFactory func(repository domain.Repository, token string) (openPullRequestForgeClient, error)
 
+type openPullRequestAuditRecorder interface {
+	Record(ctx context.Context, event audit.Event) error
+}
+
 type forgeOpenPullRequestSyncer struct {
 	repositories openPullRequestRepositoryGetter
 	tokens       openPullRequestStatusTokenGetter
 	pullRequests openPullRequestUpserter
+	auditor      openPullRequestAuditRecorder
 	allowedRepos map[string]struct{}
 	clientFor    openPullRequestForgeClientFactory
 }
 
-func newForgeOpenPullRequestSyncer(repositories openPullRequestRepositoryGetter, tokens openPullRequestStatusTokenGetter, pullRequests openPullRequestUpserter, allowedRepositories []string, clientFor openPullRequestForgeClientFactory) *forgeOpenPullRequestSyncer {
-	return &forgeOpenPullRequestSyncer{repositories: repositories, tokens: tokens, pullRequests: pullRequests, allowedRepos: normalizedOpenPullRequestSyncAllowlist(allowedRepositories), clientFor: clientFor}
+func newForgeOpenPullRequestSyncer(repositories openPullRequestRepositoryGetter, tokens openPullRequestStatusTokenGetter, pullRequests openPullRequestUpserter, allowedRepositories []string, clientFor openPullRequestForgeClientFactory, auditors ...openPullRequestAuditRecorder) *forgeOpenPullRequestSyncer {
+	var auditor openPullRequestAuditRecorder
+	if len(auditors) > 0 {
+		auditor = auditors[0]
+	}
+	return &forgeOpenPullRequestSyncer{repositories: repositories, tokens: tokens, pullRequests: pullRequests, auditor: auditor, allowedRepos: normalizedOpenPullRequestSyncAllowlist(allowedRepositories), clientFor: clientFor}
 }
 
 func (s *forgeOpenPullRequestSyncer) SyncOpenPullRequests(ctx context.Context, repositoryID int64, targetBranch string) error {
@@ -92,10 +104,36 @@ func (s *forgeOpenPullRequestSyncer) SyncOpenPullRequests(ctx context.Context, r
 		}
 		openIndexes = append(openIndexes, pr.Index)
 	}
-	if _, err := s.pullRequests.MarkAbsentOpenByTargetBranchClosed(ctx, repositoryID, targetBranch, openIndexes); err != nil {
+	closedAbsent, err := s.pullRequests.MarkAbsentOpenByTargetBranchClosed(ctx, repositoryID, targetBranch, openIndexes)
+	if err != nil {
 		return safeOpenPullRequestSyncError(fmt.Errorf("close cached pull requests absent from forge open list: %w", err), token)
 	}
+	if s.auditor != nil {
+		if err := s.auditor.Record(ctx, openPullRequestsSyncedEvent(repo, targetBranch, len(prs), closedAbsent)); err != nil {
+			return fmt.Errorf("record open pull request sync audit event: %w", err)
+		}
+	}
 	return nil
+}
+
+func openPullRequestsSyncedEvent(repo domain.Repository, targetBranch string, openCount int, closedAbsentCount int64) audit.Event {
+	details := map[string]string{
+		"repository_id":       strconv.FormatInt(repo.ID, 10),
+		"full_name":           repo.FullName(),
+		"target_branch":       targetBranch,
+		"open_count":          strconv.Itoa(openCount),
+		"closed_absent_count": strconv.FormatInt(closedAbsentCount, 10),
+	}
+	detailsJSON, err := json.Marshal(details)
+	if err != nil {
+		detailsJSON = []byte(`{}`)
+	}
+	return audit.Event{
+		Action:      audit.ActionRepositoryOpenPullRequestsSynced,
+		SubjectType: audit.SubjectTypeRepository,
+		SubjectID:   strconv.FormatInt(repo.ID, 10),
+		DetailsJSON: string(detailsJSON),
+	}
 }
 
 func (s *forgeOpenPullRequestSyncer) repositoryAllowed(repo domain.Repository) bool {

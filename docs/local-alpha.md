@@ -52,6 +52,8 @@ make e2e-logs    # follow Thawguard logs
 
 `make e2e-reset` deletes the `thawguard-data` Docker volume. Use it when you want a clean E2E database and are ready to re-enter repository setup, webhook secret, and status token.
 
+Local alpha data is stored in SQLite and includes append-only operator metadata such as audit events, status decisions, status publication attempts, and webhook delivery receipts. The logical database should stay small during E2E testing, but the SQLite WAL file can be larger until checkpointed; this is normal SQLite behavior. Use `make e2e-reset` for clean test runs. Production retention/cleanup policy is not yet wired.
+
 To stop without deleting local state:
 
 ```sh
@@ -116,13 +118,15 @@ In the throwaway Forgejo/Codeberg repository:
 
 In Thawguard, inspect:
 
-- `/webhooks` — signed delivery receipt and processing state.
+- `/webhooks` — system activity, status publication attempts, signed delivery receipt, and processing state.
 - `/publications` — latest local publication intent and dry-run publication attempt.
 - `/decisions` — local status decision history.
 - `/freezes` — active freeze and audit history.
 
 Expected alpha behavior:
 
+- System activity should show repository/freeze/sync/thaw actions as sanitized audit events.
+- Status publication attempts should show dry-run or live status posting outcomes.
 - Webhook deliveries should show as verified and processed.
 - Frozen-branch PRs should produce a local failure decision.
 - Publication attempts should show `dry_run` / `planned`.

@@ -69,6 +69,7 @@ type FreezeStore interface {
 }
 
 type AuditStore interface {
+	List(ctx context.Context, limit int) ([]audit.Event, error)
 	ListBySubjectType(ctx context.Context, subjectType string, limit int) ([]audit.Event, error)
 }
 
@@ -160,6 +161,17 @@ type webhookDeliveryView struct {
 	VerificationStateClass string
 }
 
+type systemAuditEventView struct {
+	Event      audit.Event
+	Repository domain.Repository
+	CreatedAt  string
+	Label      string
+	Summary    string
+	Detail     string
+	Actor      string
+	StateClass string
+}
+
 type auditLogControls struct {
 	Limit           int
 	Sort            string
@@ -171,6 +183,8 @@ type auditLogControls struct {
 
 type auditLogView struct {
 	Deliveries              []webhookDeliveryView
+	SystemEvents            []systemAuditEventView
+	StatusAttempts          []statusPublicationAttemptView
 	Filters                 auditLogFilterView
 	RepositoryFilterOptions []auditLogOption
 	EventFilterOptions      []auditLogOption
@@ -349,7 +363,7 @@ func (s *Server) handlePublications(w http.ResponseWriter, r *http.Request) {
 		internalServerError(w)
 		return
 	}
-	s.renderPublications(w, s.statusPublicationViews(repositories, publications), s.statusPublicationAttemptViews(repositories, attempts))
+	s.renderPublications(w, s.statusPublicationViews(repositories, publications), statusPublicationAttemptViews(repositories, attempts))
 }
 
 func (s *Server) handleWebhooks(w http.ResponseWriter, r *http.Request) {
@@ -362,12 +376,12 @@ func (s *Server) handleWebhooks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	controls := parseAuditLogControls(r)
-	repositories, deliveries, err := s.webhookDeliveryPageData(r.Context())
+	repositories, deliveries, events, attempts, err := s.webhookDeliveryPageData(r.Context())
 	if err != nil {
 		internalServerError(w)
 		return
 	}
-	s.renderWebhookDeliveries(w, auditLogViewData(controls, repositories, deliveries))
+	s.renderWebhookDeliveries(w, auditLogViewData(controls, repositories, deliveries, events, attempts))
 }
 
 func (s *Server) handleForgejoWebhook(w http.ResponseWriter, r *http.Request) {
@@ -923,16 +937,31 @@ func (s *Server) webhookDeliveries(ctx context.Context) ([]webhook.Delivery, err
 	return s.cfg.WebhookDeliveryStore.ListRecent(ctx, maxAuditLogLimit)
 }
 
-func (s *Server) webhookDeliveryPageData(ctx context.Context) ([]domain.Repository, []webhook.Delivery, error) {
+func (s *Server) systemAuditEvents(ctx context.Context) ([]audit.Event, error) {
+	if s.cfg.AuditStore == nil {
+		return nil, nil
+	}
+	return s.cfg.AuditStore.List(ctx, 25)
+}
+
+func (s *Server) webhookDeliveryPageData(ctx context.Context) ([]domain.Repository, []webhook.Delivery, []audit.Event, []statuspublication.Attempt, error) {
 	repositories, err := s.repositories(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	deliveries, err := s.webhookDeliveries(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
-	return repositories, deliveries, nil
+	events, err := s.systemAuditEvents(ctx)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	attempts, err := s.statusPublicationAttempts(ctx)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	return repositories, deliveries, events, attempts, nil
 }
 
 func parseAuditLogControls(r *http.Request) auditLogControls {
@@ -964,7 +993,7 @@ func parseAuditLogControls(r *http.Request) auditLogControls {
 	return controls
 }
 
-func auditLogViewData(controls auditLogControls, repositories []domain.Repository, deliveries []webhook.Delivery) auditLogView {
+func auditLogViewData(controls auditLogControls, repositories []domain.Repository, deliveries []webhook.Delivery, events []audit.Event, attempts []statuspublication.Attempt) auditLogView {
 	filtered := filterAuditLogDeliveries(deliveries, controls)
 	sortAuditLogDeliveries(filtered, controls)
 	limited := filtered
@@ -991,6 +1020,8 @@ func auditLogViewData(controls auditLogControls, repositories []domain.Repositor
 	}
 	return auditLogView{
 		Deliveries:              webhookDeliveryViews(repositories, limited),
+		SystemEvents:            systemAuditEventViews(repositories, events),
+		StatusAttempts:          statusPublicationAttemptViews(repositories, attempts),
 		Filters:                 filterView,
 		RepositoryFilterOptions: auditLogRepositoryOptions(repositories, controls.RepositoryID),
 		EventFilterOptions:      auditLogEventOptions(deliveries, controls.Event),
@@ -1242,7 +1273,7 @@ func (s *Server) statusPublicationViews(repositories []domain.Repository, public
 	return views
 }
 
-func (s *Server) statusPublicationAttemptViews(repositories []domain.Repository, attempts []statuspublication.Attempt) []statusPublicationAttemptView {
+func statusPublicationAttemptViews(repositories []domain.Repository, attempts []statuspublication.Attempt) []statusPublicationAttemptView {
 	repositoriesByID := repositoriesByID(repositories)
 	views := make([]statusPublicationAttemptView, 0, len(attempts))
 	for _, attempt := range attempts {
@@ -1270,6 +1301,116 @@ func webhookDeliveryViews(repositories []domain.Repository, deliveries []webhook
 		})
 	}
 	return views
+}
+
+func systemAuditEventViews(repositories []domain.Repository, events []audit.Event) []systemAuditEventView {
+	repositoriesByID := repositoriesByID(repositories)
+	views := make([]systemAuditEventView, 0, len(events))
+	for _, event := range events {
+		view, ok := systemAuditEventViewForEvent(repositoriesByID, event)
+		if ok {
+			views = append(views, view)
+		}
+	}
+	return views
+}
+
+func systemAuditEventViewForEvent(repositoriesByID map[int64]domain.Repository, event audit.Event) (systemAuditEventView, bool) {
+	details := map[string]string{}
+	if strings.TrimSpace(event.DetailsJSON) != "" {
+		if err := json.Unmarshal([]byte(event.DetailsJSON), &details); err != nil {
+			details = map[string]string{}
+		}
+	}
+	view := systemAuditEventView{
+		Event:      event,
+		CreatedAt:  event.CreatedAt.UTC().Format("2006-01-02 15:04 UTC"),
+		Actor:      actorLabel(details["actor_kind"], details["actor_role"]),
+		StateClass: "info",
+	}
+	if repositoryID, ok := auditDetailInt64(details, "repository_id"); ok {
+		view.Repository = repositoriesByID[repositoryID]
+	}
+	if view.Actor == "unknown" {
+		view.Actor = "system"
+	}
+	switch event.Action {
+	case audit.ActionRepositoryCreated:
+		view.Label = "Repository added"
+		view.Summary = auditRepositoryLabel(view.Repository, details)
+		view.Detail = "Default branch " + auditDetailOrDash(details, "default_branch")
+		view.StateClass = "ok"
+	case audit.ActionRepositoryWebhookSecretConfigured:
+		view.Label = "Webhook secret configured"
+		view.Summary = auditRepositoryLabel(view.Repository, details)
+		view.Detail = auditRotationDetail(details, "webhook_secret_was_configured")
+		view.StateClass = "ok"
+	case audit.ActionRepositoryStatusTokenConfigured:
+		view.Label = "Status token configured"
+		view.Summary = auditRepositoryLabel(view.Repository, details)
+		view.Detail = auditRotationDetail(details, "status_token_was_configured")
+		view.StateClass = "ok"
+	case audit.ActionRepositoryOpenPullRequestsSynced:
+		view.Label = "Open PRs synced"
+		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "target_branch")
+		view.Detail = auditDetailOrDash(details, "open_count") + " open from forge, " + auditDetailOrDash(details, "closed_absent_count") + " cached closed"
+		view.StateClass = "ok"
+	case audit.ActionBranchFreezeCreated:
+		view.Label = "Freeze created"
+		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "branch")
+		view.Detail = auditDetailOrDash(details, "reason")
+		view.StateClass = "failed"
+	case audit.ActionBranchFreezeEnded:
+		view.Label = "Freeze lifted"
+		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "branch")
+		view.Detail = auditDetailOrDash(details, "reason")
+		view.StateClass = "ok"
+	case audit.ActionBranchFreezeCancelled:
+		view.Label = "Freeze cancelled"
+		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "branch")
+		view.Detail = auditDetailOrDash(details, "reason")
+		view.StateClass = "warning"
+	case audit.ActionThawExceptionApproved:
+		view.Label = "Thaw approved"
+		view.Summary = auditRepositoryLabel(view.Repository, details) + " PR #" + auditDetailOrDash(details, "pull_request_index")
+		view.Detail = "Head " + auditDetailOrDash(details, "head_sha") + " on " + auditDetailOrDash(details, "target_branch") + " — " + auditDetailOrDash(details, "reason")
+		view.StateClass = "ok"
+	default:
+		return systemAuditEventView{}, false
+	}
+	return view, true
+}
+
+func auditDetailInt64(details map[string]string, key string) (int64, bool) {
+	value, err := strconv.ParseInt(strings.TrimSpace(details[key]), 10, 64)
+	return value, err == nil && value > 0
+}
+
+func auditRepositoryLabel(repo domain.Repository, details map[string]string) string {
+	if repo.ID > 0 {
+		return repo.FullName()
+	}
+	if fullName := strings.TrimSpace(details["full_name"]); fullName != "" {
+		return fullName
+	}
+	if repositoryID := strings.TrimSpace(details["repository_id"]); repositoryID != "" {
+		return "Repository #" + repositoryID
+	}
+	return "Repository"
+}
+
+func auditDetailOrDash(details map[string]string, key string) string {
+	if value := strings.TrimSpace(details[key]); value != "" {
+		return value
+	}
+	return "—"
+}
+
+func auditRotationDetail(details map[string]string, key string) string {
+	if details[key] == "true" {
+		return "Existing credential was replaced"
+	}
+	return "Credential was set"
 }
 
 func webhookDeliveryProcessingState(delivery webhook.Delivery) (string, string) {
@@ -1511,7 +1652,10 @@ func (s *Server) renderWebhookDeliveries(w http.ResponseWriter, auditLog auditLo
 	s.render(w, webhookDeliveriesTemplate, map[string]any{
 		"AppName":                 s.cfg.AppName,
 		"ActivePage":              "audit",
+		"RequiredContext":         domain.RequiredStatusContext,
 		"Deliveries":              auditLog.Deliveries,
+		"SystemEvents":            auditLog.SystemEvents,
+		"StatusAttempts":          auditLog.StatusAttempts,
 		"Filters":                 auditLog.Filters,
 		"RepositoryFilterOptions": auditLog.RepositoryFilterOptions,
 		"EventFilterOptions":      auditLog.EventFilterOptions,
@@ -1811,6 +1955,61 @@ const webhookDeliveriesTemplate = pageHead + `
     <section class="tg-warning-callout">
       <span aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-warning"></use></svg></span>
       <span>This page does not store or render raw webhook payloads, signatures, webhook secrets, or status tokens. Bootstrap sessions are for local development only.</span>
+    </section>
+
+    <section class="tg-panel tg-data-panel tg-audit-log-panel">
+      <div class="tg-panel-head"><h2>System activity</h2><span class="tg-badge tg-badge-info">{{ len .SystemEvents }} audit events</span></div>
+      <p class="tg-panel-subtitle">Recent setup, freeze, sync, and thaw actions recorded as sanitized audit events.</p>
+      {{ if .SystemEvents }}
+      <div class="tg-table-wrap tg-responsive-table">
+        <table class="tg-data-table tg-audit-table">
+          <caption class="tg-sr-only">Recent system activity</caption>
+          <thead><tr><th>Time</th><th>Action</th><th>Repository</th><th>Summary</th><th>Actor</th><th>Details</th></tr></thead>
+          <tbody>
+          {{ range .SystemEvents }}
+            <tr>
+              <td data-label="Time">{{ .CreatedAt }}</td>
+              <td data-label="Action"><span class="status status-{{ .StateClass }}">{{ .Label }}</span></td>
+              <td data-label="Repository"><span class="tg-table-repo"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-repositories"></use></svg><code>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository{{ end }}</code></span></td>
+              <td data-label="Summary">{{ .Summary }}</td>
+              <td data-label="Actor">{{ .Actor }}</td>
+              <td data-label="Details">{{ .Detail }}</td>
+            </tr>
+          {{ end }}
+          </tbody>
+        </table>
+      </div>
+      {{ else }}
+        <div class="tg-empty-row tg-data-empty"><strong>No system activity yet</strong><span>Repository setup, freeze lifecycle, open PR sync, and thaw approvals will appear here.</span></div>
+      {{ end }}
+    </section>
+
+    <section class="tg-panel tg-data-panel tg-audit-log-panel">
+      <div class="tg-panel-head"><h2>Status publication attempts</h2><span class="tg-badge tg-badge-info">{{ len .StatusAttempts }} attempts</span></div>
+      <p class="tg-panel-subtitle">Recent dry-run or live attempts for the <code>{{ .RequiredContext }}</code> status context. Errors shown here are already sanitized by the publisher.</p>
+      {{ if .StatusAttempts }}
+      <div class="tg-table-wrap tg-responsive-table">
+        <table class="tg-data-table tg-audit-table">
+          <caption class="tg-sr-only">Recent status publication attempts</caption>
+          <thead><tr><th>Attempted</th><th>Repository</th><th>PR</th><th>Head SHA</th><th>Mode</th><th>Result</th><th>Description</th></tr></thead>
+          <tbody>
+          {{ range .StatusAttempts }}
+            <tr>
+              <td data-label="Attempted">{{ .AttemptedAt }}</td>
+              <td data-label="Repository"><span class="tg-table-repo"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-repositories"></use></svg><code>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Attempt.RepositoryID }}{{ end }}</code></span></td>
+              <td data-label="PR">#{{ .Attempt.PullRequestIndex }}</td>
+              <td data-label="Head SHA"><code>{{ .Attempt.HeadSHA }}</code><small class="tg-muted">{{ .Attempt.TargetBranch }}</small></td>
+              <td data-label="Mode"><code>{{ .Attempt.Mode }}</code></td>
+              <td data-label="Result"><span class="status status-{{ if eq .Attempt.Result "posted" }}ok{{ else if eq .Attempt.Result "failed" }}failed{{ else }}pending{{ end }}">{{ .Attempt.Result }}</span></td>
+              <td data-label="Description">{{ .Attempt.Description }}{{ if .Attempt.Error }}<small class="tg-muted">{{ .Attempt.Error }}</small>{{ end }}</td>
+            </tr>
+          {{ end }}
+          </tbody>
+        </table>
+      </div>
+      {{ else }}
+        <div class="tg-empty-row tg-data-empty"><strong>No status publication attempts yet</strong><span>Status dry-runs and live post attempts will appear here after freeze/thaw recomputation.</span></div>
+      {{ end }}
     </section>
 
     <section class="tg-panel tg-data-panel tg-audit-log-panel">
