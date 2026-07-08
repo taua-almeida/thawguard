@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -60,6 +61,12 @@ func TestOpenAndApplyMigrationsAgainstSQLite(t *testing.T) {
 	assertTableExists(t, database, "status_publication_attempts")
 	assertIndexExists(t, database, "idx_status_publication_attempts_recent")
 	assertStatusPublicationLiveModesAllowed(t, database)
+	assertColumnExists(t, database, "branch_freezes", "scheduled")
+	assertColumnExists(t, database, "branch_freezes", "planned_ends_at")
+	assertColumnExists(t, database, "branch_freezes", "needs_recompute")
+	assertIndexExists(t, database, "idx_branch_freezes_scheduled_due")
+	assertIndexExists(t, database, "idx_branch_freezes_planned_unfreeze_due")
+	assertIndexExists(t, database, "idx_branch_freezes_scheduled_recompute")
 
 	var applied int
 	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = ?`, "0001_initial").Scan(&applied); err != nil {
@@ -121,7 +128,10 @@ CREATE TABLE audit_events (
   subject_id TEXT NOT NULL,
   details_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL
-);`); err != nil {
+);
+INSERT INTO repositories(id, active) VALUES (7001, 1);
+INSERT INTO branch_freezes(id, repository_id, branch, status, reason, starts_at, created_at, updated_at)
+VALUES (7001, 7001, 'main', 'scheduled', 'future freeze', '2026-07-10T18:00:00Z', '2026-07-08T12:00:00Z', '2026-07-08T12:00:00Z');`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)`, "0001_initial", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
@@ -145,6 +155,16 @@ CREATE TABLE audit_events (
 	assertTableExists(t, database, "webhook_deliveries")
 	assertColumnExists(t, database, "webhook_deliveries", "processing_started_at")
 	assertTableExists(t, database, "repository_webhook_secrets")
+	assertColumnExists(t, database, "branch_freezes", "scheduled")
+	assertColumnExists(t, database, "branch_freezes", "planned_ends_at")
+	assertColumnExists(t, database, "branch_freezes", "needs_recompute")
+	var scheduledFlag int
+	if err := database.QueryRowContext(ctx, `SELECT scheduled FROM branch_freezes WHERE id = 7001`).Scan(&scheduledFlag); err != nil {
+		t.Fatal(err)
+	}
+	if scheduledFlag != 1 {
+		t.Fatalf("expected existing scheduled freeze row to be backfilled, got %d", scheduledFlag)
+	}
 
 	var applied int
 	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = ?`, "0002_setup_checks").Scan(&applied); err != nil {
@@ -207,11 +227,27 @@ CREATE TABLE audit_events (
 	if applied != 1 {
 		t.Fatalf("expected status publication live modes migration to be recorded once, got %d", applied)
 	}
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = ?`, "0015_scheduled_freeze_windows").Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected scheduled freeze windows migration to be recorded once, got %d", applied)
+	}
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = ?`, "0016_relax_scheduled_freeze_branch_duplicates").Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected scheduled freeze duplicate relaxation migration to be recorded once, got %d", applied)
+	}
 	assertWebhookDeliveriesAreRepositoryScoped(t, database)
-	assertIndexExists(t, database, "idx_branch_freezes_one_active")
 	assertIndexExists(t, database, "idx_audit_events_subject_type_id")
 	assertIndexExists(t, database, "idx_status_publication_intents_idempotency")
 	assertIndexExists(t, database, "idx_status_publication_attempts_recent")
+	assertIndexExists(t, database, "idx_branch_freezes_scheduled_due")
+	assertIndexExists(t, database, "idx_branch_freezes_planned_unfreeze_due")
+	assertIndexExists(t, database, "idx_branch_freezes_scheduled_recompute")
+	assertIndexDoesNotExist(t, database, "idx_branch_freezes_one_active")
+	assertIndexDoesNotExist(t, database, "idx_branch_freezes_one_open")
 	assertStatusPublicationLiveModesAllowed(t, database)
 }
 
@@ -230,6 +266,18 @@ func TestApplyMigrationsDedupesStatusPublicationIntents(t *testing.T) {
 CREATE TABLE repositories (
   id INTEGER PRIMARY KEY,
   active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE branch_freezes (
+  id INTEGER PRIMARY KEY,
+  repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+  branch TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('scheduled', 'active', 'ended', 'cancelled')),
+  reason TEXT NOT NULL,
+  starts_at TEXT,
+  ends_at TEXT,
+  created_by INTEGER,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
 );
 CREATE TABLE status_results (
   id INTEGER PRIMARY KEY,
@@ -311,6 +359,18 @@ func TestApplyMigrationsRebuildsWebhookDeliveriesForRepositoryScopedClaims(t *te
 CREATE TABLE repositories (
   id INTEGER PRIMARY KEY,
   active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE branch_freezes (
+  id INTEGER PRIMARY KEY,
+  repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+  branch TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('scheduled', 'active', 'ended', 'cancelled')),
+  reason TEXT NOT NULL,
+  starts_at TEXT,
+  ends_at TEXT,
+  created_by INTEGER,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
 );
 CREATE TABLE webhook_deliveries (
   id INTEGER PRIMARY KEY,
@@ -477,6 +537,19 @@ func assertIndexExists(t *testing.T, database *sql.DB, name string) {
 	if err := database.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?`, name).Scan(&found); err != nil {
 		t.Fatalf("expected index %s to exist: %v", name, err)
 	}
+}
+
+func assertIndexDoesNotExist(t *testing.T, database *sql.DB, name string) {
+	t.Helper()
+	var found string
+	err := database.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?`, name).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Fatalf("expected index %s not to exist", name)
 }
 
 func assertColumnExists(t *testing.T, database *sql.DB, table string, column string) {

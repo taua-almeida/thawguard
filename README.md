@@ -40,6 +40,7 @@ Current local pages:
 - `/` dashboard
 - `/repositories` repository setup form and manual setup checklist
 - `/freezes` local active branch-freeze form and list
+- `/scheduled-freezes` one-time scheduled freeze windows with optional planned unfreeze
 - `/decisions` immediate bootstrap-admin thaw approval; fetches the current PR head from the forge in live mode and scopes the thaw to that PR/head SHA
 - `/publications` latest idempotent local status publication intents and dry-run publication attempts; shows what would be posted later and does not post to Forgejo/Codeberg
 - `/webhooks` system activity, status publication attempts, and recent signed webhook delivery metadata; shows sanitized local processing history and does not store raw payloads, signatures, or secrets

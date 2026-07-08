@@ -846,6 +846,90 @@ func TestEndFreezeHidesInternalErrorDetails(t *testing.T) {
 	}
 }
 
+func TestScheduledFreezesPageShowsFormAndWindows(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	startsAt := time.Date(2026, 7, 10, 18, 0, 0, 0, time.UTC)
+	plannedEndsAt := startsAt.Add(63 * time.Hour)
+	store := &fakeFreezeStore{scheduled: []domain.BranchFreeze{{ID: 9, RepositoryID: repo.ID, Branch: "main", Status: domain.BranchFreezeStatusScheduled, Scheduled: true, Reason: "Weekend release freeze", StartsAt: &startsAt, PlannedEndsAt: &plannedEndsAt}}}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, ScheduledFreezeStore: store})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/scheduled-freezes", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{"Scheduled Freezes", "Create scheduled freeze", "One-time windows only", "taua-almeida/thawguard", "main", "Weekend release freeze", "2026-07-10 18:00 UTC", "2026-07-13 09:00 UTC", "upcoming", `action="/scheduled-freezes/cancel"`, `data-confirm-action="Cancel schedule"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected body to contain %q, got %q", want, body)
+		}
+	}
+	if token := csrfTokenFromBody(t, body); token == "" {
+		t.Fatal("expected CSRF token in scheduled freeze form")
+	}
+}
+
+func TestCreateScheduledFreezePostsToStore(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	store := &fakeFreezeStore{}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, ScheduledFreezeStore: store})
+	form := scheduledFreezeCreateForm()
+	cookie, csrfToken := getScheduledFreezeForm(t, server)
+	form.Set(csrfFormField, csrfToken)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/scheduled-freezes", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect, got %d", recorder.Code)
+	}
+	if len(store.scheduledCreated) != 1 {
+		t.Fatalf("expected one scheduled freeze creation, got %+v", store.scheduledCreated)
+	}
+	created := store.scheduledCreated[0]
+	if created.RepositoryID != repo.ID || created.Branch != "main" || created.Reason != "weekend freeze" || created.StartsAt.Format(time.RFC3339) != "2026-07-10T18:00:00Z" || created.PlannedEndsAt == nil || created.PlannedEndsAt.Format(time.RFC3339) != "2026-07-13T09:00:00Z" {
+		t.Fatalf("unexpected scheduled freeze params: %+v", created)
+	}
+	if len(store.actors) != 1 || store.actors[0].Kind != domain.ActorKindBootstrapAdmin || store.actors[0].Role != "admin" {
+		t.Fatalf("unexpected actors: %+v", store.actors)
+	}
+}
+
+func TestParseScheduledFreezeFormTimeUsesBrowserTimezoneOffset(t *testing.T) {
+	parsed, err := parseScheduledFreezeFormTime("2026-07-08T16:50", 240)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := parsed.Format(time.RFC3339), "2026-07-08T20:50:00Z"; got != want {
+		t.Fatalf("expected browser-local time to convert to UTC %s, got %s", want, got)
+	}
+}
+
+func TestCancelScheduledFreezePostsToStore(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	store := &fakeFreezeStore{scheduled: []domain.BranchFreeze{{ID: 9, RepositoryID: repo.ID, Branch: "main", Status: domain.BranchFreezeStatusScheduled, Scheduled: true, Reason: "weekend"}}}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, ScheduledFreezeStore: store})
+	form := freezeCloseForm(9)
+	cookie, csrfToken := getScheduledFreezeForm(t, server)
+	form.Set(csrfFormField, csrfToken)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/scheduled-freezes/cancel", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect, got %d", recorder.Code)
+	}
+	if len(store.scheduledCancelled) != 1 || store.scheduledCancelled[0] != 9 {
+		t.Fatalf("expected scheduled freeze 9 to cancel, got %+v", store.scheduledCancelled)
+	}
+}
+
 func TestDecisionsPageShowsFormAndRecentResults(t *testing.T) {
 	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
 	createdAt := time.Date(2026, 6, 29, 16, 30, 0, 0, time.UTC)
@@ -1488,6 +1572,17 @@ func freezeCreateForm() url.Values {
 	}
 }
 
+func scheduledFreezeCreateForm() url.Values {
+	return url.Values{
+		"repository_id":           {"1"},
+		"branch":                  {"main"},
+		"starts_at":               {"2026-07-10T18:00"},
+		"planned_ends_at":         {"2026-07-13T09:00"},
+		"reason":                  {"weekend freeze"},
+		"timezone_offset_minutes": {"0"},
+	}
+}
+
 func repositoryCreateForm() url.Values {
 	return url.Values{
 		"forge":          {"forgejo"},
@@ -1514,6 +1609,16 @@ func getFreezeForm(t *testing.T, server *Server) (*http.Cookie, string) {
 	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/freezes", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected freeze form status 200, got %d", recorder.Code)
+	}
+	return sessionCookieFromRecorder(t, recorder), csrfTokenFromBody(t, recorder.Body.String())
+}
+
+func getScheduledFreezeForm(t *testing.T, server *Server) (*http.Cookie, string) {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/scheduled-freezes", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected scheduled freeze form status 200, got %d", recorder.Code)
 	}
 	return sessionCookieFromRecorder(t, recorder), csrfTokenFromBody(t, recorder.Body.String())
 }
@@ -1884,12 +1989,15 @@ func (s *fakeAuditStore) ListBySubjectType(ctx context.Context, subjectType stri
 }
 
 type fakeFreezeStore struct {
-	freezes   []domain.BranchFreeze
-	created   []freeze.CreateParams
-	ended     []int64
-	cancelled []int64
-	actors    []domain.Actor
-	err       error
+	freezes            []domain.BranchFreeze
+	scheduled          []domain.BranchFreeze
+	created            []freeze.CreateParams
+	scheduledCreated   []freeze.ScheduleParams
+	ended              []int64
+	cancelled          []int64
+	scheduledCancelled []int64
+	actors             []domain.Actor
+	err                error
 }
 
 func (s *fakeFreezeStore) ListActive(ctx context.Context) ([]domain.BranchFreeze, error) {
@@ -1923,6 +2031,33 @@ func (s *fakeFreezeStore) Cancel(ctx context.Context, id int64, actor domain.Act
 	s.cancelled = append(s.cancelled, id)
 	s.actors = append(s.actors, actor)
 	return domain.BranchFreeze{ID: id, Status: domain.BranchFreezeStatusCancelled}, nil
+}
+
+func (s *fakeFreezeStore) ListScheduled(ctx context.Context, limit int) ([]domain.BranchFreeze, error) {
+	if limit > 0 && len(s.scheduled) > limit {
+		return s.scheduled[:limit], nil
+	}
+	return s.scheduled, nil
+}
+
+func (s *fakeFreezeStore) CreateScheduled(ctx context.Context, params freeze.ScheduleParams, actor domain.Actor) (domain.BranchFreeze, error) {
+	if s.err != nil {
+		return domain.BranchFreeze{}, s.err
+	}
+	s.scheduledCreated = append(s.scheduledCreated, params)
+	s.actors = append(s.actors, actor)
+	created := domain.BranchFreeze{ID: int64(len(s.scheduled) + 1), RepositoryID: params.RepositoryID, Branch: params.Branch, Status: domain.BranchFreezeStatusScheduled, Scheduled: true, Reason: params.Reason, StartsAt: &params.StartsAt, PlannedEndsAt: params.PlannedEndsAt}
+	s.scheduled = append(s.scheduled, created)
+	return created, nil
+}
+
+func (s *fakeFreezeStore) CancelScheduled(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error) {
+	if s.err != nil {
+		return domain.BranchFreeze{}, s.err
+	}
+	s.scheduledCancelled = append(s.scheduledCancelled, id)
+	s.actors = append(s.actors, actor)
+	return domain.BranchFreeze{ID: id, Status: domain.BranchFreezeStatusCancelled, Scheduled: true}, nil
 }
 
 func (r *fakeSetupCheckRunner) Run(ctx context.Context, repo domain.Repository) ([]setupcheck.Result, error) {

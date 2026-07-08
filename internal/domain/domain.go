@@ -34,6 +34,7 @@ type Actor struct {
 }
 
 const ActorKindBootstrapAdmin = "bootstrap_admin"
+const ActorKindSystem = "system"
 
 func (r Repository) FullName() string {
 	if r.Owner == "" {
@@ -67,16 +68,19 @@ const (
 )
 
 type BranchFreeze struct {
-	ID           int64
-	RepositoryID int64
-	Branch       string
-	Status       BranchFreezeStatus
-	Active       bool
-	Reason       string
-	StartsAt     *time.Time
-	EndsAt       *time.Time
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	ID             int64
+	RepositoryID   int64
+	Branch         string
+	Status         BranchFreezeStatus
+	Active         bool
+	Scheduled      bool
+	NeedsRecompute bool
+	Reason         string
+	StartsAt       *time.Time
+	EndsAt         *time.Time
+	PlannedEndsAt  *time.Time
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 type ThawException struct {

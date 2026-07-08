@@ -122,6 +122,7 @@ In Thawguard, inspect:
 - `/publications` — latest local publication intent and dry-run publication attempt.
 - `/decisions` — local status decision history.
 - `/freezes` — active freeze and audit history.
+- `/scheduled-freezes` — one-time scheduled windows and optional planned unfreeze.
 
 Expected alpha behavior:
 
@@ -132,6 +133,7 @@ Expected alpha behavior:
 - Publication attempts should show `dry_run` / `planned`.
 - Codeberg will not show a Thawguard commit status yet.
 - Freeze, lift, and cancel actions recompute statuses for open PRs already known in Thawguard's local PR cache. The default dry-run mode does not call the forge to sync PRs, so PRs that existed before webhook setup may still need a new webhook event in shadow-mode testing.
+- Scheduled freeze windows activate from the local Thawguard process. Keep the process running for scheduled start/planned unfreeze times to execute.
 
 ## 7. Guarded live-pilot E2E flow
 

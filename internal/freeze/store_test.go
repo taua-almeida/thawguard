@@ -83,21 +83,207 @@ func TestStoreRejectsDuplicateActiveFreeze(t *testing.T) {
 	}
 }
 
-func TestDatabaseRejectsDuplicateActiveFreeze(t *testing.T) {
+func TestStoreAllowsScheduledFreezeWhenBranchIsAlreadyFrozen(t *testing.T) {
 	ctx := context.Background()
 	database := newTestDB(t, ctx)
 	repo := createTestRepository(t, ctx, database)
 	store := NewStore(database)
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
 
 	if _, err := store.CreateActive(ctx, CreateParams{RepositoryID: repo.ID, Branch: "main", Reason: "release"}); err != nil {
 		t.Fatal(err)
 	}
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err := database.ExecContext(ctx, `
-INSERT INTO branch_freezes(repository_id, branch, status, reason, starts_at, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?)`, repo.ID, "main", domain.BranchFreezeStatusActive, "duplicate", now, now, now)
-	if err == nil {
-		t.Fatal("expected database unique constraint to reject duplicate active freeze")
+	scheduled, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repo.ID, Branch: "main", Reason: "weekend", StartsAt: now.Add(time.Hour)})
+	if err != nil {
+		t.Fatalf("expected scheduled freeze to be allowed while branch is active: %v", err)
+	}
+	if scheduled.Status != domain.BranchFreezeStatusScheduled || !scheduled.Scheduled {
+		t.Fatalf("expected scheduled freeze, got %+v", scheduled)
+	}
+	store.now = func() time.Time { return now.Add(time.Hour + time.Minute) }
+	activated, err := store.ActivateScheduled(ctx, scheduled.ID)
+	if err != nil {
+		t.Fatalf("expected scheduled freeze to activate even while another freeze is active: %v", err)
+	}
+	if activated.Status != domain.BranchFreezeStatusActive || !activated.Active || !activated.Scheduled {
+		t.Fatalf("expected active scheduled freeze, got %+v", activated)
+	}
+	active, err := store.ListActive(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 2 {
+		t.Fatalf("expected manual and scheduled active freezes, got %+v", active)
+	}
+}
+
+func TestStoreAllowsMultipleScheduledFreezesForSameBranch(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	store := NewStore(database)
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+
+	if _, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repo.ID, Branch: "main", Reason: "weekday freeze", StartsAt: now.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repo.ID, Branch: "main", Reason: "weekend freeze", StartsAt: now.Add(48 * time.Hour)}); err != nil {
+		t.Fatalf("expected multiple scheduled freezes for one branch: %v", err)
+	}
+	scheduled, err := store.ListScheduled(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scheduled) != 2 {
+		t.Fatalf("expected two scheduled freezes for same branch, got %+v", scheduled)
+	}
+}
+
+func TestStoreCreatesListsActivatesAndEndsScheduledFreeze(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	store := NewStore(database)
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+	startsAt := now.Add(time.Hour)
+	plannedEndsAt := startsAt.Add(2 * time.Hour)
+
+	scheduled, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repo.ID, Branch: " main ", Reason: " weekend freeze ", StartsAt: startsAt, PlannedEndsAt: &plannedEndsAt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !scheduled.Scheduled || scheduled.Status != domain.BranchFreezeStatusScheduled || scheduled.Active || scheduled.StartsAt == nil || scheduled.PlannedEndsAt == nil {
+		t.Fatalf("expected scheduled freeze metadata, got %+v", scheduled)
+	}
+	listed, err := store.ListScheduled(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].ID != scheduled.ID {
+		t.Fatalf("expected scheduled freeze in list, got %+v", listed)
+	}
+	if due, err := store.ListDueScheduled(ctx, 10); err != nil || len(due) != 0 {
+		t.Fatalf("expected no due freezes before start, due=%+v err=%v", due, err)
+	}
+
+	store.now = func() time.Time { return startsAt.Add(123 * time.Millisecond) }
+	due, err := store.ListDueScheduled(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 1 || due[0].ID != scheduled.ID {
+		t.Fatalf("expected due scheduled freeze, got %+v", due)
+	}
+	activated, err := store.ActivateScheduled(ctx, scheduled.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activated.Status != domain.BranchFreezeStatusActive || !activated.Active || !activated.Scheduled || !activated.NeedsRecompute {
+		t.Fatalf("expected activated scheduled freeze, got %+v", activated)
+	}
+	recompute, err := store.ListScheduledNeedsRecompute(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recompute) != 1 || recompute[0].ID != scheduled.ID {
+		t.Fatalf("expected activated schedule to need recompute, got %+v", recompute)
+	}
+	marked, err := store.MarkScheduledRecomputed(ctx, scheduled.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if marked.NeedsRecompute {
+		t.Fatalf("expected recompute marker to clear, got %+v", marked)
+	}
+
+	store.now = func() time.Time { return plannedEndsAt.Add(time.Minute) }
+	dueEnds, err := store.ListDuePlannedUnfreezes(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dueEnds) != 1 || dueEnds[0].ID != scheduled.ID {
+		t.Fatalf("expected due planned unfreeze, got %+v", dueEnds)
+	}
+	ended, err := store.ExecutePlannedUnfreeze(ctx, scheduled.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ended.Status != domain.BranchFreezeStatusEnded || ended.Active || ended.EndsAt == nil || ended.PlannedEndsAt == nil || !ended.NeedsRecompute {
+		t.Fatalf("expected ended scheduled freeze with planned end preserved, got %+v", ended)
+	}
+}
+
+func TestStoreCancelsScheduledFreezeBeforeActivation(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	store := NewStore(database)
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+	scheduled, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repo.ID, Branch: "main", Reason: "maintenance", StartsAt: now.Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cancelled, err := store.CancelScheduled(ctx, scheduled.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cancelled.Status != domain.BranchFreezeStatusCancelled || cancelled.EndsAt == nil || !cancelled.Scheduled {
+		t.Fatalf("expected cancelled scheduled freeze, got %+v", cancelled)
+	}
+}
+
+func TestStoreMarksActiveScheduledFreezeForRecomputeWhenManuallyClosed(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	store := NewStore(database)
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+	scheduled, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repo.ID, Branch: "main", Reason: "manual lift later", StartsAt: now.Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.now = func() time.Time { return now.Add(time.Hour) }
+	activated, err := store.ActivateScheduled(ctx, scheduled.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkScheduledRecomputed(ctx, activated.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	ended, err := store.End(ctx, scheduled.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ended.Scheduled || !ended.NeedsRecompute || ended.Status != domain.BranchFreezeStatusEnded {
+		t.Fatalf("expected manually ended scheduled freeze to need recompute, got %+v", ended)
+	}
+}
+
+func TestStoreRejectsInvalidScheduledFreezeParams(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	store := NewStore(database)
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+	startsAt := now.Add(time.Hour)
+	plannedEndsAt := now.Add(30 * time.Minute)
+
+	if _, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repo.ID, Branch: "main", Reason: "release", StartsAt: now}); !IsValidationError(err) {
+		t.Fatalf("expected past start validation error, got %v", err)
+	}
+	if _, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repo.ID, Branch: "main", Reason: "release", StartsAt: startsAt, PlannedEndsAt: &plannedEndsAt}); !IsValidationError(err) {
+		t.Fatalf("expected invalid planned end validation error, got %v", err)
+	}
+	if _, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: 999, Branch: "main", Reason: "release", StartsAt: startsAt}); !IsValidationError(err) {
+		t.Fatalf("expected missing repository validation error, got %v", err)
 	}
 }
 
@@ -241,6 +427,28 @@ func TestServiceCancelsFreezeAndRecordsAuditEvent(t *testing.T) {
 		t.Fatalf("expected cancelled freeze, got %+v", cancelled)
 	}
 	assertLatestFreezeAudit(t, ctx, database, audit.ActionBranchFreezeCancelled, cancelled)
+}
+
+func TestServiceScheduledFreezeLifecycleRecordsAuditEvents(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	service := NewService(database)
+	startsAt := time.Now().UTC().Add(time.Hour)
+	plannedEndsAt := startsAt.Add(time.Hour)
+	actor := domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}
+
+	scheduled, err := service.CreateScheduled(ctx, ScheduleParams{RepositoryID: repo.ID, Branch: "main", Reason: "weekend", StartsAt: startsAt, PlannedEndsAt: &plannedEndsAt}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertLatestFreezeAudit(t, ctx, database, audit.ActionFreezeScheduleCreated, scheduled)
+
+	cancelled, err := service.CancelScheduled(ctx, scheduled.ID, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertLatestFreezeAudit(t, ctx, database, audit.ActionFreezeScheduleCancelled, cancelled)
 }
 
 func TestServiceRollsBackEndWhenAuditFails(t *testing.T) {

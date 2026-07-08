@@ -17,6 +17,10 @@ const (
 	ActionBranchFreezeCreated               = "branch_freeze.created"
 	ActionBranchFreezeEnded                 = "branch_freeze.ended"
 	ActionBranchFreezeCancelled             = "branch_freeze.cancelled"
+	ActionFreezeScheduleCreated             = "freeze_schedule.created"
+	ActionFreezeScheduleCancelled           = "freeze_schedule.cancelled"
+	ActionFreezeScheduleActivated           = "freeze_schedule.activated"
+	ActionFreezeSchedulePlannedUnfreeze     = "freeze_schedule.planned_unfreeze_executed"
 	ActionThawExceptionApproved             = "thaw_exception.approved"
 
 	SubjectTypeRepository    = "repository"
