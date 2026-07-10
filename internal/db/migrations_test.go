@@ -67,6 +67,9 @@ func TestOpenAndApplyMigrationsAgainstSQLite(t *testing.T) {
 	assertIndexExists(t, database, "idx_branch_freezes_scheduled_due")
 	assertIndexExists(t, database, "idx_branch_freezes_planned_unfreeze_due")
 	assertIndexExists(t, database, "idx_branch_freezes_scheduled_recompute")
+	assertColumnExists(t, database, "sessions", "csrf_token")
+	assertIndexExists(t, database, "idx_sessions_expires_at")
+	assertTableExists(t, database, "user_roles")
 
 	var applied int
 	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = ?`, "0001_initial").Scan(&applied); err != nil {
@@ -108,6 +111,21 @@ CREATE TABLE repositories (
   id INTEGER PRIMARY KEY,
   active INTEGER NOT NULL DEFAULT 1
 );
+CREATE TABLE users (
+  id INTEGER PRIMARY KEY,
+  email TEXT NOT NULL UNIQUE,
+  display_name TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('admin', 'freezer', 'thaw_approver', 'viewer')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE sessions (
+  id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 CREATE TABLE branch_freezes (
   id INTEGER PRIMARY KEY,
   repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
@@ -130,6 +148,12 @@ CREATE TABLE audit_events (
   created_at TEXT NOT NULL
 );
 INSERT INTO repositories(id, active) VALUES (7001, 1);
+INSERT INTO users(id, email, display_name, password_hash, role, created_at, updated_at)
+VALUES
+  (101, 'admin@example.test', 'Admin', 'hash', 'admin', '2026-07-08T12:00:00Z', '2026-07-08T12:00:00Z'),
+  (102, 'freezer@example.test', 'Freezer', 'hash', 'freezer', '2026-07-08T12:00:00Z', '2026-07-08T12:00:00Z');
+INSERT INTO sessions(id, user_id, expires_at, created_at)
+VALUES ('legacy-session', 101, '2026-07-09T12:00:00Z', '2026-07-08T12:00:00Z');
 INSERT INTO branch_freezes(id, repository_id, branch, status, reason, starts_at, created_at, updated_at)
 VALUES (7001, 7001, 'main', 'scheduled', 'future freeze', '2026-07-10T18:00:00Z', '2026-07-08T12:00:00Z', '2026-07-08T12:00:00Z');`); err != nil {
 		t.Fatal(err)
@@ -158,6 +182,17 @@ VALUES (7001, 7001, 'main', 'scheduled', 'future freeze', '2026-07-10T18:00:00Z'
 	assertColumnExists(t, database, "branch_freezes", "scheduled")
 	assertColumnExists(t, database, "branch_freezes", "planned_ends_at")
 	assertColumnExists(t, database, "branch_freezes", "needs_recompute")
+	assertColumnExists(t, database, "sessions", "csrf_token")
+	assertTableExists(t, database, "user_roles")
+	assertUserRoles(t, database, 101, []string{"admin", "freezer", "thaw_approver", "viewer"})
+	assertUserRoles(t, database, 102, []string{"freezer"})
+	var sessionCount int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM sessions WHERE id = 'legacy-session'`).Scan(&sessionCount); err != nil {
+		t.Fatal(err)
+	}
+	if sessionCount != 0 {
+		t.Fatalf("expected legacy sessions without csrf tokens to be removed, got %d", sessionCount)
+	}
 	var scheduledFlag int
 	if err := database.QueryRowContext(ctx, `SELECT scheduled FROM branch_freezes WHERE id = 7001`).Scan(&scheduledFlag); err != nil {
 		t.Fatal(err)
@@ -267,6 +302,21 @@ CREATE TABLE repositories (
   id INTEGER PRIMARY KEY,
   active INTEGER NOT NULL DEFAULT 1
 );
+CREATE TABLE users (
+  id INTEGER PRIMARY KEY,
+  email TEXT NOT NULL UNIQUE,
+  display_name TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('admin', 'freezer', 'thaw_approver', 'viewer')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE sessions (
+  id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 CREATE TABLE branch_freezes (
   id INTEGER PRIMARY KEY,
   repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
@@ -359,6 +409,21 @@ func TestApplyMigrationsRebuildsWebhookDeliveriesForRepositoryScopedClaims(t *te
 CREATE TABLE repositories (
   id INTEGER PRIMARY KEY,
   active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE users (
+  id INTEGER PRIMARY KEY,
+  email TEXT NOT NULL UNIQUE,
+  display_name TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('admin', 'freezer', 'thaw_approver', 'viewer')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE sessions (
+  id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
 );
 CREATE TABLE branch_freezes (
   id INTEGER PRIMARY KEY,
@@ -528,6 +593,34 @@ func assertTableExists(t *testing.T, database *sql.DB, name string) {
 	var found string
 	if err := database.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, name).Scan(&found); err != nil {
 		t.Fatalf("expected table %s to exist: %v", name, err)
+	}
+}
+
+func assertUserRoles(t *testing.T, database *sql.DB, userID int64, want []string) {
+	t.Helper()
+	rows, err := database.Query(`SELECT role FROM user_roles WHERE user_id = ?`, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	got := map[string]bool{}
+	for rows.Next() {
+		var role string
+		if err := rows.Scan(&role); err != nil {
+			t.Fatal(err)
+		}
+		got[role] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("user %d roles: want %v, got %v", userID, want, got)
+	}
+	for _, role := range want {
+		if !got[role] {
+			t.Fatalf("user %d roles: want %v, got %v", userID, want, got)
+		}
 	}
 }
 

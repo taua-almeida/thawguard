@@ -19,7 +19,7 @@ go test ./...
 go run ./cmd/thawguard
 ```
 
-The service listens on `127.0.0.1:8080` by default. Override with `THAWGUARD_HTTP_ADDR`; while bootstrap sessions are active, Thawguard refuses non-loopback bind addresses.
+The service listens on `127.0.0.1:8080` by default. Override with `THAWGUARD_HTTP_ADDR`. Until the first local admin user exists, Thawguard refuses non-loopback bind addresses for first-admin setup.
 
 The service creates `thawguard.db` by default. Override with `THAWGUARD_DB_PATH`.
 
@@ -38,14 +38,17 @@ Freeze, lift, and cancel actions recompute statuses for open PRs on the affected
 Current local pages:
 
 - `/` dashboard
+- `/setup` first local admin setup when no users exist; the first account starts with all MVP roles for local bootstrap
+- `/login` and `/logout` local user session flow
 - `/repositories` repository setup form and manual setup checklist
 - `/freezes` local active branch-freeze form and list
 - `/scheduled-freezes` one-time scheduled freeze windows with optional planned unfreeze
-- `/decisions` immediate bootstrap-admin thaw approval; fetches the current PR head from the forge in live mode and scopes the thaw to that PR/head SHA
+- `/decisions` immediate thaw approval; fetches the current PR head from the forge in live mode and scopes the thaw to that PR/head SHA
 - `/publications` latest idempotent local status publication intents and dry-run publication attempts; shows what would be posted later and does not post to Forgejo/Codeberg
 - `/webhooks` system activity, status publication attempts, and recent signed webhook delivery metadata; shows sanitized local processing history and does not store raw payloads, signatures, or secrets
+- `/users` admin-only local user and multi-role management
 
-Current bootstrap sessions are for local development only. Do not expose the server on a network until real local auth is configured.
+Local users can hold one or more explicit role flags. Admin configures repositories/users/secrets, freezer performs freeze actions, thaw approver approves PR exceptions, and viewer is read-only. If you bind beyond loopback after first-admin setup, keep Thawguard behind the network controls appropriate for your trusted team.
 
 ## License
 

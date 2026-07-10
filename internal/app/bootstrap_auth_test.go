@@ -1,6 +1,8 @@
 package app
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	"github.com/taua-almeida/thawguard/internal/config"
@@ -12,6 +14,27 @@ func TestValidateBootstrapLocalBindAcceptsLoopback(t *testing.T) {
 		if err := validateBootstrapLocalBind(addr); err != nil {
 			t.Fatalf("expected %q to be accepted: %v", addr, err)
 		}
+	}
+}
+
+func TestValidateInitialSetupBindAllowsNetworkBindAfterUsersExist(t *testing.T) {
+	checker := fakeUserPresenceChecker{hasUsers: true}
+	if err := validateInitialSetupBind(context.Background(), "0.0.0.0:8080", checker); err != nil {
+		t.Fatalf("expected network bind after local users exist: %v", err)
+	}
+}
+
+func TestValidateInitialSetupBindRejectsNetworkBindBeforeUsersExist(t *testing.T) {
+	checker := fakeUserPresenceChecker{}
+	if err := validateInitialSetupBind(context.Background(), "0.0.0.0:8080", checker); err == nil {
+		t.Fatal("expected network bind to be rejected before first admin setup")
+	}
+}
+
+func TestValidateInitialSetupBindReturnsUserCheckErrors(t *testing.T) {
+	checker := fakeUserPresenceChecker{err: errors.New("database unavailable")}
+	if err := validateInitialSetupBind(context.Background(), "127.0.0.1:8080", checker); err == nil {
+		t.Fatal("expected user check error")
 	}
 }
 
@@ -43,6 +66,15 @@ func TestStatusPublisherMode(t *testing.T) {
 	if _, err := statusPublisherMode("live"); err == nil {
 		t.Fatal("expected invalid publisher mode error")
 	}
+}
+
+type fakeUserPresenceChecker struct {
+	hasUsers bool
+	err      error
+}
+
+func (f fakeUserPresenceChecker) HasUsers(context.Context) (bool, error) {
+	return f.hasUsers, f.err
 }
 
 func TestValidateStatusPublisherConfigRequiresLiveOptIn(t *testing.T) {

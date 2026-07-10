@@ -1,12 +1,17 @@
 package web
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,19 +21,42 @@ import (
 
 const (
 	sessionCookieName = "thawguard_session"
+	setupCookieName   = "thawguard_setup"
+	loginCookieName   = "thawguard_login"
 	csrfFormField     = "csrf_token"
 	sessionTTL        = 12 * time.Hour
+	preAuthCSRFMaxAge = 30 * time.Minute
+)
+
+const (
+	setupCSRFPurpose = "setup"
+	loginCSRFPurpose = "login"
 )
 
 type sessionState struct {
-	ID        string
-	CSRFToken string
-	Role      auth.Role
-	ExpiresAt time.Time
+	ID          string
+	CSRFToken   string
+	UserID      *int64
+	Email       string
+	DisplayName string
+	Role        auth.Role
+	Roles       auth.RoleSet
+	ExpiresAt   time.Time
 }
 
 func (s sessionState) auditActor() domain.Actor {
-	return domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: string(s.Role)}
+	role := s.Roles.String()
+	if role == "" {
+		role = string(s.Role)
+	}
+	if s.UserID != nil {
+		return domain.Actor{UserID: s.UserID, Kind: domain.ActorKindUser, Role: role}
+	}
+	bootstrapRole := string(s.Role)
+	if bootstrapRole == "" {
+		bootstrapRole = role
+	}
+	return domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: bootstrapRole}
 }
 
 type sessionStore struct {
@@ -60,22 +88,29 @@ func (s *sessionStore) getOrCreate(w http.ResponseWriter, r *http.Request) (sess
 }
 
 func (s *sessionStore) get(r *http.Request) (sessionState, bool) {
-	cookie, err := r.Cookie(sessionCookieName)
-	if err != nil || cookie.Value == "" {
-		return sessionState{}, false
+	for _, cookie := range r.Cookies() {
+		if cookie.Name != sessionCookieName || cookie.Value == "" {
+			continue
+		}
+		s.mu.Lock()
+		session, ok := s.sessions[cookie.Value]
+		if ok && !s.now().Before(session.ExpiresAt) {
+			delete(s.sessions, cookie.Value)
+			s.mu.Unlock()
+			continue
+		}
+		s.mu.Unlock()
+		if ok {
+			return session, true
+		}
 	}
+	return sessionState{}, false
+}
 
+func (s *sessionStore) delete(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	session, ok := s.sessions[cookie.Value]
-	if !ok {
-		return sessionState{}, false
-	}
-	if !s.now().Before(session.ExpiresAt) {
-		delete(s.sessions, cookie.Value)
-		return sessionState{}, false
-	}
-	return session, true
+	delete(s.sessions, id)
 }
 
 func (s *sessionStore) create() (sessionState, error) {
@@ -92,6 +127,7 @@ func (s *sessionStore) create() (sessionState, error) {
 			ID:        id,
 			CSRFToken: csrfToken,
 			Role:      auth.RoleAdmin,
+			Roles:     auth.RoleSet(auth.Roles()),
 			ExpiresAt: s.now().Add(s.ttl),
 		}
 
@@ -104,6 +140,170 @@ func (s *sessionStore) create() (sessionState, error) {
 		s.mu.Unlock()
 	}
 	return sessionState{}, errors.New("create unique session")
+}
+
+func clearSessionCookie(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		Expires:  time.Unix(0, 0).UTC(),
+		MaxAge:   -1,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   r.TLS != nil,
+	})
+}
+
+func sameOriginRequest(r *http.Request) bool {
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
+		return originMatchesRequest(r, origin)
+	}
+	referer := strings.TrimSpace(r.Header.Get("Referer"))
+	if referer == "" {
+		return false
+	}
+	parsed, err := url.Parse(referer)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return false
+	}
+	return parsed.Scheme == requestScheme(r) && parsed.Host == r.Host
+}
+
+func originMatchesRequest(r *http.Request, origin string) bool {
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return false
+	}
+	return parsed.Scheme == requestScheme(r) && parsed.Host == r.Host
+}
+
+func requestScheme(r *http.Request) string {
+	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); forwarded != "" {
+		scheme, _, _ := strings.Cut(forwarded, ",")
+		scheme = strings.TrimSpace(scheme)
+		if scheme == "http" || scheme == "https" {
+			return scheme
+		}
+	}
+	if r.TLS != nil {
+		return "https"
+	}
+	return "http"
+}
+
+func newCSRFSigningKey() []byte {
+	key := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+		panic("create csrf signing key: " + err.Error())
+	}
+	return key
+}
+
+func (s *Server) newSetupCSRFToken(w http.ResponseWriter, r *http.Request) (string, error) {
+	token, err := s.newSignedCSRFToken(setupCSRFPurpose)
+	if err != nil {
+		return "", err
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     setupCookieName,
+		Value:    token,
+		Path:     "/setup",
+		Expires:  time.Now().UTC().Add(preAuthCSRFMaxAge),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   r.TLS != nil,
+	})
+	return token, nil
+}
+
+func (s *Server) validSetupCSRFToken(r *http.Request) bool {
+	return s.validPreAuthCSRFToken(r, setupCSRFPurpose)
+}
+
+func clearSetupCSRFCookie(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     setupCookieName,
+		Value:    "",
+		Path:     "/setup",
+		Expires:  time.Unix(0, 0).UTC(),
+		MaxAge:   -1,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   r.TLS != nil,
+	})
+}
+
+func (s *Server) newLoginCSRFToken(w http.ResponseWriter, r *http.Request) (string, error) {
+	token, err := s.newSignedCSRFToken(loginCSRFPurpose)
+	if err != nil {
+		return "", err
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     loginCookieName,
+		Value:    token,
+		Path:     "/login",
+		Expires:  time.Now().UTC().Add(preAuthCSRFMaxAge),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   r.TLS != nil,
+	})
+	return token, nil
+}
+
+func (s *Server) validLoginCSRFToken(r *http.Request) bool {
+	return s.validPreAuthCSRFToken(r, loginCSRFPurpose)
+}
+
+func (s *Server) newSignedCSRFToken(purpose string) (string, error) {
+	nonce, err := randomToken(32)
+	if err != nil {
+		return "", err
+	}
+	payload := purpose + "." + strconv.FormatInt(time.Now().UTC().Unix(), 10) + "." + nonce
+	return payload + "." + s.signCSRFPayload(payload), nil
+}
+
+func (s *Server) validPreAuthCSRFToken(r *http.Request, purpose string) bool {
+	submitted := r.PostForm.Get(csrfFormField)
+	return submitted != "" && s.validSignedCSRFToken(submitted, purpose)
+}
+
+func (s *Server) validSignedCSRFToken(token string, purpose string) bool {
+	parts := strings.Split(token, ".")
+	if len(parts) != 4 || parts[0] != purpose || parts[1] == "" || parts[2] == "" || parts[3] == "" {
+		return false
+	}
+	issuedUnix, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return false
+	}
+	issuedAt := time.Unix(issuedUnix, 0).UTC()
+	now := time.Now().UTC()
+	if issuedAt.After(now.Add(time.Minute)) || now.Sub(issuedAt) > preAuthCSRFMaxAge {
+		return false
+	}
+	payload := strings.Join(parts[:3], ".")
+	return constantTimeTokenEqual(parts[3], s.signCSRFPayload(payload))
+}
+
+func (s *Server) signCSRFPayload(payload string) string {
+	mac := hmac.New(sha256.New, s.csrfKey)
+	_, _ = mac.Write([]byte(payload))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func clearLoginCSRFCookie(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     loginCookieName,
+		Value:    "",
+		Path:     "/login",
+		Expires:  time.Unix(0, 0).UTC(),
+		MaxAge:   -1,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   r.TLS != nil,
+	})
 }
 
 func setSessionCookie(w http.ResponseWriter, r *http.Request, session sessionState) {

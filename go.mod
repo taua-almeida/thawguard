@@ -2,7 +2,10 @@ module github.com/taua-almeida/thawguard
 
 go 1.26.3
 
-require modernc.org/sqlite v1.53.0
+require (
+	golang.org/x/crypto v0.45.0
+	modernc.org/sqlite v1.53.0
+)
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect

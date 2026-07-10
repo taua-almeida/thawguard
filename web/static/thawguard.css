@@ -175,6 +175,34 @@ a {
   font-weight: 600;
 }
 
+.tg-sidebar-user {
+  display: grid;
+  gap: 8px;
+  margin-top: 28px;
+  border: 1px solid rgba(42, 58, 92, 0.74);
+  border-radius: var(--tg-radius-md);
+  padding: 12px;
+  background: rgba(15, 23, 41, 0.42);
+}
+
+.tg-sidebar-user strong {
+  font-size: 13px;
+}
+
+.tg-sidebar-user span {
+  color: var(--tg-text-secondary);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.tg-sidebar-user .tg-badge {
+  justify-self: start;
+}
+
+.tg-sidebar-user .tg-btn {
+  width: 100%;
+}
+
 .tg-status-dot {
   width: 7px;
   height: 7px;
@@ -190,6 +218,31 @@ a {
 .tg-main {
   min-height: 100vh;
   padding: 32px 40px;
+}
+
+.tg-auth-page {
+  display: grid;
+  place-items: center;
+  padding: 32px 20px;
+}
+
+.tg-auth-card {
+  width: min(100%, 520px);
+  padding-bottom: 20px;
+}
+
+.tg-auth-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 20px 20px 0;
+  color: var(--tg-text-primary);
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.tg-auth-form {
+  padding-top: 10px;
 }
 
 .tg-dashboard {
@@ -674,6 +727,10 @@ code,
 
 .tg-setup-form.tg-thaw-form {
   padding: 10px 20px 16px;
+}
+
+.tg-setup-form.tg-users-form {
+  padding: 10px 20px 20px;
 }
 
 .tg-thaw-panel-title {

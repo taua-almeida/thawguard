@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/taua-almeida/thawguard/internal/audit"
+	"github.com/taua-almeida/thawguard/internal/auth"
 	"github.com/taua-almeida/thawguard/internal/db"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/freeze"
@@ -58,6 +59,344 @@ func TestRepositoriesPageShowsManualSetupContext(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
+	}
+}
+
+func TestAuthRedirectsToFirstAdminSetupBeforeUsersExist(t *testing.T) {
+	ctx := context.Background()
+	database := newWebTestDB(t, ctx)
+	server := NewServer(Config{AppName: "Thawguard", AuthService: auth.NewService(database)})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != "/setup" {
+		t.Fatalf("expected redirect to setup, status=%d location=%q", recorder.Code, recorder.Header().Get("Location"))
+	}
+	recorder = httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/setup", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected setup form, got %d", recorder.Code)
+	}
+	namedCookieFromRecorder(t, recorder, setupCookieName)
+	setupBody := recorder.Body.String()
+	if !strings.Contains(setupBody, "tg-brand-icon") || strings.Contains(setupBody, ">TG</span>") {
+		t.Fatalf("expected setup page to use shield brand icon, body=%q", setupBody)
+	}
+	setupCSRF := csrfTokenFromBody(t, setupBody)
+
+	form := url.Values{"email": {"admin@example.test"}, "display_name": {"Admin"}, "password": {"correct horse battery staple"}, csrfFormField: {setupCSRF}}
+	recorder = httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/setup", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", "http://example.com")
+	request.AddCookie(&http.Cookie{Name: setupCookieName, Value: "stale-token"})
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != "/" {
+		t.Fatalf("expected first admin setup redirect, status=%d location=%q body=%q", recorder.Code, recorder.Header().Get("Location"), recorder.Body.String())
+	}
+	cookie := sessionCookieFromRecorder(t, recorder)
+
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, "/", nil)
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "admin@example.test") {
+		t.Fatalf("expected dashboard for configured admin, status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestFirstAdminSetupRejectsMissingCSRFToken(t *testing.T) {
+	ctx := context.Background()
+	database := newWebTestDB(t, ctx)
+	server := NewServer(Config{AppName: "Thawguard", AuthService: auth.NewService(database)})
+	form := url.Values{"email": {"admin@example.test"}, "display_name": {"Admin"}, "password": {"correct horse battery staple"}}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/setup", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", "http://example.com")
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected setup without csrf to be forbidden, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, "Setup form expired") || !strings.Contains(body, "Create the first Thawguard admin") {
+		t.Fatalf("expected setup csrf failure to re-render setup form, body=%q", body)
+	}
+	refreshedCookie := namedCookieFromRecorder(t, recorder, setupCookieName)
+	refreshedCSRF := csrfTokenFromBody(t, body)
+	if refreshedCookie.Value != refreshedCSRF {
+		t.Fatalf("expected refreshed setup cookie to match rendered csrf token")
+	}
+}
+
+func TestFirstAdminSetupRejectsUnsignedInjectedCSRFToken(t *testing.T) {
+	ctx := context.Background()
+	database := newWebTestDB(t, ctx)
+	authService := auth.NewService(database)
+	server := NewServer(Config{AppName: "Thawguard", AuthService: authService})
+
+	form := url.Values{"email": {"admin@example.test"}, "display_name": {"Admin"}, "password": {"correct horse battery staple"}, csrfFormField: {"known-token"}}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/setup", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", "http://example.com")
+	request.AddCookie(&http.Cookie{Name: setupCookieName, Value: "known-token"})
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected unsigned injected csrf token to be forbidden, got %d", recorder.Code)
+	}
+	hasUsers, err := authService.HasUsers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasUsers {
+		t.Fatal("expected forged setup csrf to leave database without users")
+	}
+}
+
+func TestFirstAdminSetupRefreshesCSRFAfterValidationError(t *testing.T) {
+	ctx := context.Background()
+	database := newWebTestDB(t, ctx)
+	server := NewServer(Config{AppName: "Thawguard", AuthService: auth.NewService(database)})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/setup", nil))
+	setupCookie := namedCookieFromRecorder(t, recorder, setupCookieName)
+	setupCSRF := csrfTokenFromBody(t, recorder.Body.String())
+
+	form := url.Values{"email": {"admin@example.test"}, "display_name": {"Admin"}, "password": {"short"}, csrfFormField: {setupCSRF}}
+	recorder = httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/setup", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", "http://example.com")
+	request.AddCookie(setupCookie)
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected validation error status, got %d", recorder.Code)
+	}
+	refreshedCookie := namedCookieFromRecorder(t, recorder, setupCookieName)
+	refreshedCSRF := csrfTokenFromBody(t, recorder.Body.String())
+	if refreshedCookie.Value != refreshedCSRF {
+		t.Fatalf("expected refreshed setup cookie to match rendered csrf token")
+	}
+
+	form.Set("password", "correct horse battery staple")
+	form.Set(csrfFormField, refreshedCSRF)
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPost, "/setup", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", "http://example.com")
+	request.AddCookie(refreshedCookie)
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusSeeOther {
+		t.Fatalf("expected corrected setup to succeed, got %d body=%q", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestLoginAndLogoutUsePersistentSessions(t *testing.T) {
+	ctx := context.Background()
+	database := newWebTestDB(t, ctx)
+	authService := auth.NewService(database)
+	if _, err := authService.CreateFirstAdmin(ctx, auth.CreateFirstAdminParams{Email: "admin@example.test", DisplayName: "Admin", Password: "correct horse battery staple"}); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(Config{AppName: "Thawguard", AuthService: authService})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+	if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != "/login" {
+		t.Fatalf("expected unauthenticated redirect to login, status=%d location=%q", recorder.Code, recorder.Header().Get("Location"))
+	}
+
+	recorder = httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/login", nil)
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected login form, got %d", recorder.Code)
+	}
+	loginCookie := namedCookieFromRecorder(t, recorder, loginCookieName)
+	loginCSRF := csrfTokenFromBody(t, recorder.Body.String())
+
+	form := url.Values{"email": {"admin@example.test"}, "password": {"correct horse battery staple"}, csrfFormField: {loginCSRF}}
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", "http://example.com")
+	request.AddCookie(loginCookie)
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != "/" {
+		t.Fatalf("expected login redirect, status=%d location=%q body=%q", recorder.Code, recorder.Header().Get("Location"), recorder.Body.String())
+	}
+	cookie := sessionCookieFromRecorder(t, recorder)
+
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, "/", nil)
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected authenticated dashboard, got %d", recorder.Code)
+	}
+	csrfToken := csrfTokenFromBody(t, recorder.Body.String())
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, "/", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "stale-session"})
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected authenticated dashboard with stale session cookie first, got %d", recorder.Code)
+	}
+
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPost, "/logout", strings.NewReader(url.Values{csrfFormField: {csrfToken}}.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != "/login" {
+		t.Fatalf("expected logout redirect, status=%d location=%q", recorder.Code, recorder.Header().Get("Location"))
+	}
+	if _, found, err := authService.SessionByID(ctx, cookie.Value); err != nil || found {
+		t.Fatalf("expected session to be removed after logout, found=%v err=%v", found, err)
+	}
+}
+
+func TestLoginRejectsCrossOriginSignedCSRFToken(t *testing.T) {
+	ctx := context.Background()
+	database := newWebTestDB(t, ctx)
+	authService := auth.NewService(database)
+	if _, err := authService.CreateFirstAdmin(ctx, auth.CreateFirstAdminParams{Email: "admin@example.test", DisplayName: "Admin", Password: "correct horse battery staple"}); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(Config{AppName: "Thawguard", AuthService: authService})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/login", nil))
+	loginCSRF := csrfTokenFromBody(t, recorder.Body.String())
+
+	form := url.Values{"email": {"admin@example.test"}, "password": {"correct horse battery staple"}, csrfFormField: {loginCSRF}}
+	recorder = httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", "http://attacker.example")
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected cross-origin login post to be forbidden, got %d", recorder.Code)
+	}
+	for _, cookie := range recorder.Result().Cookies() {
+		if cookie.Name == sessionCookieName && cookie.Value != "" {
+			t.Fatalf("expected cross-origin login to avoid setting session cookie, got %q", cookie.Value)
+		}
+	}
+}
+
+func TestLoginRejectsMissingCSRFToken(t *testing.T) {
+	ctx := context.Background()
+	database := newWebTestDB(t, ctx)
+	authService := auth.NewService(database)
+	if _, err := authService.CreateFirstAdmin(ctx, auth.CreateFirstAdminParams{Email: "admin@example.test", DisplayName: "Admin", Password: "correct horse battery staple"}); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(Config{AppName: "Thawguard", AuthService: authService})
+
+	form := url.Values{"email": {"admin@example.test"}, "password": {"correct horse battery staple"}}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", "http://example.com")
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected login without csrf to be forbidden, got %d", recorder.Code)
+	}
+}
+
+func TestUsersPageCreatesUsersAndViewerCannotManageRepositories(t *testing.T) {
+	ctx := context.Background()
+	database := newWebTestDB(t, ctx)
+	authService := auth.NewService(database)
+	adminSession, err := authService.CreateFirstAdmin(ctx, auth.CreateFirstAdminParams{Email: "admin@example.test", DisplayName: "Admin", Password: "correct horse battery staple"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(Config{AppName: "Thawguard", AuthService: authService, RepositoryStore: &fakeRepositoryStore{}})
+	adminCookie := &http.Cookie{Name: sessionCookieName, Value: adminSession.ID}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/users", nil)
+	request.AddCookie(adminCookie)
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "Users & Roles") {
+		t.Fatalf("expected users page for admin, status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+	csrfToken := csrfTokenFromBody(t, recorder.Body.String())
+
+	form := url.Values{"email": {"viewer@example.test"}, "display_name": {"Viewer"}, "password": {"correct horse battery staple"}, "roles": {string(auth.RoleViewer)}, csrfFormField: {csrfToken}}
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPost, "/users", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(adminCookie)
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusSeeOther {
+		t.Fatalf("expected user create redirect, got %d body=%q", recorder.Code, recorder.Body.String())
+	}
+
+	viewerSession, err := authService.Login(ctx, auth.LoginParams{Email: "viewer@example.test", Password: "correct horse battery staple"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	viewerCookie := &http.Cookie{Name: sessionCookieName, Value: viewerSession.ID}
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, "/repositories", nil)
+	request.AddCookie(viewerCookie)
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || strings.Contains(recorder.Body.String(), "Users & Roles") {
+		t.Fatalf("expected viewer to read repositories without admin nav, status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+	form = repositoryCreateForm()
+	form.Set(csrfFormField, viewerSession.CSRFToken)
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPost, "/repositories", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(viewerCookie)
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected viewer repository create to be forbidden, got %d", recorder.Code)
+	}
+}
+
+func TestAdminRoleDoesNotImplyFreezeOrThawActions(t *testing.T) {
+	ctx := context.Background()
+	database := newWebTestDB(t, ctx)
+	authService := auth.NewService(database)
+	if _, err := authService.CreateFirstAdmin(ctx, auth.CreateFirstAdminParams{Email: "admin@example.test", DisplayName: "Admin", Password: "correct horse battery staple"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authService.CreateUser(ctx, auth.CreateUserParams{Email: "admin-only@example.test", DisplayName: "Admin only", Password: "correct horse battery staple", Roles: []auth.Role{auth.RoleAdmin}}); err != nil {
+		t.Fatal(err)
+	}
+	adminOnlySession, err := authService.Login(ctx, auth.LoginParams{Email: "admin-only@example.test", Password: "correct horse battery staple"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(Config{AppName: "Thawguard", AuthService: authService, FreezeStore: &fakeFreezeStore{}, StatusDecisionStore: &fakeStatusDecisionStore{}})
+	adminOnlyCookie := &http.Cookie{Name: sessionCookieName, Value: adminOnlySession.ID}
+
+	form := url.Values{"repository_id": {"1"}, "branch": {"main"}, "reason": {"release"}, csrfFormField: {adminOnlySession.CSRFToken}}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/freezes", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(adminOnlyCookie)
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected admin-only freeze create to be forbidden, got %d", recorder.Code)
+	}
+
+	form = url.Values{"repository_id": {"1"}, "pull_request_index": {"42"}, "target_branch": {"main"}, "head_sha": {"abc123"}, "reason": {"production fix"}, csrfFormField: {adminOnlySession.CSRFToken}}
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPost, "/decisions", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(adminOnlyCookie)
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected admin-only thaw approval to be forbidden, got %d", recorder.Code)
 	}
 }
 
@@ -1635,12 +1974,17 @@ func getDecisionForm(t *testing.T, server *Server) (*http.Cookie, string) {
 
 func sessionCookieFromRecorder(t *testing.T, recorder *httptest.ResponseRecorder) *http.Cookie {
 	t.Helper()
+	return namedCookieFromRecorder(t, recorder, sessionCookieName)
+}
+
+func namedCookieFromRecorder(t *testing.T, recorder *httptest.ResponseRecorder, name string) *http.Cookie {
+	t.Helper()
 	for _, cookie := range recorder.Result().Cookies() {
-		if cookie.Name == sessionCookieName {
+		if cookie.Name == name {
 			return cookie
 		}
 	}
-	t.Fatalf("expected %s cookie", sessionCookieName)
+	t.Fatalf("expected %s cookie", name)
 	return nil
 }
 

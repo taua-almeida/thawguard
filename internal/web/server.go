@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/taua-almeida/thawguard/internal/audit"
+	"github.com/taua-almeida/thawguard/internal/auth"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/freeze"
 	"github.com/taua-almeida/thawguard/internal/repository"
@@ -45,6 +46,17 @@ type Config struct {
 	WebhookDeliveryStore                 WebhookDeliveryStore
 	PullRequestWebhookProcessor          PullRequestWebhookProcessor
 	WebhookMaxBodyBytes                  int64
+	AuthService                          AuthService
+}
+
+type AuthService interface {
+	HasUsers(ctx context.Context) (bool, error)
+	CreateFirstAdmin(ctx context.Context, params auth.CreateFirstAdminParams) (auth.Session, error)
+	Login(ctx context.Context, params auth.LoginParams) (auth.Session, error)
+	SessionByID(ctx context.Context, id string) (auth.Session, bool, error)
+	Logout(ctx context.Context, id string) error
+	ListUsers(ctx context.Context) ([]auth.User, error)
+	CreateUser(ctx context.Context, params auth.CreateUserParams) (auth.User, error)
 }
 
 type RepositoryStore interface {
@@ -190,6 +202,28 @@ type systemAuditEventView struct {
 	StateClass string
 }
 
+type currentUserView struct {
+	Email                 string
+	DisplayName           string
+	RoleLabel             string
+	IsAdmin               bool
+	CanManageRepositories bool
+	CanFreeze             bool
+	CanThaw               bool
+}
+
+type userView struct {
+	User      auth.User
+	RoleLabel string
+	CreatedAt string
+}
+
+type roleOption struct {
+	Value    string
+	Label    string
+	Selected bool
+}
+
 type auditLogControls struct {
 	Limit           int
 	Sort            string
@@ -247,13 +281,14 @@ type Server struct {
 	cfg      Config
 	mux      *http.ServeMux
 	sessions *sessionStore
+	csrfKey  []byte
 }
 
 func NewServer(cfg Config) *Server {
 	if cfg.AppName == "" {
 		cfg.AppName = "Thawguard"
 	}
-	s := &Server{cfg: cfg, mux: http.NewServeMux(), sessions: newSessionStore()}
+	s := &Server{cfg: cfg, mux: http.NewServeMux(), sessions: newSessionStore(), csrfKey: newCSRFSigningKey()}
 	s.routes()
 	return s
 }
@@ -264,6 +299,11 @@ func (s *Server) Routes() http.Handler {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
+	s.mux.HandleFunc("GET /setup", s.handleSetup)
+	s.mux.HandleFunc("POST /setup", s.handleCreateFirstAdmin)
+	s.mux.HandleFunc("GET /login", s.handleLogin)
+	s.mux.HandleFunc("POST /login", s.handleLoginPost)
+	s.mux.HandleFunc("POST /logout", s.handleLogout)
 	s.mux.HandleFunc("GET /", s.handleDashboard)
 	s.mux.HandleFunc("GET /repositories", s.handleRepositories)
 	s.mux.HandleFunc("POST /repositories", s.handleCreateRepository)
@@ -282,6 +322,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /publications", s.handlePublications)
 	s.mux.HandleFunc("GET /webhooks", s.handleWebhooks)
 	s.mux.HandleFunc("POST /webhooks/forgejo", s.handleForgejoWebhook)
+	s.mux.HandleFunc("GET /users", s.handleUsers)
+	s.mux.HandleFunc("POST /users", s.handleCreateUser)
 	s.mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.Dir("web/static"))))
 }
 
@@ -290,7 +332,144 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("ok\n"))
 }
 
+func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.AuthService == nil {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	hasUsers, err := s.cfg.AuthService.HasUsers(r.Context())
+	if err != nil {
+		internalServerError(w)
+		return
+	}
+	if hasUsers {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+	s.renderSetup(w, r, "")
+}
+
+func (s *Server) handleCreateFirstAdmin(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.AuthService == nil {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	hasUsers, err := s.cfg.AuthService.HasUsers(r.Context())
+	if err != nil {
+		internalServerError(w)
+		return
+	}
+	if hasUsers {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if !sameOriginRequest(r) {
+		s.renderSetupStatus(w, r, "Setup form expired. Please try again.", http.StatusForbidden)
+		return
+	}
+	if !s.validSetupCSRFToken(r) {
+		s.renderSetupStatus(w, r, "Setup form expired. Please try again.", http.StatusForbidden)
+		return
+	}
+	session, err := s.cfg.AuthService.CreateFirstAdmin(r.Context(), auth.CreateFirstAdminParams{
+		Email:       r.PostFormValue("email"),
+		DisplayName: r.PostFormValue("display_name"),
+		Password:    r.PostFormValue("password"),
+	})
+	if err != nil {
+		if !auth.IsValidationError(err) {
+			internalServerError(w)
+			return
+		}
+		s.renderSetupStatus(w, r, err.Error(), http.StatusBadRequest)
+		return
+	}
+	clearSetupCSRFCookie(w, r)
+	setSessionCookie(w, r, sessionStateFromAuth(session))
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.AuthService == nil {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	hasUsers, err := s.cfg.AuthService.HasUsers(r.Context())
+	if err != nil {
+		internalServerError(w)
+		return
+	}
+	if !hasUsers {
+		http.Redirect(w, r, "/setup", http.StatusSeeOther)
+		return
+	}
+	if _, ok, err := s.currentSession(r); err != nil {
+		internalServerError(w)
+		return
+	} else if ok {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	s.renderLoginStatus(w, r, "", http.StatusOK)
+}
+
+func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.AuthService == nil {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if !sameOriginRequest(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if !s.validLoginCSRFToken(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	session, err := s.cfg.AuthService.Login(r.Context(), auth.LoginParams{Email: r.PostFormValue("email"), Password: r.PostFormValue("password")})
+	if err != nil {
+		if !auth.IsAuthenticationError(err) {
+			internalServerError(w)
+			return
+		}
+		s.renderLoginStatus(w, r, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	clearLoginCSRFCookie(w, r)
+	setSessionCookie(w, r, sessionStateFromAuth(session))
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	session, ok := s.requireAuthenticatedForm(w, r)
+	if !ok {
+		return
+	}
+	if s.cfg.AuthService != nil {
+		if err := s.cfg.AuthService.Logout(r.Context(), session.ID); err != nil {
+			internalServerError(w)
+			return
+		}
+	} else {
+		s.sessions.delete(session.ID)
+	}
+	clearSessionCookie(w, r)
+	http.Redirect(w, r, "/login", http.StatusSeeOther)
+}
+
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
+	session, ok := s.requireView(w, r)
+	if !ok {
+		return
+	}
 	repositories, err := s.repositories(r.Context())
 	if err != nil {
 		internalServerError(w)
@@ -309,6 +488,8 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	s.render(w, dashboardTemplate, map[string]any{
 		"AppName":                     s.cfg.AppName,
 		"ActivePage":                  "dashboard",
+		"CurrentUser":                 currentUserFromSession(session),
+		"CSRFToken":                   session.CSRFToken,
 		"RepositoryCount":             len(repositories),
 		"ActiveFreezeCount":           len(freezes),
 		"ScheduledFreezePreviewCount": len(scheduledFreezes),
@@ -322,9 +503,8 @@ func (s *Server) handleDecisions(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "status decision store is not configured", http.StatusServiceUnavailable)
 		return
 	}
-	session, err := s.sessions.getOrCreate(w, r)
-	if err != nil {
-		http.Error(w, "create session", http.StatusInternalServerError)
+	session, ok := s.requireView(w, r)
+	if !ok {
 		return
 	}
 	repositories, results, err := s.decisionPageData(r.Context())
@@ -332,7 +512,7 @@ func (s *Server) handleDecisions(w http.ResponseWriter, r *http.Request) {
 		internalServerError(w)
 		return
 	}
-	s.renderDecisions(w, repositories, s.statusResultViews(repositories, results), "", session.CSRFToken)
+	s.renderDecisions(w, repositories, s.statusResultViews(repositories, results), "", session)
 }
 
 func (s *Server) handleCreateDecision(w http.ResponseWriter, r *http.Request) {
@@ -340,7 +520,7 @@ func (s *Server) handleCreateDecision(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "status decision store is not configured", http.StatusServiceUnavailable)
 		return
 	}
-	session, ok := s.requireFreezerForm(w, r)
+	session, ok := s.requireThawApproverForm(w, r)
 	if !ok {
 		return
 	}
@@ -358,7 +538,7 @@ func (s *Server) handleCreateDecision(w http.ResponseWriter, r *http.Request) {
 		TargetBranch:     r.PostFormValue("target_branch"),
 		HeadSHA:          r.PostFormValue("head_sha"),
 		Reason:           r.PostFormValue("reason"),
-	}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+	}, session.auditActor())
 	if err != nil {
 		if !statusresult.IsValidationError(err) {
 			internalServerError(w)
@@ -371,7 +551,7 @@ func (s *Server) handleCreateDecision(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
-		s.renderDecisions(w, repositories, s.statusResultViews(repositories, results), err.Error(), session.CSRFToken)
+		s.renderDecisions(w, repositories, s.statusResultViews(repositories, results), err.Error(), session)
 		return
 	}
 	http.Redirect(w, r, "/decisions", http.StatusSeeOther)
@@ -382,8 +562,8 @@ func (s *Server) handlePublications(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "status publication store is not configured", http.StatusServiceUnavailable)
 		return
 	}
-	if _, err := s.sessions.getOrCreate(w, r); err != nil {
-		http.Error(w, "create session", http.StatusInternalServerError)
+	session, ok := s.requireView(w, r)
+	if !ok {
 		return
 	}
 	repositories, publications, attempts, err := s.publicationPageData(r.Context())
@@ -391,7 +571,7 @@ func (s *Server) handlePublications(w http.ResponseWriter, r *http.Request) {
 		internalServerError(w)
 		return
 	}
-	s.renderPublications(w, s.statusPublicationViews(repositories, publications), statusPublicationAttemptViews(repositories, attempts))
+	s.renderPublications(w, s.statusPublicationViews(repositories, publications), statusPublicationAttemptViews(repositories, attempts), session)
 }
 
 func (s *Server) handleWebhooks(w http.ResponseWriter, r *http.Request) {
@@ -399,8 +579,8 @@ func (s *Server) handleWebhooks(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "webhook delivery store is not configured", http.StatusServiceUnavailable)
 		return
 	}
-	if _, err := s.sessions.getOrCreate(w, r); err != nil {
-		http.Error(w, "create session", http.StatusInternalServerError)
+	session, ok := s.requireView(w, r)
+	if !ok {
 		return
 	}
 	controls := parseAuditLogControls(r)
@@ -409,7 +589,7 @@ func (s *Server) handleWebhooks(w http.ResponseWriter, r *http.Request) {
 		internalServerError(w)
 		return
 	}
-	s.renderWebhookDeliveries(w, auditLogViewData(controls, repositories, deliveries, events, attempts))
+	s.renderWebhookDeliveries(w, auditLogViewData(controls, repositories, deliveries, events, attempts), session)
 }
 
 func (s *Server) handleForgejoWebhook(w http.ResponseWriter, r *http.Request) {
@@ -606,9 +786,8 @@ func acceptedWebhook(w http.ResponseWriter) {
 }
 
 func (s *Server) handleRepositories(w http.ResponseWriter, r *http.Request) {
-	session, err := s.sessions.getOrCreate(w, r)
-	if err != nil {
-		http.Error(w, "create session", http.StatusInternalServerError)
+	session, ok := s.requireView(w, r)
+	if !ok {
 		return
 	}
 
@@ -622,7 +801,7 @@ func (s *Server) handleRepositories(w http.ResponseWriter, r *http.Request) {
 		internalServerError(w)
 		return
 	}
-	s.renderRepositories(w, views, "", session.CSRFToken)
+	s.renderRepositories(w, views, "", session)
 }
 
 func (s *Server) handleCreateRepository(w http.ResponseWriter, r *http.Request) {
@@ -659,7 +838,7 @@ func (s *Server) handleCreateRepository(w http.ResponseWriter, r *http.Request) 
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
-		s.renderRepositories(w, views, err.Error(), session.CSRFToken)
+		s.renderRepositories(w, views, err.Error(), session)
 		return
 	}
 	http.Redirect(w, r, "/repositories", http.StatusSeeOther)
@@ -704,7 +883,7 @@ func (s *Server) handleSetRepositoryWebhookSecret(w http.ResponseWriter, r *http
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
-		s.renderRepositories(w, views, err.Error(), session.CSRFToken)
+		s.renderRepositories(w, views, err.Error(), session)
 		return
 	}
 	http.Redirect(w, r, "/repositories", http.StatusSeeOther)
@@ -749,16 +928,15 @@ func (s *Server) handleSetRepositoryStatusToken(w http.ResponseWriter, r *http.R
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
-		s.renderRepositories(w, views, err.Error(), session.CSRFToken)
+		s.renderRepositories(w, views, err.Error(), session)
 		return
 	}
 	http.Redirect(w, r, "/repositories", http.StatusSeeOther)
 }
 
 func (s *Server) handleFreezes(w http.ResponseWriter, r *http.Request) {
-	session, err := s.sessions.getOrCreate(w, r)
-	if err != nil {
-		http.Error(w, "create session", http.StatusInternalServerError)
+	session, ok := s.requireView(w, r)
+	if !ok {
 		return
 	}
 	repositories, freezes, auditEvents, err := s.freezePageData(r.Context())
@@ -766,7 +944,7 @@ func (s *Server) handleFreezes(w http.ResponseWriter, r *http.Request) {
 		internalServerError(w)
 		return
 	}
-	s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), auditEvents, "", session.CSRFToken)
+	s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), auditEvents, "", session)
 }
 
 func (s *Server) handleCreateFreeze(w http.ResponseWriter, r *http.Request) {
@@ -800,7 +978,7 @@ func (s *Server) handleCreateFreeze(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
-		s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), auditEvents, err.Error(), session.CSRFToken)
+		s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), auditEvents, err.Error(), session)
 		return
 	}
 	http.Redirect(w, r, "/freezes", http.StatusSeeOther)
@@ -840,7 +1018,7 @@ func (s *Server) handleCloseFreeze(w http.ResponseWriter, r *http.Request, close
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
-		s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), auditEvents, err.Error(), session.CSRFToken)
+		s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), auditEvents, err.Error(), session)
 		return
 	}
 	http.Redirect(w, r, "/freezes", http.StatusSeeOther)
@@ -861,9 +1039,8 @@ func (s *Server) handleScheduledFreezes(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "scheduled freeze store is not configured", http.StatusServiceUnavailable)
 		return
 	}
-	session, err := s.sessions.getOrCreate(w, r)
-	if err != nil {
-		http.Error(w, "create session", http.StatusInternalServerError)
+	session, ok := s.requireView(w, r)
+	if !ok {
 		return
 	}
 	repositories, scheduled, err := s.scheduledFreezePageData(r.Context())
@@ -871,7 +1048,7 @@ func (s *Server) handleScheduledFreezes(w http.ResponseWriter, r *http.Request) 
 		internalServerError(w)
 		return
 	}
-	s.renderScheduledFreezes(w, repositories, scheduledFreezeViews(repositories, scheduled), "", session.CSRFToken)
+	s.renderScheduledFreezes(w, repositories, scheduledFreezeViews(repositories, scheduled), "", session)
 }
 
 func (s *Server) handleCreateScheduledFreeze(w http.ResponseWriter, r *http.Request) {
@@ -899,7 +1076,7 @@ func (s *Server) handleCreateScheduledFreeze(w http.ResponseWriter, r *http.Requ
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
-		s.renderScheduledFreezes(w, repositories, scheduledFreezeViews(repositories, scheduled), err.Error(), session.CSRFToken)
+		s.renderScheduledFreezes(w, repositories, scheduledFreezeViews(repositories, scheduled), err.Error(), session)
 		return
 	}
 	http.Redirect(w, r, "/scheduled-freezes", http.StatusSeeOther)
@@ -931,7 +1108,7 @@ func (s *Server) handleCancelScheduledFreeze(w http.ResponseWriter, r *http.Requ
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
-		s.renderScheduledFreezes(w, repositories, scheduledFreezeViews(repositories, scheduled), err.Error(), session.CSRFToken)
+		s.renderScheduledFreezes(w, repositories, scheduledFreezeViews(repositories, scheduled), err.Error(), session)
 		return
 	}
 	http.Redirect(w, r, "/scheduled-freezes", http.StatusSeeOther)
@@ -1020,13 +1197,84 @@ func (s *Server) handleRunRepositorySetupCheck(w http.ResponseWriter, r *http.Re
 	http.Redirect(w, r, "/repositories", http.StatusSeeOther)
 }
 
-func (s *Server) requireRepositoryManagerForm(w http.ResponseWriter, r *http.Request) (sessionState, bool) {
-	session, ok := s.sessions.get(r)
+func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.AuthService == nil {
+		http.Error(w, "auth service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	session, ok := s.requireView(w, r)
 	if !ok {
+		return
+	}
+	if !session.Roles.CanManageRepositories() {
 		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	users, err := s.cfg.AuthService.ListUsers(r.Context())
+	if err != nil {
+		internalServerError(w)
+		return
+	}
+	s.renderUsers(w, users, "", auth.RoleSet{auth.RoleViewer}, session)
+}
+
+func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.AuthService == nil {
+		http.Error(w, "auth service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	session, ok := s.requireRepositoryManagerForm(w, r)
+	if !ok {
+		return
+	}
+	roles := rolesFromForm(r)
+	_, err := s.cfg.AuthService.CreateUser(r.Context(), auth.CreateUserParams{
+		Email:       r.PostFormValue("email"),
+		DisplayName: r.PostFormValue("display_name"),
+		Password:    r.PostFormValue("password"),
+		Roles:       roles,
+	})
+	if err != nil {
+		if !auth.IsValidationError(err) {
+			internalServerError(w)
+			return
+		}
+		users, listErr := s.cfg.AuthService.ListUsers(r.Context())
+		if listErr != nil {
+			internalServerError(w)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusBadRequest)
+		s.renderUsers(w, users, err.Error(), auth.RoleSet(roles), session)
+		return
+	}
+	http.Redirect(w, r, "/users", http.StatusSeeOther)
+}
+
+func (s *Server) requireRepositoryManagerForm(w http.ResponseWriter, r *http.Request) (sessionState, bool) {
+	return s.requireRoleForm(w, r, func(roles auth.RoleSet) bool { return roles.CanManageRepositories() })
+}
+
+func (s *Server) requireFreezerForm(w http.ResponseWriter, r *http.Request) (sessionState, bool) {
+	return s.requireRoleForm(w, r, func(roles auth.RoleSet) bool { return roles.CanFreeze() })
+}
+
+func (s *Server) requireThawApproverForm(w http.ResponseWriter, r *http.Request) (sessionState, bool) {
+	return s.requireRoleForm(w, r, func(roles auth.RoleSet) bool { return roles.CanThaw() })
+}
+
+func (s *Server) requireAuthenticatedForm(w http.ResponseWriter, r *http.Request) (sessionState, bool) {
+	return s.requireRoleForm(w, r, func(roles auth.RoleSet) bool { return roles.CanView() })
+}
+
+func (s *Server) requireRoleForm(w http.ResponseWriter, r *http.Request, allowed func(auth.RoleSet) bool) (sessionState, bool) {
+	session, ok, err := s.currentSession(r)
+	if err != nil {
+		internalServerError(w)
 		return sessionState{}, false
 	}
-	if !session.Role.CanManageRepositories() {
+	if !ok || !allowed(session.Roles) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return sessionState{}, false
 	}
@@ -1041,25 +1289,90 @@ func (s *Server) requireRepositoryManagerForm(w http.ResponseWriter, r *http.Req
 	return session, true
 }
 
-func (s *Server) requireFreezerForm(w http.ResponseWriter, r *http.Request) (sessionState, bool) {
-	session, ok := s.sessions.get(r)
-	if !ok {
+func (s *Server) requireView(w http.ResponseWriter, r *http.Request) (sessionState, bool) {
+	if s.cfg.AuthService == nil {
+		session, err := s.sessions.getOrCreate(w, r)
+		if err != nil {
+			http.Error(w, "create session", http.StatusInternalServerError)
+			return sessionState{}, false
+		}
+		return session, true
+	}
+
+	session, ok, err := s.currentSession(r)
+	if err != nil {
+		internalServerError(w)
+		return sessionState{}, false
+	}
+	if ok && session.Roles.CanView() {
+		setSessionCookie(w, r, session)
+		return session, true
+	}
+	if ok {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return sessionState{}, false
 	}
-	if !session.Role.CanFreeze() {
-		http.Error(w, "forbidden", http.StatusForbidden)
+	hasUsers, err := s.cfg.AuthService.HasUsers(r.Context())
+	if err != nil {
+		internalServerError(w)
 		return sessionState{}, false
 	}
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
+	if !hasUsers {
+		http.Redirect(w, r, "/setup", http.StatusSeeOther)
 		return sessionState{}, false
 	}
-	if !constantTimeTokenEqual(r.PostForm.Get(csrfFormField), session.CSRFToken) {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return sessionState{}, false
+	http.Redirect(w, r, "/login", http.StatusSeeOther)
+	return sessionState{}, false
+}
+
+func (s *Server) currentSession(r *http.Request) (sessionState, bool, error) {
+	if s.cfg.AuthService == nil {
+		session, ok := s.sessions.get(r)
+		return session, ok, nil
 	}
-	return session, true
+	for _, cookie := range r.Cookies() {
+		if cookie.Name != sessionCookieName || cookie.Value == "" {
+			continue
+		}
+		session, ok, err := s.cfg.AuthService.SessionByID(r.Context(), cookie.Value)
+		if err != nil {
+			return sessionState{}, false, err
+		}
+		if ok {
+			return sessionStateFromAuth(session), true, nil
+		}
+	}
+	return sessionState{}, false, nil
+}
+
+func sessionStateFromAuth(session auth.Session) sessionState {
+	userID := session.User.ID
+	return sessionState{
+		ID:          session.ID,
+		CSRFToken:   session.CSRFToken,
+		UserID:      &userID,
+		Email:       session.User.Email,
+		DisplayName: session.User.DisplayName,
+		Role:        session.User.Role,
+		Roles:       session.User.Roles,
+		ExpiresAt:   session.ExpiresAt,
+	}
+}
+
+func currentUserFromSession(session sessionState) currentUserView {
+	roles := session.Roles
+	if len(roles) == 0 && session.Role.Valid() {
+		roles = auth.RoleSet{session.Role}
+	}
+	return currentUserView{
+		Email:                 session.Email,
+		DisplayName:           session.DisplayName,
+		RoleLabel:             roles.Label(),
+		IsAdmin:               session.UserID != nil && roles.CanManageRepositories(),
+		CanManageRepositories: roles.CanManageRepositories(),
+		CanFreeze:             roles.CanFreeze(),
+		CanThaw:               roles.CanThaw(),
+	}
 }
 
 func (s *Server) repositories(ctx context.Context) ([]domain.Repository, error) {
@@ -1485,7 +1798,7 @@ func systemAuditEventViewForEvent(repositoriesByID map[int64]domain.Repository, 
 	view := systemAuditEventView{
 		Event:      event,
 		CreatedAt:  event.CreatedAt.UTC().Format("2006-01-02 15:04 UTC"),
-		Actor:      actorLabel(details["actor_kind"], details["actor_role"]),
+		Actor:      actorLabelForEvent(event, details["actor_kind"], details["actor_role"]),
 		StateClass: "info",
 	}
 	if repositoryID, ok := auditDetailInt64(details, "repository_id"); ok {
@@ -1696,6 +2009,39 @@ func scheduledFreezeViews(repositories []domain.Repository, freezes []domain.Bra
 	return views
 }
 
+func userViews(users []auth.User) []userView {
+	views := make([]userView, 0, len(users))
+	for _, user := range users {
+		roleLabel := user.Roles.Label()
+		if roleLabel == "" {
+			roleLabel = user.Role.Label()
+		}
+		views = append(views, userView{
+			User:      user,
+			RoleLabel: roleLabel,
+			CreatedAt: user.CreatedAt.UTC().Format("2006-01-02 15:04 UTC"),
+		})
+	}
+	return views
+}
+
+func roleOptionsFor(selected auth.RoleSet) []roleOption {
+	roles := auth.Roles()
+	options := make([]roleOption, 0, len(roles))
+	for _, role := range roles {
+		options = append(options, roleOption{Value: string(role), Label: role.Label(), Selected: selected.Contains(role)})
+	}
+	return options
+}
+
+func rolesFromForm(r *http.Request) []auth.Role {
+	roles := make([]auth.Role, 0, len(r.PostForm["roles"]))
+	for _, role := range r.PostForm["roles"] {
+		roles = append(roles, auth.Role(strings.TrimSpace(role)))
+	}
+	return roles
+}
+
 func scheduledFreezeStatus(status domain.BranchFreezeStatus) (string, string) {
 	switch status {
 	case domain.BranchFreezeStatusScheduled:
@@ -1743,7 +2089,7 @@ func (s *Server) freezeAuditViews(ctx context.Context, repositories []domain.Rep
 			view.Branch = details["branch"]
 			view.Status = details["status"]
 			view.Reason = details["reason"]
-			view.Actor = actorLabel(details["actor_kind"], details["actor_role"])
+			view.Actor = actorLabelForEvent(event, details["actor_kind"], details["actor_role"])
 			if repositoryID, err := strconv.ParseInt(details["repository_id"], 10, 64); err == nil {
 				view.Repository = repositoriesByID[repositoryID]
 			}
@@ -1783,6 +2129,18 @@ func actorLabel(kind string, role string) string {
 		return role
 	}
 	return kind + " (" + role + ")"
+}
+
+func actorLabelForEvent(event audit.Event, kind string, role string) string {
+	role = strings.TrimSpace(role)
+	if event.ActorUserID != nil {
+		label := "user #" + strconv.FormatInt(*event.ActorUserID, 10)
+		if role != "" {
+			label += " (" + role + ")"
+		}
+		return label
+	}
+	return actorLabel(kind, role)
 }
 
 func (s *Server) repositoryByID(ctx context.Context, id int64) (domain.Repository, bool, error) {
@@ -1829,7 +2187,7 @@ func latestSetupChecks(checks []setupcheck.Check) []setupcheck.Check {
 	return latest
 }
 
-func (s *Server) renderRepositories(w http.ResponseWriter, views []repositoryView, formError string, csrfToken string) {
+func (s *Server) renderRepositories(w http.ResponseWriter, views []repositoryView, formError string, session sessionState) {
 	overview := repositoryOverview{RepositoryCount: len(views), WebhookSecretStorageEnabled: s.cfg.RepositorySecretEncryptionConfigured}
 	for _, view := range views {
 		if view.Repository.HasWebhookSecret {
@@ -1848,61 +2206,82 @@ func (s *Server) renderRepositories(w http.ResponseWriter, views []repositoryVie
 		"Overview":                          overview,
 		"RepositoryViews":                   views,
 		"FormError":                         formError,
-		"CSRFToken":                         csrfToken,
+		"CSRFToken":                         session.CSRFToken,
+		"CurrentUser":                       currentUserFromSession(session),
 		"RequiredContext":                   domain.RequiredStatusContext,
 		"SetupSteps":                        setupcheck.ManualSetupSteps(),
 		"WebhookSecretEncryptionConfigured": s.cfg.RepositorySecretEncryptionConfigured,
 	})
 }
 
-func (s *Server) renderFreezes(w http.ResponseWriter, repositories []domain.Repository, freezes []freezeView, auditEvents []freezeAuditView, formError string, csrfToken string) {
+func (s *Server) renderFreezes(w http.ResponseWriter, repositories []domain.Repository, freezes []freezeView, auditEvents []freezeAuditView, formError string, session sessionState) {
 	s.render(w, freezesTemplate, map[string]any{
 		"AppName":      s.cfg.AppName,
 		"ActivePage":   "freezes",
+		"CurrentUser":  currentUserFromSession(session),
 		"Repositories": repositories,
 		"Freezes":      freezes,
 		"AuditEvents":  auditEvents,
 		"FormError":    formError,
-		"CSRFToken":    csrfToken,
+		"CSRFToken":    session.CSRFToken,
 	})
 }
 
-func (s *Server) renderScheduledFreezes(w http.ResponseWriter, repositories []domain.Repository, scheduled []scheduledFreezeView, formError string, csrfToken string) {
+func (s *Server) renderScheduledFreezes(w http.ResponseWriter, repositories []domain.Repository, scheduled []scheduledFreezeView, formError string, session sessionState) {
 	s.render(w, scheduledFreezesTemplate, map[string]any{
 		"AppName":          s.cfg.AppName,
 		"ActivePage":       "scheduled",
+		"CurrentUser":      currentUserFromSession(session),
 		"Repositories":     repositories,
 		"ScheduledFreezes": scheduled,
 		"FormError":        formError,
-		"CSRFToken":        csrfToken,
+		"CSRFToken":        session.CSRFToken,
 	})
 }
 
-func (s *Server) renderDecisions(w http.ResponseWriter, repositories []domain.Repository, results []statusResultView, formError string, csrfToken string) {
+func (s *Server) renderDecisions(w http.ResponseWriter, repositories []domain.Repository, results []statusResultView, formError string, session sessionState) {
 	s.render(w, decisionsTemplate, map[string]any{
 		"AppName":         s.cfg.AppName,
 		"ActivePage":      "thaws",
+		"CurrentUser":     currentUserFromSession(session),
 		"Repositories":    repositories,
 		"Results":         results,
 		"FormError":       formError,
-		"CSRFToken":       csrfToken,
+		"CSRFToken":       session.CSRFToken,
 		"RequiredContext": domain.RequiredStatusContext,
 	})
 }
 
-func (s *Server) renderPublications(w http.ResponseWriter, publications []statusPublicationView, attempts []statusPublicationAttemptView) {
+func (s *Server) renderUsers(w http.ResponseWriter, users []auth.User, formError string, selectedRoles auth.RoleSet, session sessionState) {
+	s.render(w, usersTemplate, map[string]any{
+		"AppName":     s.cfg.AppName,
+		"ActivePage":  "users",
+		"CurrentUser": currentUserFromSession(session),
+		"CSRFToken":   session.CSRFToken,
+		"Users":       userViews(users),
+		"UserCount":   len(users),
+		"FormError":   formError,
+		"RoleOptions": roleOptionsFor(selectedRoles),
+	})
+}
+
+func (s *Server) renderPublications(w http.ResponseWriter, publications []statusPublicationView, attempts []statusPublicationAttemptView, session sessionState) {
 	s.render(w, publicationsTemplate, map[string]any{
 		"AppName":      s.cfg.AppName,
 		"ActivePage":   "activity",
+		"CurrentUser":  currentUserFromSession(session),
+		"CSRFToken":    session.CSRFToken,
 		"Publications": publications,
 		"Attempts":     attempts,
 	})
 }
 
-func (s *Server) renderWebhookDeliveries(w http.ResponseWriter, auditLog auditLogView) {
+func (s *Server) renderWebhookDeliveries(w http.ResponseWriter, auditLog auditLogView, session sessionState) {
 	s.render(w, webhookDeliveriesTemplate, map[string]any{
 		"AppName":                 s.cfg.AppName,
 		"ActivePage":              "audit",
+		"CurrentUser":             currentUserFromSession(session),
+		"CSRFToken":               session.CSRFToken,
 		"RequiredContext":         domain.RequiredStatusContext,
 		"Deliveries":              auditLog.Deliveries,
 		"SystemEvents":            auditLog.SystemEvents,
@@ -1925,6 +2304,54 @@ func (s *Server) render(w http.ResponseWriter, source string, data any) {
 		return
 	}
 	_ = tpl.Execute(w, data)
+}
+
+func (s *Server) renderSetup(w http.ResponseWriter, r *http.Request, formError string) {
+	s.renderSetupStatus(w, r, formError, http.StatusOK)
+}
+
+func (s *Server) renderSetupStatus(w http.ResponseWriter, r *http.Request, formError string, status int) {
+	csrfToken, err := s.newSetupCSRFToken(w, r)
+	if err != nil {
+		internalServerError(w)
+		return
+	}
+	tpl, err := template.New("page").Parse(setupTemplate)
+	if err != nil {
+		internalServerError(w)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if status != http.StatusOK {
+		w.WriteHeader(status)
+	}
+	_ = tpl.Execute(w, map[string]any{
+		"AppName":   s.cfg.AppName,
+		"FormError": formError,
+		"CSRFToken": csrfToken,
+	})
+}
+
+func (s *Server) renderLoginStatus(w http.ResponseWriter, r *http.Request, formError string, status int) {
+	csrfToken, err := s.newLoginCSRFToken(w, r)
+	if err != nil {
+		internalServerError(w)
+		return
+	}
+	tpl, err := template.New("page").Parse(loginTemplate)
+	if err != nil {
+		internalServerError(w)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if status != http.StatusOK {
+		w.WriteHeader(status)
+	}
+	_ = tpl.Execute(w, map[string]any{
+		"AppName":   s.cfg.AppName,
+		"FormError": formError,
+		"CSRFToken": csrfToken,
+	})
 }
 
 func internalServerError(w http.ResponseWriter) {
@@ -1973,11 +2400,22 @@ const pageHead = `<!doctype html>
         <a class="tg-nav-item{{ if eq .ActivePage "scheduled" }} is-active{{ end }}" href="/scheduled-freezes"><svg class="tg-icon"><use href="#tg-i-schedule"></use></svg>Scheduled Freezes</a>
         <a class="tg-nav-item{{ if eq .ActivePage "thaws" }} is-active{{ end }}" href="/decisions"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg>Thaw Requests</a>
         <a class="tg-nav-item{{ if eq .ActivePage "audit" }} is-active{{ end }}" href="/webhooks"><svg class="tg-icon"><use href="#tg-i-audit"></use></svg>Audit Log</a>
-        <a class="tg-nav-item is-disabled" href="#"><svg class="tg-icon"><use href="#tg-i-users"></use></svg>Users & Roles</a>
+        {{ if .CurrentUser.IsAdmin }}<a class="tg-nav-item{{ if eq .ActivePage "users" }} is-active{{ end }}" href="/users"><svg class="tg-icon"><use href="#tg-i-users"></use></svg>Users & Roles</a>{{ end }}
       </nav>
+      {{ if .CurrentUser.Email }}
+      <div class="tg-sidebar-user">
+        <strong>{{ .CurrentUser.DisplayName }}</strong>
+        <span>{{ .CurrentUser.Email }}</span>
+        <span class="tg-badge tg-badge-info">{{ .CurrentUser.RoleLabel }}</span>
+        <form method="post" action="/logout">
+          <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
+          <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm">Log out</button>
+        </form>
+      </div>
+      {{ end }}
       <div class="tg-sidebar-note">
         <span class="tg-status-dot"></span>
-        <span>Shadow mode</span>
+        <span>Cooperative enforcement</span>
       </div>
     </aside>
     <div class="tg-content">`
@@ -2086,6 +2524,121 @@ const pageFoot = `
   </script>
 </body></html>`
 
+const authPageHead = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ .AppName }}</title>
+  <link rel="stylesheet" href="/static/thawguard.css">
+</head>
+<body>
+  <main class="tg-main tg-auth-page">
+    <section class="tg-panel tg-auth-card">
+      <div class="tg-auth-brand">
+        <span class="tg-logo-mark" aria-hidden="true"><svg class="tg-brand-icon" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M12 21.7c4.5-2.2 7-5.7 7-9.7V5.3L12 2.6 5 5.3V12c0 4 2.5 7.5 7 9.7z M12 8v8 M8.5 10l7 4 M15.5 10l-7 4"/></svg></span>
+        <span>{{ .AppName }}</span>
+      </div>`
+
+const authPageFoot = `
+    </section>
+  </main>
+</body></html>`
+
+const setupTemplate = authPageHead + `
+      <div class="tg-panel-head tg-panel-head-stacked">
+        <div>
+          <p class="eyebrow">First admin setup</p>
+          <h1 class="tg-title">Create the first Thawguard admin</h1>
+          <p class="tg-subtitle">Create a local admin account. The first account starts with all MVP roles so a fresh install can configure repositories and run freeze/thaw flows.</p>
+        </div>
+      </div>
+      {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
+      <form method="post" action="/setup" class="tg-setup-form tg-auth-form">
+        <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
+        <label>Email <input type="email" name="email" autocomplete="email" required></label>
+        <label>Display name <input name="display_name" autocomplete="name" required></label>
+        <label class="tg-field-wide">Password <input type="password" name="password" autocomplete="new-password" minlength="12" required></label>
+        <div class="tg-form-submit tg-field-wide"><button type="submit" class="tg-btn tg-btn-primary">Create admin</button></div>
+      </form>
+      <p class="tg-local-note"><span>Use a strong local password. Thawguard remains cooperative enforcement for trusted teams, not an unbypassable forge security boundary.</span></p>` + authPageFoot
+
+const loginTemplate = authPageHead + `
+      <div class="tg-panel-head tg-panel-head-stacked">
+        <div>
+          <p class="eyebrow">Local sign in</p>
+          <h1 class="tg-title">Sign in to Thawguard</h1>
+          <p class="tg-subtitle">Freeze branches. Thaw exceptions. Keep release flow auditable.</p>
+        </div>
+      </div>
+      {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
+      <form method="post" action="/login" class="tg-setup-form tg-auth-form">
+        <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
+        <label class="tg-field-wide">Email <input type="email" name="email" autocomplete="email" required autofocus></label>
+        <label class="tg-field-wide">Password <input type="password" name="password" autocomplete="current-password" required></label>
+        <div class="tg-form-submit tg-field-wide"><button type="submit" class="tg-btn tg-btn-primary">Sign in</button></div>
+      </form>` + authPageFoot
+
+const usersTemplate = pageHead + `
+  <main class="tg-main tg-setup-page tg-users-page">
+    <header class="tg-header">
+      <div>
+        <p class="eyebrow">Local access control</p>
+        <h1 class="tg-title">Users & Roles</h1>
+        <p class="tg-subtitle">Create local users and assign one or more narrow MVP roles used by Thawguard route gates.</p>
+      </div>
+      <span class="tg-badge tg-badge-info">{{ .UserCount }} users</span>
+    </header>
+
+    {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
+
+    <section class="tg-panel tg-users-panel">
+      <div class="tg-panel-head tg-panel-head-stacked">
+        <div>
+          <h2>Add user</h2>
+          <p class="tg-panel-subtitle">Admins manage repositories, users, roles, tokens, and webhook secrets. Freezers create and end freezes. Thaw approvers approve PR exceptions. Viewers can read dashboards and audit history. Add action roles explicitly; admin alone does not freeze or approve thaws.</p>
+        </div>
+      </div>
+      <form method="post" action="/users" class="tg-setup-form tg-users-form">
+        <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
+        <label>Email <input type="email" name="email" autocomplete="email" required></label>
+        <label>Display name <input name="display_name" autocomplete="name" required></label>
+        <label>Password <input type="password" name="password" autocomplete="new-password" minlength="12" required></label>
+        <fieldset class="tg-role-fieldset">
+          <legend>Roles</legend>
+          {{ range .RoleOptions }}
+          <label class="tg-role-check"><input type="checkbox" name="roles" value="{{ .Value }}"{{ if .Selected }} checked{{ end }}> {{ .Label }}</label>
+          {{ end }}
+        </fieldset>
+        <div class="tg-form-submit tg-field-wide"><button type="submit" class="tg-btn tg-btn-primary">Create user</button></div>
+      </form>
+    </section>
+
+    <section class="tg-panel tg-data-panel tg-users-panel">
+      <div class="tg-panel-head"><h2>Configured users</h2><span class="tg-badge tg-badge-info">local auth</span></div>
+      {{ if .Users }}
+      <div class="tg-table-wrap tg-responsive-table">
+        <table class="tg-data-table">
+          <caption class="tg-sr-only">Configured Thawguard users</caption>
+          <thead><tr><th>Name</th><th>Email</th><th>Roles</th><th>Created</th></tr></thead>
+          <tbody>
+          {{ range .Users }}
+            <tr>
+              <td data-label="Name">{{ .User.DisplayName }}</td>
+              <td data-label="Email"><code>{{ .User.Email }}</code></td>
+              <td data-label="Roles"><span class="status status-ok">{{ .RoleLabel }}</span></td>
+              <td data-label="Created">{{ .CreatedAt }}</td>
+            </tr>
+          {{ end }}
+          </tbody>
+        </table>
+      </div>
+      {{ else }}
+        <div class="tg-empty-row tg-data-empty"><strong>No users yet</strong><span>Create the first admin from setup.</span></div>
+      {{ end }}
+    </section>
+  </main>` + pageFoot
+
 const dashboardTemplate = pageHead + `
   <main class="tg-main tg-dashboard">
     <header class="tg-header">
@@ -2094,8 +2647,12 @@ const dashboardTemplate = pageHead + `
         <p class="tg-subtitle">Freeze branches. Thaw exceptions. Keep release flow auditable.</p>
       </div>
       <div class="tg-header-actions">
+        {{ if .CurrentUser.CanFreeze }}
         <a class="tg-btn tg-btn-primary" href="/freezes"><svg class="tg-icon"><use href="#tg-i-freeze-branch"></use></svg>Freeze Branch</a>
+        {{ end }}
+        {{ if .CurrentUser.CanThaw }}
         <a class="tg-btn tg-btn-secondary" href="/decisions"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg>Thaw PR</a>
+        {{ end }}
       </div>
     </header>
 
@@ -2129,7 +2686,7 @@ const dashboardTemplate = pageHead + `
           {{ range .Freezes }}
           <div class="tg-freeze-row">
             <div class="tg-freeze-main"><span class="tg-lock" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-freeze-branch"></use></svg></span><code>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Freeze.RepositoryID }}{{ end }}</code><span class="tg-arrow">→</span><code class="tg-branch">{{ .Freeze.Branch }}</code></div>
-            <div class="tg-freeze-meta"><span>{{ .Freeze.Reason }}</span><span class="tg-dot">·</span><span>bootstrap admin</span><span class="tg-dot">·</span><span class="tg-muted">recorded locally</span></div>
+            <div class="tg-freeze-meta"><span>{{ .Freeze.Reason }}</span><span class="tg-dot">·</span><span class="tg-muted">recorded locally</span></div>
           </div>
           {{ end }}
         {{ else }}
@@ -2188,7 +2745,7 @@ const webhookDeliveriesTemplate = pageHead + `
 
     <section class="tg-warning-callout">
       <span aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-warning"></use></svg></span>
-      <span>This page does not store or render raw webhook payloads, signatures, webhook secrets, or status tokens. Bootstrap sessions are for local development only.</span>
+      <span>This page does not store or render raw webhook payloads, signatures, webhook secrets, or status tokens. Local users are role-gated for audit visibility.</span>
     </section>
 
     <section class="tg-panel tg-data-panel tg-audit-log-panel">
@@ -2383,7 +2940,7 @@ const publicationsTemplate = pageHead + `
       <p class="eyebrow">Local publication intents</p>
       <h1>Status publication intents</h1>
       <p class="warning">These are idempotent local records of the latest status Thawguard would publish later. No status has been posted to Forgejo/Codeberg from this page or from the current local publisher.</p>
-      <p class="warning">Bootstrap sessions are for local development only. Do not expose publication-intent visibility on a network until real local auth is configured.</p>
+      <p class="warning">Publication-intent visibility is available to signed-in local users only. Keep live status posting behind the explicit guardrails.</p>
       <p>Use this page to inspect the status context, state, head SHA, dry-run attempt history, and description generated by the local recomputation pipeline before live status posting is wired.</p>
     </section>
 
@@ -2450,9 +3007,11 @@ const repositoriesTemplate = pageHead + `
         <h1 class="tg-title">Repositories</h1>
         <p class="tg-subtitle">Connect Forgejo/Codeberg repositories and verify freeze setup.</p>
       </div>
+      {{ if .CurrentUser.CanManageRepositories }}
       <div class="tg-header-actions">
         <a class="tg-btn tg-btn-primary" href="#connect-repository"><svg class="tg-icon"><use href="#tg-i-plus"></use></svg>Add Repository</a>
       </div>
+      {{ end }}
     </header>
 
     {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
@@ -2480,6 +3039,7 @@ const repositoriesTemplate = pageHead + `
       </article>
     </section>
 
+    {{ if .CurrentUser.CanManageRepositories }}
     <section id="connect-repository" class="tg-modal tg-connect-modal" aria-labelledby="connect-repository-title">
       <a class="tg-modal-backdrop" href="#" aria-label="Close connect repository"></a>
       <div class="tg-modal-card" role="dialog" aria-modal="true">
@@ -2502,9 +3062,15 @@ const repositoriesTemplate = pageHead + `
           <label>Default branch <input name="default_branch" value="main"></label>
           <div class="tg-form-submit"><button type="submit" class="tg-btn tg-btn-primary">Connect</button></div>
         </form>
-        <p class="tg-local-note"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-warning"></use></svg><span>Local bootstrap session active. Keep this UI on loopback until real auth is configured.</span></p>
+        <p class="tg-local-note"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-warning"></use></svg><span>Repository credentials are write-only and restricted to admins.</span></p>
       </div>
     </section>
+    {{ else }}
+    <section class="tg-warning-callout">
+      <span aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-warning"></use></svg></span>
+      <span>Your role can view repository setup. Admin role is required to add repositories, rotate credentials, or run setup checks.</span>
+    </section>
+    {{ end }}
 
     <div class="tg-section-heading tg-section-heading-compact">
       <div>
@@ -2542,6 +3108,7 @@ const repositoriesTemplate = pageHead + `
             <p class="tg-muted">Run a local setup check to record placeholder readiness results. Live forge verification is not wired yet.</p>
           {{ end }}
         </div>
+        {{ if $.CurrentUser.CanManageRepositories }}
         <div class="tg-repo-actions">
           {{ if $.WebhookSecretEncryptionConfigured }}
           <div class="tg-credential-grid">
@@ -2619,6 +3186,9 @@ const repositoriesTemplate = pageHead + `
             <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-health-check"></use></svg>Run setup check</button>
           </form>
         </div>
+        {{ else }}
+        <div class="tg-empty-row"><strong>Read-only repository access</strong><span>Ask an admin to change repository credentials or run setup checks.</span></div>
+        {{ end }}
       </article>
       {{ end }}
     </section>
@@ -2659,7 +3229,12 @@ const freezesTemplate = pageHead + `
             <p class="tg-panel-subtitle">Open PRs on the branch receive a failing <code>` + domain.RequiredStatusContext + `</code> status check.</p>
           </div>
         </div>
-        {{ if .Repositories }}
+        {{ if not .CurrentUser.CanFreeze }}
+        <div class="tg-empty-row">
+          <strong>Read-only freeze access</strong>
+          <span>Your role can view freezes. Explicit freezer role is required to create, lift, or cancel freezes.</span>
+        </div>
+        {{ else if .Repositories }}
         <form method="post" action="/freezes" class="tg-setup-form tg-freeze-form" data-freeze-form>
           <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
           <label>Repository
@@ -2681,7 +3256,11 @@ const freezesTemplate = pageHead + `
         <div class="tg-empty-row">
           <strong>No repositories configured yet</strong>
           <span>Add a repository before creating a freeze.</span>
+          {{ if .CurrentUser.CanManageRepositories }}
           <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/repositories"><svg class="tg-icon"><use href="#tg-i-plus"></use></svg>Add repository</a>
+          {{ else }}
+          <span class="tg-muted">Ask an admin to add a repository.</span>
+          {{ end }}
         </div>
         {{ end }}
       </section>
@@ -2709,17 +3288,17 @@ const freezesTemplate = pageHead + `
       {{ if .Freezes }}
       <div class="tg-table-wrap">
         <table class="tg-data-table tg-freezes-table">
-          <thead><tr><th>Repository / branch</th><th>Reason</th><th>Created by</th><th>Expiry</th><th>PRs</th><th>Status</th><th></th></tr></thead>
+          <thead><tr><th>Repository / branch</th><th>Reason</th><th>Expiry</th><th>PRs</th><th>Status</th><th></th></tr></thead>
           <tbody>
           {{ range .Freezes }}
             <tr>
               <td><span class="tg-table-repo"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-freeze-branch"></use></svg><code>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Freeze.RepositoryID }}{{ end }}</code><span class="tg-arrow">→</span><code class="tg-branch">{{ .Freeze.Branch }}</code></span></td>
               <td>{{ .Freeze.Reason }}</td>
-              <td>bootstrap admin</td>
               <td><span class="tg-muted">Manual</span></td>
               <td><span class="tg-muted">preview</span></td>
               <td><span class="status status-frozen">{{ .Freeze.Status }}</span></td>
               <td class="tg-table-actions">
+                {{ if $.CurrentUser.CanFreeze }}
                 <form method="post" action="/freezes/end" data-confirm-submit data-confirm-title="Lift freeze?" data-confirm-message="Future status recomputation can pass if no other freeze applies. This action is auditable and may publish updated statuses for known open PRs." data-confirm-action="Lift freeze">
                   <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
                   <input type="hidden" name="freeze_id" value="{{ .Freeze.ID }}">
@@ -2730,6 +3309,9 @@ const freezesTemplate = pageHead + `
                   <input type="hidden" name="freeze_id" value="{{ .Freeze.ID }}">
                   <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-close"></use></svg>Cancel</button>
                 </form>
+                {{ else }}
+                <span class="tg-muted">Read only</span>
+                {{ end }}
               </td>
             </tr>
           {{ end }}
@@ -2783,7 +3365,12 @@ const scheduledFreezesTemplate = pageHead + `
             <p class="tg-panel-subtitle">Times are interpreted as UTC for the local alpha. Recurring schedules are intentionally out of scope for v1.</p>
           </div>
         </div>
-        {{ if .Repositories }}
+        {{ if not .CurrentUser.CanFreeze }}
+        <div class="tg-empty-row">
+          <strong>Read-only schedule access</strong>
+          <span>Your role can view scheduled freezes. Explicit freezer role is required to create or cancel schedules.</span>
+        </div>
+        {{ else if .Repositories }}
         <form method="post" action="/scheduled-freezes" class="tg-setup-form tg-freeze-form" data-scheduled-freeze-form>
           <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
           <input type="hidden" name="timezone_offset_minutes" value="0" data-timezone-offset-minutes>
@@ -2809,7 +3396,11 @@ const scheduledFreezesTemplate = pageHead + `
         <div class="tg-empty-row">
           <strong>No repositories configured yet</strong>
           <span>Add a repository before creating a scheduled freeze.</span>
+          {{ if .CurrentUser.CanManageRepositories }}
           <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/repositories"><svg class="tg-icon"><use href="#tg-i-plus"></use></svg>Add repository</a>
+          {{ else }}
+          <span class="tg-muted">Ask an admin to add a repository.</span>
+          {{ end }}
         </div>
         {{ end }}
       </section>
@@ -2840,7 +3431,7 @@ const scheduledFreezesTemplate = pageHead + `
               <td data-label="Reason">{{ .Freeze.Reason }}</td>
               <td data-label="Ended/cancelled">{{ .EndedAt }}</td>
               <td data-label="Actions" class="tg-table-actions">
-                {{ if .CanCancel }}
+                {{ if and .CanCancel $.CurrentUser.CanFreeze }}
                 <form method="post" action="/scheduled-freezes/cancel" data-confirm-submit data-confirm-title="Cancel scheduled freeze?" data-confirm-message="This cancels a future scheduled freeze before it activates. The action is auditable and no live statuses are changed." data-confirm-action="Cancel schedule">
                   <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
                   <input type="hidden" name="freeze_id" value="{{ .Freeze.ID }}">
@@ -2890,7 +3481,12 @@ const decisionsTemplate = pageHead + `
             </div>
           </div>
         </div>
-        {{ if .Repositories }}
+        {{ if not .CurrentUser.CanThaw }}
+        <div class="tg-empty-row">
+          <strong>Read-only thaw access</strong>
+          <span>Your role can view thaw decisions. Explicit thaw approver role is required to approve exceptions.</span>
+        </div>
+        {{ else if .Repositories }}
         <form method="post" action="/decisions" class="tg-setup-form tg-thaw-form" data-thaw-form>
           <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
           <label>Repository
@@ -2919,7 +3515,11 @@ const decisionsTemplate = pageHead + `
         <div class="tg-empty-row">
           <strong>No repositories configured yet</strong>
           <span>Add a repository before approving a thaw exception.</span>
+          {{ if .CurrentUser.CanManageRepositories }}
           <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/repositories"><svg class="tg-icon"><use href="#tg-i-plus"></use></svg>Add repository</a>
+          {{ else }}
+          <span class="tg-muted">Ask an admin to add a repository.</span>
+          {{ end }}
         </div>
         {{ end }}
       </section>
@@ -2957,12 +3557,11 @@ const decisionsTemplate = pageHead + `
       {{ if .Results }}
       <div class="tg-table-wrap">
         <table class="tg-data-table tg-thaws-table">
-          <thead><tr><th>Request candidate</th><th>Source</th><th>Policy result</th><th>Status context</th><th>Expiry</th><th>Status</th><th>Workflow</th></tr></thead>
+          <thead><tr><th>Request candidate</th><th>Policy result</th><th>Status context</th><th>Expiry</th><th>Status</th><th>Workflow</th></tr></thead>
           <tbody>
           {{ range .Results }}
             <tr>
               <td><div class="tg-thaw-request-main"><a href="#">#{{ .Result.PullRequestIndex }}</a><span><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-git-branch"></use></svg><code>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Result.RepositoryID }}{{ end }}</code><span class="tg-arrow">→</span><code class="tg-branch">{{ .Result.TargetBranch }}</code></span><small><code>{{ .Result.HeadSHA }}</code> · {{ .CreatedAt }}</small></div></td>
-              <td><span>bootstrap admin</span><small class="tg-muted">immediate approval</small></td>
               <td>{{ .Result.Description }}</td>
               <td><span class="tg-table-repo"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-freeze-branch"></use></svg><code>{{ .Result.Context }}</code></span><small class="tg-muted">{{ if eq .Result.State "failure" }}freeze · failing{{ else }}freeze · passing{{ end }}</small></td>
               <td><span class="tg-muted">Head SHA scoped</span></td>

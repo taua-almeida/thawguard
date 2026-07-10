@@ -34,6 +34,7 @@ type Actor struct {
 }
 
 const ActorKindBootstrapAdmin = "bootstrap_admin"
+const ActorKindUser = "user"
 const ActorKindSystem = "system"
 
 func (r Repository) FullName() string {

@@ -3,7 +3,7 @@ services:
     build:
       context: .
     image: thawguard:local-alpha
-    # Host networking lets the bootstrap-only server bind to 127.0.0.1
+    # Host networking keeps first-admin setup bound to 127.0.0.1
     # while remaining reachable at http://127.0.0.1:8080 on Linux hosts.
     network_mode: host
     environment:

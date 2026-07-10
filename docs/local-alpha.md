@@ -33,11 +33,11 @@ Keep this key stable for a local alpha database. If it changes, stored webhook s
 docker compose up --build
 ```
 
-Open <http://127.0.0.1:8080>.
+Open <http://127.0.0.1:8080> and create the first local admin user if this is a fresh database. The first account starts with all MVP roles so the local bootstrap user can configure repositories and exercise freeze/thaw flows.
 
 Thawguard runtime configuration is environment-variable based. The Docker Compose file sets `THAWGUARD_DB_PATH=/data/thawguard.db`, defaults `THAWGUARD_STATUS_PUBLISHER=dry_run`, and leaves the live-posting opt-in and allowlist empty; the binary does not parse `--db` or `--addr` CLI flags.
 
-The compose file is Linux-oriented. It uses host networking so Thawguard can keep its bootstrap-only bind on `127.0.0.1:8080`. Host networking has lower network isolation than the default Docker bridge, so treat this as a local-alpha convenience only. Do not change the container to bind `0.0.0.0` while bootstrap sessions are still the only local auth.
+The compose file is Linux-oriented. It uses host networking so first-admin setup can stay on `127.0.0.1:8080`. Host networking has lower network isolation than the default Docker bridge, so treat this as a local-alpha convenience only. Do not change the container to bind `0.0.0.0` before the first local admin user exists.
 
 The first build may pull Docker base images and Go modules. This runbook does not publish images or contact Codeberg during the Docker build.
 
@@ -93,7 +93,7 @@ No Codeberg token is needed for shadow mode unless you want to exercise encrypte
 
 Codeberg must reach `POST /webhooks/forgejo` to send real webhooks. For local testing, use a tunnel or reverse proxy you trust, with HTTPS/TLS enabled.
 
-Important safety rule: bootstrap sessions are local-development only. Do not expose the full Thawguard UI or any bootstrap-authenticated routes to the public internet. Prefer a tunnel/proxy that only forwards:
+Important safety rule: local Thawguard users are for trusted operators. Admin, freezer, thaw approver, and viewer are explicit local role flags, not a hard security boundary against forge write collaborators. Do not expose the full Thawguard UI to the public internet during alpha testing. Prefer a tunnel/proxy that only forwards:
 
 ```text
 POST /webhooks/forgejo
@@ -188,7 +188,7 @@ In live mode, freeze create, lift/end, and cancel sync current open PRs for the 
 - Thawguard cannot decrypt a stored webhook secret or status token: restore the original `THAWGUARD_SECRET_KEY` or recreate the local database volume.
 - A live thaw does not post success: confirm the repository is on `THAWGUARD_LIVE_STATUS_REPOSITORIES`, the status token is configured after the current `THAWGUARD_SECRET_KEY` was set, the PR is still open, and no other open PR shares the same head SHA.
 - Inspecting the live SQLite database requires copying the WAL files too: copy `/data/thawguard.db`, `/data/thawguard.db-wal`, and `/data/thawguard.db-shm` to the same local directory before opening the database.
-- Docker cannot reach the app on non-Linux hosts: run `go run ./cmd/thawguard` locally for now. The compose file intentionally uses Linux host networking to preserve loopback-only bootstrap safety.
+- Docker cannot reach the app on non-Linux hosts: run `go run ./cmd/thawguard` locally for now. The compose file intentionally uses Linux host networking so first-admin setup stays loopback-only until a local user exists.
 
 ## What this local alpha does not do
 

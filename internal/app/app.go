@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/taua-almeida/thawguard/internal/audit"
+	"github.com/taua-almeida/thawguard/internal/auth"
 	"github.com/taua-almeida/thawguard/internal/config"
 	"github.com/taua-almeida/thawguard/internal/db"
 	"github.com/taua-almeida/thawguard/internal/domain"
@@ -43,10 +44,6 @@ func New(cfg config.Config, logger *slog.Logger) *App {
 }
 
 func (a *App) Run(ctx context.Context) error {
-	if err := validateBootstrapLocalBind(a.cfg.HTTPAddr); err != nil {
-		return err
-	}
-
 	database, err := db.Open(ctx, db.DefaultConfig(a.cfg.DatabasePath))
 	if err != nil {
 		return err
@@ -72,6 +69,10 @@ func (a *App) Run(ctx context.Context) error {
 	freezeStore := freeze.NewService(database)
 	pullRequestStore := pullrequest.NewStore(database)
 	auditStore := audit.NewStore(database)
+	authService := auth.NewService(database)
+	if err := validateInitialSetupBind(ctx, a.cfg.HTTPAddr, authService); err != nil {
+		return err
+	}
 	thawExceptionStore := thawexception.NewService(database)
 	statusDecisionStore := statusresult.NewServiceWithThawExceptions(statusresult.NewStore(database), freezeStore, thawExceptionStore, pullRequestStore)
 	statusPublicationStore := statuspublication.NewStore(database)
@@ -110,6 +111,7 @@ func (a *App) Run(ctx context.Context) error {
 			WebhookRepositoryStore:               repositorySetup,
 			WebhookDeliveryStore:                 webhookDeliveryStore,
 			PullRequestWebhookProcessor:          pullRequestWebhookProcessor,
+			AuthService:                          authService,
 		}).Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
