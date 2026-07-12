@@ -5,8 +5,10 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/taua-almeida/thawguard/internal/config"
+	"github.com/taua-almeida/thawguard/internal/repository"
+	"github.com/taua-almeida/thawguard/internal/repositorysetup"
 	"github.com/taua-almeida/thawguard/internal/statuspublication"
+	"github.com/taua-almeida/thawguard/internal/statuspublisher"
 )
 
 func TestValidateBootstrapLocalBindAcceptsLoopback(t *testing.T) {
@@ -46,25 +48,15 @@ func TestValidateBootstrapLocalBindRejectsNetworkBinds(t *testing.T) {
 	}
 }
 
-func TestStatusPublisherMode(t *testing.T) {
-	for _, raw := range []string{"", "dry_run", " DRY_RUN "} {
-		mode, err := statusPublisherMode(raw)
-		if err != nil {
-			t.Fatalf("expected %q to be accepted: %v", raw, err)
-		}
-		if mode != statuspublication.AttemptModeDryRun {
-			t.Fatalf("expected dry_run mode for %q, got %q", raw, mode)
-		}
-	}
-	mode, err := statusPublisherMode("forgejo_status")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if mode != statuspublication.DeliveryModeForgejoStatus {
-		t.Fatalf("expected forgejo status mode, got %q", mode)
-	}
-	if _, err := statusPublisherMode("live"); err == nil {
-		t.Fatal("expected invalid publisher mode error")
+// The runtime has exactly one status publisher construction path: the live
+// Forgejo/Codeberg publisher. There is no dry-run/shadow selection left.
+func TestRuntimeStatusPublisherIsForgejoOnly(t *testing.T) {
+	ctx := context.Background()
+	database := newAppTestDB(t, ctx)
+	publications := statuspublication.NewStore(database)
+	publisher := newRuntimeStatusPublisher(publications, repository.NewStore(database), repositorysetup.NewService(database))
+	if _, ok := publisher.(*statuspublisher.ForgejoStatusPublisher); !ok {
+		t.Fatalf("expected runtime to wire the Forgejo status publisher, got %T", publisher)
 	}
 }
 
@@ -75,55 +67,4 @@ type fakeUserPresenceChecker struct {
 
 func (f fakeUserPresenceChecker) HasUsers(context.Context) (bool, error) {
 	return f.hasUsers, f.err
-}
-
-func TestValidateStatusPublisherConfigRequiresLiveOptIn(t *testing.T) {
-	mode := statuspublication.DeliveryModeForgejoStatus
-	if err := validateStatusPublisherConfig(config.Config{StatusPublisherMode: mode}, mode, true); err == nil {
-		t.Fatal("expected forgejo status mode to require explicit live opt-in")
-	}
-	if err := validateStatusPublisherConfig(config.Config{StatusPublisherMode: mode, LiveStatusPosting: "disabled"}, mode, true); err == nil {
-		t.Fatal("expected invalid live opt-in value to be rejected")
-	}
-}
-
-func TestValidateStatusPublisherConfigRequiresSecretKeyForLiveMode(t *testing.T) {
-	mode := statuspublication.DeliveryModeForgejoStatus
-	if err := validateStatusPublisherConfig(config.Config{StatusPublisherMode: mode, LiveStatusPosting: "enabled"}, mode, false); err == nil {
-		t.Fatal("expected forgejo status mode to require secret key")
-	}
-}
-
-func TestValidateStatusPublisherConfigRequiresRepositoryAllowlistForLiveMode(t *testing.T) {
-	mode := statuspublication.DeliveryModeForgejoStatus
-	if err := validateStatusPublisherConfig(config.Config{StatusPublisherMode: mode, LiveStatusPosting: "enabled"}, mode, true); err == nil {
-		t.Fatal("expected forgejo status mode to require repository allowlist")
-	}
-}
-
-func TestValidateStatusPublisherConfigAcceptsExplicitLiveMode(t *testing.T) {
-	mode := statuspublication.DeliveryModeForgejoStatus
-	if err := validateStatusPublisherConfig(config.Config{StatusPublisherMode: mode, LiveStatusPosting: " ENABLED ", LiveStatusRepos: "taua-almeida/thawguard"}, mode, true); err != nil {
-		t.Fatalf("expected explicit live mode to pass guardrails: %v", err)
-	}
-}
-
-func TestLiveStatusRepositoriesParsesList(t *testing.T) {
-	repositories := liveStatusRepositories("taua-almeida/thawguard, acme/api\nEXAMPLE/repo")
-	if len(repositories) != 3 || repositories[0] != "taua-almeida/thawguard" || repositories[1] != "acme/api" || repositories[2] != "example/repo" {
-		t.Fatalf("unexpected repository allowlist parse: %+v", repositories)
-	}
-}
-
-func TestLiveStatusRepositoriesIgnoresMalformedEntries(t *testing.T) {
-	repositories := liveStatusRepositories("not-a-full-name, /missing-owner, missing-name/")
-	if len(repositories) != 0 {
-		t.Fatalf("expected malformed allowlist entries to be ignored, got %+v", repositories)
-	}
-}
-
-func TestValidateStatusPublisherConfigAllowsDryRun(t *testing.T) {
-	if err := validateStatusPublisherConfig(config.Config{}, statuspublication.AttemptModeDryRun, false); err != nil {
-		t.Fatalf("expected dry-run mode without live guardrails to pass: %v", err)
-	}
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/auth"
 	"github.com/taua-almeida/thawguard/internal/db"
 	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/forge/forgejo"
 	"github.com/taua-almeida/thawguard/internal/freeze"
 	"github.com/taua-almeida/thawguard/internal/pullrequest"
 	"github.com/taua-almeida/thawguard/internal/repository"
@@ -833,7 +834,7 @@ func TestRunRepositorySetupCheckReportsRunnerError(t *testing.T) {
 }
 
 func TestFreezesPageShowsRepositoriesAndActiveFreezes(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "dev"}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "dev", EnforcementState: domain.EnforcementActive}
 	activeFreeze := domain.BranchFreeze{ID: 1, RepositoryID: repo.ID, Branch: "dev", Status: domain.BranchFreezeStatusActive, Active: true, Reason: "QA freeze"}
 	auditEvent := audit.Event{
 		Action:      audit.ActionBranchFreezeCreated,
@@ -871,8 +872,64 @@ func TestFreezesPageShowsRepositoriesAndActiveFreezes(t *testing.T) {
 	}
 }
 
+func TestRepositoriesPageShowsEnforcementState(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementSetupIncomplete}
+	server := NewServer(Config{
+		AppName:         "Thawguard",
+		RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}},
+	})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{"setup incomplete", "cannot enforce freezes", "Enforcing"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected body to contain %q, got %q", want, body)
+		}
+	}
+	for _, stale := range []string{"Shadow", "shadow mode", "dry-run", "Activate enforcement</button>"} {
+		if strings.Contains(body, stale) {
+			t.Fatalf("expected repositories page not to contain %q", stale)
+		}
+	}
+}
+
+func TestMutationPagesShowSetupRequiredWithoutEnforceableRepositories(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementSetupIncomplete}
+	server := NewServer(Config{
+		AppName:              "Thawguard",
+		RepositoryStore:      &fakeRepositoryStore{repositories: []domain.Repository{repo}},
+		FreezeStore:          &fakeFreezeStore{},
+		ScheduledFreezeStore: &fakeFreezeStore{},
+		AuditStore:           &fakeAuditStore{},
+		StatusDecisionStore:  &fakeStatusDecisionStore{},
+	})
+
+	for path, formMarker := range map[string]string{
+		"/freezes":           `<form method="post" action="/freezes" `,
+		"/scheduled-freezes": `<form method="post" action="/scheduled-freezes" `,
+		"/decisions":         `<form method="post" action="/decisions" `,
+	} {
+		recorder := httptest.NewRecorder()
+		server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("%s: expected status 200, got %d", path, recorder.Code)
+		}
+		body := recorder.Body.String()
+		if strings.Contains(body, formMarker) {
+			t.Fatalf("%s: expected mutation form to be omitted for setup-incomplete repositories", path)
+		}
+		if !strings.Contains(body, "Repository enforcement is not active") {
+			t.Fatalf("%s: expected setup-required message, got %q", path, body)
+		}
+	}
+}
+
 func TestFreezesPageHidesNonFreezeAuditEvents(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	server := NewServer(Config{
 		AppName:         "Thawguard",
 		RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}},
@@ -943,7 +1000,7 @@ func TestFreezesPageDoesNotRenderRawAuditJSON(t *testing.T) {
 }
 
 func TestCreateFreezePostsToStore(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	store := &fakeFreezeStore{}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, FreezeStore: store})
 	form := freezeCreateForm()
@@ -989,7 +1046,7 @@ func TestCreateFreezeRejectsMissingCSRFSession(t *testing.T) {
 }
 
 func TestCreateFreezeRejectsInvalidCSRFToken(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	store := &fakeFreezeStore{}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, FreezeStore: store})
 	form := freezeCreateForm()
@@ -1011,7 +1068,7 @@ func TestCreateFreezeRejectsInvalidCSRFToken(t *testing.T) {
 }
 
 func TestCreateFreezeShowsValidationError(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	store := &fakeFreezeStore{err: freeze.ValidationError{Message: "branch is already frozen"}}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, FreezeStore: store})
 	form := freezeCreateForm()
@@ -1033,7 +1090,7 @@ func TestCreateFreezeShowsValidationError(t *testing.T) {
 }
 
 func TestEndFreezePostsToStore(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	store := &fakeFreezeStore{freezes: []domain.BranchFreeze{{ID: 9, RepositoryID: repo.ID, Branch: "main", Status: domain.BranchFreezeStatusActive, Active: true, Reason: "release"}}}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, FreezeStore: store})
 	form := freezeCloseForm(9)
@@ -1058,7 +1115,7 @@ func TestEndFreezePostsToStore(t *testing.T) {
 }
 
 func TestCancelFreezePostsToStore(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	store := &fakeFreezeStore{freezes: []domain.BranchFreeze{{ID: 9, RepositoryID: repo.ID, Branch: "main", Status: domain.BranchFreezeStatusActive, Active: true, Reason: "mistake"}}}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, FreezeStore: store})
 	form := freezeCloseForm(9)
@@ -1098,7 +1155,7 @@ func TestEndFreezeRejectsMissingCSRFSession(t *testing.T) {
 }
 
 func TestEndFreezeRejectsInvalidCSRFToken(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	store := &fakeFreezeStore{}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, FreezeStore: store})
 	form := freezeCloseForm(9)
@@ -1120,7 +1177,7 @@ func TestEndFreezeRejectsInvalidCSRFToken(t *testing.T) {
 }
 
 func TestCancelFreezeRejectsInvalidCSRFToken(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	store := &fakeFreezeStore{}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, FreezeStore: store})
 	form := freezeCloseForm(9)
@@ -1142,7 +1199,7 @@ func TestCancelFreezeRejectsInvalidCSRFToken(t *testing.T) {
 }
 
 func TestEndFreezeShowsValidationError(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	store := &fakeFreezeStore{err: freeze.ValidationError{Message: "freeze is not active"}}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, FreezeStore: store})
 	form := freezeCloseForm(9)
@@ -1164,7 +1221,7 @@ func TestEndFreezeShowsValidationError(t *testing.T) {
 }
 
 func TestEndFreezeHidesInternalErrorDetails(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	store := &fakeFreezeStore{err: errors.New("database failed with secret-token")}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, FreezeStore: store})
 	form := freezeCloseForm(9)
@@ -1186,7 +1243,7 @@ func TestEndFreezeHidesInternalErrorDetails(t *testing.T) {
 }
 
 func TestScheduledFreezesPageShowsFormAndWindows(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	startsAt := time.Date(2026, 7, 10, 18, 0, 0, 0, time.UTC)
 	plannedEndsAt := startsAt.Add(63 * time.Hour)
 	store := &fakeFreezeStore{scheduled: []domain.BranchFreeze{{ID: 9, RepositoryID: repo.ID, Branch: "main", Status: domain.BranchFreezeStatusScheduled, Scheduled: true, Reason: "Weekend release freeze", StartsAt: &startsAt, PlannedEndsAt: &plannedEndsAt}}}
@@ -1209,7 +1266,7 @@ func TestScheduledFreezesPageShowsFormAndWindows(t *testing.T) {
 }
 
 func TestCreateScheduledFreezePostsToStore(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	store := &fakeFreezeStore{}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, ScheduledFreezeStore: store})
 	form := scheduledFreezeCreateForm()
@@ -1248,7 +1305,7 @@ func TestParseScheduledFreezeFormTimeUsesBrowserTimezoneOffset(t *testing.T) {
 }
 
 func TestCancelScheduledFreezePostsToStore(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	store := &fakeFreezeStore{scheduled: []domain.BranchFreeze{{ID: 9, RepositoryID: repo.ID, Branch: "main", Status: domain.BranchFreezeStatusScheduled, Scheduled: true, Reason: "weekend"}}}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, ScheduledFreezeStore: store})
 	form := freezeCloseForm(9)
@@ -1270,7 +1327,7 @@ func TestCancelScheduledFreezePostsToStore(t *testing.T) {
 }
 
 func TestDecisionsPageShowsFormAndRecentResults(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	createdAt := time.Date(2026, 6, 29, 16, 30, 0, 0, time.UTC)
 	result := statusresult.Result{ID: 1, RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "Branch is frozen; merge is blocked by Thawguard", CreatedAt: createdAt}
 	server := NewServer(Config{
@@ -1310,7 +1367,7 @@ func TestDecisionsPageRequiresStatusDecisionStore(t *testing.T) {
 }
 
 func TestCreateDecisionPostsToStore(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	store := &fakeStatusDecisionStore{}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, StatusDecisionStore: store})
 	form := decisionCreateForm()
@@ -1339,7 +1396,7 @@ func TestCreateDecisionPostsToStore(t *testing.T) {
 }
 
 func TestCreateDecisionParsesSharedHeadConfirmation(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	store := &fakeStatusDecisionStore{}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, StatusDecisionStore: store})
 	form := decisionCreateForm()
@@ -1365,7 +1422,7 @@ func TestCreateDecisionParsesSharedHeadConfirmation(t *testing.T) {
 }
 
 func TestCreateDecisionReturnsConflictWhenSharedHeadConfirmationIsRequired(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	store := &fakeStatusDecisionStore{outcome: statusresult.ThawApprovalOutcome{
 		ConfirmationRequired: true,
 		Confirmation:         &statusresult.ThawApprovalConfirmation{HeadSHA: "abc123", AffectedSignature: strings.Repeat("a", 64)},
@@ -1414,7 +1471,7 @@ func postDecisionForm(t *testing.T, server *Server, form url.Values) *httptest.R
 }
 
 func TestCreateDecisionSharedHeadConflictRendersConfirmationPanel(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	store := &fakeStatusDecisionStore{outcome: sharedHeadOutcome("Release fix", "Other fix")}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, StatusDecisionStore: store})
 
@@ -1455,7 +1512,7 @@ func TestCreateDecisionSharedHeadConflictRendersConfirmationPanel(t *testing.T) 
 }
 
 func TestCreateDecisionSharedHeadReconfirmationKeepsOriginalValues(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	outcome := sharedHeadOutcome("Release fix", "Other fix", "Third fix")
 	outcome.Confirmation.HeadSHA = "def456"
 	store := &fakeStatusDecisionStore{outcome: outcome}
@@ -1485,7 +1542,7 @@ func TestCreateDecisionSharedHeadReconfirmationKeepsOriginalValues(t *testing.T)
 }
 
 func TestCreateDecisionSharedHeadConfirmationEscapesTitles(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	store := &fakeStatusDecisionStore{outcome: sharedHeadOutcome(`<script>alert("pwn")</script>`, "Other fix")}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, StatusDecisionStore: store})
 
@@ -1501,7 +1558,7 @@ func TestCreateDecisionSharedHeadConfirmationEscapesTitles(t *testing.T) {
 }
 
 func TestRenderDecisionsSharedHeadReadOnlyUserGetsNoConfirmationForm(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, StatusDecisionStore: &fakeStatusDecisionStore{}})
 	confirmation := sharedHeadConfirmationViewFrom(sharedHeadOutcome("Release fix", "Other fix"), repo.ID, 42, "main", "production fix")
 	session := sessionState{CSRFToken: "viewer-token", Roles: auth.RoleSet{auth.RoleAdmin}}
@@ -1537,7 +1594,7 @@ func TestCreateDecisionRejectsMissingCSRFSession(t *testing.T) {
 }
 
 func TestCreateDecisionRejectsInvalidCSRFToken(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	store := &fakeStatusDecisionStore{}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, StatusDecisionStore: store})
 	form := decisionCreateForm()
@@ -1559,7 +1616,7 @@ func TestCreateDecisionRejectsInvalidCSRFToken(t *testing.T) {
 }
 
 func TestCreateDecisionShowsValidationError(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	store := &fakeStatusDecisionStore{err: statusresult.ValidationError{Message: "missing required thaw approval fields: reason"}}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, StatusDecisionStore: store})
 	form := decisionCreateForm()
@@ -1581,7 +1638,7 @@ func TestCreateDecisionShowsValidationError(t *testing.T) {
 }
 
 func TestCreateDecisionHidesInternalErrorDetails(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	store := &fakeStatusDecisionStore{err: errors.New("database failed with secret-token")}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, StatusDecisionStore: store})
 	form := decisionCreateForm()
@@ -1605,8 +1662,8 @@ func TestCreateDecisionHidesInternalErrorDetails(t *testing.T) {
 func TestPublicationsPageShowsRecentPublicationIntents(t *testing.T) {
 	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
 	createdAt := time.Date(2026, 6, 29, 17, 30, 0, 0, time.UTC)
-	publication := statuspublication.Publication{ID: 1, StatusResultID: 7, RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "Branch is frozen; merge is blocked by Thawguard", DeliveryMode: statuspublication.DeliveryModeLocalRecord, CreatedAt: createdAt, UpdatedAt: createdAt}
-	attempt := statuspublication.Attempt{ID: 1, PublicationID: publication.ID, StatusResultID: publication.StatusResultID, RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "Branch is frozen; merge is blocked by Thawguard", Mode: statuspublication.AttemptModeDryRun, Result: statuspublication.AttemptResultPlanned, AttemptedAt: createdAt.Add(time.Minute)}
+	publication := statuspublication.Publication{ID: 1, StatusResultID: 7, RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "Branch is frozen; merge is blocked by Thawguard", DeliveryMode: statuspublication.DeliveryModeForgejoStatus, CreatedAt: createdAt, UpdatedAt: createdAt}
+	attempt := statuspublication.Attempt{ID: 1, PublicationID: publication.ID, StatusResultID: publication.StatusResultID, RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "Branch is frozen; merge is blocked by Thawguard", Mode: statuspublication.AttemptModeForgejoStatus, Result: statuspublication.AttemptResultPosted, AttemptedAt: createdAt.Add(time.Minute)}
 	server := NewServer(Config{
 		AppName:                "Thawguard",
 		RepositoryStore:        &fakeRepositoryStore{repositories: []domain.Repository{repo}},
@@ -1623,9 +1680,14 @@ func TestPublicationsPageShowsRecentPublicationIntents(t *testing.T) {
 		t.Fatal("expected session cookie value")
 	}
 	body := recorder.Body.String()
-	for _, want := range []string{"Status publication intents", "No status has been posted", "Recent dry-run publication attempts", "do not call Forgejo/Codeberg", "taua-almeida/thawguard", "#42", "main", "abc123", "thawguard/freeze", "failure", "local_record", "dry_run", "planned", "Branch is frozen", "2026-06-29 17:30 UTC", "2026-06-29 17:31 UTC"} {
+	for _, want := range []string{"Status publications", "Latest desired statuses", "Recent live posting attempts", "taua-almeida/thawguard", "#42", "main", "abc123", "thawguard/freeze", "failure", "forgejo_status", "posted", "Branch is frozen", "2026-06-29 17:30 UTC", "2026-06-29 17:31 UTC"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
+		}
+	}
+	for _, stale := range []string{"dry-run", "dry_run", "shadow", "Shadow", "would be posted", "what would publish"} {
+		if strings.Contains(body, stale) {
+			t.Fatalf("expected publications page not to mention %q, got %q", stale, body)
 		}
 	}
 }
@@ -1899,8 +1961,17 @@ func TestForgejoWebhookProcessesValidSignedPullRequest(t *testing.T) {
 	}
 }
 
-func TestForgejoWebhookSmokeWithSQLiteStores(t *testing.T) {
+func TestForgejoWebhookSmokeWithSQLiteStoresPostsLiveStatus(t *testing.T) {
 	ctx := context.Background()
+	var postedAuth string
+	var postedPath string
+	forge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		postedAuth = r.Header.Get("Authorization")
+		postedPath = r.URL.Path
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer forge.Close()
+
 	database := newWebTestDB(t, ctx)
 	secretStore, err := secrets.NewAESGCMStore(make([]byte, 32))
 	if err != nil {
@@ -1908,11 +1979,17 @@ func TestForgejoWebhookSmokeWithSQLiteStores(t *testing.T) {
 	}
 	repositorySetup := repositorysetup.NewServiceWithSecrets(database, secretStore)
 	actor := domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}
-	repo, err := repositorySetup.Create(ctx, repository.CreateParams{Forge: "forgejo", BaseURL: "https://codeberg.org", Owner: "example-owner", Name: "example-repo", DefaultBranch: "main"}, actor)
+	repo, err := repositorySetup.Create(ctx, repository.CreateParams{Forge: "forgejo", BaseURL: forge.URL, Owner: "example-owner", Name: "example-repo", DefaultBranch: "main"}, actor)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := repositorySetup.SetWebhookSecret(ctx, repo.ID, "super-secret-value", actor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repositorySetup.SetStatusToken(ctx, repo.ID, "live-status-token-123", actor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.NewStore(database).SetEnforcementState(ctx, repo.ID, domain.EnforcementActive); err != nil {
 		t.Fatal(err)
 	}
 	freezeService := freeze.NewService(database)
@@ -1924,9 +2001,11 @@ func TestForgejoWebhookSmokeWithSQLiteStores(t *testing.T) {
 	statusStore := statusresult.NewStore(database)
 	statusService := statusresult.NewService(statusStore, freezeService)
 	publicationStore := statuspublication.NewStore(database)
-	dryRunPublisher := statuspublisher.NewDryRunPublisher(publicationStore, publicationStore)
+	livePublisher := statuspublisher.NewForgejoStatusPublisher(publicationStore, publicationStore, repository.NewStore(database), repositorySetup, func(repo domain.Repository, token string) (statuspublisher.ForgeStatusClient, error) {
+		return forgejo.New(repo.BaseURL, token), nil
+	})
 	deliveryStore := webhook.NewDeliveryStore(database)
-	processor := webhook.NewPullRequestProcessor(repository.NewStore(database), pullRequestStore, statusService, dryRunPublisher)
+	processor := webhook.NewPullRequestProcessor(repository.NewStore(database), pullRequestStore, statusService, livePublisher)
 	server := NewServer(Config{
 		AppName:                     "Thawguard",
 		RepositoryStore:             repositorySetup,
@@ -1936,7 +2015,7 @@ func TestForgejoWebhookSmokeWithSQLiteStores(t *testing.T) {
 		PullRequestWebhookProcessor: processor,
 	})
 
-	body := pullRequestWebhookBody("opened")
+	body := strings.ReplaceAll(pullRequestWebhookBody("opened"), "https://codeberg.org", forge.URL)
 	recorder := httptest.NewRecorder()
 	server.Routes().ServeHTTP(recorder, signedWebhookRequest(t, body, "super-secret-value", "delivery-smoke"))
 
@@ -1968,15 +2047,18 @@ func TestForgejoWebhookSmokeWithSQLiteStores(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(publications) != 1 || publications[0].StatusResultID != results[0].ID || publications[0].HeadSHA != results[0].HeadSHA || publications[0].DeliveryMode != statuspublication.DeliveryModeLocalRecord {
-		t.Fatalf("expected local publication intent, got %+v", publications)
+	if len(publications) != 1 || publications[0].StatusResultID != results[0].ID || publications[0].HeadSHA != results[0].HeadSHA || publications[0].DeliveryMode != statuspublication.DeliveryModeForgejoStatus {
+		t.Fatalf("expected forgejo publication intent, got %+v", publications)
 	}
 	attempts, err := publicationStore.ListRecentAttempts(ctx, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(attempts) != 1 || attempts[0].PublicationID != publications[0].ID || attempts[0].StatusResultID != results[0].ID || attempts[0].Mode != statuspublication.AttemptModeDryRun || attempts[0].Result != statuspublication.AttemptResultPlanned {
-		t.Fatalf("expected dry-run publication attempt, got %+v", attempts)
+	if len(attempts) != 1 || attempts[0].PublicationID != publications[0].ID || attempts[0].StatusResultID != results[0].ID || attempts[0].Mode != statuspublication.AttemptModeForgejoStatus || attempts[0].Result != statuspublication.AttemptResultPosted {
+		t.Fatalf("expected posted forgejo publication attempt, got %+v", attempts)
+	}
+	if postedAuth != "token live-status-token-123" || !strings.Contains(postedPath, "/statuses/0123456789abcdef0123456789abcdef01234567") {
+		t.Fatalf("expected live forge status post, auth=%q path=%q", postedAuth, postedPath)
 	}
 
 	webhooksPage := httptest.NewRecorder()
@@ -1986,8 +2068,95 @@ func TestForgejoWebhookSmokeWithSQLiteStores(t *testing.T) {
 	}
 	publicationsPage := httptest.NewRecorder()
 	server.Routes().ServeHTTP(publicationsPage, httptest.NewRequest(http.MethodGet, "/publications", nil))
-	if publicationsPage.Code != http.StatusOK || !strings.Contains(publicationsPage.Body.String(), "dry_run") || !strings.Contains(publicationsPage.Body.String(), "Branch is frozen") {
-		t.Fatalf("expected publications page to show dry-run attempt, status=%d body=%q", publicationsPage.Code, publicationsPage.Body.String())
+	if publicationsPage.Code != http.StatusOK || !strings.Contains(publicationsPage.Body.String(), "posted") || !strings.Contains(publicationsPage.Body.String(), "Branch is frozen") {
+		t.Fatalf("expected publications page to show posted attempt, status=%d body=%q", publicationsPage.Code, publicationsPage.Body.String())
+	}
+}
+
+func TestForgejoWebhookForSetupIncompleteRepositoryRecordsEvidenceWithoutPublishing(t *testing.T) {
+	ctx := context.Background()
+	forgeCalls := 0
+	forge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forgeCalls++
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer forge.Close()
+
+	database := newWebTestDB(t, ctx)
+	secretStore, err := secrets.NewAESGCMStore(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repositorySetup := repositorysetup.NewServiceWithSecrets(database, secretStore)
+	actor := domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}
+	repo, err := repositorySetup.Create(ctx, repository.CreateParams{Forge: "forgejo", BaseURL: forge.URL, Owner: "example-owner", Name: "example-repo", DefaultBranch: "main"}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repositorySetup.SetWebhookSecret(ctx, repo.ID, "super-secret-value", actor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repositorySetup.SetStatusToken(ctx, repo.ID, "live-status-token-123", actor); err != nil {
+		t.Fatal(err)
+	}
+
+	pullRequestStore := pullrequest.NewStore(database)
+	statusStore := statusresult.NewStore(database)
+	publicationStore := statuspublication.NewStore(database)
+	livePublisher := statuspublisher.NewForgejoStatusPublisher(publicationStore, publicationStore, repository.NewStore(database), repositorySetup, func(repo domain.Repository, token string) (statuspublisher.ForgeStatusClient, error) {
+		return forgejo.New(repo.BaseURL, token), nil
+	})
+	deliveryStore := webhook.NewDeliveryStore(database)
+	processor := webhook.NewPullRequestProcessor(repository.NewStore(database), pullRequestStore, statusresult.NewService(statusStore, freeze.NewService(database)), livePublisher)
+	server := NewServer(Config{
+		AppName:                     "Thawguard",
+		RepositoryStore:             repositorySetup,
+		WebhookRepositoryStore:      repositorySetup,
+		WebhookDeliveryStore:        deliveryStore,
+		PullRequestWebhookProcessor: processor,
+	})
+
+	body := strings.ReplaceAll(pullRequestWebhookBody("opened"), "https://codeberg.org", forge.URL)
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, signedWebhookRequest(t, body, "super-secret-value", "delivery-inactive"))
+
+	if recorder.Code != http.StatusAccepted || recorder.Body.String() != "accepted\n" {
+		t.Fatalf("expected generic accepted response, got status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+	deliveries, err := deliveryStore.ListRecent(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries) != 1 || !deliveries[0].Verified || deliveries[0].ProcessedAt == nil || deliveries[0].Error != "" {
+		t.Fatalf("expected verified processed delivery evidence, got %+v", deliveries)
+	}
+	cached, err := pullRequestStore.Get(ctx, repo.ID, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached.HeadSHA != "0123456789abcdef0123456789abcdef01234567" {
+		t.Fatalf("expected PR cache evidence, got %+v", cached)
+	}
+	results, err := statusStore.ListRecent(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("expected no status result for setup-incomplete repository, got %+v", results)
+	}
+	publications, err := publicationStore.ListRecent(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempts, err := publicationStore.ListRecentAttempts(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(publications) != 0 || len(attempts) != 0 {
+		t.Fatalf("expected no publication intent or attempt, got intents=%+v attempts=%+v", publications, attempts)
+	}
+	if forgeCalls != 0 {
+		t.Fatalf("expected no forge status call, got %d", forgeCalls)
 	}
 }
 

@@ -13,7 +13,6 @@ import (
 )
 
 var ErrOpenPullRequestSyncStatusTokenMissing = errors.New("repository status token is not configured for open pull request sync")
-var ErrOpenPullRequestSyncRepositoryNotAllowed = errors.New("repository is not enabled for open pull request sync")
 
 type openPullRequestSyncer interface {
 	SyncOpenPullRequests(ctx context.Context, repositoryID int64, targetBranch string) error
@@ -47,16 +46,15 @@ type forgeOpenPullRequestSyncer struct {
 	tokens       openPullRequestStatusTokenGetter
 	pullRequests openPullRequestUpserter
 	auditor      openPullRequestAuditRecorder
-	allowedRepos map[string]struct{}
 	clientFor    openPullRequestForgeClientFactory
 }
 
-func newForgeOpenPullRequestSyncer(repositories openPullRequestRepositoryGetter, tokens openPullRequestStatusTokenGetter, pullRequests openPullRequestUpserter, allowedRepositories []string, clientFor openPullRequestForgeClientFactory, auditors ...openPullRequestAuditRecorder) *forgeOpenPullRequestSyncer {
+func newForgeOpenPullRequestSyncer(repositories openPullRequestRepositoryGetter, tokens openPullRequestStatusTokenGetter, pullRequests openPullRequestUpserter, clientFor openPullRequestForgeClientFactory, auditors ...openPullRequestAuditRecorder) *forgeOpenPullRequestSyncer {
 	var auditor openPullRequestAuditRecorder
 	if len(auditors) > 0 {
 		auditor = auditors[0]
 	}
-	return &forgeOpenPullRequestSyncer{repositories: repositories, tokens: tokens, pullRequests: pullRequests, auditor: auditor, allowedRepos: normalizedOpenPullRequestSyncAllowlist(allowedRepositories), clientFor: clientFor}
+	return &forgeOpenPullRequestSyncer{repositories: repositories, tokens: tokens, pullRequests: pullRequests, auditor: auditor, clientFor: clientFor}
 }
 
 func (s *forgeOpenPullRequestSyncer) SyncOpenPullRequests(ctx context.Context, repositoryID int64, targetBranch string) error {
@@ -71,8 +69,8 @@ func (s *forgeOpenPullRequestSyncer) SyncOpenPullRequests(ctx context.Context, r
 	if err != nil {
 		return fmt.Errorf("load repository for open pull request sync: %w", err)
 	}
-	if !s.repositoryAllowed(repo) {
-		return ErrOpenPullRequestSyncRepositoryNotAllowed
+	if !repo.EnforcementActive() {
+		return domain.ErrEnforcementNotActive
 	}
 	token, found, err := s.tokens.StatusToken(ctx, repositoryID)
 	if err != nil {
@@ -137,25 +135,6 @@ func openPullRequestsSyncedEvent(repo domain.Repository, targetBranch string, op
 		SubjectID:   strconv.FormatInt(repo.ID, 10),
 		DetailsJSON: string(detailsJSON),
 	}
-}
-
-func (s *forgeOpenPullRequestSyncer) repositoryAllowed(repo domain.Repository) bool {
-	if len(s.allowedRepos) == 0 {
-		return false
-	}
-	_, ok := s.allowedRepos[normalizeLiveStatusRepository(repo.FullName())]
-	return ok
-}
-
-func normalizedOpenPullRequestSyncAllowlist(repositories []string) map[string]struct{} {
-	allowed := make(map[string]struct{}, len(repositories))
-	for _, repository := range repositories {
-		key := normalizeLiveStatusRepository(repository)
-		if key != "" {
-			allowed[key] = struct{}{}
-		}
-	}
-	return allowed
 }
 
 func safeOpenPullRequestSyncError(cause error, sensitiveValues ...string) error {

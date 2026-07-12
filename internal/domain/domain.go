@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"errors"
+	"time"
+)
 
 const RequiredStatusContext = "thawguard/freeze"
 
@@ -13,6 +16,35 @@ const (
 	CommitStatusError   CommitStatusState = "error"
 )
 
+// EnforcementState is the persisted repository enforcement lifecycle. It is
+// independent from Repository.Active, which controls whether the repository
+// and its encrypted credentials can be loaded at all.
+type EnforcementState string
+
+const (
+	EnforcementSetupIncomplete EnforcementState = "setup_incomplete"
+	EnforcementReady           EnforcementState = "ready"
+	EnforcementActive          EnforcementState = "active"
+	EnforcementUnhealthy       EnforcementState = "unhealthy"
+)
+
+func (s EnforcementState) Valid() bool {
+	switch s {
+	case EnforcementSetupIncomplete, EnforcementReady, EnforcementActive, EnforcementUnhealthy:
+		return true
+	default:
+		return false
+	}
+}
+
+// EnforcementNotActiveMessage is the single operator-facing message for
+// mutations that require active repository enforcement.
+const EnforcementNotActiveMessage = "Repository enforcement is not active. Complete setup and activate enforcement before performing this action."
+
+// ErrEnforcementNotActive guards non-form boundaries (publisher, forge sync)
+// against posting for repositories whose enforcement is not active.
+var ErrEnforcementNotActive = errors.New(EnforcementNotActiveMessage)
+
 type Repository struct {
 	ID               int64
 	Forge            string
@@ -23,8 +55,13 @@ type Repository struct {
 	HasWebhookSecret bool
 	HasStatusToken   bool
 	Active           bool
+	EnforcementState EnforcementState
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
+}
+
+func (r Repository) EnforcementActive() bool {
+	return r.EnforcementState == EnforcementActive
 }
 
 type Actor struct {

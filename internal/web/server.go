@@ -129,6 +129,7 @@ type repositoryOverview struct {
 	WebhookConfiguredCount      int
 	StatusTokenConfiguredCount  int
 	SetupCheckRepositoryCount   int
+	EnforcementActiveCount      int
 	WebhookSecretStorageEnabled bool
 }
 
@@ -2363,6 +2364,9 @@ func (s *Server) renderRepositories(w http.ResponseWriter, views []repositoryVie
 		if len(view.SetupChecks) > 0 {
 			overview.SetupCheckRepositoryCount++
 		}
+		if view.Repository.EnforcementActive() {
+			overview.EnforcementActiveCount++
+		}
 	}
 	s.render(w, repositoriesTemplate, map[string]any{
 		"AppName":                           s.cfg.AppName,
@@ -2380,39 +2384,51 @@ func (s *Server) renderRepositories(w http.ResponseWriter, views []repositoryVie
 
 func (s *Server) renderFreezes(w http.ResponseWriter, repositories []domain.Repository, freezes []freezeView, auditEvents []freezeAuditView, formError string, session sessionState) {
 	s.render(w, freezesTemplate, map[string]any{
-		"AppName":      s.cfg.AppName,
-		"ActivePage":   "freezes",
-		"CurrentUser":  currentUserFromSession(session),
-		"Repositories": repositories,
-		"Freezes":      freezes,
-		"AuditEvents":  auditEvents,
-		"FormError":    formError,
-		"CSRFToken":    session.CSRFToken,
+		"AppName":                 s.cfg.AppName,
+		"ActivePage":              "freezes",
+		"CurrentUser":             currentUserFromSession(session),
+		"EnforceableRepositories": enforcementActiveRepositories(repositories),
+		"Freezes":                 freezes,
+		"AuditEvents":             auditEvents,
+		"FormError":               formError,
+		"CSRFToken":               session.CSRFToken,
 	})
+}
+
+// enforcementActiveRepositories keeps mutation forms scoped to repositories
+// that may enforce freezes; server-side gating remains authoritative.
+func enforcementActiveRepositories(repositories []domain.Repository) []domain.Repository {
+	enforceable := make([]domain.Repository, 0, len(repositories))
+	for _, repo := range repositories {
+		if repo.EnforcementActive() {
+			enforceable = append(enforceable, repo)
+		}
+	}
+	return enforceable
 }
 
 func (s *Server) renderScheduledFreezes(w http.ResponseWriter, repositories []domain.Repository, scheduled []scheduledFreezeView, formError string, session sessionState) {
 	s.render(w, scheduledFreezesTemplate, map[string]any{
-		"AppName":          s.cfg.AppName,
-		"ActivePage":       "scheduled",
-		"CurrentUser":      currentUserFromSession(session),
-		"Repositories":     repositories,
-		"ScheduledFreezes": scheduled,
-		"FormError":        formError,
-		"CSRFToken":        session.CSRFToken,
+		"AppName":                 s.cfg.AppName,
+		"ActivePage":              "scheduled",
+		"CurrentUser":             currentUserFromSession(session),
+		"EnforceableRepositories": enforcementActiveRepositories(repositories),
+		"ScheduledFreezes":        scheduled,
+		"FormError":               formError,
+		"CSRFToken":               session.CSRFToken,
 	})
 }
 
 func (s *Server) renderDecisions(w http.ResponseWriter, repositories []domain.Repository, results []statusResultView, formError string, session sessionState, confirmations ...sharedHeadConfirmationView) {
 	data := map[string]any{
-		"AppName":         s.cfg.AppName,
-		"ActivePage":      "thaws",
-		"CurrentUser":     currentUserFromSession(session),
-		"Repositories":    repositories,
-		"Results":         results,
-		"FormError":       formError,
-		"CSRFToken":       session.CSRFToken,
-		"RequiredContext": domain.RequiredStatusContext,
+		"AppName":                 s.cfg.AppName,
+		"ActivePage":              "thaws",
+		"CurrentUser":             currentUserFromSession(session),
+		"EnforceableRepositories": enforcementActiveRepositories(repositories),
+		"Results":                 results,
+		"FormError":               formError,
+		"CSRFToken":               session.CSRFToken,
+		"RequiredContext":         domain.RequiredStatusContext,
 	}
 	if len(confirmations) > 0 {
 		data["SharedHeadConfirmation"] = confirmations[0]
@@ -2868,7 +2884,7 @@ const dashboardTemplate = pageHead + `
       <article class="tg-panel">
         <div class="tg-panel-head"><h2>Recent Events</h2><a class="tg-btn tg-btn-secondary tg-btn-sm" href="/webhooks">View All</a></div>
         <div class="tg-event-row"><span class="tg-event-icon tg-event-freeze"><svg class="tg-icon"><use href="#tg-i-freeze-branch"></use></svg></span><span>Branch freeze workflow is ready for local records</span><span class="tg-muted">local</span></div>
-        <div class="tg-event-row"><span class="tg-event-icon tg-event-ok"><svg class="tg-icon"><use href="#tg-i-check"></use></svg></span><span>Dry-run publisher records what would publish later</span><span class="tg-muted">dry-run</span></div>
+        <div class="tg-event-row"><span class="tg-event-icon tg-event-ok"><svg class="tg-icon"><use href="#tg-i-check"></use></svg></span><span>Commit statuses post only for enforcement-active repositories</span><span class="tg-muted">enforcement</span></div>
         <div class="tg-event-row"><span class="tg-event-icon tg-event-fail"><svg class="tg-icon"><use href="#tg-i-warning"></use></svg></span><span>Signed webhook receiver stores sanitized delivery metadata only</span><span class="tg-muted">safe</span></div>
         <div class="tg-event-row"><span class="tg-event-icon tg-event-ok"><svg class="tg-icon"><use href="#tg-i-check"></use></svg></span><span>Required status context is <code>` + domain.RequiredStatusContext + `</code></span><span class="tg-muted">future</span></div>
       </article>
@@ -2895,7 +2911,7 @@ const dashboardTemplate = pageHead + `
 
     <section class="tg-warning-callout">
       <span aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-warning"></use></svg></span>
-      <span>Shadow mode alpha: Thawguard records decisions and dry-run publication attempts. It does not post live Forgejo/Codeberg statuses yet.</span>
+      <span>Repositories start setup-incomplete and cannot enforce freezes yet. Enforcement activation ships with the upcoming readiness checks; until then freeze, schedule, and thaw actions stay unavailable.</span>
       <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/repositories">View Setup</a>
     </section>
   </main>` + pageFoot
@@ -2945,7 +2961,7 @@ const webhookDeliveriesTemplate = pageHead + `
 
     <section class="tg-panel tg-data-panel tg-audit-log-panel">
       <div class="tg-panel-head"><h2>Status publication attempts</h2><span class="tg-badge tg-badge-info">{{ len .StatusAttempts }} attempts</span></div>
-      <p class="tg-panel-subtitle">Recent dry-run or live attempts for the <code>{{ .RequiredContext }}</code> status context. Errors shown here are already sanitized by the publisher.</p>
+      <p class="tg-panel-subtitle">Recent live posting attempts for the <code>{{ .RequiredContext }}</code> status context. Errors shown here are already sanitized by the publisher.</p>
       {{ if .StatusAttempts }}
       <div class="tg-table-wrap tg-responsive-table">
         <table class="tg-data-table tg-audit-table">
@@ -2967,7 +2983,7 @@ const webhookDeliveriesTemplate = pageHead + `
         </table>
       </div>
       {{ else }}
-        <div class="tg-empty-row tg-data-empty"><strong>No status publication attempts yet</strong><span>Status dry-runs and live post attempts will appear here after freeze/thaw recomputation.</span></div>
+        <div class="tg-empty-row tg-data-empty"><strong>No status publication attempts yet</strong><span>Live status post attempts will appear here after freeze/thaw recomputation for enforcement-active repositories.</span></div>
       {{ end }}
     </section>
 
@@ -3105,15 +3121,13 @@ const publicationsTemplate = pageHead + `
   <main class="shell stack">
     <nav class="topnav"><a href="/">Dashboard</a></nav>
     <section class="panel">
-      <p class="eyebrow">Local publication intents</p>
-      <h1>Status publication intents</h1>
-      <p class="warning">These are idempotent local records of the latest status Thawguard would publish later. No status has been posted to Forgejo/Codeberg from this page or from the current local publisher.</p>
-      <p class="warning">Publication-intent visibility is available to signed-in local users only. Keep live status posting behind the explicit guardrails.</p>
-      <p>Use this page to inspect the status context, state, head SHA, dry-run attempt history, and description generated by the local recomputation pipeline before live status posting is wired.</p>
+      <p class="eyebrow">Status publication diagnostics</p>
+      <h1>Status publications</h1>
+      <p>Each intent below is the latest desired <code>thawguard/freeze</code> status per repository head. Attempts record real posted or failed deliveries to the forge for enforcement-active repositories; errors are sanitized before storage.</p>
     </section>
 
     <section class="panel">
-      <h2>Latest local publication intents</h2>
+      <h2>Latest desired statuses</h2>
       {{ if .Publications }}
       <table>
         <thead><tr><th>Last updated</th><th>Repository</th><th>PR</th><th>Target branch</th><th>Head SHA</th><th>Context</th><th>State</th><th>Mode</th><th>Description</th></tr></thead>
@@ -3139,8 +3153,8 @@ const publicationsTemplate = pageHead + `
     </section>
 
     <section class="panel">
-      <h2>Recent dry-run publication attempts</h2>
-      <p class="muted">Dry-run attempts are local planning records created by the publisher seam. They do not call Forgejo/Codeberg.</p>
+      <h2>Recent live posting attempts</h2>
+      <p class="muted">Posted and failed attempts against the forge. Historical records from older databases may still appear here.</p>
       {{ if .Attempts }}
       <table>
         <thead><tr><th>Attempted</th><th>Repository</th><th>PR</th><th>Target branch</th><th>Head SHA</th><th>Context</th><th>State</th><th>Mode</th><th>Result</th><th>Description</th><th>Error</th></tr></thead>
@@ -3163,7 +3177,7 @@ const publicationsTemplate = pageHead + `
         </tbody>
       </table>
       {{ else }}
-      <p>No dry-run publication attempts yet.</p>
+      <p>No status publication attempts yet.</p>
       {{ end }}
     </section>
   </main>` + pageFoot
@@ -3203,7 +3217,7 @@ const repositoriesTemplate = pageHead + `
       </article>
       <article class="tg-stat tg-stat-scheduled">
         <span class="tg-stat-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-icy-shield"></use></svg></span>
-        <span><span class="tg-stat-label">Mode</span><strong class="tg-stat-value">Shadow</strong></span>
+        <span><span class="tg-stat-label">Enforcing</span><strong class="tg-stat-value">{{ .Overview.EnforcementActiveCount }}</strong></span>
       </article>
     </section>
 
@@ -3257,10 +3271,14 @@ const repositoriesTemplate = pageHead + `
             <h3>{{ .Repository.FullName }}</h3>
           </div>
           <div class="tg-repo-badges">
+            {{ if .Repository.EnforcementActive }}<span class="tg-badge status-ok">enforcement active</span>{{ else }}<span class="tg-badge status-warning">setup incomplete</span>{{ end }}
             {{ if .Repository.HasWebhookSecret }}<span class="tg-badge status-ok">webhook configured</span>{{ else }}<span class="tg-badge status-warning">webhook missing</span>{{ end }}
             {{ if .Repository.HasStatusToken }}<span class="tg-badge status-ok">status token configured</span>{{ else }}<span class="tg-badge status-warning">status token missing</span>{{ end }}
           </div>
         </div>
+        {{ if not .Repository.EnforcementActive }}
+        <p class="tg-muted">Setup incomplete: this repository cannot enforce freezes, schedules, or thaws. Signed webhooks are still received and recorded as setup evidence. Activation ships with the upcoming readiness checks.</p>
+        {{ end }}
         <dl class="tg-repo-meta">
           <div><span class="tg-meta-icon"><svg class="tg-icon"><use href="#tg-i-git-branch"></use></svg></span><dt>Default branch</dt><dd><code>{{ .Repository.DefaultBranch }}</code></dd></div>
           <div><span class="tg-meta-icon"><svg class="tg-icon"><use href="#tg-i-check"></use></svg></span><dt>Required context</dt><dd><code>` + domain.RequiredStatusContext + `</code></dd></div>
@@ -3317,7 +3335,7 @@ const repositoriesTemplate = pageHead + `
                 <span class="tg-credential-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-key"></use></svg></span>
                 <div>
                   <strong>Status token</strong>
-                  <span>{{ if .Repository.HasStatusToken }}Stored encrypted for guarded live status posting. Hidden until rotation.{{ else }}Needed only for explicit guarded live commit-status posting.{{ end }}</span>
+                  <span>{{ if .Repository.HasStatusToken }}Stored encrypted. Hidden until rotation.{{ else }}Required for enforcement: posts the <code>` + domain.RequiredStatusContext + `</code> commit status and syncs open PRs.{{ end }}</span>
                 </div>
                 {{ if .Repository.HasStatusToken }}<span class="tg-badge status-ok">stored encrypted</span>{{ else }}<span class="tg-badge status-warning">missing</span>{{ end }}
               </div>
@@ -3344,7 +3362,7 @@ const repositoriesTemplate = pageHead + `
               {{ end }}
             </section>
           </div>
-          <p class="tg-muted">Credential values are write-only and stored encrypted. Dry-run remains the default; live status posting still requires explicit guardrails.</p>
+          <p class="tg-muted">Credential values are write-only and stored encrypted.</p>
           {{ else }}
           <p class="tg-muted">Set <code>THAWGUARD_SECRET_KEY</code> to save webhook secrets and status tokens.</p>
           {{ end }}
@@ -3370,7 +3388,7 @@ const repositoriesTemplate = pageHead + `
     <section class="tg-panel tg-setup-checklist">
       <div class="tg-panel-head"><h2>Manual setup checklist</h2><span class="tg-badge tg-badge-info">local guidance</span></div>
       <div class="tg-checklist-grid">
-        <article><span>1</span><div><strong>Required status context</strong><p>Configure branch protection to require <code>{{ .RequiredContext }}</code> once live status posting is configured.</p></div></article>
+        <article><span>1</span><div><strong>Required status context</strong><p>Configure branch protection to require <code>{{ .RequiredContext }}</code> once enforcement is active for the repository.</p></div></article>
         <article><span>2</span><div><strong>Signed webhook receiver</strong><p>Point pull request webhooks at <code>/webhooks/forgejo</code> with the repository webhook secret.</p></div></article>
         <article><span>3</span><div><strong>Local setup checks</strong><p>Current checks are local placeholders for setup visibility, not live Forgejo/Codeberg verification.</p></div></article>
       </div>
@@ -3402,12 +3420,12 @@ const freezesTemplate = pageHead + `
           <strong>Read-only freeze access</strong>
           <span>Your role can view freezes. Explicit freezer role is required to create, lift, or cancel freezes.</span>
         </div>
-        {{ else if .Repositories }}
+        {{ else if .EnforceableRepositories }}
         <form method="post" action="/freezes" class="tg-setup-form tg-freeze-form" data-freeze-form>
           <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
           <label>Repository
             <select name="repository_id" required data-freeze-repository>
-            {{ range .Repositories }}<option value="{{ .ID }}">{{ .FullName }}</option>{{ end }}
+            {{ range .EnforceableRepositories }}<option value="{{ .ID }}">{{ .FullName }}</option>{{ end }}
             </select>
           </label>
           <label>Branch <input name="branch" placeholder="main" value="main" required data-freeze-branch></label>
@@ -3422,13 +3440,9 @@ const freezesTemplate = pageHead + `
         </form>
         {{ else }}
         <div class="tg-empty-row">
-          <strong>No repositories configured yet</strong>
-          <span>Add a repository before creating a freeze.</span>
-          {{ if .CurrentUser.CanManageRepositories }}
-          <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/repositories"><svg class="tg-icon"><use href="#tg-i-plus"></use></svg>Add repository</a>
-          {{ else }}
-          <span class="tg-muted">Ask an admin to add a repository.</span>
-          {{ end }}
+          <strong>No repository has active enforcement</strong>
+          <span>Repository enforcement is not active. Complete setup and activate enforcement before creating a freeze.</span>
+          <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/repositories">Repository setup</a>
         </div>
         {{ end }}
       </section>
@@ -3538,13 +3552,13 @@ const scheduledFreezesTemplate = pageHead + `
           <strong>Read-only schedule access</strong>
           <span>Your role can view scheduled freezes. Explicit freezer role is required to create or cancel schedules.</span>
         </div>
-        {{ else if .Repositories }}
+        {{ else if .EnforceableRepositories }}
         <form method="post" action="/scheduled-freezes" class="tg-setup-form tg-freeze-form" data-scheduled-freeze-form>
           <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
           <input type="hidden" name="timezone_offset_minutes" value="0" data-timezone-offset-minutes>
           <label>Repository
             <select name="repository_id" required>
-            {{ range .Repositories }}<option value="{{ .ID }}">{{ .FullName }}</option>{{ end }}
+            {{ range .EnforceableRepositories }}<option value="{{ .ID }}">{{ .FullName }}</option>{{ end }}
             </select>
           </label>
           <label>Branch <input name="branch" placeholder="main" value="main" required></label>
@@ -3562,13 +3576,9 @@ const scheduledFreezesTemplate = pageHead + `
         </form>
         {{ else }}
         <div class="tg-empty-row">
-          <strong>No repositories configured yet</strong>
-          <span>Add a repository before creating a scheduled freeze.</span>
-          {{ if .CurrentUser.CanManageRepositories }}
-          <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/repositories"><svg class="tg-icon"><use href="#tg-i-plus"></use></svg>Add repository</a>
-          {{ else }}
-          <span class="tg-muted">Ask an admin to add a repository.</span>
-          {{ end }}
+          <strong>No repository has active enforcement</strong>
+          <span>Repository enforcement is not active. Complete setup and activate enforcement before scheduling a freeze.</span>
+          <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/repositories">Repository setup</a>
         </div>
         {{ end }}
       </section>
@@ -3707,12 +3717,12 @@ const decisionsTemplate = pageHead + `
           <strong>Read-only thaw access</strong>
           <span>Your role can view thaw decisions. Explicit thaw approver role is required to approve exceptions.</span>
         </div>
-        {{ else if .Repositories }}
+        {{ else if .EnforceableRepositories }}
         <form method="post" action="/decisions" class="tg-setup-form tg-thaw-form" data-thaw-form>
           <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
           <label>Repository
             <select name="repository_id" required data-thaw-repository>
-            {{ range .Repositories }}<option value="{{ .ID }}">{{ .FullName }}</option>{{ end }}
+            {{ range .EnforceableRepositories }}<option value="{{ .ID }}">{{ .FullName }}</option>{{ end }}
             </select>
           </label>
           <label>Pull request <input name="pull_request_index" inputmode="numeric" placeholder="251" required data-thaw-pr></label>
@@ -3734,13 +3744,9 @@ const decisionsTemplate = pageHead + `
         </form>
         {{ else }}
         <div class="tg-empty-row">
-          <strong>No repositories configured yet</strong>
-          <span>Add a repository before approving a thaw exception.</span>
-          {{ if .CurrentUser.CanManageRepositories }}
-          <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/repositories"><svg class="tg-icon"><use href="#tg-i-plus"></use></svg>Add repository</a>
-          {{ else }}
-          <span class="tg-muted">Ask an admin to add a repository.</span>
-          {{ end }}
+          <strong>No repository has active enforcement</strong>
+          <span>Repository enforcement is not active. Complete setup and activate enforcement before approving a thaw exception.</span>
+          <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/repositories">Repository setup</a>
         </div>
         {{ end }}
       </section>

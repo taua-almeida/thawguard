@@ -70,6 +70,8 @@ func TestOpenAndApplyMigrationsAgainstSQLite(t *testing.T) {
 	assertColumnExists(t, database, "sessions", "csrf_token")
 	assertIndexExists(t, database, "idx_sessions_expires_at")
 	assertTableExists(t, database, "user_roles")
+	assertColumnExists(t, database, "repositories", "enforcement_state")
+	assertEnforcementStateConstraint(t, database)
 
 	var applied int
 	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = ?`, "0001_initial").Scan(&applied); err != nil {
@@ -273,6 +275,14 @@ VALUES (7001, 7001, 'main', 'scheduled', 'future freeze', '2026-07-10T18:00:00Z'
 	}
 	if applied != 1 {
 		t.Fatalf("expected scheduled freeze duplicate relaxation migration to be recorded once, got %d", applied)
+	}
+	assertColumnExists(t, database, "repositories", "enforcement_state")
+	var enforcementState string
+	if err := database.QueryRowContext(ctx, `SELECT enforcement_state FROM repositories WHERE id = 7001`).Scan(&enforcementState); err != nil {
+		t.Fatal(err)
+	}
+	if enforcementState != "setup_incomplete" {
+		t.Fatalf("expected existing repository to migrate to setup_incomplete enforcement, got %q", enforcementState)
 	}
 	assertWebhookDeliveriesAreRepositoryScoped(t, database)
 	assertIndexExists(t, database, "idx_audit_events_subject_type_id")
@@ -507,6 +517,23 @@ VALUES
 	}
 	if _, err := database.ExecContext(ctx, `INSERT INTO webhook_deliveries(repository_id, delivery_id, event, received_at, verified) VALUES (2, 'retry-me', 'pull_request', '2026-06-30T12:00:05.000000000Z', 1)`); err != nil {
 		t.Fatalf("expected repository-scoped duplicate delivery id after rebuild: %v", err)
+	}
+}
+
+func assertEnforcementStateConstraint(t *testing.T, database *sql.DB) {
+	t.Helper()
+	if _, err := database.Exec(`INSERT INTO repositories(forge, base_url, owner, name, default_branch, active, enforcement_state, created_at, updated_at) VALUES ('forgejo', 'https://codeberg.org', 'enforcement-owner', 'enforcement-repo', 'main', 1, 'shadow', '2026-07-01T00:00:00.000000000Z', '2026-07-01T00:00:00.000000000Z')`); err == nil {
+		t.Fatal("expected invalid enforcement state to be rejected by check constraint")
+	}
+	if _, err := database.Exec(`INSERT INTO repositories(forge, base_url, owner, name, default_branch, active, created_at, updated_at) VALUES ('forgejo', 'https://codeberg.org', 'enforcement-owner', 'enforcement-repo', 'main', 1, '2026-07-01T00:00:00.000000000Z', '2026-07-01T00:00:00.000000000Z')`); err != nil {
+		t.Fatalf("expected repository insert without enforcement state to default: %v", err)
+	}
+	var enforcementState string
+	if err := database.QueryRow(`SELECT enforcement_state FROM repositories WHERE owner = 'enforcement-owner' AND name = 'enforcement-repo'`).Scan(&enforcementState); err != nil {
+		t.Fatal(err)
+	}
+	if enforcementState != "setup_incomplete" {
+		t.Fatalf("expected setup_incomplete default enforcement state, got %q", enforcementState)
 	}
 }
 

@@ -12,6 +12,15 @@ Early Milestone 1 foundation. Not ready for production use.
 
 Thawguard is cooperative enforcement for trusted teams. It is intended to prevent accidental merges and automate auditable freeze workflows. It is not a hard security boundary against repository writers who can post forge commit statuses with sufficient token permissions.
 
+## How enforcement works
+
+Thawguard has one operational mode. Each repository carries a persisted enforcement state:
+
+- New and existing repositories start **setup incomplete**. Setup (encrypted webhook secret, encrypted status token, signed webhook deliveries) stays fully available, and verified webhooks are recorded as setup evidence, but no commit status is ever posted and freeze, scheduled-freeze, and thaw actions are rejected.
+- An **enforcement-active** repository has one behavior: freeze lifecycle actions synchronize current open pull requests from the forge, evaluate each affected head SHA across the whole repository (including PRs on other target branches sharing the same commit), and post the real `thawguard/freeze` commit status. A missing token or forge failure fails closed: no stale status is posted, and failures during posting are recorded as sanitized failed attempts.
+
+Activation is not implemented yet: it ships with the upcoming readiness checks, which will require the encrypted status token, the required branch context, a verified signed webhook, and passing readiness checks. Current builds therefore leave every repository setup-incomplete. There is no shadow or dry-run runtime mode.
+
 ## Local development
 
 ```sh
@@ -25,26 +34,22 @@ The service creates `thawguard.db` by default. Override with `THAWGUARD_DB_PATH`
 
 Runtime configuration is environment-variable based. The binary does not currently parse CLI flags such as `--db` or `--addr`; use `THAWGUARD_DB_PATH` and `THAWGUARD_HTTP_ADDR` instead.
 
-For a Docker-based shadow-mode alpha with mock Codeberg repositories, see [`docs/local-alpha.md`](docs/local-alpha.md).
+For a Docker-based local alpha runbook, see [`docs/local-alpha.md`](docs/local-alpha.md).
 
 Repository webhook secrets and status-posting tokens are encrypted before they are stored. To enable secret/token setup in local development, set `THAWGUARD_SECRET_KEY` to a stable, high-entropy, base64-encoded 32-byte installation key. Without this key, the rest of the local UI remains usable, but webhook secret and status token setup are disabled. Losing or changing this key makes stored secrets and tokens undecryptable.
 
-The local signed webhook receiver is `POST /webhooks/forgejo`. It verifies configured repository webhook secrets, records sanitized delivery results, updates the local PR cache, and recomputes local status/publication-intent records plus dry-run publication attempts. `THAWGUARD_STATUS_PUBLISHER` defaults to `dry_run`.
-
-Live Forgejo/Codeberg commit-status posting is a guarded pilot mode, not the default. To start in live mode, `THAWGUARD_STATUS_PUBLISHER=forgejo_status` must be paired with `THAWGUARD_LIVE_STATUS_POSTING=enabled`, `THAWGUARD_LIVE_STATUS_REPOSITORIES=owner/name` for the specific repositories allowed to post, a valid `THAWGUARD_SECRET_KEY`, and a configured encrypted status token on each allowed repository. Repositories not on the allowlist and repositories missing tokens are recorded as failed publication attempts rather than falling back silently. Keep this mode limited to throwaway or explicitly approved repositories until the rest of the live-pilot process is reviewed.
-
-Freeze, lift, and cancel actions recompute statuses for open PRs on the affected repository and branch. In guarded `forgejo_status` live mode, each freeze change first syncs current open PRs for the target branch from the forge using the repository's encrypted status token, then publishes only the `thawguard/freeze` status context.
+The local signed webhook receiver is `POST /webhooks/forgejo`. It verifies configured repository webhook secrets and records sanitized delivery results. For a setup-incomplete repository it also refreshes the local PR cache as setup evidence; for an enforcement-active repository it additionally recomputes and posts the `thawguard/freeze` status.
 
 Current local pages:
 
 - `/` dashboard
 - `/setup` first local admin setup when no users exist; the first account starts with all MVP roles for local bootstrap
 - `/login` and `/logout` local user session flow
-- `/repositories` repository setup form and manual setup checklist
-- `/freezes` local active branch-freeze form and list
-- `/scheduled-freezes` one-time scheduled freeze windows with optional planned unfreeze
-- `/decisions` immediate thaw approval; fetches the current PR head from the forge in live mode and scopes the thaw to that PR/head SHA
-- `/publications` latest idempotent local status publication intents and dry-run publication attempts; shows what would be posted later and does not post to Forgejo/Codeberg
+- `/repositories` repository setup form, enforcement state, and manual setup checklist
+- `/freezes` active branch-freeze form and list (requires an enforcement-active repository)
+- `/scheduled-freezes` one-time scheduled freeze windows with optional planned unfreeze (requires an enforcement-active repository)
+- `/decisions` immediate thaw approval; fetches the current PR head from the forge and scopes the thaw to that PR/head SHA (requires an enforcement-active repository)
+- `/publications` latest desired statuses and live posting attempts (posted/failed)
 - `/webhooks` system activity, status publication attempts, and recent signed webhook delivery metadata; shows sanitized local processing history and does not store raw payloads, signatures, or secrets
 - `/users` admin-only local user and multi-role management
 

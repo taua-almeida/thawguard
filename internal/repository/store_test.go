@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/taua-almeida/thawguard/internal/db"
+	"github.com/taua-almeida/thawguard/internal/domain"
 )
 
 func TestStoreCreatesAndListsRepositories(t *testing.T) {
@@ -38,6 +39,12 @@ func TestStoreCreatesAndListsRepositories(t *testing.T) {
 	}
 	if !repo.Active {
 		t.Fatal("expected repository to be active")
+	}
+	if repo.EnforcementState != domain.EnforcementSetupIncomplete {
+		t.Fatalf("expected new repository to default to setup_incomplete enforcement, got %q", repo.EnforcementState)
+	}
+	if repo.EnforcementActive() {
+		t.Fatal("expected new repository not to be enforcement-active")
 	}
 
 	repositories, err := store.List(ctx)
@@ -203,6 +210,55 @@ func TestStoreSetsAndReadsStatusTokenCiphertext(t *testing.T) {
 	}
 	if stored != 1 {
 		t.Fatalf("expected one repository status token row, got %d", stored)
+	}
+}
+
+func TestStoreEnforcementStateRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	repo, err := store.Create(ctx, CreateParams{Owner: "example-owner", Name: "example-repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := store.SetEnforcementState(ctx, repo.ID, domain.EnforcementActive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.EnforcementState != domain.EnforcementActive || !updated.EnforcementActive() {
+		t.Fatalf("expected active enforcement state, got %q", updated.EnforcementState)
+	}
+
+	fetched, err := store.Get(ctx, repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fetched.EnforcementState != domain.EnforcementActive {
+		t.Fatalf("expected enforcement state to round-trip, got %q", fetched.EnforcementState)
+	}
+
+	reverted, err := store.SetEnforcementState(ctx, repo.ID, domain.EnforcementSetupIncomplete)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reverted.EnforcementState != domain.EnforcementSetupIncomplete {
+		t.Fatalf("expected setup_incomplete enforcement state, got %q", reverted.EnforcementState)
+	}
+}
+
+func TestStoreRejectsInvalidEnforcementState(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	repo, err := store.Create(ctx, CreateParams{Owner: "example-owner", Name: "example-repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.SetEnforcementState(ctx, repo.ID, "shadow"); !IsValidationError(err) {
+		t.Fatalf("expected invalid enforcement state validation error, got %v", err)
+	}
+	if _, err := store.SetEnforcementState(ctx, 0, domain.EnforcementActive); !IsValidationError(err) {
+		t.Fatalf("expected repository id validation error, got %v", err)
 	}
 }
 

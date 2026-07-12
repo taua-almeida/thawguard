@@ -3,26 +3,20 @@ package config
 import "os"
 
 type Config struct {
-	HTTPAddr            string
-	DatabasePath        string
-	PublicURL           string
-	Environment         string
-	SecretKey           string
-	StatusPublisherMode string
-	LiveStatusPosting   string
-	LiveStatusRepos     string
+	HTTPAddr     string
+	DatabasePath string
+	PublicURL    string
+	Environment  string
+	SecretKey    string
 }
 
 func FromEnv() Config {
 	return Config{
-		HTTPAddr:            env("THAWGUARD_HTTP_ADDR", "127.0.0.1:8080"),
-		DatabasePath:        env("THAWGUARD_DB_PATH", "thawguard.db"),
-		PublicURL:           env("THAWGUARD_PUBLIC_URL", "http://localhost:8080"),
-		Environment:         env("THAWGUARD_ENV", "development"),
-		SecretKey:           env("THAWGUARD_SECRET_KEY", ""),
-		StatusPublisherMode: env("THAWGUARD_STATUS_PUBLISHER", "dry_run"),
-		LiveStatusPosting:   env("THAWGUARD_LIVE_STATUS_POSTING", ""),
-		LiveStatusRepos:     env("THAWGUARD_LIVE_STATUS_REPOSITORIES", ""),
+		HTTPAddr:     env("THAWGUARD_HTTP_ADDR", "127.0.0.1:8080"),
+		DatabasePath: env("THAWGUARD_DB_PATH", "thawguard.db"),
+		PublicURL:    env("THAWGUARD_PUBLIC_URL", "http://localhost:8080"),
+		Environment:  env("THAWGUARD_ENV", "development"),
+		SecretKey:    env("THAWGUARD_SECRET_KEY", ""),
 	}
 }
 

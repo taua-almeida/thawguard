@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 
@@ -19,6 +20,7 @@ type freezeOperations interface {
 }
 
 type scheduledFreezeOperations interface {
+	Get(ctx context.Context, id int64) (domain.BranchFreeze, error)
 	ListScheduled(ctx context.Context, limit int) ([]domain.BranchFreeze, error)
 	CreateScheduled(ctx context.Context, params freeze.ScheduleParams, actor domain.Actor) (domain.BranchFreeze, error)
 	CancelScheduled(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error)
@@ -42,19 +44,29 @@ type statusPublisher interface {
 	Publish(ctx context.Context, result statusresult.Result) (statuspublication.Publication, error)
 }
 
-// freezeRecomputingStore recomputes and publishes statuses from the cached
-// open-PR view only. It deliberately has no live forge sync dependency so
-// freeze lifecycle actions keep working offline in dry-run mode; the thaw
-// approval service owns its own live refresh and fails closed instead.
+type recomputeRepositoryGetter interface {
+	Get(ctx context.Context, id int64) (domain.Repository, error)
+}
+
+// freezeRecomputingStore wraps freeze lifecycle mutations with the one
+// enforcement behavior: for an enforcement-active repository every action
+// that requires publication first synchronizes current open PRs from the
+// forge, then evaluates each affected head SHA across the whole repository
+// (including cross-target-branch collisions) and publishes the result.
+// Freeze and scheduled-freeze creation are rejected before mutation when the
+// repository is not enforcement-active; end/cancel stay possible for cleanup
+// but never sync or publish for an inactive repository.
 type freezeRecomputingStore struct {
 	freezes      freezeOperations
+	repositories recomputeRepositoryGetter
+	syncer       openPullRequestSyncer
 	pullRequests openPullRequestBranchLister
 	statuses     sharedHeadStatusRunner
 	publisher    statusPublisher
 }
 
-func newFreezeRecomputingStore(freezes freezeOperations, pullRequests openPullRequestBranchLister, statuses sharedHeadStatusRunner, publisher statusPublisher) *freezeRecomputingStore {
-	return &freezeRecomputingStore{freezes: freezes, pullRequests: pullRequests, statuses: statuses, publisher: publisher}
+func newFreezeRecomputingStore(freezes freezeOperations, repositories recomputeRepositoryGetter, syncer openPullRequestSyncer, pullRequests openPullRequestBranchLister, statuses sharedHeadStatusRunner, publisher statusPublisher) *freezeRecomputingStore {
+	return &freezeRecomputingStore{freezes: freezes, repositories: repositories, syncer: syncer, pullRequests: pullRequests, statuses: statuses, publisher: publisher}
 }
 
 func (s *freezeRecomputingStore) ListActive(ctx context.Context) ([]domain.BranchFreeze, error) {
@@ -67,6 +79,9 @@ func (s *freezeRecomputingStore) ListActive(ctx context.Context) ([]domain.Branc
 func (s *freezeRecomputingStore) CreateActive(ctx context.Context, params freeze.CreateParams, actor domain.Actor) (domain.BranchFreeze, error) {
 	if s == nil || s.freezes == nil {
 		return domain.BranchFreeze{}, errors.New("freeze recomputing store has no freeze store")
+	}
+	if err := s.requireEnforcementActive(ctx, params.RepositoryID); err != nil {
+		return domain.BranchFreeze{}, err
 	}
 	created, err := s.freezes.CreateActive(ctx, params, actor)
 	if err != nil {
@@ -125,6 +140,9 @@ func (s *freezeRecomputingStore) CreateScheduled(ctx context.Context, params fre
 	if err != nil {
 		return domain.BranchFreeze{}, err
 	}
+	if err := s.requireEnforcementActive(ctx, params.RepositoryID); err != nil {
+		return domain.BranchFreeze{}, err
+	}
 	return scheduled.CreateScheduled(ctx, params, actor)
 }
 
@@ -147,6 +165,18 @@ func (s *freezeRecomputingStore) ListDueScheduled(ctx context.Context, limit int
 func (s *freezeRecomputingStore) ActivateScheduled(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error) {
 	scheduled, err := s.scheduledFreezes()
 	if err != nil {
+		return domain.BranchFreeze{}, err
+	}
+	// A due window on a repository whose enforcement is not active must stay
+	// scheduled: no activation mutation, audit event, recompute, or publication.
+	target, err := scheduled.Get(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return domain.BranchFreeze{}, freeze.ValidationError{Message: "scheduled freeze is not due"}
+		}
+		return domain.BranchFreeze{}, fmt.Errorf("load scheduled freeze for enforcement gating: %w", err)
+	}
+	if err := s.requireEnforcementActive(ctx, target.RepositoryID); err != nil {
 		return domain.BranchFreeze{}, err
 	}
 	activated, err := scheduled.ActivateScheduled(ctx, id, actor)
@@ -231,15 +261,58 @@ func (s *freezeRecomputingStore) scheduledFreezes() (scheduledFreezeOperations, 
 	return scheduled, nil
 }
 
+func (s *freezeRecomputingStore) requireEnforcementActive(ctx context.Context, repositoryID int64) error {
+	repo, err := s.loadRepository(ctx, repositoryID)
+	if err != nil {
+		return err
+	}
+	if !repo.EnforcementActive() {
+		return freeze.ValidationError{Message: domain.EnforcementNotActiveMessage}
+	}
+	return nil
+}
+
+func (s *freezeRecomputingStore) loadRepository(ctx context.Context, repositoryID int64) (domain.Repository, error) {
+	if s == nil || s.repositories == nil {
+		return domain.Repository{}, errors.New("freeze recomputing store has no repository store")
+	}
+	repo, err := s.repositories.Get(ctx, repositoryID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return domain.Repository{}, freeze.ValidationError{Message: "repository not found"}
+		}
+		return domain.Repository{}, fmt.Errorf("load repository for freeze enforcement: %w", err)
+	}
+	return repo, nil
+}
+
 func (s *freezeRecomputingStore) recomputeBranch(ctx context.Context, repositoryID int64, branch string) error {
-	if s == nil || s.pullRequests == nil || s.statuses == nil || s.publisher == nil {
+	if s == nil || s.syncer == nil || s.pullRequests == nil || s.statuses == nil || s.publisher == nil {
 		return errors.New("freeze recomputing store is not configured")
 	}
-	prs, err := s.pullRequests.ListOpenByTargetBranch(ctx, repositoryID, branch)
+	repo, err := s.loadRepository(ctx, repositoryID)
+	if err != nil {
+		return err
+	}
+	// End/cancel cleanup stays possible for repositories that are not
+	// enforcement-active, but nothing is synced or published for them.
+	if !repo.EnforcementActive() {
+		return nil
+	}
+	// Fail closed: an active repository always refreshes forge state first. If
+	// the sync fails (missing token, forge error), no stale cached status is
+	// recomputed or published.
+	if err := s.syncer.SyncOpenPullRequests(ctx, repositoryID, ""); err != nil {
+		return fmt.Errorf("sync open pull requests for freeze recomputation: %w", err)
+	}
+	branchPRs, err := s.pullRequests.ListOpenByTargetBranch(ctx, repositoryID, branch)
 	if err != nil {
 		return fmt.Errorf("list cached open pull requests for freeze recomputation: %w", err)
 	}
-	for _, group := range pullRequestsByHead(prs) {
+	// One decision per affected head SHA; the status runner expands each group
+	// to every cached open PR in the repository sharing the head, including
+	// cross-target-branch collisions.
+	for _, group := range pullRequestsByHead(branchPRs) {
 		if len(group) == 0 {
 			continue
 		}

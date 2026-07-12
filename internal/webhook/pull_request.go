@@ -91,6 +91,16 @@ func (p *PullRequestProcessor) Process(ctx context.Context, body []byte) (PullRe
 
 	pr := event.PullRequest
 	pr.RepositoryID = repo.ID
+	// Before enforcement activation a verified webhook still refreshes the PR
+	// cache as setup evidence, but no status is recomputed or published and no
+	// publication attempt is recorded.
+	if !repo.EnforcementActive() {
+		cached, err := p.cache.Upsert(ctx, pr)
+		if err != nil {
+			return PullRequestProcessResult{}, err
+		}
+		return PullRequestProcessResult{Event: event, Repository: repo, PullRequest: cached}, nil
+	}
 	previous, previousFound, err := p.previousPullRequest(ctx, repo.ID, pr.Index)
 	if err != nil {
 		return PullRequestProcessResult{}, err

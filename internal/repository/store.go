@@ -112,7 +112,7 @@ func (s *Store) Get(ctx context.Context, id int64) (domain.Repository, error) {
 		return domain.Repository{}, errors.New("repository store has no database")
 	}
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, forge, base_url, owner, name, default_branch, active,
+SELECT id, forge, base_url, owner, name, default_branch, active, enforcement_state,
   EXISTS(SELECT 1 FROM repository_webhook_secrets WHERE repository_id = repositories.id),
   EXISTS(SELECT 1 FROM repository_status_tokens WHERE repository_id = repositories.id),
   created_at, updated_at
@@ -126,7 +126,7 @@ func (s *Store) List(ctx context.Context) ([]domain.Repository, error) {
 		return nil, errors.New("repository store has no database")
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, forge, base_url, owner, name, default_branch, active,
+SELECT id, forge, base_url, owner, name, default_branch, active, enforcement_state,
   EXISTS(SELECT 1 FROM repository_webhook_secrets WHERE repository_id = repositories.id),
   EXISTS(SELECT 1 FROM repository_status_tokens WHERE repository_id = repositories.id),
   created_at, updated_at
@@ -160,7 +160,7 @@ func (s *Store) FindActiveByRemote(ctx context.Context, params RemoteParams) (do
 		return domain.Repository{}, false, ValidationError{Message: "missing required repository remote fields"}
 	}
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, forge, base_url, owner, name, default_branch, active,
+SELECT id, forge, base_url, owner, name, default_branch, active, enforcement_state,
   EXISTS(SELECT 1 FROM repository_webhook_secrets WHERE repository_id = repositories.id),
   EXISTS(SELECT 1 FROM repository_status_tokens WHERE repository_id = repositories.id),
   created_at, updated_at
@@ -174,6 +174,34 @@ FROM repositories
 		return domain.Repository{}, false, err
 	}
 	return repo, true, nil
+}
+
+func (s *Store) SetEnforcementState(ctx context.Context, repositoryID int64, state domain.EnforcementState) (domain.Repository, error) {
+	if s == nil || s.db == nil {
+		return domain.Repository{}, errors.New("repository store has no database")
+	}
+	if repositoryID <= 0 {
+		return domain.Repository{}, ValidationError{Message: "repository id is required"}
+	}
+	if !state.Valid() {
+		return domain.Repository{}, ValidationError{Message: "repository enforcement state is invalid"}
+	}
+	updatedAt := s.now().UTC().Format(time.RFC3339Nano)
+	result, err := s.db.ExecContext(ctx, `
+UPDATE repositories
+SET enforcement_state = ?, updated_at = ?
+WHERE id = ?`, string(state), updatedAt, repositoryID)
+	if err != nil {
+		return domain.Repository{}, fmt.Errorf("set repository enforcement state: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return domain.Repository{}, fmt.Errorf("set repository enforcement state rows: %w", err)
+	}
+	if affected == 0 {
+		return domain.Repository{}, sql.ErrNoRows
+	}
+	return s.Get(ctx, repositoryID)
 }
 
 func (s *Store) SetWebhookSecretCiphertext(ctx context.Context, repositoryID int64, ciphertext []byte) (domain.Repository, error) {
@@ -361,11 +389,13 @@ type scanner interface {
 func scanRepository(row scanner) (domain.Repository, error) {
 	var repo domain.Repository
 	var active, hasWebhookSecret, hasStatusToken int
+	var enforcementState string
 	var createdAt, updatedAt string
-	if err := row.Scan(&repo.ID, &repo.Forge, &repo.BaseURL, &repo.Owner, &repo.Name, &repo.DefaultBranch, &active, &hasWebhookSecret, &hasStatusToken, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&repo.ID, &repo.Forge, &repo.BaseURL, &repo.Owner, &repo.Name, &repo.DefaultBranch, &active, &enforcementState, &hasWebhookSecret, &hasStatusToken, &createdAt, &updatedAt); err != nil {
 		return domain.Repository{}, fmt.Errorf("scan repository: %w", err)
 	}
 	repo.Active = active != 0
+	repo.EnforcementState = domain.EnforcementState(enforcementState)
 	repo.HasWebhookSecret = hasWebhookSecret != 0
 	repo.HasStatusToken = hasStatusToken != 0
 

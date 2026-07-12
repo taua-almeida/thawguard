@@ -13,6 +13,56 @@ import (
 	"github.com/taua-almeida/thawguard/internal/thawexception"
 )
 
+func TestThawApprovalRejectsRepositoryWithoutActiveEnforcement(t *testing.T) {
+	cache := &thawApprovalTestPullRequestCache{}
+	exceptions := &thawApprovalTestExceptionApprover{}
+	statuses := &thawApprovalTestStatusRunner{}
+	publisher := &thawApprovalTestPublisher{}
+	syncer := &thawApprovalTestSyncer{cache: cache}
+	tokens := &countingThawApprovalTokenGetter{}
+	service := newThawApprovalService(
+		inactiveThawApprovalRepositoryGetter{},
+		tokens,
+		cache,
+		exceptions,
+		&thawApprovalTestFreezeLister{},
+		statuses,
+		publisher,
+		syncer,
+		func(repository domain.Repository, token string) (thawApprovalForgeClient, error) {
+			t.Fatal("forge client must not be created without active enforcement")
+			return nil, nil
+		},
+	)
+
+	_, err := service.ApproveThaw(context.Background(), thawApprovalTestParams(nil), thawApprovalTestActor())
+	if !statusresult.IsValidationError(err) || err.Error() != domain.EnforcementNotActiveMessage {
+		t.Fatalf("expected enforcement validation error, got %v", err)
+	}
+	if tokens.calls != 0 {
+		t.Fatalf("expected no token lookup without active enforcement, got %d", tokens.calls)
+	}
+	if syncer.calls != 0 {
+		t.Fatalf("expected no forge sync without active enforcement, got %d", syncer.calls)
+	}
+	assertNoThawApprovalMutation(t, exceptions, statuses, publisher)
+}
+
+type inactiveThawApprovalRepositoryGetter struct{}
+
+func (inactiveThawApprovalRepositoryGetter) Get(context.Context, int64) (domain.Repository, error) {
+	return domain.Repository{ID: 7, Owner: "taua-almeida", Name: "thawguard", EnforcementState: domain.EnforcementSetupIncomplete}, nil
+}
+
+type countingThawApprovalTokenGetter struct {
+	calls int
+}
+
+func (g *countingThawApprovalTokenGetter) StatusToken(context.Context, int64) (string, bool, error) {
+	g.calls++
+	return "secret-token", true, nil
+}
+
 func TestThawApprovalChangedHeadRequiresConfirmationAgain(t *testing.T) {
 	selectedABC := thawApprovalTestPullRequest(42, "abc123")
 	selectedDEF := thawApprovalTestPullRequest(42, "def456")
@@ -312,7 +362,6 @@ func newThawApprovalTestServiceWithFreezes(cache *thawApprovalTestPullRequestCac
 		statuses,
 		publisher,
 		syncer,
-		[]string{"taua-almeida/thawguard"},
 		func(repository domain.Repository, token string) (thawApprovalForgeClient, error) { return client, nil },
 	)
 }
@@ -320,7 +369,7 @@ func newThawApprovalTestServiceWithFreezes(cache *thawApprovalTestPullRequestCac
 type thawApprovalTestRepositoryGetter struct{}
 
 func (thawApprovalTestRepositoryGetter) Get(context.Context, int64) (domain.Repository, error) {
-	return domain.Repository{ID: 7, Owner: "taua-almeida", Name: "thawguard"}, nil
+	return domain.Repository{ID: 7, Owner: "taua-almeida", Name: "thawguard", EnforcementState: domain.EnforcementActive}, nil
 }
 
 type thawApprovalTestTokenGetter struct{}

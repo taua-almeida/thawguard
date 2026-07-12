@@ -12,12 +12,12 @@ import (
 	"github.com/taua-almeida/thawguard/internal/statusresult"
 )
 
+// Historical databases may still hold 'local_record' intents and 'dry_run'
+// attempts with a 'planned' result from the removed shadow mode. Those rows
+// stay readable; the store only writes forgejo_status records now.
 const (
-	DeliveryModeLocalRecord   = "local_record"
 	DeliveryModeForgejoStatus = "forgejo_status"
-	AttemptModeDryRun         = "dry_run"
 	AttemptModeForgejoStatus  = "forgejo_status"
-	AttemptResultPlanned      = "planned"
 	AttemptResultPosted       = "posted"
 	AttemptResultFailed       = "failed"
 )
@@ -87,10 +87,6 @@ func NewStore(db *sql.DB) *Store {
 
 func newStore(db database) *Store {
 	return &Store{db: db, now: func() time.Time { return time.Now().UTC() }}
-}
-
-func (s *Store) Publish(ctx context.Context, result statusresult.Result) (Publication, error) {
-	return s.publish(ctx, result, DeliveryModeLocalRecord)
 }
 
 func (s *Store) PublishForgejoStatus(ctx context.Context, result statusresult.Result) (Publication, error) {
@@ -167,10 +163,6 @@ LIMIT ?`, limit)
 		return nil, fmt.Errorf("list status publication intents rows: %w", err)
 	}
 	return publications, nil
-}
-
-func (s *Store) RecordDryRunAttempt(ctx context.Context, publication Publication) (Attempt, error) {
-	return s.recordAttempt(ctx, publication, AttemptModeDryRun, AttemptResultPlanned, "")
 }
 
 func (s *Store) RecordForgejoStatusAttempt(ctx context.Context, publication Publication, result string, errorMessage string) (Attempt, error) {
@@ -334,7 +326,7 @@ func validatePublication(publication Publication) error {
 	if len(missing) > 0 {
 		return ValidationError{Message: fmt.Sprintf("missing required status publication fields: %s", strings.Join(missing, ", "))}
 	}
-	if !validDeliveryMode(publication.DeliveryMode) {
+	if publication.DeliveryMode != DeliveryModeForgejoStatus {
 		return ValidationError{Message: "status publication delivery mode is invalid"}
 	}
 	if !validState(publication.State) {
@@ -381,10 +373,10 @@ func validateAttempt(attempt Attempt) error {
 	if len(missing) > 0 {
 		return ValidationError{Message: fmt.Sprintf("missing required status publication attempt fields: %s", strings.Join(missing, ", "))}
 	}
-	if !validAttemptMode(attempt.Mode) {
+	if attempt.Mode != AttemptModeForgejoStatus {
 		return ValidationError{Message: "status publication attempt mode is invalid"}
 	}
-	if !validAttemptResult(attempt.Mode, attempt.Result) {
+	if attempt.Result != AttemptResultPosted && attempt.Result != AttemptResultFailed {
 		return ValidationError{Message: "status publication attempt result is invalid"}
 	}
 	if attempt.Mode == AttemptModeForgejoStatus && attempt.Result == AttemptResultFailed && attempt.Error == "" {
@@ -394,35 +386,6 @@ func validateAttempt(attempt Attempt) error {
 		return ValidationError{Message: "status publication attempt state is invalid"}
 	}
 	return nil
-}
-
-func validDeliveryMode(mode string) bool {
-	switch mode {
-	case DeliveryModeLocalRecord, DeliveryModeForgejoStatus:
-		return true
-	default:
-		return false
-	}
-}
-
-func validAttemptMode(mode string) bool {
-	switch mode {
-	case AttemptModeDryRun, AttemptModeForgejoStatus:
-		return true
-	default:
-		return false
-	}
-}
-
-func validAttemptResult(mode string, result string) bool {
-	switch mode {
-	case AttemptModeDryRun:
-		return result == AttemptResultPlanned
-	case AttemptModeForgejoStatus:
-		return result == AttemptResultPosted || result == AttemptResultFailed
-	default:
-		return false
-	}
 }
 
 func validState(state domain.CommitStatusState) bool {

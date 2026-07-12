@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -13,7 +14,6 @@ import (
 	"testing"
 
 	"github.com/taua-almeida/thawguard/internal/audit"
-	"github.com/taua-almeida/thawguard/internal/config"
 	"github.com/taua-almeida/thawguard/internal/db"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/freeze"
@@ -26,7 +26,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/thawexception"
 )
 
-func TestStatusPublisherFromConfigPostsWithDecryptedRepositoryToken(t *testing.T) {
+func TestRuntimeStatusPublisherPostsWithDecryptedRepositoryToken(t *testing.T) {
 	ctx := context.Background()
 	var authHeader string
 	var statusPath string
@@ -47,16 +47,16 @@ func TestStatusPublisherFromConfigPostsWithDecryptedRepositoryToken(t *testing.T
 	if _, err := repositorySetup.SetStatusToken(ctx, repo.ID, "live-status-token-123", domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := repository.NewStore(database).SetEnforcementState(ctx, repo.ID, domain.EnforcementActive); err != nil {
+		t.Fatal(err)
+	}
 
 	result, err := statusresult.NewStore(database).Create(ctx, statusresult.CreateParams{RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "ABC123", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "Branch is frozen; merge is blocked by Thawguard"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	publications := statuspublication.NewStore(database)
-	publisher, err := statusPublisherFromConfig(config.Config{LiveStatusRepos: "taua-almeida/thawguard"}, statuspublication.DeliveryModeForgejoStatus, publications, repository.NewStore(database), repositorySetup)
-	if err != nil {
-		t.Fatal(err)
-	}
+	publisher := newRuntimeStatusPublisher(publications, repository.NewStore(database), repositorySetup)
 
 	publication, err := publisher.Publish(ctx, result)
 	if err != nil {
@@ -77,6 +77,74 @@ func TestStatusPublisherFromConfigPostsWithDecryptedRepositoryToken(t *testing.T
 	}
 	if len(attempts) != 1 || attempts[0].Mode != statuspublication.AttemptModeForgejoStatus || attempts[0].Result != statuspublication.AttemptResultPosted || attempts[0].Error != "" {
 		t.Fatalf("expected posted forgejo status attempt, got %+v", attempts)
+	}
+}
+
+// Legacy mode environment variables must not re-enable publishing or select a
+// dry-run publisher; enforcement state is the only gate.
+func TestRemovedModeEnvVarsDoNotAffectPublishing(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("THAWGUARD_STATUS_PUBLISHER", "dry_run")
+	t.Setenv("THAWGUARD_LIVE_STATUS_POSTING", "enabled")
+	t.Setenv("THAWGUARD_LIVE_STATUS_REPOSITORIES", "taua-almeida/thawguard")
+
+	database := newAppTestDB(t, ctx)
+	repositorySetup := repositorysetup.NewServiceWithSecrets(database, newAppTestSecretStore(t))
+	repo, err := repositorySetup.Create(ctx, repository.CreateParams{Forge: "forgejo", BaseURL: "https://codeberg.org", Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repositorySetup.SetStatusToken(ctx, repo.ID, "live-status-token-123", domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := statusresult.NewStore(database).Create(ctx, statusresult.CreateParams{RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "Branch is frozen; merge is blocked by Thawguard"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publications := statuspublication.NewStore(database)
+	publisher := newRuntimeStatusPublisher(publications, repository.NewStore(database), repositorySetup)
+
+	if _, err := publisher.Publish(ctx, result); !errors.Is(err, domain.ErrEnforcementNotActive) {
+		t.Fatalf("expected setup-incomplete repository to stay unpublished despite legacy env vars, got %v", err)
+	}
+	attempts, err := publications.ListRecentAttempts(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 0 {
+		t.Fatalf("expected no publication attempts, got %+v", attempts)
+	}
+}
+
+// Matrix row: active repository with a missing token fails closed and leaves a
+// sanitized operator-visible failed attempt.
+func TestActiveRepositoryMissingTokenFailsClosedWithSanitizedAttempt(t *testing.T) {
+	ctx := context.Background()
+	database := newAppTestDB(t, ctx)
+	repositorySetup := repositorysetup.NewServiceWithSecrets(database, newAppTestSecretStore(t))
+	repo, err := repositorySetup.Create(ctx, repository.CreateParams{Forge: "forgejo", BaseURL: "https://codeberg.org", Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.NewStore(database).SetEnforcementState(ctx, repo.ID, domain.EnforcementActive); err != nil {
+		t.Fatal(err)
+	}
+	result, err := statusresult.NewStore(database).Create(ctx, statusresult.CreateParams{RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "Branch is frozen; merge is blocked by Thawguard"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publications := statuspublication.NewStore(database)
+	publisher := newRuntimeStatusPublisher(publications, repository.NewStore(database), repositorySetup)
+
+	if _, err := publisher.Publish(ctx, result); err == nil {
+		t.Fatal("expected missing-token publish to fail closed")
+	}
+	attempts, err := publications.ListRecentAttempts(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 1 || attempts[0].Result != statuspublication.AttemptResultFailed || attempts[0].Error == "" {
+		t.Fatalf("expected sanitized failed attempt for missing token, got %+v", attempts)
 	}
 }
 
@@ -114,6 +182,9 @@ func TestThawApprovalApprovesAndPublishesCurrentPullRequestHead(t *testing.T) {
 	if _, err := repositorySetup.SetStatusToken(ctx, repo.ID, "live-status-token-123", domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := repository.NewStore(database).SetEnforcementState(ctx, repo.ID, domain.EnforcementActive); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := freeze.NewService(database).CreateActive(ctx, freeze.CreateParams{RepositoryID: repo.ID, Branch: "main", Reason: "release"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); err != nil {
 		t.Fatal(err)
 	}
@@ -121,12 +192,9 @@ func TestThawApprovalApprovesAndPublishesCurrentPullRequestHead(t *testing.T) {
 	thaws := thawexception.NewService(database)
 	statuses := statusresult.NewServiceWithThawExceptions(statusresult.NewStore(database), freeze.NewService(database), thaws, pullRequests)
 	publications := statuspublication.NewStore(database)
-	publisher, err := statusPublisherFromConfig(config.Config{LiveStatusRepos: "taua-almeida/thawguard"}, statuspublication.DeliveryModeForgejoStatus, publications, repository.NewStore(database), repositorySetup)
-	if err != nil {
-		t.Fatal(err)
-	}
-	syncer := newForgeOpenPullRequestSyncer(repository.NewStore(database), repositorySetup, pullRequests, []string{"taua-almeida/thawguard"}, forgejoPullRequestClientForRepository)
-	approvals := newThawApprovalService(repository.NewStore(database), repositorySetup, pullRequests, thaws, freeze.NewService(database), statuses, publisher, syncer, []string{"taua-almeida/thawguard"}, forgejoThawApprovalClientForRepository)
+	publisher := newRuntimeStatusPublisher(publications, repository.NewStore(database), repositorySetup)
+	syncer := newForgeOpenPullRequestSyncer(repository.NewStore(database), repositorySetup, pullRequests, forgejoPullRequestClientForRepository)
+	approvals := newThawApprovalService(repository.NewStore(database), repositorySetup, pullRequests, thaws, freeze.NewService(database), statuses, publisher, syncer, forgejoThawApprovalClientForRepository)
 
 	outcome, err := approvals.ApproveThaw(ctx, statusresult.ThawApprovalParams{RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", Reason: "production fix"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
 	if err != nil {
@@ -182,6 +250,9 @@ func TestThawApprovalRequiresThenAppliesSharedHeadConfirmation(t *testing.T) {
 	if _, err := repositorySetup.SetStatusToken(ctx, repo.ID, "live-status-token-123", domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := repository.NewStore(database).SetEnforcementState(ctx, repo.ID, domain.EnforcementActive); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := freeze.NewService(database).CreateActive(ctx, freeze.CreateParams{RepositoryID: repo.ID, Branch: "main", Reason: "release"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); err != nil {
 		t.Fatal(err)
 	}
@@ -189,12 +260,9 @@ func TestThawApprovalRequiresThenAppliesSharedHeadConfirmation(t *testing.T) {
 	thaws := thawexception.NewService(database)
 	statuses := statusresult.NewServiceWithThawExceptions(statusresult.NewStore(database), freeze.NewService(database), thaws, pullRequests)
 	publications := statuspublication.NewStore(database)
-	publisher, err := statusPublisherFromConfig(config.Config{LiveStatusRepos: "taua-almeida/thawguard"}, statuspublication.DeliveryModeForgejoStatus, publications, repository.NewStore(database), repositorySetup)
-	if err != nil {
-		t.Fatal(err)
-	}
-	syncer := newForgeOpenPullRequestSyncer(repository.NewStore(database), repositorySetup, pullRequests, []string{"taua-almeida/thawguard"}, forgejoPullRequestClientForRepository)
-	approvals := newThawApprovalService(repository.NewStore(database), repositorySetup, pullRequests, thaws, freeze.NewService(database), statuses, publisher, syncer, []string{"taua-almeida/thawguard"}, forgejoThawApprovalClientForRepository)
+	publisher := newRuntimeStatusPublisher(publications, repository.NewStore(database), repositorySetup)
+	syncer := newForgeOpenPullRequestSyncer(repository.NewStore(database), repositorySetup, pullRequests, forgejoPullRequestClientForRepository)
+	approvals := newThawApprovalService(repository.NewStore(database), repositorySetup, pullRequests, thaws, freeze.NewService(database), statuses, publisher, syncer, forgejoThawApprovalClientForRepository)
 
 	outcome, err := approvals.ApproveThaw(ctx, statusresult.ThawApprovalParams{RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", Reason: "production fix"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
 	if err != nil {

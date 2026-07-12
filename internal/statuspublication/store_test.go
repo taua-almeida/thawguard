@@ -14,14 +14,14 @@ import (
 	"github.com/taua-almeida/thawguard/internal/statusresult"
 )
 
-func TestStorePublishesLocalStatusIntent(t *testing.T) {
+func TestStorePublishesForgejoStatusIntent(t *testing.T) {
 	ctx := context.Background()
 	database := newTestDB(t, ctx)
 	repo := createTestRepository(t, ctx, database)
 	result := createStatusResult(t, ctx, database, repo.ID)
 	store := NewStore(database)
 
-	publication, err := store.Publish(ctx, result)
+	publication, err := store.PublishForgejoStatus(ctx, result)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,8 +31,8 @@ func TestStorePublishesLocalStatusIntent(t *testing.T) {
 	if publication.StatusResultID != result.ID || publication.RepositoryID != repo.ID || publication.HeadSHA != result.HeadSHA {
 		t.Fatalf("unexpected publication: %+v", publication)
 	}
-	if publication.DeliveryMode != DeliveryModeLocalRecord {
-		t.Fatalf("expected local delivery mode, got %q", publication.DeliveryMode)
+	if publication.DeliveryMode != DeliveryModeForgejoStatus {
+		t.Fatalf("expected forgejo delivery mode, got %q", publication.DeliveryMode)
 	}
 	if publication.CreatedAt.IsZero() || publication.UpdatedAt.IsZero() {
 		t.Fatalf("expected publication timestamps, got %+v", publication)
@@ -50,7 +50,7 @@ func TestStorePublishesLocalStatusIntent(t *testing.T) {
 	}
 }
 
-func TestStorePublishUpsertsLocalStatusIntentByStatusKey(t *testing.T) {
+func TestStorePublishUpsertsForgejoStatusIntentByStatusKey(t *testing.T) {
 	ctx := context.Background()
 	database := newTestDB(t, ctx)
 	repo := createTestRepository(t, ctx, database)
@@ -59,7 +59,7 @@ func TestStorePublishUpsertsLocalStatusIntentByStatusKey(t *testing.T) {
 	firstTime := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
 	store.now = func() time.Time { return firstTime }
 
-	first, err := store.Publish(ctx, firstResult)
+	first, err := store.PublishForgejoStatus(ctx, firstResult)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func TestStorePublishUpsertsLocalStatusIntentByStatusKey(t *testing.T) {
 	secondResult := createStatusResultWithParams(t, ctx, database, repo.ID, 43, "release", "abc123", domain.CommitStatusSuccess, "No active freeze applies to this PR")
 	secondTime := firstTime.Add(5 * time.Minute)
 	store.now = func() time.Time { return secondTime }
-	second, err := store.Publish(ctx, secondResult)
+	second, err := store.PublishForgejoStatus(ctx, secondResult)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,66 +94,23 @@ func TestStorePublishUpsertsLocalStatusIntentByStatusKey(t *testing.T) {
 	}
 }
 
-func TestStorePublishesForgejoStatusIntent(t *testing.T) {
+func TestStoreKeepsHistoricalLocalRecordIntentsReadable(t *testing.T) {
 	ctx := context.Background()
 	database := newTestDB(t, ctx)
 	repo := createTestRepository(t, ctx, database)
 	result := createStatusResult(t, ctx, database, repo.ID)
 	store := NewStore(database)
 
-	publication, err := store.PublishForgejoStatus(ctx, result)
-	if err != nil {
+	if _, err := database.ExecContext(ctx, `INSERT INTO status_publication_intents(status_result_id, repository_id, pull_request_index, target_branch, head_sha, context, state, description, delivery_mode, created_at, updated_at) VALUES (?, ?, 42, 'main', 'abc123', ?, 'failure', 'historical shadow record', 'local_record', '2026-06-30T12:00:00.000000000Z', '2026-06-30T12:00:00.000000000Z')`, result.ID, repo.ID, domain.RequiredStatusContext); err != nil {
 		t.Fatal(err)
-	}
-	if publication.DeliveryMode != DeliveryModeForgejoStatus {
-		t.Fatalf("expected forgejo delivery mode, got %q", publication.DeliveryMode)
-	}
-	if publication.StatusResultID != result.ID || publication.RepositoryID != repo.ID || publication.HeadSHA != result.HeadSHA {
-		t.Fatalf("unexpected publication: %+v", publication)
 	}
 
-	local, err := store.Publish(ctx, result)
+	publications, err := store.ListRecent(ctx, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if local.ID == publication.ID {
-		t.Fatalf("expected local and forgejo delivery modes to keep separate intents, got id %d", local.ID)
-	}
-}
-
-func TestStoreRecordsDryRunPublicationAttempt(t *testing.T) {
-	ctx := context.Background()
-	database := newTestDB(t, ctx)
-	repo := createTestRepository(t, ctx, database)
-	result := createStatusResult(t, ctx, database, repo.ID)
-	store := NewStore(database)
-	publication, err := store.Publish(ctx, result)
-	if err != nil {
-		t.Fatal(err)
-	}
-	attemptedAt := time.Date(2026, 6, 30, 15, 0, 0, 0, time.UTC)
-	store.now = func() time.Time { return attemptedAt }
-
-	attempt, err := store.RecordDryRunAttempt(ctx, publication)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if attempt.ID == 0 || attempt.PublicationID != publication.ID || attempt.StatusResultID != result.ID || attempt.RepositoryID != repo.ID {
-		t.Fatalf("unexpected attempt identity: %+v", attempt)
-	}
-	if attempt.PullRequestIndex != publication.PullRequestIndex || attempt.TargetBranch != publication.TargetBranch || attempt.HeadSHA != publication.HeadSHA || attempt.Context != publication.Context || attempt.State != publication.State || attempt.Description != publication.Description {
-		t.Fatalf("expected attempt snapshot to match publication, publication=%+v attempt=%+v", publication, attempt)
-	}
-	if attempt.Mode != AttemptModeDryRun || attempt.Result != AttemptResultPlanned || !attempt.AttemptedAt.Equal(attemptedAt) {
-		t.Fatalf("unexpected attempt mode/result/time: %+v", attempt)
-	}
-
-	attempts, err := store.ListRecentAttempts(ctx, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(attempts) != 1 || attempts[0].ID != attempt.ID {
-		t.Fatalf("expected recent dry-run attempt, got %+v", attempts)
+	if len(publications) != 1 || publications[0].DeliveryMode != "local_record" {
+		t.Fatalf("expected historical local_record intent to stay readable, got %+v", publications)
 	}
 }
 
@@ -175,6 +132,9 @@ func TestStoreRecordsForgejoStatusPublicationAttempts(t *testing.T) {
 	if posted.Mode != AttemptModeForgejoStatus || posted.Result != AttemptResultPosted || posted.Error != "" {
 		t.Fatalf("unexpected posted attempt: %+v", posted)
 	}
+	if posted.PublicationID != publication.ID || posted.StatusResultID != result.ID || posted.RepositoryID != repo.ID {
+		t.Fatalf("unexpected attempt identity: %+v", posted)
+	}
 
 	failed, err := store.RecordForgejoStatusAttempt(ctx, publication, AttemptResultFailed, "forge returned 500")
 	if err != nil {
@@ -183,18 +143,26 @@ func TestStoreRecordsForgejoStatusPublicationAttempts(t *testing.T) {
 	if failed.Mode != AttemptModeForgejoStatus || failed.Result != AttemptResultFailed || failed.Error != "forge returned 500" {
 		t.Fatalf("unexpected failed attempt: %+v", failed)
 	}
+
+	attempts, err := store.ListRecentAttempts(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 2 {
+		t.Fatalf("expected two recent attempts, got %+v", attempts)
+	}
 }
 
-func TestStoreRejectsInvalidDryRunPublicationAttempt(t *testing.T) {
+func TestStoreRejectsInvalidPublicationAttempt(t *testing.T) {
 	ctx := context.Background()
 	database := newTestDB(t, ctx)
 	store := NewStore(database)
 
-	if _, err := store.RecordDryRunAttempt(ctx, Publication{}); !IsValidationError(err) {
+	if _, err := store.RecordForgejoStatusAttempt(ctx, Publication{}, AttemptResultPosted, ""); !IsValidationError(err) {
 		t.Fatalf("expected validation error, got %v", err)
 	}
 	publication := Publication{ID: 1, StatusResultID: 1, RepositoryID: 1, PullRequestIndex: 1, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "blocked", DeliveryMode: DeliveryModeForgejoStatus}
-	if _, err := store.RecordForgejoStatusAttempt(ctx, publication, AttemptResultPlanned, ""); !IsValidationError(err) {
+	if _, err := store.RecordForgejoStatusAttempt(ctx, publication, "planned", ""); !IsValidationError(err) {
 		t.Fatalf("expected invalid forgejo attempt result validation error, got %v", err)
 	}
 	if _, err := store.RecordForgejoStatusAttempt(ctx, publication, AttemptResultFailed, ""); !IsValidationError(err) {
@@ -207,10 +175,10 @@ func TestStoreRejectsInvalidPublicationResult(t *testing.T) {
 	database := newTestDB(t, ctx)
 	store := NewStore(database)
 
-	if _, err := store.Publish(ctx, statusresult.Result{}); !IsValidationError(err) {
+	if _, err := store.PublishForgejoStatus(ctx, statusresult.Result{}); !IsValidationError(err) {
 		t.Fatalf("expected validation error, got %v", err)
 	}
-	if _, err := store.Publish(ctx, statusresult.Result{ID: 1, RepositoryID: 1, PullRequestIndex: 1, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: "invalid", Description: "ok"}); !IsValidationError(err) {
+	if _, err := store.PublishForgejoStatus(ctx, statusresult.Result{ID: 1, RepositoryID: 1, PullRequestIndex: 1, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: "invalid", Description: "ok"}); !IsValidationError(err) {
 		t.Fatalf("expected invalid state validation error, got %v", err)
 	}
 }

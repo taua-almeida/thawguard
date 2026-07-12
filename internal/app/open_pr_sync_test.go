@@ -13,14 +13,14 @@ import (
 
 func TestForgeOpenPullRequestSyncerCachesOpenPullRequests(t *testing.T) {
 	ctx := context.Background()
-	repositories := &fakeOpenPRRepositoryGetter{repo: domain.Repository{ID: 7, Forge: "codeberg", BaseURL: "https://codeberg.org", Owner: "taua-almeida", Name: "thawguard"}}
+	repositories := &fakeOpenPRRepositoryGetter{repo: domain.Repository{ID: 7, Forge: "codeberg", BaseURL: "https://codeberg.org", Owner: "taua-almeida", Name: "thawguard", EnforcementState: domain.EnforcementActive}}
 	tokens := &fakeOpenPRStatusTokenGetter{token: "sync-token", found: true}
 	upserter := &fakeOpenPRUpserter{}
 	client := &fakeOpenPRForgeClient{prs: []domain.PullRequest{
 		{Index: 11, State: "open", TargetBranch: "main", HeadSHA: "abcdef123456", Title: "Before webhook"},
 		{Index: 12, State: "open", TargetBranch: "main", HeadSHA: "bbbbbb123456", Title: "Also open"},
 	}}
-	syncer := newForgeOpenPullRequestSyncer(repositories, tokens, upserter, []string{"taua-almeida/thawguard"}, func(repo domain.Repository, token string) (openPullRequestForgeClient, error) {
+	syncer := newForgeOpenPullRequestSyncer(repositories, tokens, upserter, func(repo domain.Repository, token string) (openPullRequestForgeClient, error) {
 		if token != "sync-token" {
 			t.Fatalf("unexpected token %q", token)
 		}
@@ -48,14 +48,14 @@ func TestForgeOpenPullRequestSyncerCachesOpenPullRequests(t *testing.T) {
 
 func TestForgeOpenPullRequestSyncerRefreshesAllRepositoryBranches(t *testing.T) {
 	ctx := context.Background()
-	repositories := &fakeOpenPRRepositoryGetter{repo: domain.Repository{ID: 7, Owner: "taua-almeida", Name: "thawguard"}}
+	repositories := &fakeOpenPRRepositoryGetter{repo: domain.Repository{ID: 7, Owner: "taua-almeida", Name: "thawguard", EnforcementState: domain.EnforcementActive}}
 	tokens := &fakeOpenPRStatusTokenGetter{token: "sync-token", found: true}
 	upserter := &fakeOpenPRUpserter{}
 	client := &fakeOpenPRForgeClient{prs: []domain.PullRequest{
 		{Index: 11, State: "open", TargetBranch: "main", HeadSHA: "abcdef123456"},
 		{Index: 12, State: "open", TargetBranch: "release", HeadSHA: "abcdef123456"},
 	}}
-	syncer := newForgeOpenPullRequestSyncer(repositories, tokens, upserter, []string{"taua-almeida/thawguard"}, func(domain.Repository, string) (openPullRequestForgeClient, error) {
+	syncer := newForgeOpenPullRequestSyncer(repositories, tokens, upserter, func(domain.Repository, string) (openPullRequestForgeClient, error) {
 		return client, nil
 	})
 
@@ -69,12 +69,12 @@ func TestForgeOpenPullRequestSyncerRefreshesAllRepositoryBranches(t *testing.T) 
 
 func TestForgeOpenPullRequestSyncerRecordsAuditEvent(t *testing.T) {
 	ctx := context.Background()
-	repositories := &fakeOpenPRRepositoryGetter{repo: domain.Repository{ID: 7, Forge: "codeberg", BaseURL: "https://codeberg.org", Owner: "taua-almeida", Name: "thawguard"}}
+	repositories := &fakeOpenPRRepositoryGetter{repo: domain.Repository{ID: 7, Forge: "codeberg", BaseURL: "https://codeberg.org", Owner: "taua-almeida", Name: "thawguard", EnforcementState: domain.EnforcementActive}}
 	tokens := &fakeOpenPRStatusTokenGetter{token: "sync-token", found: true}
 	upserter := &fakeOpenPRUpserter{closedAbsentCount: 3}
 	client := &fakeOpenPRForgeClient{prs: []domain.PullRequest{{Index: 11, State: "open", TargetBranch: "main", HeadSHA: "abcdef123456"}}}
 	auditor := &fakeOpenPRAuditRecorder{}
-	syncer := newForgeOpenPullRequestSyncer(repositories, tokens, upserter, []string{"taua-almeida/thawguard"}, func(repo domain.Repository, token string) (openPullRequestForgeClient, error) {
+	syncer := newForgeOpenPullRequestSyncer(repositories, tokens, upserter, func(repo domain.Repository, token string) (openPullRequestForgeClient, error) {
 		return client, nil
 	}, auditor)
 
@@ -97,27 +97,27 @@ func TestForgeOpenPullRequestSyncerRecordsAuditEvent(t *testing.T) {
 	}
 }
 
-func TestForgeOpenPullRequestSyncerRequiresAllowlistedRepository(t *testing.T) {
-	repositories := &fakeOpenPRRepositoryGetter{repo: domain.Repository{ID: 7, Owner: "taua-almeida", Name: "thawguard"}}
+func TestForgeOpenPullRequestSyncerRequiresActiveEnforcement(t *testing.T) {
+	repositories := &fakeOpenPRRepositoryGetter{repo: domain.Repository{ID: 7, Owner: "taua-almeida", Name: "thawguard", EnforcementState: domain.EnforcementSetupIncomplete}}
 	tokens := &fakeOpenPRStatusTokenGetter{token: "sync-token", found: true}
-	syncer := newForgeOpenPullRequestSyncer(repositories, tokens, &fakeOpenPRUpserter{}, []string{"other/repo"}, func(repo domain.Repository, token string) (openPullRequestForgeClient, error) {
-		t.Fatal("client factory should not be called for repository outside allowlist")
+	syncer := newForgeOpenPullRequestSyncer(repositories, tokens, &fakeOpenPRUpserter{}, func(repo domain.Repository, token string) (openPullRequestForgeClient, error) {
+		t.Fatal("client factory should not be called without active enforcement")
 		return nil, nil
 	})
 
 	err := syncer.SyncOpenPullRequests(context.Background(), 7, "main")
-	if !errors.Is(err, ErrOpenPullRequestSyncRepositoryNotAllowed) {
-		t.Fatalf("expected repository allowlist error, got %v", err)
+	if !errors.Is(err, domain.ErrEnforcementNotActive) {
+		t.Fatalf("expected enforcement gating error, got %v", err)
 	}
 	if tokens.calls != 0 {
-		t.Fatalf("expected no token lookup for repository outside allowlist, got %d", tokens.calls)
+		t.Fatalf("expected no token lookup without active enforcement, got %d", tokens.calls)
 	}
 }
 
 func TestForgeOpenPullRequestSyncerRequiresStatusToken(t *testing.T) {
-	repositories := &fakeOpenPRRepositoryGetter{repo: domain.Repository{ID: 7, Owner: "taua-almeida", Name: "thawguard"}}
+	repositories := &fakeOpenPRRepositoryGetter{repo: domain.Repository{ID: 7, Owner: "taua-almeida", Name: "thawguard", EnforcementState: domain.EnforcementActive}}
 	tokens := &fakeOpenPRStatusTokenGetter{}
-	syncer := newForgeOpenPullRequestSyncer(repositories, tokens, &fakeOpenPRUpserter{}, []string{"taua-almeida/thawguard"}, func(repo domain.Repository, token string) (openPullRequestForgeClient, error) {
+	syncer := newForgeOpenPullRequestSyncer(repositories, tokens, &fakeOpenPRUpserter{}, func(repo domain.Repository, token string) (openPullRequestForgeClient, error) {
 		t.Fatal("client factory should not be called without token")
 		return nil, nil
 	})
@@ -129,10 +129,10 @@ func TestForgeOpenPullRequestSyncerRequiresStatusToken(t *testing.T) {
 }
 
 func TestForgeOpenPullRequestSyncerRedactsTokenFromListErrors(t *testing.T) {
-	repositories := &fakeOpenPRRepositoryGetter{repo: domain.Repository{ID: 7, Owner: "taua-almeida", Name: "thawguard"}}
+	repositories := &fakeOpenPRRepositoryGetter{repo: domain.Repository{ID: 7, Owner: "taua-almeida", Name: "thawguard", EnforcementState: domain.EnforcementActive}}
 	tokens := &fakeOpenPRStatusTokenGetter{token: "sync-token", found: true}
 	client := &fakeOpenPRForgeClient{err: errors.New("forge said sync-token is invalid")}
-	syncer := newForgeOpenPullRequestSyncer(repositories, tokens, &fakeOpenPRUpserter{}, []string{"taua-almeida/thawguard"}, func(repo domain.Repository, token string) (openPullRequestForgeClient, error) {
+	syncer := newForgeOpenPullRequestSyncer(repositories, tokens, &fakeOpenPRUpserter{}, func(repo domain.Repository, token string) (openPullRequestForgeClient, error) {
 		return client, nil
 	})
 

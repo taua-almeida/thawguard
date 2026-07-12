@@ -21,6 +21,13 @@ func NewService(db *sql.DB) *Service {
 	return &Service{db: db}
 }
 
+func (s *Service) Get(ctx context.Context, id int64) (domain.BranchFreeze, error) {
+	if s == nil || s.db == nil {
+		return domain.BranchFreeze{}, errors.New("freeze service has no database")
+	}
+	return NewStore(s.db).Get(ctx, id)
+}
+
 func (s *Service) ListActive(ctx context.Context) ([]domain.BranchFreeze, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("freeze service has no database")

@@ -56,12 +56,11 @@ type thawApprovalService struct {
 	statuses     thawApprovalStatusRunner
 	publisher    statusPublisher
 	syncer       openPullRequestSyncer
-	allowedRepos map[string]struct{}
 	clientFor    thawApprovalForgeClientFactory
 }
 
-func newThawApprovalService(repositories thawApprovalRepositoryGetter, tokens thawApprovalStatusTokenGetter, pullRequests thawApprovalPullRequestCache, exceptions thawApprovalExceptionApprover, freezes thawApprovalFreezeLister, statuses thawApprovalStatusRunner, publisher statusPublisher, syncer openPullRequestSyncer, allowedRepositories []string, clientFor thawApprovalForgeClientFactory) *thawApprovalService {
-	return &thawApprovalService{repositories: repositories, tokens: tokens, pullRequests: pullRequests, exceptions: exceptions, freezes: freezes, statuses: statuses, publisher: publisher, syncer: syncer, allowedRepos: normalizedOpenPullRequestSyncAllowlist(allowedRepositories), clientFor: clientFor}
+func newThawApprovalService(repositories thawApprovalRepositoryGetter, tokens thawApprovalStatusTokenGetter, pullRequests thawApprovalPullRequestCache, exceptions thawApprovalExceptionApprover, freezes thawApprovalFreezeLister, statuses thawApprovalStatusRunner, publisher statusPublisher, syncer openPullRequestSyncer, clientFor thawApprovalForgeClientFactory) *thawApprovalService {
+	return &thawApprovalService{repositories: repositories, tokens: tokens, pullRequests: pullRequests, exceptions: exceptions, freezes: freezes, statuses: statuses, publisher: publisher, syncer: syncer, clientFor: clientFor}
 }
 
 func (s *thawApprovalService) ListRecent(ctx context.Context, limit int) ([]statusresult.Result, error) {
@@ -84,8 +83,9 @@ func (s *thawApprovalService) ApproveThaw(ctx context.Context, params statusresu
 	if err != nil {
 		return statusresult.ThawApprovalOutcome{}, fmt.Errorf("load repository for thaw approval: %w", err)
 	}
-	if !s.repositoryAllowed(repo) {
-		return statusresult.ThawApprovalOutcome{}, statusresult.ValidationError{Message: "repository is not enabled for live thaw approvals"}
+	// Reject before any forge fetch, exception, recompute, or publication.
+	if !repo.EnforcementActive() {
+		return statusresult.ThawApprovalOutcome{}, statusresult.ValidationError{Message: domain.EnforcementNotActiveMessage}
 	}
 	token, found, err := s.tokens.StatusToken(ctx, params.RepositoryID)
 	if err != nil {
@@ -168,14 +168,6 @@ func (s *thawApprovalService) ApproveThaw(ctx context.Context, params statusresu
 		return statusresult.ThawApprovalOutcome{}, safeThawApprovalError(err, token)
 	}
 	return statusresult.ThawApprovalOutcome{Result: &result}, nil
-}
-
-func (s *thawApprovalService) repositoryAllowed(repo domain.Repository) bool {
-	if len(s.allowedRepos) == 0 {
-		return false
-	}
-	_, ok := s.allowedRepos[normalizeLiveStatusRepository(repo.FullName())]
-	return ok
 }
 
 func (s *thawApprovalService) openPullRequestsForHead(ctx context.Context, pr domain.PullRequest) ([]domain.PullRequest, error) {

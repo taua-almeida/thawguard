@@ -39,41 +39,39 @@ type ForgejoStatusPublisher struct {
 	attempts     ForgejoStatusAttemptRecorder
 	repositories RepositoryGetter
 	tokens       RepositoryStatusTokenGetter
-	allowedRepos map[string]struct{}
 	clientFor    ForgeStatusClientFactory
 }
 
 var ErrRepositoryStatusTokenMissing = errors.New("repository status token is not configured")
-var ErrRepositoryNotAllowed = errors.New("repository is not enabled for live status posting")
 
-func NewForgejoStatusPublisher(intents ForgejoStatusIntentPublisher, attempts ForgejoStatusAttemptRecorder, repositories RepositoryGetter, tokens RepositoryStatusTokenGetter, allowedRepositories []string, clientFor ForgeStatusClientFactory) *ForgejoStatusPublisher {
-	return &ForgejoStatusPublisher{intents: intents, attempts: attempts, repositories: repositories, tokens: tokens, allowedRepos: normalizedRepositoryAllowlist(allowedRepositories), clientFor: clientFor}
+func NewForgejoStatusPublisher(intents ForgejoStatusIntentPublisher, attempts ForgejoStatusAttemptRecorder, repositories RepositoryGetter, tokens RepositoryStatusTokenGetter, clientFor ForgeStatusClientFactory) *ForgejoStatusPublisher {
+	return &ForgejoStatusPublisher{intents: intents, attempts: attempts, repositories: repositories, tokens: tokens, clientFor: clientFor}
 }
 
 func (p *ForgejoStatusPublisher) Publish(ctx context.Context, result statusresult.Result) (statuspublication.Publication, error) {
 	if p == nil || p.intents == nil || p.attempts == nil || p.repositories == nil || p.tokens == nil || p.clientFor == nil {
 		return statuspublication.Publication{}, errors.New("forgejo status publisher is not configured")
 	}
+	repo, err := p.repositories.Get(ctx, result.RepositoryID)
+	if err != nil {
+		return statuspublication.Publication{}, fmt.Errorf("load repository for status publication: %w", err)
+	}
+	// Backstop: callers gate on enforcement state before recomputing statuses.
+	// A repository that is not enforcement-active must never produce a
+	// publication intent or attempt, so this fails before any record exists.
+	if !repo.EnforcementActive() {
+		return statuspublication.Publication{}, domain.ErrEnforcementNotActive
+	}
 	publication, err := p.intents.PublishForgejoStatus(ctx, result)
 	if err != nil {
 		return statuspublication.Publication{}, err
-	}
-	repo, err := p.repositories.Get(ctx, result.RepositoryID)
-	if err != nil {
-		return publication, p.recordFailedAttempt(ctx, publication, fmt.Errorf("load repository for status publication: %w", err))
-	}
-	if !p.repositoryAllowed(repo) {
-		return publication, p.recordFailedAttempt(ctx, publication, ErrRepositoryNotAllowed)
 	}
 	token, found, err := p.tokens.StatusToken(ctx, result.RepositoryID)
 	if err != nil {
 		return publication, p.recordFailedAttempt(ctx, publication, fmt.Errorf("load repository status token: %w", err))
 	}
 	token = strings.TrimSpace(token)
-	if !found {
-		return publication, p.recordFailedAttempt(ctx, publication, ErrRepositoryStatusTokenMissing)
-	}
-	if token == "" {
+	if !found || token == "" {
 		return publication, p.recordFailedAttempt(ctx, publication, ErrRepositoryStatusTokenMissing)
 	}
 	client, err := p.clientFor(repo, token)
@@ -91,38 +89,6 @@ func (p *ForgejoStatusPublisher) Publish(ctx context.Context, result statusresul
 		return publication, fmt.Errorf("record posted forgejo status attempt: %w", err)
 	}
 	return publication, nil
-}
-
-func normalizedRepositoryAllowlist(repositories []string) map[string]struct{} {
-	allowed := make(map[string]struct{}, len(repositories))
-	for _, repository := range repositories {
-		key := normalizeRepositoryFullName(repository)
-		if key != "" {
-			allowed[key] = struct{}{}
-		}
-	}
-	return allowed
-}
-
-func (p *ForgejoStatusPublisher) repositoryAllowed(repo domain.Repository) bool {
-	if len(p.allowedRepos) == 0 {
-		return false
-	}
-	_, ok := p.allowedRepos[normalizeRepositoryFullName(repo.FullName())]
-	return ok
-}
-
-func normalizeRepositoryFullName(fullName string) string {
-	parts := strings.Split(strings.ToLower(strings.TrimSpace(fullName)), "/")
-	if len(parts) != 2 {
-		return ""
-	}
-	owner := strings.TrimSpace(parts[0])
-	name := strings.TrimSpace(parts[1])
-	if owner == "" || name == "" {
-		return ""
-	}
-	return owner + "/" + name
 }
 
 func (p *ForgejoStatusPublisher) recordFailedAttempt(ctx context.Context, publication statuspublication.Publication, cause error, sensitiveValues ...string) error {
