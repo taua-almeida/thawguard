@@ -42,20 +42,19 @@ type statusPublisher interface {
 	Publish(ctx context.Context, result statusresult.Result) (statuspublication.Publication, error)
 }
 
+// freezeRecomputingStore recomputes and publishes statuses from the cached
+// open-PR view only. It deliberately has no live forge sync dependency so
+// freeze lifecycle actions keep working offline in dry-run mode; the thaw
+// approval service owns its own live refresh and fails closed instead.
 type freezeRecomputingStore struct {
 	freezes      freezeOperations
 	pullRequests openPullRequestBranchLister
-	syncer       openPullRequestSyncer
 	statuses     sharedHeadStatusRunner
 	publisher    statusPublisher
 }
 
-func newFreezeRecomputingStore(freezes freezeOperations, pullRequests openPullRequestBranchLister, statuses sharedHeadStatusRunner, publisher statusPublisher, syncers ...openPullRequestSyncer) *freezeRecomputingStore {
-	var syncer openPullRequestSyncer
-	if len(syncers) > 0 {
-		syncer = syncers[0]
-	}
-	return &freezeRecomputingStore{freezes: freezes, pullRequests: pullRequests, syncer: syncer, statuses: statuses, publisher: publisher}
+func newFreezeRecomputingStore(freezes freezeOperations, pullRequests openPullRequestBranchLister, statuses sharedHeadStatusRunner, publisher statusPublisher) *freezeRecomputingStore {
+	return &freezeRecomputingStore{freezes: freezes, pullRequests: pullRequests, statuses: statuses, publisher: publisher}
 }
 
 func (s *freezeRecomputingStore) ListActive(ctx context.Context) ([]domain.BranchFreeze, error) {
@@ -73,7 +72,7 @@ func (s *freezeRecomputingStore) CreateActive(ctx context.Context, params freeze
 	if err != nil {
 		return domain.BranchFreeze{}, err
 	}
-	if err := s.syncAndRecomputeBranch(ctx, created.RepositoryID, created.Branch); err != nil {
+	if err := s.recomputeBranch(ctx, created.RepositoryID, created.Branch); err != nil {
 		return created, err
 	}
 	return created, nil
@@ -87,7 +86,7 @@ func (s *freezeRecomputingStore) End(ctx context.Context, id int64, actor domain
 	if err != nil {
 		return domain.BranchFreeze{}, err
 	}
-	if err := s.syncAndRecomputeBranch(ctx, ended.RepositoryID, ended.Branch); err != nil {
+	if err := s.recomputeBranch(ctx, ended.RepositoryID, ended.Branch); err != nil {
 		return ended, err
 	}
 	if err := s.markScheduledRecomputedIfNeeded(ctx, ended); err != nil {
@@ -104,7 +103,7 @@ func (s *freezeRecomputingStore) Cancel(ctx context.Context, id int64, actor dom
 	if err != nil {
 		return domain.BranchFreeze{}, err
 	}
-	if err := s.syncAndRecomputeBranch(ctx, cancelled.RepositoryID, cancelled.Branch); err != nil {
+	if err := s.recomputeBranch(ctx, cancelled.RepositoryID, cancelled.Branch); err != nil {
 		return cancelled, err
 	}
 	if err := s.markScheduledRecomputedIfNeeded(ctx, cancelled); err != nil {
@@ -154,7 +153,7 @@ func (s *freezeRecomputingStore) ActivateScheduled(ctx context.Context, id int64
 	if err != nil {
 		return domain.BranchFreeze{}, err
 	}
-	if err := s.syncAndRecomputeBranch(ctx, activated.RepositoryID, activated.Branch); err != nil {
+	if err := s.recomputeBranch(ctx, activated.RepositoryID, activated.Branch); err != nil {
 		return activated, err
 	}
 	if _, err := scheduled.MarkScheduledRecomputed(ctx, activated.ID); err != nil {
@@ -188,7 +187,7 @@ func (s *freezeRecomputingStore) ExecutePlannedUnfreeze(ctx context.Context, id 
 	if err != nil {
 		return domain.BranchFreeze{}, err
 	}
-	if err := s.syncAndRecomputeBranch(ctx, ended.RepositoryID, ended.Branch); err != nil {
+	if err := s.recomputeBranch(ctx, ended.RepositoryID, ended.Branch); err != nil {
 		return ended, err
 	}
 	if _, err := scheduled.MarkScheduledRecomputed(ctx, ended.ID); err != nil {
@@ -202,7 +201,7 @@ func (s *freezeRecomputingStore) RetryScheduledRecompute(ctx context.Context, sc
 	if err != nil {
 		return err
 	}
-	if err := s.syncAndRecomputeBranch(ctx, scheduledFreeze.RepositoryID, scheduledFreeze.Branch); err != nil {
+	if err := s.recomputeBranch(ctx, scheduledFreeze.RepositoryID, scheduledFreeze.Branch); err != nil {
 		return err
 	}
 	_, err = scheduled.MarkScheduledRecomputed(ctx, scheduledFreeze.ID)
@@ -230,17 +229,6 @@ func (s *freezeRecomputingStore) scheduledFreezes() (scheduledFreezeOperations, 
 		return nil, errors.New("freeze store does not support scheduled freezes")
 	}
 	return scheduled, nil
-}
-
-func (s *freezeRecomputingStore) syncAndRecomputeBranch(ctx context.Context, repositoryID int64, branch string) error {
-	var syncErr error
-	if s.syncer != nil {
-		syncErr = s.syncer.SyncOpenPullRequests(ctx, repositoryID, branch)
-	}
-	if err := s.recomputeBranch(ctx, repositoryID, branch); err != nil {
-		return errors.Join(syncErr, err)
-	}
-	return syncErr
 }
 
 func (s *freezeRecomputingStore) recomputeBranch(ctx context.Context, repositoryID int64, branch string) error {

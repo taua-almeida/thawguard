@@ -22,6 +22,7 @@ const (
 	ActionFreezeScheduleActivated           = "freeze_schedule.activated"
 	ActionFreezeSchedulePlannedUnfreeze     = "freeze_schedule.planned_unfreeze_executed"
 	ActionThawExceptionApproved             = "thaw_exception.approved"
+	ActionThawExceptionSharedHeadApproved   = "thaw_exception.shared_head_approved"
 
 	SubjectTypeRepository    = "repository"
 	SubjectTypeBranchFreeze  = "branch_freeze"

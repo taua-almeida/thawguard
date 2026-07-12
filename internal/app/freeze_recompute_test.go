@@ -5,10 +5,14 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/taua-almeida/thawguard/internal/config"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/freeze"
+	"github.com/taua-almeida/thawguard/internal/pullrequest"
+	"github.com/taua-almeida/thawguard/internal/repository"
 	"github.com/taua-almeida/thawguard/internal/statuspublication"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
+	"github.com/taua-almeida/thawguard/internal/thawexception"
 )
 
 func TestFreezeRecomputingStorePublishesCachedPRHeadsOnCreate(t *testing.T) {
@@ -44,29 +48,45 @@ func TestFreezeRecomputingStorePublishesCachedPRHeadsOnCreate(t *testing.T) {
 	}
 }
 
-func TestFreezeRecomputingStoreSyncsOpenPRsBeforeCreateRecompute(t *testing.T) {
+func TestDryRunFreezeLifecycleRecomputesOfflineWithoutLiveAllowlistOrToken(t *testing.T) {
 	ctx := context.Background()
-	freezes := &fakeFreezeOperations{created: domain.BranchFreeze{ID: 1, RepositoryID: 7, Branch: "main", Status: domain.BranchFreezeStatusActive, Active: true}}
-	pulls := &fakeOpenPullRequestBranchLister{}
-	syncer := &fakeOpenPullRequestSyncer{afterSync: func() {
-		pulls.prs = []domain.PullRequest{{RepositoryID: 7, Index: 9, State: "open", TargetBranch: "main", HeadSHA: "ddd444"}}
-	}}
-	statuses := &fakeSharedHeadStatusRunner{}
-	publisher := &fakeStatusPublisher{}
-	store := newFreezeRecomputingStore(freezes, pulls, statuses, publisher, syncer)
-
-	created, err := store.CreateActive(ctx, freeze.CreateParams{RepositoryID: 7, Branch: "main", Reason: "release freeze"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+	database := newAppTestDB(t, ctx)
+	admin := domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}
+	repo, err := repository.NewStore(database).Create(ctx, repository.CreateParams{Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if created.ID != freezes.created.ID {
-		t.Fatalf("unexpected created freeze %+v", created)
+	pullRequests := pullrequest.NewStore(database)
+	if _, err := pullRequests.Upsert(ctx, domain.PullRequest{RepositoryID: repo.ID, Index: 1, State: "open", TargetBranch: "main", HeadSHA: "abc123"}); err != nil {
+		t.Fatal(err)
 	}
-	if len(syncer.calls) != 1 || syncer.calls[0].repositoryID != 7 || syncer.calls[0].targetBranch != "main" {
-		t.Fatalf("expected create sync call, got %+v", syncer.calls)
+	freezes := freeze.NewService(database)
+	statuses := statusresult.NewServiceWithThawExceptions(statusresult.NewStore(database), freezes, thawexception.NewService(database), pullRequests)
+	publications := statuspublication.NewStore(database)
+	publisher, err := statusPublisherFromConfig(config.Config{}, statuspublication.AttemptModeDryRun, publications, repository.NewStore(database), nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(statuses.calls) != 1 || statuses.calls[0].prs[0].Index != 9 {
-		t.Fatalf("expected recompute to use synced PR cache, got %+v", statuses.calls)
+	store := newFreezeRecomputingStore(freezes, pullRequests, statuses, publisher)
+
+	created, err := store.CreateActive(ctx, freeze.CreateParams{RepositoryID: repo.ID, Branch: "main", Reason: "release freeze"}, admin)
+	if err != nil {
+		t.Fatalf("expected dry-run freeze create to recompute offline without allowlist or token, got %v", err)
+	}
+	if _, err := store.End(ctx, created.ID, admin); err != nil {
+		t.Fatalf("expected dry-run freeze end to recompute offline without allowlist or token, got %v", err)
+	}
+	attempts, err := publications.ListRecentAttempts(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 2 {
+		t.Fatalf("expected one cached recompute publication per freeze action, got %+v", attempts)
+	}
+	for _, attempt := range attempts {
+		if attempt.Mode != statuspublication.AttemptModeDryRun || attempt.Error != "" {
+			t.Fatalf("expected offline dry-run publication attempts, got %+v", attempt)
+		}
 	}
 }
 
@@ -105,50 +125,6 @@ func TestFreezeRecomputingStorePublishesCachedPRHeadsOnEndAndCancel(t *testing.T
 	}
 }
 
-func TestFreezeRecomputingStoreSyncsOpenPRsBeforeEndAndCancelRecompute(t *testing.T) {
-	for _, test := range []struct {
-		name   string
-		close  func(context.Context, *freezeRecomputingStore) (domain.BranchFreeze, error)
-		status domain.BranchFreezeStatus
-	}{
-		{name: "end", status: domain.BranchFreezeStatusEnded, close: func(ctx context.Context, store *freezeRecomputingStore) (domain.BranchFreeze, error) {
-			return store.End(ctx, 9, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
-		}},
-		{name: "cancel", status: domain.BranchFreezeStatusCancelled, close: func(ctx context.Context, store *freezeRecomputingStore) (domain.BranchFreeze, error) {
-			return store.Cancel(ctx, 9, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
-		}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			ctx := context.Background()
-			freezes := &fakeFreezeOperations{closed: domain.BranchFreeze{ID: 9, RepositoryID: 7, Branch: "main", Status: test.status}}
-			pulls := &fakeOpenPullRequestBranchLister{}
-			syncer := &fakeOpenPullRequestSyncer{afterSync: func() {
-				pulls.prs = []domain.PullRequest{{RepositoryID: 7, Index: 10, State: "open", TargetBranch: "main", HeadSHA: "eee555"}}
-			}}
-			statuses := &fakeSharedHeadStatusRunner{}
-			publisher := &fakeStatusPublisher{}
-			store := newFreezeRecomputingStore(freezes, pulls, statuses, publisher, syncer)
-
-			closed, err := test.close(ctx, store)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if closed.Status != test.status {
-				t.Fatalf("unexpected close status %+v", closed)
-			}
-			if len(syncer.calls) != 1 || syncer.calls[0].repositoryID != 7 || syncer.calls[0].targetBranch != "main" {
-				t.Fatalf("expected %s sync call, got %+v", test.name, syncer.calls)
-			}
-			if len(statuses.calls) != 1 || statuses.calls[0].prs[0].Index != 10 {
-				t.Fatalf("expected close recompute to use synced PR cache, got %+v", statuses.calls)
-			}
-			if len(publisher.results) != 1 || publisher.results[0].HeadSHA != "eee555" {
-				t.Fatalf("expected one synced PR publication, got %+v", publisher.results)
-			}
-		})
-	}
-}
-
 func TestFreezeRecomputingStoreSkipsWhenNoCachedPRs(t *testing.T) {
 	ctx := context.Background()
 	freezes := &fakeFreezeOperations{created: domain.BranchFreeze{ID: 1, RepositoryID: 7, Branch: "main", Status: domain.BranchFreezeStatusActive, Active: true}}
@@ -182,27 +158,6 @@ func TestFreezeRecomputingStoreReturnsPublishErrorAfterFreezeChange(t *testing.T
 	}
 }
 
-func TestFreezeRecomputingStoreReturnsSyncErrorAfterRecomputingCachedPRs(t *testing.T) {
-	ctx := context.Background()
-	freezes := &fakeFreezeOperations{created: domain.BranchFreeze{ID: 1, RepositoryID: 7, Branch: "main", Status: domain.BranchFreezeStatusActive, Active: true}}
-	pulls := &fakeOpenPullRequestBranchLister{prs: []domain.PullRequest{{RepositoryID: 7, Index: 1, State: "open", TargetBranch: "main", HeadSHA: "aaa111"}}}
-	statuses := &fakeSharedHeadStatusRunner{}
-	publisher := &fakeStatusPublisher{}
-	syncErr := errors.New("sync failed")
-	store := newFreezeRecomputingStore(freezes, pulls, statuses, publisher, &fakeOpenPullRequestSyncer{err: syncErr})
-
-	created, err := store.CreateActive(ctx, freeze.CreateParams{RepositoryID: 7, Branch: "main", Reason: "release freeze"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
-	if !errors.Is(err, syncErr) {
-		t.Fatalf("expected sync error, got %v", err)
-	}
-	if created.ID != freezes.created.ID {
-		t.Fatalf("expected freeze returned with sync error, got %+v", created)
-	}
-	if len(statuses.calls) != 1 || len(publisher.results) != 1 || publisher.results[0].HeadSHA != "aaa111" {
-		t.Fatalf("expected cached PR recompute despite sync error, calls=%+v results=%+v", statuses.calls, publisher.results)
-	}
-}
-
 type fakeFreezeOperations struct {
 	created domain.BranchFreeze
 	closed  domain.BranchFreeze
@@ -230,28 +185,6 @@ type fakeOpenPullRequestBranchLister struct {
 
 func (l *fakeOpenPullRequestBranchLister) ListOpenByTargetBranch(ctx context.Context, repositoryID int64, targetBranch string) ([]domain.PullRequest, error) {
 	return l.prs, nil
-}
-
-type fakeOpenPullRequestSyncer struct {
-	calls     []fakeOpenPullRequestSyncCall
-	err       error
-	afterSync func()
-}
-
-type fakeOpenPullRequestSyncCall struct {
-	repositoryID int64
-	targetBranch string
-}
-
-func (s *fakeOpenPullRequestSyncer) SyncOpenPullRequests(ctx context.Context, repositoryID int64, targetBranch string) error {
-	s.calls = append(s.calls, fakeOpenPullRequestSyncCall{repositoryID: repositoryID, targetBranch: targetBranch})
-	if s.err != nil {
-		return s.err
-	}
-	if s.afterSync != nil {
-		s.afterSync()
-	}
-	return nil
 }
 
 type fakeSharedHeadStatusRunner struct {

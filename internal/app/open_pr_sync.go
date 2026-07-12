@@ -29,7 +29,7 @@ type openPullRequestStatusTokenGetter interface {
 
 type openPullRequestUpserter interface {
 	Upsert(ctx context.Context, pr domain.PullRequest) (domain.PullRequest, error)
-	MarkAbsentOpenByTargetBranchClosed(ctx context.Context, repositoryID int64, targetBranch string, openIndexes []int) (int64, error)
+	MarkAbsentOpenClosed(ctx context.Context, repositoryID int64, targetBranch string, openIndexes []int) (int64, error)
 }
 
 type openPullRequestForgeClient interface {
@@ -64,7 +64,7 @@ func (s *forgeOpenPullRequestSyncer) SyncOpenPullRequests(ctx context.Context, r
 		return errors.New("open pull request syncer is not configured")
 	}
 	targetBranch = strings.TrimSpace(targetBranch)
-	if repositoryID <= 0 || targetBranch == "" {
+	if repositoryID <= 0 {
 		return errors.New("missing required open pull request sync fields")
 	}
 	repo, err := s.repositories.Get(ctx, repositoryID)
@@ -104,7 +104,7 @@ func (s *forgeOpenPullRequestSyncer) SyncOpenPullRequests(ctx context.Context, r
 		}
 		openIndexes = append(openIndexes, pr.Index)
 	}
-	closedAbsent, err := s.pullRequests.MarkAbsentOpenByTargetBranchClosed(ctx, repositoryID, targetBranch, openIndexes)
+	closedAbsent, err := s.pullRequests.MarkAbsentOpenClosed(ctx, repositoryID, targetBranch, openIndexes)
 	if err != nil {
 		return safeOpenPullRequestSyncError(fmt.Errorf("close cached pull requests absent from forge open list: %w", err), token)
 	}
@@ -117,6 +117,9 @@ func (s *forgeOpenPullRequestSyncer) SyncOpenPullRequests(ctx context.Context, r
 }
 
 func openPullRequestsSyncedEvent(repo domain.Repository, targetBranch string, openCount int, closedAbsentCount int64) audit.Event {
+	if targetBranch == "" {
+		targetBranch = "all"
+	}
 	details := map[string]string{
 		"repository_id":       strconv.FormatInt(repo.ID, 10),
 		"full_name":           repo.FullName(),

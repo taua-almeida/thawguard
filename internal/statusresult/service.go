@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
@@ -42,6 +43,27 @@ type ThawApprovalParams struct {
 	TargetBranch     string
 	HeadSHA          string
 	Reason           string
+	Confirmation     *ThawApprovalConfirmation
+}
+
+type ThawApprovalConfirmation struct {
+	HeadSHA           string
+	AffectedSignature string
+}
+
+type ThawApprovalPullRequest struct {
+	Index        int
+	Title        string
+	TargetBranch string
+	URL          string
+	HeadSHA      string
+}
+
+type ThawApprovalOutcome struct {
+	Result               *Result
+	ConfirmationRequired bool
+	Confirmation         *ThawApprovalConfirmation
+	AffectedPullRequests []ThawApprovalPullRequest
 }
 
 func NewService(store *Store, freezes FreezeLister) *Service {
@@ -82,7 +104,11 @@ func (s *Service) RunForPullRequest(ctx context.Context, pr domain.PullRequest) 
 	if err != nil {
 		return Result{}, err
 	}
-	decision, err := s.evaluate(ctx, pr, openPRs)
+	sharedHeadApproved, err := s.sharedHeadFullyThawed(ctx, openPRs)
+	if err != nil {
+		return Result{}, err
+	}
+	decision, err := s.evaluate(ctx, pr, openPRs, sharedHeadApproved)
 	if err != nil {
 		return Result{}, err
 	}
@@ -97,13 +123,21 @@ func (s *Service) RunForSharedHead(ctx context.Context, prs []domain.PullRequest
 	if err != nil {
 		return Result{}, err
 	}
+	normalized, err = s.expandSharedHead(ctx, normalized)
+	if err != nil {
+		return Result{}, err
+	}
+	sharedHeadApproved, err := s.sharedHeadFullyThawed(ctx, normalized)
+	if err != nil {
+		return Result{}, err
+	}
 	selected := preferredPullRequest(normalized, preferredIndex)
-	selectedDecision, err := s.evaluate(ctx, selected, normalized)
+	selectedDecision, err := s.evaluate(ctx, selected, normalized, sharedHeadApproved)
 	if err != nil {
 		return Result{}, err
 	}
 	for _, pr := range normalized {
-		decision, err := s.evaluate(ctx, pr, normalized)
+		decision, err := s.evaluate(ctx, pr, normalized, sharedHeadApproved)
 		if err != nil {
 			return Result{}, err
 		}
@@ -116,7 +150,38 @@ func (s *Service) RunForSharedHead(ctx context.Context, prs []domain.PullRequest
 	return s.create(ctx, selected, selectedDecision)
 }
 
-func (s *Service) evaluate(ctx context.Context, pr domain.PullRequest, openPRs []domain.PullRequest) (policy.Decision, error) {
+// expandSharedHead widens the evaluated set to every cached open pull request
+// in the repository sharing the head SHA, independent of target branch. A
+// commit status is SHA-scoped on the forge, so a decision computed from a
+// branch-scoped subset could silently thaw PRs targeting other frozen
+// branches; expanding here keeps webhook, freeze lifecycle, thaw approval,
+// and scheduled recomputation under one invariant.
+func (s *Service) expandSharedHead(ctx context.Context, prs []domain.PullRequest) ([]domain.PullRequest, error) {
+	if s.pullRequests == nil {
+		return prs, nil
+	}
+	cached, err := s.pullRequests.ListOpenByHead(ctx, prs[0].RepositoryID, prs[0].HeadSHA)
+	if err != nil {
+		return nil, fmt.Errorf("list open pull requests sharing head SHA for status decision: %w", err)
+	}
+	seen := make(map[int]struct{}, len(prs))
+	for _, pr := range prs {
+		seen[pr.Index] = struct{}{}
+	}
+	expanded := append([]domain.PullRequest(nil), prs...)
+	for _, pr := range cached {
+		pr = normalizePullRequest(pr)
+		if _, ok := seen[pr.Index]; ok || !pr.IsOpen() {
+			continue
+		}
+		seen[pr.Index] = struct{}{}
+		expanded = append(expanded, pr)
+	}
+	sort.Slice(expanded, func(i, j int) bool { return expanded[i].Index < expanded[j].Index })
+	return expanded, nil
+}
+
+func (s *Service) evaluate(ctx context.Context, pr domain.PullRequest, openPRs []domain.PullRequest, sharedHeadApproved bool) (policy.Decision, error) {
 	activeFreeze, err := s.activeFreeze(ctx, pr.RepositoryID, pr.TargetBranch)
 	if err != nil {
 		return policy.Decision{}, err
@@ -125,7 +190,30 @@ func (s *Service) evaluate(ctx context.Context, pr domain.PullRequest, openPRs [
 	if err != nil {
 		return policy.Decision{}, err
 	}
-	return policy.Evaluate(policy.Input{PullRequest: pr, ActiveFreeze: activeFreeze, ThawException: activeThaw, OpenPullRequests: openPRs}), nil
+	return policy.Evaluate(policy.Input{PullRequest: pr, ActiveFreeze: activeFreeze, ThawException: activeThaw, OpenPullRequests: openPRs, SharedHeadApproved: sharedHeadApproved}), nil
+}
+
+func (s *Service) sharedHeadFullyThawed(ctx context.Context, prs []domain.PullRequest) (bool, error) {
+	if len(prs) < 2 {
+		return false, nil
+	}
+	for _, pr := range prs {
+		activeFreeze, err := s.activeFreeze(ctx, pr.RepositoryID, pr.TargetBranch)
+		if err != nil {
+			return false, err
+		}
+		if activeFreeze == nil {
+			continue
+		}
+		activeThaw, err := s.activeThawException(ctx, pr)
+		if err != nil {
+			return false, err
+		}
+		if activeThaw == nil {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (s *Service) create(ctx context.Context, pr domain.PullRequest, decision policy.Decision) (Result, error) {

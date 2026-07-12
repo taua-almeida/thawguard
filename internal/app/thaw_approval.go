@@ -2,8 +2,11 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
@@ -26,6 +29,11 @@ type thawApprovalPullRequestCache interface {
 
 type thawApprovalExceptionApprover interface {
 	Approve(ctx context.Context, params thawexception.ApproveParams, actor domain.Actor) (domain.ThawException, error)
+	ApproveSharedHead(ctx context.Context, params thawexception.ApproveSharedHeadParams, actor domain.Actor) ([]domain.ThawException, error)
+}
+
+type thawApprovalFreezeLister interface {
+	ListActive(ctx context.Context) ([]domain.BranchFreeze, error)
 }
 
 type thawApprovalStatusRunner interface {
@@ -44,6 +52,7 @@ type thawApprovalService struct {
 	tokens       thawApprovalStatusTokenGetter
 	pullRequests thawApprovalPullRequestCache
 	exceptions   thawApprovalExceptionApprover
+	freezes      thawApprovalFreezeLister
 	statuses     thawApprovalStatusRunner
 	publisher    statusPublisher
 	syncer       openPullRequestSyncer
@@ -51,8 +60,8 @@ type thawApprovalService struct {
 	clientFor    thawApprovalForgeClientFactory
 }
 
-func newThawApprovalService(repositories thawApprovalRepositoryGetter, tokens thawApprovalStatusTokenGetter, pullRequests thawApprovalPullRequestCache, exceptions thawApprovalExceptionApprover, statuses thawApprovalStatusRunner, publisher statusPublisher, syncer openPullRequestSyncer, allowedRepositories []string, clientFor thawApprovalForgeClientFactory) *thawApprovalService {
-	return &thawApprovalService{repositories: repositories, tokens: tokens, pullRequests: pullRequests, exceptions: exceptions, statuses: statuses, publisher: publisher, syncer: syncer, allowedRepos: normalizedOpenPullRequestSyncAllowlist(allowedRepositories), clientFor: clientFor}
+func newThawApprovalService(repositories thawApprovalRepositoryGetter, tokens thawApprovalStatusTokenGetter, pullRequests thawApprovalPullRequestCache, exceptions thawApprovalExceptionApprover, freezes thawApprovalFreezeLister, statuses thawApprovalStatusRunner, publisher statusPublisher, syncer openPullRequestSyncer, allowedRepositories []string, clientFor thawApprovalForgeClientFactory) *thawApprovalService {
+	return &thawApprovalService{repositories: repositories, tokens: tokens, pullRequests: pullRequests, exceptions: exceptions, freezes: freezes, statuses: statuses, publisher: publisher, syncer: syncer, allowedRepos: normalizedOpenPullRequestSyncAllowlist(allowedRepositories), clientFor: clientFor}
 }
 
 func (s *thawApprovalService) ListRecent(ctx context.Context, limit int) ([]statusresult.Result, error) {
@@ -62,74 +71,103 @@ func (s *thawApprovalService) ListRecent(ctx context.Context, limit int) ([]stat
 	return s.statuses.ListRecent(ctx, limit)
 }
 
-func (s *thawApprovalService) ApproveThaw(ctx context.Context, params statusresult.ThawApprovalParams, actor domain.Actor) (statusresult.Result, error) {
-	if s == nil || s.repositories == nil || s.tokens == nil || s.pullRequests == nil || s.exceptions == nil || s.statuses == nil || s.publisher == nil || s.clientFor == nil {
-		return statusresult.Result{}, errors.New("thaw approval service is not configured")
+func (s *thawApprovalService) ApproveThaw(ctx context.Context, params statusresult.ThawApprovalParams, actor domain.Actor) (statusresult.ThawApprovalOutcome, error) {
+	if s == nil || s.repositories == nil || s.tokens == nil || s.pullRequests == nil || s.exceptions == nil || s.freezes == nil || s.statuses == nil || s.publisher == nil || s.syncer == nil || s.clientFor == nil {
+		return statusresult.ThawApprovalOutcome{}, errors.New("thaw approval service is not configured")
 	}
 	params = normalizeThawApprovalParams(params)
 	if err := validateThawApprovalParams(params); err != nil {
-		return statusresult.Result{}, err
+		return statusresult.ThawApprovalOutcome{}, err
 	}
 
 	repo, err := s.repositories.Get(ctx, params.RepositoryID)
 	if err != nil {
-		return statusresult.Result{}, fmt.Errorf("load repository for thaw approval: %w", err)
+		return statusresult.ThawApprovalOutcome{}, fmt.Errorf("load repository for thaw approval: %w", err)
 	}
 	if !s.repositoryAllowed(repo) {
-		return statusresult.Result{}, statusresult.ValidationError{Message: "repository is not enabled for live thaw approvals"}
+		return statusresult.ThawApprovalOutcome{}, statusresult.ValidationError{Message: "repository is not enabled for live thaw approvals"}
 	}
 	token, found, err := s.tokens.StatusToken(ctx, params.RepositoryID)
 	if err != nil {
-		return statusresult.Result{}, fmt.Errorf("load repository status token for thaw approval: %w", err)
+		return statusresult.ThawApprovalOutcome{}, fmt.Errorf("load repository status token for thaw approval: %w", err)
 	}
 	token = strings.TrimSpace(token)
 	if !found || token == "" {
-		return statusresult.Result{}, statusresult.ValidationError{Message: "repository status token is not configured"}
+		return statusresult.ThawApprovalOutcome{}, statusresult.ValidationError{Message: "repository status token is not configured"}
 	}
 	client, err := s.clientFor(repo, token)
 	if err != nil {
-		return statusresult.Result{}, safeThawApprovalError(fmt.Errorf("create forgejo pull request client: %w", err), token)
+		return statusresult.ThawApprovalOutcome{}, safeThawApprovalError(fmt.Errorf("create forgejo pull request client: %w", err), token)
 	}
 	if client == nil {
-		return statusresult.Result{}, errors.New("create forgejo pull request client: nil client")
+		return statusresult.ThawApprovalOutcome{}, errors.New("create forgejo pull request client: nil client")
 	}
 
 	pr, err := client.GetPullRequest(ctx, repo.Owner, repo.Name, params.PullRequestIndex)
 	if err != nil {
-		return statusresult.Result{}, safeThawApprovalError(fmt.Errorf("fetch current pull request from forge: %w", err), token)
+		return statusresult.ThawApprovalOutcome{}, safeThawApprovalError(fmt.Errorf("fetch current pull request from forge: %w", err), token)
 	}
 	pr.RepositoryID = repo.ID
 	pr = normalizeThawApprovalPullRequest(pr)
 	if err := validateFetchedThawApprovalPullRequest(params, pr); err != nil {
-		return statusresult.Result{}, err
+		return statusresult.ThawApprovalOutcome{}, err
 	}
-	if s.syncer != nil {
-		if err := s.syncer.SyncOpenPullRequests(ctx, repo.ID, pr.TargetBranch); err != nil {
-			return statusresult.Result{}, safeThawApprovalError(fmt.Errorf("sync open pull requests for thaw approval: %w", err), token)
-		}
+	if err := s.syncer.SyncOpenPullRequests(ctx, repo.ID, ""); err != nil {
+		return statusresult.ThawApprovalOutcome{}, safeThawApprovalError(fmt.Errorf("sync open pull requests for thaw approval: %w", err), token)
 	}
 	cached, err := s.pullRequests.Upsert(ctx, pr)
 	if err != nil {
-		return statusresult.Result{}, fmt.Errorf("cache thawed pull request: %w", err)
-	}
-	if _, err := s.exceptions.Approve(ctx, thawexception.ApproveParams{RepositoryID: repo.ID, PullRequestIndex: cached.Index, PullRequestURL: cached.URL, TargetBranch: cached.TargetBranch, HeadSHA: cached.HeadSHA, Reason: params.Reason}, actor); err != nil {
-		if thawexception.IsValidationError(err) {
-			return statusresult.Result{}, statusresult.ValidationError{Message: err.Error()}
-		}
-		return statusresult.Result{}, err
+		return statusresult.ThawApprovalOutcome{}, safeThawApprovalError(fmt.Errorf("cache thawed pull request: %w", err), token)
 	}
 	openPRs, err := s.openPullRequestsForHead(ctx, cached)
 	if err != nil {
-		return statusresult.Result{}, err
+		return statusresult.ThawApprovalOutcome{}, safeThawApprovalError(err, token)
+	}
+	// Guard every path on the refreshed state: a thaw exists only to override
+	// an active freeze, so if no current affected open PR targets a frozen
+	// branch there is nothing to confirm, approve, record, or publish.
+	frozenPRs, err := s.frozenPullRequests(ctx, openPRs)
+	if err != nil {
+		return statusresult.ThawApprovalOutcome{}, safeThawApprovalError(err, token)
+	}
+	if len(frozenPRs) == 0 {
+		return statusresult.ThawApprovalOutcome{}, statusresult.ValidationError{Message: "No thaw is needed because none of the affected pull requests currently targets an actively frozen branch."}
+	}
+	if params.Confirmation != nil && !thawApprovalConfirmationMatches(*params.Confirmation, openPRs) {
+		return thawApprovalConfirmationOutcome(openPRs), nil
+	}
+	if len(openPRs) > 1 && params.Confirmation == nil {
+		return thawApprovalConfirmationOutcome(openPRs), nil
+	}
+
+	if len(openPRs) == 1 {
+		if _, err := s.exceptions.Approve(ctx, thawApprovalExceptionParams(cached, params.Reason), actor); err != nil {
+			return statusresult.ThawApprovalOutcome{}, thawApprovalExceptionError(err, token)
+		}
+	} else {
+		exceptions := make([]thawexception.ApproveParams, 0, len(frozenPRs))
+		for _, frozenPR := range frozenPRs {
+			exceptions = append(exceptions, thawApprovalExceptionParams(frozenPR, params.Reason))
+		}
+		if _, err := s.exceptions.ApproveSharedHead(ctx, thawexception.ApproveSharedHeadParams{
+			RepositoryID:               repo.ID,
+			SelectedPullRequestIndex:   cached.Index,
+			HeadSHA:                    cached.HeadSHA,
+			Reason:                     params.Reason,
+			AffectedPullRequestIndexes: pullRequestIndexes(openPRs),
+			Exceptions:                 exceptions,
+		}, actor); err != nil {
+			return statusresult.ThawApprovalOutcome{}, thawApprovalExceptionError(err, token)
+		}
 	}
 	result, err := s.statuses.RunForSharedHead(ctx, openPRs, cached.Index)
 	if err != nil {
-		return statusresult.Result{}, err
+		return statusresult.ThawApprovalOutcome{}, safeThawApprovalError(err, token)
 	}
 	if _, err := s.publisher.Publish(ctx, result); err != nil {
-		return statusresult.Result{}, err
+		return statusresult.ThawApprovalOutcome{}, safeThawApprovalError(err, token)
 	}
-	return result, nil
+	return statusresult.ThawApprovalOutcome{Result: &result}, nil
 }
 
 func (s *thawApprovalService) repositoryAllowed(repo domain.Repository) bool {
@@ -156,10 +194,79 @@ func (s *thawApprovalService) openPullRequestsForHead(ctx context.Context, pr do
 	return openPRs, nil
 }
 
+func (s *thawApprovalService) frozenPullRequests(ctx context.Context, prs []domain.PullRequest) ([]domain.PullRequest, error) {
+	freezes, err := s.freezes.ListActive(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list active freezes for shared-head thaw approval: %w", err)
+	}
+	frozen := make([]domain.PullRequest, 0, len(prs))
+	for _, pr := range prs {
+		for _, activeFreeze := range freezes {
+			if activeFreeze.Active && activeFreeze.RepositoryID == pr.RepositoryID && activeFreeze.Branch == pr.TargetBranch {
+				frozen = append(frozen, pr)
+				break
+			}
+		}
+	}
+	return frozen, nil
+}
+
+func thawApprovalExceptionParams(pr domain.PullRequest, reason string) thawexception.ApproveParams {
+	return thawexception.ApproveParams{RepositoryID: pr.RepositoryID, PullRequestIndex: pr.Index, PullRequestURL: pr.URL, TargetBranch: pr.TargetBranch, HeadSHA: pr.HeadSHA, Reason: reason}
+}
+
+func thawApprovalExceptionError(err error, token string) error {
+	if thawexception.IsValidationError(err) {
+		return statusresult.ValidationError{Message: safeThawApprovalError(err, token).Error()}
+	}
+	return safeThawApprovalError(err, token)
+}
+
+func thawApprovalConfirmationOutcome(prs []domain.PullRequest) statusresult.ThawApprovalOutcome {
+	affected := make([]statusresult.ThawApprovalPullRequest, 0, len(prs))
+	for _, pr := range prs {
+		affected = append(affected, statusresult.ThawApprovalPullRequest{Index: pr.Index, Title: pr.Title, TargetBranch: pr.TargetBranch, URL: pr.URL, HeadSHA: pr.HeadSHA})
+	}
+	confirmation := &statusresult.ThawApprovalConfirmation{HeadSHA: prs[0].HeadSHA, AffectedSignature: thawApprovalAffectedSignature(prs)}
+	return statusresult.ThawApprovalOutcome{ConfirmationRequired: true, Confirmation: confirmation, AffectedPullRequests: affected}
+}
+
+func thawApprovalConfirmationMatches(confirmation statusresult.ThawApprovalConfirmation, prs []domain.PullRequest) bool {
+	if len(prs) == 0 || confirmation.HeadSHA != prs[0].HeadSHA || confirmation.AffectedSignature != thawApprovalAffectedSignature(prs) {
+		return false
+	}
+	return true
+}
+
+func thawApprovalAffectedSignature(prs []domain.PullRequest) string {
+	canonical := append([]domain.PullRequest(nil), prs...)
+	sort.Slice(canonical, func(i, j int) bool { return canonical[i].Index < canonical[j].Index })
+	digest := sha256.New()
+	for _, pr := range canonical {
+		_, _ = fmt.Fprintf(digest, "%d\x00%s\n", pr.Index, pr.TargetBranch)
+	}
+	return hex.EncodeToString(digest.Sum(nil))
+}
+
+func pullRequestIndexes(prs []domain.PullRequest) []int {
+	indexes := make([]int, 0, len(prs))
+	for _, pr := range prs {
+		indexes = append(indexes, pr.Index)
+	}
+	sort.Ints(indexes)
+	return indexes
+}
+
 func normalizeThawApprovalParams(params statusresult.ThawApprovalParams) statusresult.ThawApprovalParams {
 	params.TargetBranch = strings.TrimSpace(params.TargetBranch)
 	params.HeadSHA = strings.ToLower(strings.TrimSpace(params.HeadSHA))
 	params.Reason = strings.TrimSpace(params.Reason)
+	if params.Confirmation != nil {
+		confirmation := *params.Confirmation
+		confirmation.HeadSHA = strings.ToLower(strings.TrimSpace(confirmation.HeadSHA))
+		confirmation.AffectedSignature = strings.ToLower(strings.TrimSpace(confirmation.AffectedSignature))
+		params.Confirmation = &confirmation
+	}
 	return params
 }
 
@@ -203,6 +310,14 @@ func validateThawApprovalParams(params statusresult.ThawApprovalParams) error {
 	}
 	if len(params.Reason) > 500 || containsControl(params.Reason) {
 		return statusresult.ValidationError{Message: "reason is invalid"}
+	}
+	if params.Confirmation != nil {
+		if len(params.Confirmation.HeadSHA) < 6 || len(params.Confirmation.HeadSHA) > 64 || containsControl(params.Confirmation.HeadSHA) || !isHex(params.Confirmation.HeadSHA) {
+			return statusresult.ValidationError{Message: "confirmed head SHA is invalid"}
+		}
+		if len(params.Confirmation.AffectedSignature) != sha256.Size*2 || !isHex(params.Confirmation.AffectedSignature) {
+			return statusresult.ValidationError{Message: "confirmed affected pull request signature is invalid"}
+		}
 	}
 	return nil
 }

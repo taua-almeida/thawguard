@@ -46,6 +46,27 @@ func TestForgeOpenPullRequestSyncerCachesOpenPullRequests(t *testing.T) {
 	}
 }
 
+func TestForgeOpenPullRequestSyncerRefreshesAllRepositoryBranches(t *testing.T) {
+	ctx := context.Background()
+	repositories := &fakeOpenPRRepositoryGetter{repo: domain.Repository{ID: 7, Owner: "taua-almeida", Name: "thawguard"}}
+	tokens := &fakeOpenPRStatusTokenGetter{token: "sync-token", found: true}
+	upserter := &fakeOpenPRUpserter{}
+	client := &fakeOpenPRForgeClient{prs: []domain.PullRequest{
+		{Index: 11, State: "open", TargetBranch: "main", HeadSHA: "abcdef123456"},
+		{Index: 12, State: "open", TargetBranch: "release", HeadSHA: "abcdef123456"},
+	}}
+	syncer := newForgeOpenPullRequestSyncer(repositories, tokens, upserter, []string{"taua-almeida/thawguard"}, func(domain.Repository, string) (openPullRequestForgeClient, error) {
+		return client, nil
+	})
+
+	if err := syncer.SyncOpenPullRequests(ctx, 7, ""); err != nil {
+		t.Fatal(err)
+	}
+	if client.targetBranch != "" || len(upserter.closedAbsent) != 1 || upserter.closedAbsent[0].targetBranch != "" {
+		t.Fatalf("expected repository-wide reconciliation, branch=%q calls=%+v", client.targetBranch, upserter.closedAbsent)
+	}
+}
+
 func TestForgeOpenPullRequestSyncerRecordsAuditEvent(t *testing.T) {
 	ctx := context.Background()
 	repositories := &fakeOpenPRRepositoryGetter{repo: domain.Repository{ID: 7, Forge: "codeberg", BaseURL: "https://codeberg.org", Owner: "taua-almeida", Name: "thawguard"}}
@@ -175,7 +196,7 @@ func (u *fakeOpenPRUpserter) Upsert(ctx context.Context, pr domain.PullRequest) 
 	return pr, nil
 }
 
-func (u *fakeOpenPRUpserter) MarkAbsentOpenByTargetBranchClosed(ctx context.Context, repositoryID int64, targetBranch string, openIndexes []int) (int64, error) {
+func (u *fakeOpenPRUpserter) MarkAbsentOpenClosed(ctx context.Context, repositoryID int64, targetBranch string, openIndexes []int) (int64, error) {
 	if u.err != nil {
 		return 0, u.err
 	}

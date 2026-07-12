@@ -94,7 +94,7 @@ type AuditStore interface {
 
 type StatusDecisionStore interface {
 	ListRecent(ctx context.Context, limit int) ([]statusresult.Result, error)
-	ApproveThaw(ctx context.Context, params statusresult.ThawApprovalParams, actor domain.Actor) (statusresult.Result, error)
+	ApproveThaw(ctx context.Context, params statusresult.ThawApprovalParams, actor domain.Actor) (statusresult.ThawApprovalOutcome, error)
 }
 
 type StatusPublicationStore interface {
@@ -532,12 +532,13 @@ func (s *Server) handleCreateDecision(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		pullRequestIndex = 0
 	}
-	_, err = s.cfg.StatusDecisionStore.ApproveThaw(r.Context(), statusresult.ThawApprovalParams{
+	outcome, err := s.cfg.StatusDecisionStore.ApproveThaw(r.Context(), statusresult.ThawApprovalParams{
 		RepositoryID:     repositoryID,
 		PullRequestIndex: pullRequestIndex,
 		TargetBranch:     r.PostFormValue("target_branch"),
 		HeadSHA:          r.PostFormValue("head_sha"),
 		Reason:           r.PostFormValue("reason"),
+		Confirmation:     thawApprovalConfirmationFromForm(r),
 	}, session.auditActor())
 	if err != nil {
 		if !statusresult.IsValidationError(err) {
@@ -554,7 +555,71 @@ func (s *Server) handleCreateDecision(w http.ResponseWriter, r *http.Request) {
 		s.renderDecisions(w, repositories, s.statusResultViews(repositories, results), err.Error(), session)
 		return
 	}
+	if outcome.ConfirmationRequired {
+		repositories, results, dataErr := s.decisionPageData(r.Context())
+		if dataErr != nil {
+			internalServerError(w)
+			return
+		}
+		confirmation := sharedHeadConfirmationViewFrom(outcome, repositoryID, pullRequestIndex, strings.TrimSpace(r.PostFormValue("target_branch")), strings.TrimSpace(r.PostFormValue("reason")))
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusConflict)
+		s.renderDecisions(w, repositories, s.statusResultViews(repositories, results), "", session, confirmation)
+		return
+	}
 	http.Redirect(w, r, "/decisions", http.StatusSeeOther)
+}
+
+func thawApprovalConfirmationFromForm(r *http.Request) *statusresult.ThawApprovalConfirmation {
+	if r.PostFormValue("confirm_shared_head") != "true" {
+		return nil
+	}
+	return &statusresult.ThawApprovalConfirmation{HeadSHA: r.PostFormValue("confirmed_head_sha"), AffectedSignature: r.PostFormValue("confirmed_affected_signature")}
+}
+
+type sharedHeadAffectedPullRequestView struct {
+	Index        int
+	Title        string
+	TargetBranch string
+	ShortHeadSHA string
+}
+
+type sharedHeadConfirmationView struct {
+	RepositoryID         int64
+	PullRequestIndex     int
+	TargetBranch         string
+	Reason               string
+	HeadSHA              string
+	ShortHeadSHA         string
+	AffectedSignature    string
+	AffectedCount        int
+	AffectedPullRequests []sharedHeadAffectedPullRequestView
+}
+
+func sharedHeadConfirmationViewFrom(outcome statusresult.ThawApprovalOutcome, repositoryID int64, pullRequestIndex int, targetBranch, reason string) sharedHeadConfirmationView {
+	view := sharedHeadConfirmationView{
+		RepositoryID:     repositoryID,
+		PullRequestIndex: pullRequestIndex,
+		TargetBranch:     targetBranch,
+		Reason:           reason,
+		AffectedCount:    len(outcome.AffectedPullRequests),
+	}
+	if outcome.Confirmation != nil {
+		view.HeadSHA = outcome.Confirmation.HeadSHA
+		view.AffectedSignature = outcome.Confirmation.AffectedSignature
+	}
+	view.ShortHeadSHA = shortHeadSHA(view.HeadSHA)
+	for _, pr := range outcome.AffectedPullRequests {
+		view.AffectedPullRequests = append(view.AffectedPullRequests, sharedHeadAffectedPullRequestView{Index: pr.Index, Title: pr.Title, TargetBranch: pr.TargetBranch, ShortHeadSHA: shortHeadSHA(pr.HeadSHA)})
+	}
+	return view
+}
+
+func shortHeadSHA(sha string) string {
+	if len(sha) > 10 {
+		return sha[:10]
+	}
+	return sha
 }
 
 func (s *Server) handlePublications(w http.ResponseWriter, r *http.Request) {
@@ -1868,6 +1933,33 @@ func systemAuditEventViewForEvent(repositoriesByID map[int64]domain.Repository, 
 		view.Summary = auditRepositoryLabel(view.Repository, details) + " PR #" + auditDetailOrDash(details, "pull_request_index")
 		view.Detail = "Head " + auditDetailOrDash(details, "head_sha") + " on " + auditDetailOrDash(details, "target_branch") + " — " + auditDetailOrDash(details, "reason")
 		view.StateClass = "ok"
+	case audit.ActionThawExceptionSharedHeadApproved:
+		created, createdCount, createdOK := auditPullRequestIndexList(details, "created_pull_request_indexes")
+		alreadyCovered, alreadyCoveredCount, alreadyCoveredOK := auditPullRequestIndexList(details, "already_covered_pull_request_indexes")
+		declaredCreatedCount, declaredCreatedOK := auditNonnegativeInt(details, "created_pull_request_count")
+		declaredCoveredCount, declaredCoveredOK := auditNonnegativeInt(details, "already_covered_pull_request_count")
+		headSHA, headOK := auditHeadSHA(details, "head_sha")
+		reason, reasonOK := auditTextDetail(details, "reason", 500)
+		repositoryLabel := auditSharedHeadRepositoryLabel(view.Repository, details)
+		if !createdOK || !alreadyCoveredOK || !declaredCreatedOK || !declaredCoveredOK || !headOK || !reasonOK || declaredCreatedCount != createdCount || declaredCoveredCount != alreadyCoveredCount || createdCount+alreadyCoveredCount == 0 {
+			view.Label = "Shared-head confirmation recorded"
+			view.Summary = repositoryLabel
+			view.Detail = "Approval details unavailable"
+			view.StateClass = "warning"
+			break
+		}
+		if createdCount == 0 {
+			view.Label = "Shared head already covered"
+			view.Summary = repositoryLabel + " · Active exceptions: " + alreadyCovered
+		} else {
+			view.Label = "Shared-head thaw approved"
+			view.Summary = repositoryLabel + " · New exceptions: " + created
+			if alreadyCoveredCount > 0 {
+				view.Summary += " · Already covered: " + alreadyCovered
+			}
+		}
+		view.Detail = "Head " + headSHA + " — Confirmation reason: " + reason
+		view.StateClass = "ok"
 	default:
 		return systemAuditEventView{}, false
 	}
@@ -1877,6 +1969,78 @@ func systemAuditEventViewForEvent(repositoriesByID map[int64]domain.Repository, 
 func auditDetailInt64(details map[string]string, key string) (int64, bool) {
 	value, err := strconv.ParseInt(strings.TrimSpace(details[key]), 10, 64)
 	return value, err == nil && value > 0
+}
+
+func auditNonnegativeInt(details map[string]string, key string) (int, bool) {
+	raw, exists := details[key]
+	if !exists {
+		return 0, false
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	return value, err == nil && value >= 0
+}
+
+func auditPullRequestIndexList(details map[string]string, key string) (string, int, bool) {
+	raw, exists := details[key]
+	if !exists {
+		return "", 0, false
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", 0, true
+	}
+	parts := strings.Split(raw, ",")
+	labels := make([]string, 0, len(parts))
+	seen := make(map[int]struct{}, len(parts))
+	for _, part := range parts {
+		index, err := strconv.Atoi(strings.TrimSpace(part))
+		if err != nil || index <= 0 || index > 1_000_000 {
+			return "", 0, false
+		}
+		if _, exists := seen[index]; exists {
+			return "", 0, false
+		}
+		seen[index] = struct{}{}
+		labels = append(labels, "#"+strconv.Itoa(index))
+	}
+	return strings.Join(labels, ", "), len(labels), true
+}
+
+func auditTextDetail(details map[string]string, key string, maxLength int) (string, bool) {
+	raw, exists := details[key]
+	value := strings.TrimSpace(raw)
+	if !exists || value == "" || len(value) > maxLength {
+		return "", false
+	}
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return "", false
+		}
+	}
+	return value, true
+}
+
+func auditHeadSHA(details map[string]string, key string) (string, bool) {
+	value, ok := auditTextDetail(details, key, 64)
+	if !ok || len(value) < 6 {
+		return "", false
+	}
+	for _, r := range value {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') && (r < 'A' || r > 'F') {
+			return "", false
+		}
+	}
+	return value, true
+}
+
+func auditSharedHeadRepositoryLabel(repo domain.Repository, details map[string]string) string {
+	if repo.ID > 0 {
+		return repo.FullName()
+	}
+	if repositoryID, ok := auditDetailInt64(details, "repository_id"); ok {
+		return "Repository #" + strconv.FormatInt(repositoryID, 10)
+	}
+	return "Repository"
 }
 
 func auditRepositoryLabel(repo domain.Repository, details map[string]string) string {
@@ -2239,8 +2403,8 @@ func (s *Server) renderScheduledFreezes(w http.ResponseWriter, repositories []do
 	})
 }
 
-func (s *Server) renderDecisions(w http.ResponseWriter, repositories []domain.Repository, results []statusResultView, formError string, session sessionState) {
-	s.render(w, decisionsTemplate, map[string]any{
+func (s *Server) renderDecisions(w http.ResponseWriter, repositories []domain.Repository, results []statusResultView, formError string, session sessionState, confirmations ...sharedHeadConfirmationView) {
+	data := map[string]any{
 		"AppName":         s.cfg.AppName,
 		"ActivePage":      "thaws",
 		"CurrentUser":     currentUserFromSession(session),
@@ -2249,7 +2413,11 @@ func (s *Server) renderDecisions(w http.ResponseWriter, repositories []domain.Re
 		"FormError":       formError,
 		"CSRFToken":       session.CSRFToken,
 		"RequiredContext": domain.RequiredStatusContext,
-	})
+	}
+	if len(confirmations) > 0 {
+		data["SharedHeadConfirmation"] = confirmations[0]
+	}
+	s.render(w, decisionsTemplate, data)
 }
 
 func (s *Server) renderUsers(w http.ResponseWriter, users []auth.User, formError string, selectedRoles auth.RoleSet, session sessionState) {
@@ -3470,6 +3638,59 @@ const decisionsTemplate = pageHead + `
 
     {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
 
+    {{ with .SharedHeadConfirmation }}
+    <section class="tg-panel tg-shared-head-panel" aria-labelledby="tg-shared-head-heading">
+      <div class="tg-panel-head tg-panel-head-stacked">
+        <div class="tg-thaw-panel-title">
+          <span class="tg-thaw-panel-icon tg-shared-head-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-warning"></use></svg></span>
+          <div>
+            <h2 id="tg-shared-head-heading">These pull requests share one commit SHA</h2>
+            <p class="tg-panel-subtitle">Forgejo applies commit statuses to the shared SHA, so approving this thaw will affect every pull request listed below.</p>
+          </div>
+        </div>
+      </div>
+      <p class="tg-warning-callout tg-shared-head-callout"><span aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-warning"></use></svg></span><span>Nothing has been approved yet. Thawguard paused this request before recording any exception or publishing any status for shared head <code>{{ .ShortHeadSHA }}</code>.</span></p>
+      {{ $selected := .PullRequestIndex }}
+      <div class="tg-table-wrap">
+        <table class="tg-data-table tg-shared-head-table">
+          <thead><tr><th>Pull request</th><th>Title</th><th>Target branch</th><th>Head SHA</th></tr></thead>
+          <tbody>
+          {{ range .AffectedPullRequests }}
+            <tr>
+              <td class="tg-shared-head-index">#{{ .Index }}{{ if eq .Index $selected }} <span class="tg-badge tg-badge-info">your selection</span>{{ end }}</td>
+              <td class="tg-shared-head-title">{{ .Title }}</td>
+              <td><code class="tg-branch">{{ .TargetBranch }}</code></td>
+              <td><code>{{ .ShortHeadSHA }}</code></td>
+            </tr>
+          {{ end }}
+          </tbody>
+        </table>
+      </div>
+      {{ if $.CurrentUser.CanThaw }}
+      <form method="post" action="/decisions" class="tg-shared-head-confirm-form">
+        <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+        <input type="hidden" name="repository_id" value="{{ .RepositoryID }}">
+        <input type="hidden" name="pull_request_index" value="{{ .PullRequestIndex }}">
+        <input type="hidden" name="target_branch" value="{{ .TargetBranch }}">
+        <input type="hidden" name="reason" value="{{ .Reason }}">
+        <input type="hidden" name="confirm_shared_head" value="true">
+        <input type="hidden" name="confirmed_head_sha" value="{{ .HeadSHA }}">
+        <input type="hidden" name="confirmed_affected_signature" value="{{ .AffectedSignature }}">
+        <p class="tg-muted">Approving publishes one SHA-scoped <code>{{ $.RequiredContext }}</code> status that applies to all {{ .AffectedCount }} pull requests above. Thawguard refreshes the forge state first; if the head SHA or affected set changed, it asks for confirmation again.</p>
+        <div class="tg-form-actions">
+          <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/decisions">Cancel</a>
+          <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg>Approve thaw for all {{ .AffectedCount }} PRs</button>
+        </div>
+      </form>
+      {{ else }}
+      <div class="tg-empty-row">
+        <strong>Read-only thaw access</strong>
+        <span>Explicit thaw approver role is required to confirm a shared-head thaw.</span>
+      </div>
+      {{ end }}
+    </section>
+    {{ end }}
+
     <section class="tg-thaw-workbench" aria-label="Approve a thaw exception">
       <section class="tg-panel tg-thaw-form-panel">
         <div class="tg-panel-head tg-panel-head-stacked">
@@ -3539,8 +3760,8 @@ const decisionsTemplate = pageHead + `
         <ul class="tg-eligibility-list">
           <li><span class="tg-event-ok"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-check"></use></svg></span><span>Repository, PR number, target branch, and reason are captured for the approval.</span></li>
           <li><span class="tg-event-ok"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-check"></use></svg></span><span>The current PR head SHA is fetched from the configured Forgejo/Codeberg repository.</span></li>
-          <li><span class="tg-event-ok"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-check"></use></svg></span><span>The thaw applies to one PR and one head SHA only.</span></li>
-          <li><span class="tg-event-fail"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-warning"></use></svg></span><span>Another open PR with the same head SHA still blocks the thaw status.</span></li>
+          <li><span class="tg-event-ok"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-check"></use></svg></span><span>A unique head SHA scopes the approval to this one PR.</span></li>
+          <li><span class="tg-event-fail"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-warning"></use></svg></span><span>If other open PRs share the head SHA, Thawguard pauses and requires explicit confirmation for every affected PR.</span></li>
         </ul>
         <div class="tg-review-actions">
           <span class="tg-caps">Reviewer decision</span>

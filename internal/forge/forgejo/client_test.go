@@ -169,13 +169,32 @@ func TestClientListOpenPullRequestsPaginatesBeforeClientSideBranchFilter(t *test
 	}
 }
 
+func TestClientListOpenPullRequestsAllowsRepositoryWideListing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("base"); got != "" {
+			t.Fatalf("expected no base filter, got %q", got)
+		}
+		writePullRequests(t, w, []pullRequestResponse{
+			newPullRequestResponse(1, "Main", "open", "main", "abc123", ""),
+			newPullRequestResponse(2, "Release", "open", "release", "abc123", ""),
+		})
+	}))
+	defer server.Close()
+	client := New(server.URL, "token")
+
+	prs, err := client.ListOpenPullRequests(context.Background(), "owner", "repo", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prs) != 2 || prs[0].TargetBranch != "main" || prs[1].TargetBranch != "release" {
+		t.Fatalf("expected all open branches, got %+v", prs)
+	}
+}
+
 func TestClientRejectsInvalidPullRequestList(t *testing.T) {
 	client := New("https://codeberg.org", "token")
 	if _, err := client.ListOpenPullRequests(context.Background(), "", "repo", "main"); err == nil {
 		t.Fatal("expected missing owner error")
-	}
-	if _, err := client.ListOpenPullRequests(context.Background(), "owner", "repo", ""); err == nil {
-		t.Fatal("expected missing target branch error")
 	}
 }
 

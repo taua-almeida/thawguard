@@ -756,6 +756,34 @@ code,
   height: 18px;
 }
 
+.tg-shared-head-panel {
+  border-color: var(--tg-warning);
+}
+
+.tg-shared-head-icon {
+  color: var(--tg-warning);
+  background: var(--tg-warning-bg);
+}
+
+.tg-shared-head-callout {
+  margin: 0 20px 14px;
+}
+
+.tg-shared-head-table td {
+  overflow-wrap: anywhere;
+}
+
+.tg-shared-head-confirm-form {
+  display: grid;
+  gap: 12px;
+  padding: 14px 20px 18px;
+  border-top: 1px solid var(--tg-border);
+}
+
+.tg-shared-head-confirm-form p {
+  margin: 0;
+}
+
 .tg-freeze-form-footer,
 .tg-form-footer {
   display: flex;

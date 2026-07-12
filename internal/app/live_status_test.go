@@ -9,8 +9,10 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
+	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/config"
 	"github.com/taua-almeida/thawguard/internal/db"
 	"github.com/taua-almeida/thawguard/internal/domain"
@@ -116,7 +118,7 @@ func TestThawApprovalApprovesAndPublishesCurrentPullRequestHead(t *testing.T) {
 		t.Fatal(err)
 	}
 	pullRequests := pullrequest.NewStore(database)
-	thaws := thawexception.NewStore(database)
+	thaws := thawexception.NewService(database)
 	statuses := statusresult.NewServiceWithThawExceptions(statusresult.NewStore(database), freeze.NewService(database), thaws, pullRequests)
 	publications := statuspublication.NewStore(database)
 	publisher, err := statusPublisherFromConfig(config.Config{LiveStatusRepos: "taua-almeida/thawguard"}, statuspublication.DeliveryModeForgejoStatus, publications, repository.NewStore(database), repositorySetup)
@@ -124,12 +126,16 @@ func TestThawApprovalApprovesAndPublishesCurrentPullRequestHead(t *testing.T) {
 		t.Fatal(err)
 	}
 	syncer := newForgeOpenPullRequestSyncer(repository.NewStore(database), repositorySetup, pullRequests, []string{"taua-almeida/thawguard"}, forgejoPullRequestClientForRepository)
-	approvals := newThawApprovalService(repository.NewStore(database), repositorySetup, pullRequests, thaws, statuses, publisher, syncer, []string{"taua-almeida/thawguard"}, forgejoThawApprovalClientForRepository)
+	approvals := newThawApprovalService(repository.NewStore(database), repositorySetup, pullRequests, thaws, freeze.NewService(database), statuses, publisher, syncer, []string{"taua-almeida/thawguard"}, forgejoThawApprovalClientForRepository)
 
-	result, err := approvals.ApproveThaw(ctx, statusresult.ThawApprovalParams{RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", Reason: "production fix"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+	outcome, err := approvals.ApproveThaw(ctx, statusresult.ThawApprovalParams{RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", Reason: "production fix"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
 	if err != nil {
 		t.Fatal(err)
 	}
+	if outcome.Result == nil || outcome.ConfirmationRequired {
+		t.Fatalf("expected immediate unique-head approval, got %+v", outcome)
+	}
+	result := *outcome.Result
 	if result.State != domain.CommitStatusSuccess || result.HeadSHA != "abc123" || result.PullRequestIndex != 42 {
 		t.Fatalf("expected thaw success for current head, got %+v", result)
 	}
@@ -146,7 +152,7 @@ func TestThawApprovalApprovesAndPublishesCurrentPullRequestHead(t *testing.T) {
 	}
 }
 
-func TestThawApprovalPublishesFailureWhenDuplicateOpenHeadExists(t *testing.T) {
+func TestThawApprovalRequiresThenAppliesSharedHeadConfirmation(t *testing.T) {
 	ctx := context.Background()
 	var postedStatus map[string]string
 	forge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -180,7 +186,7 @@ func TestThawApprovalPublishesFailureWhenDuplicateOpenHeadExists(t *testing.T) {
 		t.Fatal(err)
 	}
 	pullRequests := pullrequest.NewStore(database)
-	thaws := thawexception.NewStore(database)
+	thaws := thawexception.NewService(database)
 	statuses := statusresult.NewServiceWithThawExceptions(statusresult.NewStore(database), freeze.NewService(database), thaws, pullRequests)
 	publications := statuspublication.NewStore(database)
 	publisher, err := statusPublisherFromConfig(config.Config{LiveStatusRepos: "taua-almeida/thawguard"}, statuspublication.DeliveryModeForgejoStatus, publications, repository.NewStore(database), repositorySetup)
@@ -188,17 +194,86 @@ func TestThawApprovalPublishesFailureWhenDuplicateOpenHeadExists(t *testing.T) {
 		t.Fatal(err)
 	}
 	syncer := newForgeOpenPullRequestSyncer(repository.NewStore(database), repositorySetup, pullRequests, []string{"taua-almeida/thawguard"}, forgejoPullRequestClientForRepository)
-	approvals := newThawApprovalService(repository.NewStore(database), repositorySetup, pullRequests, thaws, statuses, publisher, syncer, []string{"taua-almeida/thawguard"}, forgejoThawApprovalClientForRepository)
+	approvals := newThawApprovalService(repository.NewStore(database), repositorySetup, pullRequests, thaws, freeze.NewService(database), statuses, publisher, syncer, []string{"taua-almeida/thawguard"}, forgejoThawApprovalClientForRepository)
 
-	result, err := approvals.ApproveThaw(ctx, statusresult.ThawApprovalParams{RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", Reason: "production fix"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+	outcome, err := approvals.ApproveThaw(ctx, statusresult.ThawApprovalParams{RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", Reason: "production fix"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.State != domain.CommitStatusFailure || result.Description != "Thaw blocked because another open PR shares this head SHA" {
-		t.Fatalf("expected duplicate-head failure, got %+v", result)
+	if !outcome.ConfirmationRequired || outcome.Result != nil || len(outcome.AffectedPullRequests) != 2 {
+		t.Fatalf("expected shared-head confirmation requirement, got %+v", outcome)
 	}
-	if postedStatus["context"] != domain.RequiredStatusContext || postedStatus["state"] != string(domain.CommitStatusFailure) {
+	for i, wantIndex := range []int{42, 43} {
+		affected := outcome.AffectedPullRequests[i]
+		if affected.Index != wantIndex || affected.Title == "" || affected.TargetBranch != "main" || affected.URL == "" || affected.HeadSHA != "abc123" {
+			t.Fatalf("unexpected sanitized affected PR: %+v", affected)
+		}
+	}
+	assertAppTableCount(t, database, "thaw_exceptions", 0)
+	assertNoThawApprovalAuditEvents(t, ctx, database)
+	if len(postedStatus) != 0 {
+		t.Fatalf("expected no status publication before confirmation, got %+v", postedStatus)
+	}
+
+	confirmed, err := approvals.ApproveThaw(ctx, statusresult.ThawApprovalParams{
+		RepositoryID:     repo.ID,
+		PullRequestIndex: 42,
+		TargetBranch:     "main",
+		Reason:           "production fix",
+		Confirmation:     outcome.Confirmation,
+	}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if confirmed.Result == nil || confirmed.ConfirmationRequired || confirmed.Result.State != domain.CommitStatusSuccess {
+		t.Fatalf("expected confirmed shared-head success, got %+v", confirmed)
+	}
+	assertAppTableCount(t, database, "thaw_exceptions", 2)
+	events, err := audit.NewStore(database).List(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharedApprovals := 0
+	for _, event := range events {
+		if event.Action == audit.ActionThawExceptionApproved {
+			t.Fatalf("shared approval must not record a unique approval event: %+v", event)
+		}
+		if event.Action == audit.ActionThawExceptionSharedHeadApproved {
+			sharedApprovals++
+			if !strings.Contains(event.DetailsJSON, `"affected_pull_request_indexes":"42,43"`) || strings.Contains(event.DetailsJSON, "live-status-token-123") {
+				t.Fatalf("unexpected shared approval audit details: %s", event.DetailsJSON)
+			}
+		}
+	}
+	if sharedApprovals != 1 {
+		t.Fatalf("expected one shared approval audit event, got %d", sharedApprovals)
+	}
+	if postedStatus["context"] != domain.RequiredStatusContext || postedStatus["state"] != string(domain.CommitStatusSuccess) {
 		t.Fatalf("unexpected posted status %+v", postedStatus)
+	}
+}
+
+func assertAppTableCount(t *testing.T, database *sql.DB, table string, want int) {
+	t.Helper()
+	var got int
+	if err := database.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("expected %d rows in %s, got %d", want, table, got)
+	}
+}
+
+func assertNoThawApprovalAuditEvents(t *testing.T, ctx context.Context, database *sql.DB) {
+	t.Helper()
+	events, err := audit.NewStore(database).List(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Action == audit.ActionThawExceptionApproved || event.Action == audit.ActionThawExceptionSharedHeadApproved {
+			t.Fatalf("expected no thaw approval audit event, got %+v", event)
+		}
 	}
 }
 

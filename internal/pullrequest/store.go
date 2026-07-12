@@ -145,19 +145,23 @@ ORDER BY pull_request_index`, repositoryID, targetBranch)
 	return prs, nil
 }
 
-func (s *Store) MarkAbsentOpenByTargetBranchClosed(ctx context.Context, repositoryID int64, targetBranch string, openIndexes []int) (int64, error) {
+func (s *Store) MarkAbsentOpenClosed(ctx context.Context, repositoryID int64, targetBranch string, openIndexes []int) (int64, error) {
 	if s == nil || s.db == nil {
 		return 0, errors.New("pull request store has no database")
 	}
 	targetBranch = strings.TrimSpace(targetBranch)
-	if repositoryID <= 0 || targetBranch == "" {
-		return 0, ValidationError{Message: "missing required pull request branch reconciliation fields"}
+	if repositoryID <= 0 {
+		return 0, ValidationError{Message: "missing required pull request repository reconciliation field"}
 	}
-	args := []any{s.now().UTC().Format(time.RFC3339Nano), repositoryID, targetBranch}
+	args := []any{s.now().UTC().Format(time.RFC3339Nano), repositoryID}
 	query := `
 UPDATE pull_request_cache
 SET state = 'closed', updated_from_forge_at = ?
-WHERE repository_id = ? AND target_branch = ? AND state = 'open'`
+WHERE repository_id = ? AND state = 'open'`
+	if targetBranch != "" {
+		query += " AND target_branch = ?"
+		args = append(args, targetBranch)
+	}
 	if len(openIndexes) > 0 {
 		placeholders := make([]string, 0, len(openIndexes))
 		for _, index := range openIndexes {

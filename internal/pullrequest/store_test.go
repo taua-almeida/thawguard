@@ -104,7 +104,7 @@ func TestStoreMarksAbsentOpenPullRequestsClosedByTargetBranch(t *testing.T) {
 		}
 	}
 
-	closed, err := store.MarkAbsentOpenByTargetBranchClosed(ctx, repo.ID, " main ", []int{2})
+	closed, err := store.MarkAbsentOpenClosed(ctx, repo.ID, " main ", []int{2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,6 +124,37 @@ func TestStoreMarksAbsentOpenPullRequestsClosedByTargetBranch(t *testing.T) {
 	}
 	if len(releasePRs) != 1 || releasePRs[0].Index != 3 {
 		t.Fatalf("expected other branches to remain open, got %+v", releasePRs)
+	}
+}
+
+func TestStoreMarksAbsentOpenPullRequestsClosedAcrossRepository(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	store := NewStore(database)
+	for _, pr := range []domain.PullRequest{
+		{RepositoryID: repo.ID, Index: 1, State: "open", TargetBranch: "main", HeadSHA: "abc123"},
+		{RepositoryID: repo.ID, Index: 2, State: "open", TargetBranch: "release", HeadSHA: "def456"},
+		{RepositoryID: repo.ID, Index: 3, State: "open", TargetBranch: "hotfix", HeadSHA: "bbb123"},
+	} {
+		if _, err := store.Upsert(ctx, pr); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	closed, err := store.MarkAbsentOpenClosed(ctx, repo.ID, "", []int{2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closed != 2 {
+		t.Fatalf("expected two stale open PRs to close, got %d", closed)
+	}
+	open, err := store.ListOpenByHead(ctx, repo.ID, "def456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 1 || open[0].Index != 2 {
+		t.Fatalf("expected only repository-wide current PR to remain open, got %+v", open)
 	}
 }
 

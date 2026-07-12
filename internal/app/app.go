@@ -91,8 +91,8 @@ func (a *App) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	freezeStoreForWeb := newFreezeRecomputingStore(freezeStore, pullRequestStore, statusDecisionStore, statusPublisher, openPullRequestSyncer)
-	thawApprovalStore := newThawApprovalService(repositoryStore, repositorySetup, pullRequestStore, thawExceptionStore, statusDecisionStore, statusPublisher, openPullRequestSyncer, liveStatusRepositories(a.cfg.LiveStatusRepos), forgejoThawApprovalClientForRepository)
+	freezeStoreForWeb := newFreezeRecomputingStore(freezeStore, pullRequestStore, statusDecisionStore, statusPublisher)
+	thawApprovalStore := newThawApprovalService(repositoryStore, repositorySetup, pullRequestStore, thawExceptionStore, freezeStore, statusDecisionStore, statusPublisher, openPullRequestSyncer, liveStatusRepositories(a.cfg.LiveStatusRepos), forgejoThawApprovalClientForRepository)
 	webhookDeliveryStore := webhook.NewDeliveryStore(database)
 	pullRequestWebhookProcessor := webhook.NewPullRequestProcessor(repositoryStore, pullRequestStore, statusDecisionStore, statusPublisher)
 	server := &http.Server{
@@ -205,9 +205,7 @@ func statusPublisherFromConfig(cfg config.Config, mode string, publications *sta
 
 func openPullRequestSyncerFromConfig(cfg config.Config, mode string, repositories *repository.Store, pullRequests *pullrequest.Store, repositorySetup *repositorysetup.Service, auditStore *audit.Store) (openPullRequestSyncer, error) {
 	switch mode {
-	case statuspublication.AttemptModeDryRun:
-		return nil, nil
-	case statuspublication.DeliveryModeForgejoStatus:
+	case statuspublication.AttemptModeDryRun, statuspublication.DeliveryModeForgejoStatus:
 		return newForgeOpenPullRequestSyncer(repositories, repositorySetup, pullRequests, liveStatusRepositories(cfg.LiveStatusRepos), forgejoPullRequestClientForRepository, auditStore), nil
 	default:
 		return nil, fmt.Errorf("unsupported status publisher mode %q", mode)

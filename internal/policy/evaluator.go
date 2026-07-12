@@ -7,11 +7,12 @@ import (
 )
 
 type Input struct {
-	PullRequest      domain.PullRequest
-	ActiveFreeze     *domain.BranchFreeze
-	ThawException    *domain.ThawException
-	OpenPullRequests []domain.PullRequest
-	Now              time.Time
+	PullRequest        domain.PullRequest
+	ActiveFreeze       *domain.BranchFreeze
+	ThawException      *domain.ThawException
+	OpenPullRequests   []domain.PullRequest
+	SharedHeadApproved bool
+	Now                time.Time
 }
 
 type Decision struct {
@@ -38,7 +39,7 @@ func Evaluate(input Input) Decision {
 	}
 
 	if thaw := input.ThawException; thaw != nil && thawMatchesPullRequest(*thaw, pr) && thaw.IsActive(now) {
-		if duplicate := duplicateOpenHead(pr, input.OpenPullRequests); duplicate != nil {
+		if duplicate := duplicateOpenHead(pr, input.OpenPullRequests); duplicate != nil && !input.SharedHeadApproved {
 			return failure("Thaw blocked because another open PR shares this head SHA", "duplicate_head_sha")
 		}
 		return success("PR is explicitly thawed during an active freeze", "thawed_exception")
@@ -60,13 +61,13 @@ func thawMatchesPullRequest(thaw domain.ThawException, pr domain.PullRequest) bo
 func duplicateOpenHead(pr domain.PullRequest, openPRs []domain.PullRequest) *domain.PullRequest {
 	for i := range openPRs {
 		other := openPRs[i]
-		if other.ID == pr.ID {
+		if other.RepositoryID == pr.RepositoryID && other.Index == pr.Index {
 			continue
 		}
 		if !other.IsOpen() {
 			continue
 		}
-		if other.RepositoryID == pr.RepositoryID && other.TargetBranch == pr.TargetBranch && other.HeadSHA == pr.HeadSHA {
+		if other.RepositoryID == pr.RepositoryID && other.HeadSHA == pr.HeadSHA {
 			return &other
 		}
 	}

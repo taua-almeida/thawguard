@@ -1338,6 +1338,186 @@ func TestCreateDecisionPostsToStore(t *testing.T) {
 	}
 }
 
+func TestCreateDecisionParsesSharedHeadConfirmation(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"}
+	store := &fakeStatusDecisionStore{}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, StatusDecisionStore: store})
+	form := decisionCreateForm()
+	form.Set("confirm_shared_head", "true")
+	form.Set("confirmed_head_sha", "abc123")
+	form.Set("confirmed_affected_signature", strings.Repeat("a", 64))
+	cookie, csrfToken := getDecisionForm(t, server)
+	form.Set(csrfFormField, csrfToken)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/decisions", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusSeeOther || len(store.runs) != 1 {
+		t.Fatalf("expected confirmed decision redirect and one run, status=%d runs=%d", recorder.Code, len(store.runs))
+	}
+	confirmation := store.runs[0].Confirmation
+	if confirmation == nil || confirmation.HeadSHA != "abc123" || confirmation.AffectedSignature != strings.Repeat("a", 64) {
+		t.Fatalf("unexpected shared-head confirmation params: %+v", confirmation)
+	}
+}
+
+func TestCreateDecisionReturnsConflictWhenSharedHeadConfirmationIsRequired(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"}
+	store := &fakeStatusDecisionStore{outcome: statusresult.ThawApprovalOutcome{
+		ConfirmationRequired: true,
+		Confirmation:         &statusresult.ThawApprovalConfirmation{HeadSHA: "abc123", AffectedSignature: strings.Repeat("a", 64)},
+		AffectedPullRequests: []statusresult.ThawApprovalPullRequest{
+			{Index: 42, Title: "Release fix", TargetBranch: "main", URL: "https://codeberg.org/example/repo/pulls/42", HeadSHA: "abc123"},
+			{Index: 43, Title: "Other fix", TargetBranch: "main", URL: "https://codeberg.org/example/repo/pulls/43", HeadSHA: "abc123"},
+		},
+	}}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, StatusDecisionStore: store})
+	form := decisionCreateForm()
+	cookie, csrfToken := getDecisionForm(t, server)
+	form.Set(csrfFormField, csrfToken)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/decisions", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusConflict || len(store.runs) != 1 {
+		t.Fatalf("expected confirmation-required conflict and one run, status=%d runs=%d", recorder.Code, len(store.runs))
+	}
+}
+
+func sharedHeadOutcome(titles ...string) statusresult.ThawApprovalOutcome {
+	outcome := statusresult.ThawApprovalOutcome{
+		ConfirmationRequired: true,
+		Confirmation:         &statusresult.ThawApprovalConfirmation{HeadSHA: "abc123", AffectedSignature: strings.Repeat("a", 64)},
+	}
+	for i, title := range titles {
+		outcome.AffectedPullRequests = append(outcome.AffectedPullRequests, statusresult.ThawApprovalPullRequest{Index: 42 + i, Title: title, TargetBranch: "main", URL: "https://codeberg.org/example/repo/pulls/42", HeadSHA: "abc123"})
+	}
+	return outcome
+}
+
+func postDecisionForm(t *testing.T, server *Server, form url.Values) *httptest.ResponseRecorder {
+	t.Helper()
+	cookie, csrfToken := getDecisionForm(t, server)
+	form.Set(csrfFormField, csrfToken)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/decisions", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+	return recorder
+}
+
+func TestCreateDecisionSharedHeadConflictRendersConfirmationPanel(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"}
+	store := &fakeStatusDecisionStore{outcome: sharedHeadOutcome("Release fix", "Other fix")}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, StatusDecisionStore: store})
+
+	recorder := postDecisionForm(t, server, decisionCreateForm())
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("expected conflict status, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{
+		"These pull requests share one commit SHA",
+		"Forgejo applies commit statuses to the shared SHA, so approving this thaw will affect every pull request listed below.",
+		"Nothing has been approved yet",
+		"#42", "Release fix", "#43", "Other fix", "main",
+		"Approve thaw for all 2 PRs",
+		`name="repository_id" value="1"`,
+		`name="pull_request_index" value="42"`,
+		`name="target_branch" value="main"`,
+		`name="reason" value="production fix"`,
+		`name="confirm_shared_head" value="true"`,
+		`name="confirmed_head_sha" value="abc123"`,
+		`name="confirmed_affected_signature" value="` + strings.Repeat("a", 64) + `"`,
+		`href="/decisions">Cancel</a>`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected confirmation panel to contain %q, got %q", want, body)
+		}
+	}
+	if token := csrfTokenFromBody(t, body); token == "" {
+		t.Fatal("expected CSRF token in confirmation form")
+	}
+	if strings.Contains(body, `name="affected`) {
+		t.Fatal("expected no client-submitted affected-PR form inputs")
+	}
+	if strings.Contains(body, strings.Repeat("a", 64)+"</") || strings.Contains(body, "<code>"+strings.Repeat("a", 64)) {
+		t.Fatal("expected affected signature to stay out of visible page content")
+	}
+}
+
+func TestCreateDecisionSharedHeadReconfirmationKeepsOriginalValues(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"}
+	outcome := sharedHeadOutcome("Release fix", "Other fix", "Third fix")
+	outcome.Confirmation.HeadSHA = "def456"
+	store := &fakeStatusDecisionStore{outcome: outcome}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, StatusDecisionStore: store})
+	form := decisionCreateForm()
+	form.Set("confirm_shared_head", "true")
+	form.Set("confirmed_head_sha", "abc123")
+	form.Set("confirmed_affected_signature", strings.Repeat("b", 64))
+
+	recorder := postDecisionForm(t, server, form)
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("expected conflict status for stale confirmation, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{
+		"Approve thaw for all 3 PRs",
+		`name="confirmed_head_sha" value="def456"`,
+		`name="confirmed_affected_signature" value="` + strings.Repeat("a", 64) + `"`,
+		`name="reason" value="production fix"`,
+		`name="pull_request_index" value="42"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected refreshed confirmation to contain %q, got %q", want, body)
+		}
+	}
+}
+
+func TestCreateDecisionSharedHeadConfirmationEscapesTitles(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"}
+	store := &fakeStatusDecisionStore{outcome: sharedHeadOutcome(`<script>alert("pwn")</script>`, "Other fix")}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, StatusDecisionStore: store})
+
+	recorder := postDecisionForm(t, server, decisionCreateForm())
+
+	body := recorder.Body.String()
+	if strings.Contains(body, `<script>alert(`) {
+		t.Fatal("expected PR title to be HTML-escaped")
+	}
+	if !strings.Contains(body, "&lt;script&gt;") {
+		t.Fatalf("expected escaped PR title in body, got %q", body)
+	}
+}
+
+func TestRenderDecisionsSharedHeadReadOnlyUserGetsNoConfirmationForm(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, StatusDecisionStore: &fakeStatusDecisionStore{}})
+	confirmation := sharedHeadConfirmationViewFrom(sharedHeadOutcome("Release fix", "Other fix"), repo.ID, 42, "main", "production fix")
+	session := sessionState{CSRFToken: "viewer-token", Roles: auth.RoleSet{auth.RoleAdmin}}
+
+	recorder := httptest.NewRecorder()
+	server.renderDecisions(recorder, []domain.Repository{repo}, nil, "", session, confirmation)
+
+	body := recorder.Body.String()
+	if !strings.Contains(body, "These pull requests share one commit SHA") {
+		t.Fatalf("expected read-only user to still see the shared-head warning, got %q", body)
+	}
+	if strings.Contains(body, `name="confirm_shared_head"`) || strings.Contains(body, "Approve thaw for all") {
+		t.Fatal("expected no actionable confirmation form for read-only thaw access")
+	}
+}
+
 func TestCreateDecisionRejectsMissingCSRFSession(t *testing.T) {
 	store := &fakeStatusDecisionStore{}
 	server := NewServer(Config{AppName: "Thawguard", StatusDecisionStore: store})
@@ -1547,6 +1727,93 @@ func TestWebhooksPageShowsSystemActivityAndStatusAttempts(t *testing.T) {
 	}
 	if strings.Contains(body, "secret-token") || strings.Contains(body, "X-Hub-Signature") {
 		t.Fatalf("expected activity page not to render sensitive details, got %q", body)
+	}
+}
+
+func TestSystemAuditEventViewShowsTruthfulSharedHeadApproval(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard"}
+	repositories := map[int64]domain.Repository{repo.ID: repo}
+	for _, test := range []struct {
+		name        string
+		detailsJSON string
+		wantLabel   string
+		wantSummary string
+	}{
+		{
+			name:        "all newly created",
+			detailsJSON: `{"repository_id":"1","created_pull_request_indexes":"42,43","already_covered_pull_request_indexes":"","created_pull_request_count":"2","already_covered_pull_request_count":"0","head_sha":"abc123","reason":"production fix"}`,
+			wantLabel:   "Shared-head thaw approved",
+			wantSummary: "taua-almeida/thawguard · New exceptions: #42, #43",
+		},
+		{
+			name:        "mixed created and covered",
+			detailsJSON: `{"repository_id":"1","created_pull_request_indexes":"43","already_covered_pull_request_indexes":"42","created_pull_request_count":"1","already_covered_pull_request_count":"1","head_sha":"abc123","reason":"production fix"}`,
+			wantLabel:   "Shared-head thaw approved",
+			wantSummary: "taua-almeida/thawguard · New exceptions: #43 · Already covered: #42",
+		},
+		{
+			name:        "all already covered",
+			detailsJSON: `{"repository_id":"1","created_pull_request_indexes":"","already_covered_pull_request_indexes":"42,43","created_pull_request_count":"0","already_covered_pull_request_count":"2","head_sha":"abc123","reason":"confirmed shared impact"}`,
+			wantLabel:   "Shared head already covered",
+			wantSummary: "taua-almeida/thawguard · Active exceptions: #42, #43",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			view, ok := systemAuditEventViewForEvent(repositories, audit.Event{Action: audit.ActionThawExceptionSharedHeadApproved, DetailsJSON: test.detailsJSON})
+			if !ok {
+				t.Fatal("expected shared-head audit event to be allowlisted")
+			}
+			if view.Label != test.wantLabel || view.Summary != test.wantSummary {
+				t.Fatalf("unexpected shared-head view: %+v", view)
+			}
+			if !strings.Contains(view.Detail, "Head abc123 — Confirmation reason:") {
+				t.Fatalf("expected reason to be scoped to the confirmation, got %q", view.Detail)
+			}
+		})
+	}
+}
+
+func TestSystemAuditEventViewSharedHeadMalformedDetailsFailSafely(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard"}
+	repositories := map[int64]domain.Repository{repo.ID: repo}
+	for _, detailsJSON := range []string{
+		`{"repository_id":"1","raw":"raw-secret-marker"`,
+		`{"repository_id":"1","created_pull_request_indexes":"42","already_covered_pull_request_indexes":"","already_covered_pull_request_count":"0","head_sha":"abc123","reason":"raw-secret-marker"}`,
+		`{"repository_id":"1","created_pull_request_indexes":"42,raw-secret-marker","already_covered_pull_request_indexes":"","created_pull_request_count":"2","already_covered_pull_request_count":"0","head_sha":"abc123","reason":"production fix"}`,
+		`{"repository_id":"1","created_pull_request_indexes":"42","already_covered_pull_request_indexes":"","created_pull_request_count":"1","already_covered_pull_request_count":"0","head_sha":"raw-secret-marker","reason":"production fix"}`,
+	} {
+		view, ok := systemAuditEventViewForEvent(repositories, audit.Event{Action: audit.ActionThawExceptionSharedHeadApproved, DetailsJSON: detailsJSON})
+		if !ok {
+			t.Fatal("expected malformed shared-head event to remain allowlisted")
+		}
+		if view.Label != "Shared-head confirmation recorded" || (view.Summary != "taua-almeida/thawguard" && view.Summary != "Repository") || view.Detail != "Approval details unavailable" || view.StateClass != "warning" {
+			t.Fatalf("expected safe fallback view, got %+v", view)
+		}
+		visible := view.Label + view.Summary + view.Detail
+		if strings.Contains(visible, "raw-secret-marker") || strings.Contains(visible, detailsJSON) {
+			t.Fatalf("expected malformed/raw details to stay hidden, got %q", visible)
+		}
+	}
+}
+
+func TestWebhooksPageEscapesSharedHeadAuditDetails(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard"}
+	event := audit.Event{Action: audit.ActionThawExceptionSharedHeadApproved, DetailsJSON: `{"repository_id":"1","created_pull_request_indexes":"42,43","already_covered_pull_request_indexes":"","created_pull_request_count":"2","already_covered_pull_request_count":"0","head_sha":"abc123","reason":"fix <b>now</b>"}`}
+	server := NewServer(Config{
+		AppName:              "Thawguard",
+		RepositoryStore:      &fakeRepositoryStore{repositories: []domain.Repository{repo}},
+		WebhookDeliveryStore: &fakeWebhookDeliveryStore{},
+		AuditStore:           &fakeAuditStore{events: []audit.Event{event}},
+	})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/webhooks", nil))
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusOK || !strings.Contains(body, "fix &lt;b&gt;now&lt;/b&gt;") {
+		t.Fatalf("expected escaped shared-head reason, status=%d body=%q", recorder.Code, body)
+	}
+	if strings.Contains(body, "fix <b>now</b>") {
+		t.Fatalf("expected template escaping to prevent raw markup, got %q", body)
 	}
 }
 
@@ -2240,6 +2507,7 @@ type fakeStatusDecisionStore struct {
 	results []statusresult.Result
 	runs    []statusresult.ThawApprovalParams
 	actors  []domain.Actor
+	outcome statusresult.ThawApprovalOutcome
 	err     error
 	listErr error
 }
@@ -2254,19 +2522,22 @@ func (s *fakeStatusDecisionStore) ListRecent(ctx context.Context, limit int) ([]
 	return s.results, nil
 }
 
-func (s *fakeStatusDecisionStore) ApproveThaw(ctx context.Context, params statusresult.ThawApprovalParams, actor domain.Actor) (statusresult.Result, error) {
+func (s *fakeStatusDecisionStore) ApproveThaw(ctx context.Context, params statusresult.ThawApprovalParams, actor domain.Actor) (statusresult.ThawApprovalOutcome, error) {
 	if s.err != nil {
-		return statusresult.Result{}, s.err
+		return statusresult.ThawApprovalOutcome{}, s.err
 	}
 	s.runs = append(s.runs, params)
 	s.actors = append(s.actors, actor)
+	if s.outcome.ConfirmationRequired {
+		return s.outcome, nil
+	}
 	headSHA := params.HeadSHA
 	if headSHA == "" {
 		headSHA = "abc123"
 	}
 	result := statusresult.Result{ID: int64(len(s.results) + 1), RepositoryID: params.RepositoryID, PullRequestIndex: params.PullRequestIndex, TargetBranch: params.TargetBranch, HeadSHA: headSHA, Context: domain.RequiredStatusContext, State: domain.CommitStatusSuccess, Description: "PR is explicitly thawed during an active freeze", CreatedAt: time.Now().UTC()}
 	s.results = append(s.results, result)
-	return result, nil
+	return statusresult.ThawApprovalOutcome{Result: &result}, nil
 }
 
 type fakeStatusPublicationStore struct {

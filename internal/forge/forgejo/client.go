@@ -208,9 +208,6 @@ func validateListOpenPullRequests(owner string, repo string, targetBranch string
 	if strings.TrimSpace(repo) == "" {
 		missing = append(missing, "repository")
 	}
-	if strings.TrimSpace(targetBranch) == "" {
-		missing = append(missing, "target branch")
-	}
 	if len(missing) > 0 {
 		return fmt.Errorf("missing required pull request list fields: %s", strings.Join(missing, ", "))
 	}
@@ -248,7 +245,9 @@ func (c *Client) pullRequestsEndpoint(owner string, repo string, targetBranch st
 	endpoint := base.JoinPath("api", "v1", "repos", owner, repo, "pulls")
 	query := endpoint.Query()
 	query.Set("state", "open")
-	query.Set("base", strings.TrimSpace(targetBranch))
+	if targetBranch = strings.TrimSpace(targetBranch); targetBranch != "" {
+		query.Set("base", targetBranch)
+	}
 	query.Set("page", strconv.Itoa(page))
 	query.Set("limit", strconv.Itoa(limit))
 	endpoint.RawQuery = query.Encode()
@@ -293,7 +292,7 @@ func decodePullRequestsPage(resp *http.Response, targetBranch string) ([]domain.
 	}
 	prs := make([]domain.PullRequest, 0, len(payload))
 	for _, item := range payload {
-		if strings.TrimSpace(item.Base.Ref) != targetBranch {
+		if targetBranch != "" && strings.TrimSpace(item.Base.Ref) != targetBranch {
 			continue
 		}
 		pr := pullRequestFromResponse(item)

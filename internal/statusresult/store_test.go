@@ -247,6 +247,85 @@ func TestServiceRunForSharedHeadBlocksApprovedThawWithDuplicateOpenHead(t *testi
 	}
 }
 
+func TestServiceRunForSharedHeadAllowsExplicitlyApprovedFrozenPullRequests(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	freezeService := freeze.NewService(database)
+	if _, err := freezeService.CreateActive(ctx, freeze.CreateParams{RepositoryID: repo.ID, Branch: "main", Reason: "release"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); err != nil {
+		t.Fatal(err)
+	}
+	prStore := pullrequest.NewStore(database)
+	pr1, err := prStore.Upsert(ctx, domain.PullRequest{RepositoryID: repo.ID, Index: 1, State: "open", TargetBranch: "main", HeadSHA: "abc123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr2, err := prStore.Upsert(ctx, domain.PullRequest{RepositoryID: repo.ID, Index: 2, State: "open", TargetBranch: "main", HeadSHA: "abc123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	thawStore := thawexception.NewStore(database)
+	for _, pr := range []domain.PullRequest{pr1, pr2} {
+		if _, err := thawStore.Approve(ctx, thawexception.ApproveParams{RepositoryID: repo.ID, PullRequestIndex: pr.Index, TargetBranch: pr.TargetBranch, HeadSHA: pr.HeadSHA, Reason: "production fix"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := NewServiceWithThawExceptions(NewStore(database), freezeService, thawStore, prStore)
+
+	result, err := service.RunForSharedHead(ctx, []domain.PullRequest{pr1, pr2}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State != domain.CommitStatusSuccess || result.HeadSHA != "abc123" {
+		t.Fatalf("expected shared-head thaw success, got %+v", result)
+	}
+}
+
+func TestServiceRunForSharedHeadExpandsToOtherFrozenBranchesSharingSHA(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	freezeService := freeze.NewService(database)
+	for _, branch := range []string{"main", "release"} {
+		if _, err := freezeService.CreateActive(ctx, freeze.CreateParams{RepositoryID: repo.ID, Branch: branch, Reason: "release"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prStore := pullrequest.NewStore(database)
+	pr1, err := prStore.Upsert(ctx, domain.PullRequest{RepositoryID: repo.ID, Index: 1, State: "open", TargetBranch: "main", HeadSHA: "abc123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr2, err := prStore.Upsert(ctx, domain.PullRequest{RepositoryID: repo.ID, Index: 2, State: "open", TargetBranch: "release", HeadSHA: "abc123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	thawStore := thawexception.NewStore(database)
+	if _, err := thawStore.Approve(ctx, thawexception.ApproveParams{RepositoryID: repo.ID, PullRequestIndex: pr1.Index, TargetBranch: pr1.TargetBranch, HeadSHA: pr1.HeadSHA, Reason: "production fix"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); err != nil {
+		t.Fatal(err)
+	}
+	service := NewServiceWithThawExceptions(NewStore(database), freezeService, thawStore, prStore)
+
+	result, err := service.RunForSharedHead(ctx, []domain.PullRequest{pr1}, pr1.Index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State != domain.CommitStatusFailure {
+		t.Fatalf("expected shared SHA on another frozen branch to keep the status failing, got %+v", result)
+	}
+
+	if _, err := thawStore.Approve(ctx, thawexception.ApproveParams{RepositoryID: repo.ID, PullRequestIndex: pr2.Index, TargetBranch: pr2.TargetBranch, HeadSHA: pr2.HeadSHA, Reason: "production fix"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); err != nil {
+		t.Fatal(err)
+	}
+	result, err = service.RunForSharedHead(ctx, []domain.PullRequest{pr1}, pr1.Index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State != domain.CommitStatusSuccess || result.HeadSHA != "abc123" {
+		t.Fatalf("expected success only after every affected frozen PR is thawed, got %+v", result)
+	}
+}
+
 func TestServiceRunForSharedHeadRejectsClosedPullRequest(t *testing.T) {
 	ctx := context.Background()
 	database := newTestDB(t, ctx)
