@@ -81,6 +81,7 @@ func (a *App) Run(ctx context.Context) error {
 	statusPublisher := newRuntimeStatusPublisher(statusPublicationStore, repositoryStore, repositorySetup)
 	openPullRequestSyncer := newForgeOpenPullRequestSyncer(repositoryStore, repositorySetup, pullRequestStore, forgejoPullRequestClientForRepository, auditStore)
 	freezeStoreForWeb := newFreezeRecomputingStore(freezeStore, repositoryStore, openPullRequestSyncer, pullRequestStore, statusDecisionStore, statusPublisher)
+	enforcementService := newEnforcementService(database, repositorySetup, setupCheckRunner, forgejoEnforcementClientForRepository, openPullRequestSyncer, pullRequestStore, statusDecisionStore, statusPublisher)
 	thawApprovalStore := newThawApprovalService(repositoryStore, repositorySetup, pullRequestStore, thawExceptionStore, freezeStore, statusDecisionStore, statusPublisher, openPullRequestSyncer, forgejoThawApprovalClientForRepository)
 	pullRequestWebhookProcessor := webhook.NewPullRequestProcessor(repositoryStore, pullRequestStore, statusDecisionStore, statusPublisher)
 	server := &http.Server{
@@ -100,6 +101,7 @@ func (a *App) Run(ctx context.Context) error {
 			WebhookDeliveryStore:                 webhookDeliveryStore,
 			PullRequestWebhookProcessor:          pullRequestWebhookProcessor,
 			AuthService:                          authService,
+			EnforcementService:                   enforcementService,
 		}).Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
@@ -158,6 +160,17 @@ func forgejoThawApprovalClientForRepository(repo domain.Repository, token string
 		return client, nil
 	default:
 		return nil, fmt.Errorf("repository forge %q is not supported for thaw approvals", repo.Forge)
+	}
+}
+
+func forgejoEnforcementClientForRepository(repo domain.Repository, token string) (enforcementForgeClient, error) {
+	switch strings.ToLower(strings.TrimSpace(repo.Forge)) {
+	case "forgejo", "codeberg", "":
+		client := forgejo.New(repo.BaseURL, token)
+		client.HTTPClient = &http.Client{Timeout: 10 * time.Second}
+		return client, nil
+	default:
+		return nil, fmt.Errorf("repository forge %q is not supported for enforcement verification", repo.Forge)
 	}
 }
 

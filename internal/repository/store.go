@@ -123,7 +123,7 @@ func (s *Store) Get(ctx context.Context, id int64) (domain.Repository, error) {
 SELECT id, forge, base_url, owner, name, default_branch, active, enforcement_state,
   EXISTS(SELECT 1 FROM repository_webhook_secrets WHERE repository_id = repositories.id),
   EXISTS(SELECT 1 FROM repository_status_tokens WHERE repository_id = repositories.id),
-  created_at, updated_at
+  status_post_verified_at, created_at, updated_at
 FROM repositories
 WHERE id = ?`, id)
 	return scanRepository(row)
@@ -137,7 +137,7 @@ func (s *Store) List(ctx context.Context) ([]domain.Repository, error) {
 SELECT id, forge, base_url, owner, name, default_branch, active, enforcement_state,
   EXISTS(SELECT 1 FROM repository_webhook_secrets WHERE repository_id = repositories.id),
   EXISTS(SELECT 1 FROM repository_status_tokens WHERE repository_id = repositories.id),
-  created_at, updated_at
+  status_post_verified_at, created_at, updated_at
 FROM repositories
 ORDER BY owner, name`)
 	if err != nil {
@@ -171,7 +171,7 @@ func (s *Store) FindActiveByRemote(ctx context.Context, params RemoteParams) (do
 SELECT id, forge, base_url, owner, name, default_branch, active, enforcement_state,
   EXISTS(SELECT 1 FROM repository_webhook_secrets WHERE repository_id = repositories.id),
   EXISTS(SELECT 1 FROM repository_status_tokens WHERE repository_id = repositories.id),
-  created_at, updated_at
+  status_post_verified_at, created_at, updated_at
 FROM repositories
 	WHERE forge = ? AND base_url = ? AND owner = ? AND name = ? AND active = 1`, params.Forge, params.BaseURL, params.Owner, params.Name)
 	repo, err := scanRepository(row)
@@ -205,6 +205,40 @@ WHERE id = ?`, string(state), updatedAt, repositoryID)
 	affected, err := result.RowsAffected()
 	if err != nil {
 		return domain.Repository{}, fmt.Errorf("set repository enforcement state rows: %w", err)
+	}
+	if affected == 0 {
+		return domain.Repository{}, sql.ErrNoRows
+	}
+	return s.Get(ctx, repositoryID)
+}
+
+// SetStatusPostVerifiedAt stores the latest successful controlled status-post
+// verification time; a nil verifiedAt clears the evidence.
+func (s *Store) SetStatusPostVerifiedAt(ctx context.Context, repositoryID int64, verifiedAt *time.Time) (domain.Repository, error) {
+	if s == nil || s.db == nil {
+		return domain.Repository{}, errors.New("repository store has no database")
+	}
+	if repositoryID <= 0 {
+		return domain.Repository{}, ValidationError{Message: "repository id is required"}
+	}
+	var verifiedAtValue any
+	if verifiedAt != nil {
+		if verifiedAt.IsZero() {
+			return domain.Repository{}, ValidationError{Message: "status post verification time is required"}
+		}
+		verifiedAtValue = verifiedAt.UTC().Format(time.RFC3339Nano)
+	}
+	updatedAt := s.now().UTC().Format(time.RFC3339Nano)
+	result, err := s.db.ExecContext(ctx, `
+UPDATE repositories
+SET status_post_verified_at = ?, updated_at = ?
+WHERE id = ?`, verifiedAtValue, updatedAt, repositoryID)
+	if err != nil {
+		return domain.Repository{}, fmt.Errorf("set repository status post verification: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return domain.Repository{}, fmt.Errorf("set repository status post verification rows: %w", err)
 	}
 	if affected == 0 {
 		return domain.Repository{}, sql.ErrNoRows
@@ -398,14 +432,22 @@ func scanRepository(row scanner) (domain.Repository, error) {
 	var repo domain.Repository
 	var active, hasWebhookSecret, hasStatusToken int
 	var enforcementState string
+	var statusPostVerifiedAt sql.NullString
 	var createdAt, updatedAt string
-	if err := row.Scan(&repo.ID, &repo.Forge, &repo.BaseURL, &repo.Owner, &repo.Name, &repo.DefaultBranch, &active, &enforcementState, &hasWebhookSecret, &hasStatusToken, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&repo.ID, &repo.Forge, &repo.BaseURL, &repo.Owner, &repo.Name, &repo.DefaultBranch, &active, &enforcementState, &hasWebhookSecret, &hasStatusToken, &statusPostVerifiedAt, &createdAt, &updatedAt); err != nil {
 		return domain.Repository{}, fmt.Errorf("scan repository: %w", err)
 	}
 	repo.Active = active != 0
 	repo.EnforcementState = domain.EnforcementState(enforcementState)
 	repo.HasWebhookSecret = hasWebhookSecret != 0
 	repo.HasStatusToken = hasStatusToken != 0
+	if statusPostVerifiedAt.Valid {
+		parsed, err := time.Parse(time.RFC3339Nano, statusPostVerifiedAt.String)
+		if err != nil {
+			return domain.Repository{}, fmt.Errorf("parse repository status_post_verified_at: %w", err)
+		}
+		repo.StatusPostVerifiedAt = &parsed
+	}
 
 	parsedCreatedAt, err := time.Parse(time.RFC3339Nano, createdAt)
 	if err != nil {

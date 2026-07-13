@@ -121,6 +121,45 @@ func (c *Client) PostCommitStatus(ctx context.Context, owner, repo string, statu
 	return nil
 }
 
+func (c *Client) GetBranchHead(ctx context.Context, owner, repo, branch string) (forge.BranchHead, error) {
+	if err := validateBranchHead(owner, repo, branch); err != nil {
+		return forge.BranchHead{}, err
+	}
+	endpoint, err := c.branchEndpoint(owner, repo, branch)
+	if err != nil {
+		return forge.BranchHead{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return forge.BranchHead{}, fmt.Errorf("create branch head request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	if strings.TrimSpace(c.Token) != "" {
+		req.Header.Set("Authorization", "token "+strings.TrimSpace(c.Token))
+	}
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return forge.BranchHead{}, fmt.Errorf("get branch head: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return forge.BranchHead{}, responseError("get branch head", resp, c.Token)
+	}
+	var payload branchResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return forge.BranchHead{}, fmt.Errorf("decode branch head response: %w", err)
+	}
+	payload.Name = strings.TrimSpace(payload.Name)
+	if payload.Name == "" || payload.Name != strings.TrimSpace(branch) {
+		return forge.BranchHead{}, errors.New("branch head response has an unexpected branch name")
+	}
+	sha := strings.ToLower(strings.TrimSpace(payload.Commit.ID))
+	if sha == "" {
+		return forge.BranchHead{}, errors.New("branch head response is missing the commit SHA")
+	}
+	return forge.BranchHead{Branch: payload.Name, SHA: sha}, nil
+}
+
 func (c *Client) ReadBranchProtection(ctx context.Context, owner, repo, branch string) (forge.BranchProtection, error) {
 	if err := validateBranchProtection(owner, repo, branch); err != nil {
 		return forge.BranchProtection{}, err
@@ -192,6 +231,13 @@ type branchProtectionResponse struct {
 	StatusCheckContexts []string `json:"status_check_contexts"`
 }
 
+type branchResponse struct {
+	Name   string `json:"name"`
+	Commit struct {
+		ID string `json:"id"`
+	} `json:"commit"`
+}
+
 func validatePostCommitStatus(owner string, repo string, status forge.CommitStatus) error {
 	var missing []string
 	if strings.TrimSpace(owner) == "" {
@@ -250,6 +296,14 @@ func validateListOpenPullRequests(owner string, repo string, targetBranch string
 }
 
 func validateBranchProtection(owner, repo, branch string) error {
+	return validateOwnerRepoBranch("branch protection", owner, repo, branch)
+}
+
+func validateBranchHead(owner, repo, branch string) error {
+	return validateOwnerRepoBranch("branch head", owner, repo, branch)
+}
+
+func validateOwnerRepoBranch(kind, owner, repo, branch string) error {
 	var missing []string
 	if strings.TrimSpace(owner) == "" {
 		missing = append(missing, "owner")
@@ -261,7 +315,7 @@ func validateBranchProtection(owner, repo, branch string) error {
 		missing = append(missing, "branch")
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("missing required branch protection fields: %s", strings.Join(missing, ", "))
+		return fmt.Errorf("missing required %s fields: %s", kind, strings.Join(missing, ", "))
 	}
 	return nil
 }
@@ -318,6 +372,16 @@ func (c *Client) pullRequestEndpoint(owner string, repo string, index int) (stri
 }
 
 func (c *Client) branchProtectionEndpoint(owner, repo, branch string) (string, error) {
+	return c.escapedEndpoint("api", "v1", "repos", owner, repo, "branch_protections", branch)
+}
+
+func (c *Client) branchEndpoint(owner, repo, branch string) (string, error) {
+	return c.escapedEndpoint("api", "v1", "repos", owner, repo, "branches", branch)
+}
+
+// escapedEndpoint escapes every path segment individually so exact owner,
+// repository, and branch names (including slashes) cannot change the path.
+func (c *Client) escapedEndpoint(segments ...string) (string, error) {
 	if c == nil {
 		return "", errors.New("forgejo client is nil")
 	}
@@ -325,7 +389,6 @@ func (c *Client) branchProtectionEndpoint(owner, repo, branch string) (string, e
 	if err != nil || base.Scheme == "" || base.Host == "" {
 		return "", errors.New("forgejo base URL is invalid")
 	}
-	segments := []string{"api", "v1", "repos", owner, repo, "branch_protections", branch}
 	path := strings.TrimRight(base.Path, "/")
 	rawPath := strings.TrimRight(base.EscapedPath(), "/")
 	for _, segment := range segments {

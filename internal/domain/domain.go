@@ -7,6 +7,11 @@ import (
 
 const RequiredStatusContext = "thawguard/freeze"
 
+// SetupStatusContext is the harmless status context used only for the
+// controlled status-post verification. It is never the required merge-gating
+// context, so posting it before activation cannot affect merges.
+const SetupStatusContext = "thawguard/setup"
+
 type CommitStatusState string
 
 const (
@@ -56,8 +61,12 @@ type Repository struct {
 	HasStatusToken   bool
 	Active           bool
 	EnforcementState EnforcementState
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
+	// StatusPostVerifiedAt is the latest successful controlled
+	// thawguard/setup status post. It is cleared when the status token
+	// changes.
+	StatusPostVerifiedAt *time.Time
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
 }
 
 func (r Repository) EnforcementActive() bool {

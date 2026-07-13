@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/taua-almeida/thawguard/internal/db"
 	"github.com/taua-almeida/thawguard/internal/domain"
@@ -407,6 +408,42 @@ func TestStoreRemoveBranchReportsUnknownBranch(t *testing.T) {
 	}
 	if managed {
 		t.Fatal("expected removed branch not to be managed")
+	}
+}
+
+func TestStoreSetsAndClearsStatusPostVerification(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	repo, err := store.Create(ctx, CreateParams{Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repo.StatusPostVerifiedAt != nil {
+		t.Fatalf("expected new repository without verification evidence, got %+v", repo.StatusPostVerifiedAt)
+	}
+
+	verifiedAt := time.Date(2026, 7, 12, 10, 30, 0, 0, time.UTC)
+	updated, err := store.SetStatusPostVerifiedAt(ctx, repo.ID, &verifiedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.StatusPostVerifiedAt == nil || !updated.StatusPostVerifiedAt.Equal(verifiedAt) {
+		t.Fatalf("expected persisted verification time, got %+v", updated.StatusPostVerifiedAt)
+	}
+
+	cleared, err := store.SetStatusPostVerifiedAt(ctx, repo.ID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleared.StatusPostVerifiedAt != nil {
+		t.Fatalf("expected cleared verification evidence, got %+v", cleared.StatusPostVerifiedAt)
+	}
+
+	if _, err := store.SetStatusPostVerifiedAt(ctx, 999, &verifiedAt); err == nil {
+		t.Fatal("expected missing repository error")
+	}
+	if _, err := store.SetStatusPostVerifiedAt(ctx, repo.ID, &time.Time{}); !IsValidationError(err) {
+		t.Fatalf("expected zero-time validation error, got %v", err)
 	}
 }
 

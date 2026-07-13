@@ -72,6 +72,18 @@ func (s *forgeOpenPullRequestSyncer) SyncOpenPullRequests(ctx context.Context, r
 	if !repo.EnforcementActive() {
 		return domain.ErrEnforcementNotActive
 	}
+	return s.syncRepository(ctx, repo, targetBranch)
+}
+
+// syncRepository is the activation-only ungated path: enforcement activation
+// must refresh the PR cache while the repository is still ready. Every other
+// caller goes through SyncOpenPullRequests and its enforcement-active gate.
+func (s *forgeOpenPullRequestSyncer) syncRepository(ctx context.Context, repo domain.Repository, targetBranch string) error {
+	if s == nil || s.repositories == nil || s.tokens == nil || s.pullRequests == nil || s.clientFor == nil {
+		return errors.New("open pull request syncer is not configured")
+	}
+	targetBranch = strings.TrimSpace(targetBranch)
+	repositoryID := repo.ID
 	token, found, err := s.tokens.StatusToken(ctx, repositoryID)
 	if err != nil {
 		return fmt.Errorf("load repository status token for open pull request sync: %w", err)

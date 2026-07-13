@@ -293,6 +293,107 @@ func TestClientBoundsAndRedactsBranchProtectionErrors(t *testing.T) {
 	}
 }
 
+func TestClientGetsBranchHead(t *testing.T) {
+	var gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("expected GET, got %s", r.Method)
+		}
+		if got := r.URL.EscapedPath(); got != "/api/v1/repos/team%20name/repo%20name/branches/release%2F1.0" {
+			t.Fatalf("unexpected escaped path %q", got)
+		}
+		gotAuth = r.Header.Get("Authorization")
+		_ = json.NewEncoder(w).Encode(newBranchResponse("release/1.0", "ABCDEF123456"))
+	}))
+	defer server.Close()
+	client := New(server.URL, "read-token")
+
+	head, err := client.GetBranchHead(context.Background(), "team name", "repo name", "release/1.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotAuth != "token read-token" {
+		t.Fatalf("unexpected auth header %q", gotAuth)
+	}
+	if head.Branch != "release/1.0" || head.SHA != "abcdef123456" {
+		t.Fatalf("unexpected branch head %+v", head)
+	}
+}
+
+func TestClientRejectsInvalidBranchHeadRequest(t *testing.T) {
+	client := New("https://codeberg.org", "token")
+	if _, err := client.GetBranchHead(context.Background(), "", "repo", "main"); err == nil {
+		t.Fatal("expected missing owner error")
+	}
+	if _, err := client.GetBranchHead(context.Background(), "owner", "repo", " "); err == nil {
+		t.Fatal("expected missing branch error")
+	}
+}
+
+func TestClientRejectsBranchHeadMissingCommitSHA(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(newBranchResponse("main", "  "))
+	}))
+	defer server.Close()
+
+	if _, err := New(server.URL, "token").GetBranchHead(context.Background(), "owner", "repo", "main"); err == nil || !strings.Contains(err.Error(), "missing the commit SHA") {
+		t.Fatalf("expected missing commit SHA error, got %v", err)
+	}
+}
+
+func TestClientRejectsBranchHeadWithMismatchedBranchName(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(newBranchResponse("develop", "abcdef123456"))
+	}))
+	defer server.Close()
+
+	if _, err := New(server.URL, "token").GetBranchHead(context.Background(), "owner", "repo", "main"); err == nil || !strings.Contains(err.Error(), "unexpected branch name") {
+		t.Fatalf("expected mismatched branch error, got %v", err)
+	}
+}
+
+func TestClientRejectsMalformedBranchHead(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"name":`))
+	}))
+	defer server.Close()
+
+	if _, err := New(server.URL, "token").GetBranchHead(context.Background(), "owner", "repo", "main"); err == nil || !strings.Contains(err.Error(), "decode branch head response") {
+		t.Fatalf("expected malformed JSON error, got %v", err)
+	}
+}
+
+func TestClientBoundsAndRedactsBranchHeadErrors(t *testing.T) {
+	const token = "secret-read-token"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(token + strings.Repeat("x", 1024)))
+	}))
+	defer server.Close()
+
+	_, err := New(server.URL, token).GetBranchHead(context.Background(), "owner", "repo", "main")
+	if err == nil {
+		t.Fatal("expected forge error")
+	}
+	var responseErr *forge.ResponseError
+	if !errors.As(err, &responseErr) || responseErr.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected bounded response error, got %v", err)
+	}
+	if strings.Contains(err.Error(), token) {
+		t.Fatalf("expected token redaction, got %v", err)
+	}
+	if len(err.Error()) > 700 {
+		t.Fatalf("expected bounded error, got %d bytes", len(err.Error()))
+	}
+}
+
+func newBranchResponse(name, commitID string) branchResponse {
+	var branch branchResponse
+	branch.Name = name
+	branch.Commit.ID = commitID
+	return branch
+}
+
 func TestClientEmptyPullRequestListProvesReadableResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode([]pullRequestResponse{})

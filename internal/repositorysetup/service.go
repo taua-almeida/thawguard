@@ -32,6 +32,11 @@ func IsValidationError(err error) bool {
 	return errors.As(err, &validationErr)
 }
 
+// ActiveStatusTokenLockedMessage rejects status-token replacement for
+// enforcement-active repositories: an untested token must never sit behind a
+// healthy-looking active state, and there is no recovery flow yet.
+const ActiveStatusTokenLockedMessage = "Deactivate repository enforcement before replacing the status token."
+
 type ConfigurationError struct {
 	Message string
 }
@@ -195,9 +200,24 @@ func (s *Service) SetStatusToken(ctx context.Context, repositoryID int64, token 
 		}
 		return domain.Repository{}, err
 	}
+	if existing.EnforcementActive() {
+		return domain.Repository{}, ValidationError{Message: ActiveStatusTokenLockedMessage}
+	}
 	updated, err := repositoryStore.SetStatusTokenCiphertext(ctx, repositoryID, ciphertext)
 	if err != nil {
 		return domain.Repository{}, err
+	}
+	// A replaced token has never proven it can post statuses: clear the
+	// verification evidence and drop a ready repository back to setup.
+	updated, err = repositoryStore.SetStatusPostVerifiedAt(ctx, repositoryID, nil)
+	if err != nil {
+		return domain.Repository{}, err
+	}
+	if existing.EnforcementState == domain.EnforcementReady {
+		updated, err = repositoryStore.SetEnforcementState(ctx, repositoryID, domain.EnforcementSetupIncomplete)
+		if err != nil {
+			return domain.Repository{}, err
+		}
 	}
 	if err := audit.NewStoreTx(tx).Record(ctx, repositoryStatusTokenConfiguredEvent(updated, actor, existing.HasStatusToken)); err != nil {
 		return domain.Repository{}, fmt.Errorf("record repository.status_token_configured audit event: %w", err)

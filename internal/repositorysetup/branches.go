@@ -53,6 +53,9 @@ func (s *Service) AddBranch(ctx context.Context, repositoryID int64, branch stri
 	if err != nil {
 		return domain.RepositoryBranch{}, err
 	}
+	if err := invalidateReadyOnBranchScopeChange(ctx, repositoryStore, repo); err != nil {
+		return domain.RepositoryBranch{}, err
+	}
 	if err := audit.NewStoreTx(tx).Record(ctx, repositoryBranchEvent(audit.ActionRepositoryBranchAdded, repo, added.Name, actor)); err != nil {
 		return domain.RepositoryBranch{}, fmt.Errorf("record repository.branch_added audit event: %w", err)
 	}
@@ -100,6 +103,9 @@ func (s *Service) RemoveBranch(ctx context.Context, repositoryID int64, branch s
 	if err := repositoryStore.RemoveBranch(ctx, repositoryID, branch); err != nil {
 		return err
 	}
+	if err := invalidateReadyOnBranchScopeChange(ctx, repositoryStore, repo); err != nil {
+		return err
+	}
 	if err := audit.NewStoreTx(tx).Record(ctx, repositoryBranchEvent(audit.ActionRepositoryBranchRemoved, repo, branch, actor)); err != nil {
 		return fmt.Errorf("record repository.branch_removed audit event: %w", err)
 	}
@@ -107,6 +113,20 @@ func (s *Service) RemoveBranch(ctx context.Context, repositoryID int64, branch s
 		return fmt.Errorf("commit managed branch removal: %w", err)
 	}
 	committed = true
+	return nil
+}
+
+// invalidateReadyOnBranchScopeChange drops a ready repository back to
+// setup-incomplete: a changed managed-branch scope means the recorded
+// readiness evidence no longer covers every managed branch. Historical
+// setup-check rows are untouched.
+func invalidateReadyOnBranchScopeChange(ctx context.Context, store *repository.Store, repo domain.Repository) error {
+	if repo.EnforcementState != domain.EnforcementReady {
+		return nil
+	}
+	if _, err := store.SetEnforcementState(ctx, repo.ID, domain.EnforcementSetupIncomplete); err != nil {
+		return fmt.Errorf("reset ready repository after managed branch change: %w", err)
+	}
 	return nil
 }
 

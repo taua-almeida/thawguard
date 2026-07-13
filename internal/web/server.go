@@ -47,6 +47,15 @@ type Config struct {
 	PullRequestWebhookProcessor          PullRequestWebhookProcessor
 	WebhookMaxBodyBytes                  int64
 	AuthService                          AuthService
+	EnforcementService                   EnforcementService
+}
+
+// EnforcementService performs the two explicit admin transitions of the
+// repository enforcement lifecycle. Both re-run readiness checks and post the
+// controlled thawguard/setup status before changing state.
+type EnforcementService interface {
+	VerifyStatusPosting(ctx context.Context, repositoryID int64, actor domain.Actor) (domain.Repository, error)
+	ActivateEnforcement(ctx context.Context, repositoryID int64, actor domain.Actor) (domain.Repository, error)
 }
 
 type AuthService interface {
@@ -123,13 +132,22 @@ type PullRequestWebhookProcessor interface {
 }
 
 type repositoryView struct {
-	Repository       domain.Repository
-	SetupChecks      []setupcheck.Check
-	RepositoryChecks []setupcheck.Check
-	Branches         []repositoryBranchView
-	LastCheckedAt    string
-	EnforcementLabel string
-	EnforcementClass string
+	Repository           domain.Repository
+	SetupChecks          []setupcheck.Check
+	RepositoryChecks     []setupcheck.Check
+	Branches             []repositoryBranchView
+	LastCheckedAt        string
+	EnforcementLabel     string
+	EnforcementClass     string
+	StatusPostVerifiedAt string
+	IsSetupIncomplete    bool
+	IsReady              bool
+	IsUnhealthy          bool
+	// VerifyAvailable is true when the latest recorded readiness run has
+	// every mandatory read-only check OK; the POST re-runs readiness, so this
+	// only controls whether the action is offered.
+	VerifyAvailable     bool
+	VerifyBlockedReason string
 }
 
 type repositoryBranchView struct {
@@ -337,6 +355,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /repositories/webhook-secret", s.handleSetRepositoryWebhookSecret)
 	s.mux.HandleFunc("POST /repositories/status-token", s.handleSetRepositoryStatusToken)
 	s.mux.HandleFunc("POST /repositories/setup-check", s.handleRunRepositorySetupCheck)
+	s.mux.HandleFunc("POST /repositories/status-verification", s.handleVerifyStatusPosting)
+	s.mux.HandleFunc("POST /repositories/activate", s.handleActivateEnforcement)
 	s.mux.HandleFunc("GET /freezes", s.handleFreezes)
 	s.mux.HandleFunc("POST /freezes", s.handleCreateFreeze)
 	s.mux.HandleFunc("POST /freezes/end", s.handleEndFreeze)
@@ -1076,6 +1096,43 @@ func (s *Server) handleSetRepositoryStatusToken(w http.ResponseWriter, r *http.R
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
 		s.renderRepositories(w, views, err.Error(), session)
+		return
+	}
+	http.Redirect(w, r, "/repositories", http.StatusSeeOther)
+}
+
+func (s *Server) handleVerifyStatusPosting(w http.ResponseWriter, r *http.Request) {
+	s.handleEnforcementTransition(w, r, func(ctx context.Context, repositoryID int64, actor domain.Actor) error {
+		_, err := s.cfg.EnforcementService.VerifyStatusPosting(ctx, repositoryID, actor)
+		return err
+	})
+}
+
+func (s *Server) handleActivateEnforcement(w http.ResponseWriter, r *http.Request) {
+	s.handleEnforcementTransition(w, r, func(ctx context.Context, repositoryID int64, actor domain.Actor) error {
+		_, err := s.cfg.EnforcementService.ActivateEnforcement(ctx, repositoryID, actor)
+		return err
+	})
+}
+
+// handleEnforcementTransition guards the admin-only CSRF-protected enforcement
+// actions and re-renders the repositories page with the typed validation
+// message when the service rejects or reports a sanitized failure.
+func (s *Server) handleEnforcementTransition(w http.ResponseWriter, r *http.Request, transition func(ctx context.Context, repositoryID int64, actor domain.Actor) error) {
+	if s.cfg.EnforcementService == nil {
+		http.Error(w, "enforcement service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	session, ok := s.requireRepositoryManagerForm(w, r)
+	if !ok {
+		return
+	}
+	repositoryID, err := strconv.ParseInt(strings.TrimSpace(r.PostFormValue("repository_id")), 10, 64)
+	if err != nil {
+		repositoryID = 0
+	}
+	if err := transition(r.Context(), repositoryID, session.auditActor()); err != nil {
+		s.renderRepositoriesValidationError(w, r, err, session)
 		return
 	}
 	http.Redirect(w, r, "/repositories", http.StatusSeeOther)
@@ -1975,6 +2032,26 @@ func systemAuditEventViewForEvent(repositoriesByID map[int64]domain.Repository, 
 		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "target_branch")
 		view.Detail = auditDetailOrDash(details, "open_count") + " open from forge, " + auditDetailOrDash(details, "closed_absent_count") + " cached closed"
 		view.StateClass = "ok"
+	case audit.ActionRepositoryStatusPostVerified:
+		view.Label = "Status posting verified"
+		view.Summary = auditRepositoryLabel(view.Repository, details)
+		view.Detail = "Controlled " + domain.SetupStatusContext + " post on " + auditDetailOrDash(details, "default_branch") + " head " + auditDetailOrDash(details, "head_sha")
+		view.StateClass = "ok"
+	case audit.ActionRepositoryStatusPostVerifyFailed:
+		view.Label = "Status-post verification failed"
+		view.Summary = auditRepositoryLabel(view.Repository, details)
+		view.Detail = auditDetailOrDash(details, "reason") + " — state " + auditDetailOrDash(details, "enforcement_state")
+		view.StateClass = "failed"
+	case audit.ActionRepositoryEnforcementActivated:
+		view.Label = "Enforcement activated"
+		view.Summary = auditRepositoryLabel(view.Repository, details)
+		view.Detail = auditDetailOrDash(details, "open_pull_request_count") + " open PRs, " + auditDetailOrDash(details, "statuses_posted") + " statuses posted"
+		view.StateClass = "ok"
+	case audit.ActionRepositoryEnforcementActivateFail:
+		view.Label = "Enforcement activation failed"
+		view.Summary = auditRepositoryLabel(view.Repository, details)
+		view.Detail = auditDetailOrDash(details, "reason") + " — state " + auditDetailOrDash(details, "enforcement_state")
+		view.StateClass = "failed"
 	case audit.ActionBranchFreezeCreated:
 		view.Label = "Freeze created"
 		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "branch")
@@ -2415,6 +2492,12 @@ func (s *Server) repositoryViews(ctx context.Context, repositories []domain.Repo
 	for _, repo := range repositories {
 		view := repositoryView{Repository: repo}
 		view.EnforcementLabel, view.EnforcementClass = enforcementView(repo.EnforcementState)
+		view.IsSetupIncomplete = repo.EnforcementState == domain.EnforcementSetupIncomplete
+		view.IsReady = repo.EnforcementState == domain.EnforcementReady
+		view.IsUnhealthy = repo.EnforcementState == domain.EnforcementUnhealthy
+		if repo.StatusPostVerifiedAt != nil {
+			view.StatusPostVerifiedAt = formatReadinessTime(*repo.StatusPostVerifiedAt)
+		}
 		if s.cfg.SetupCheckStore != nil {
 			checks, err := s.cfg.SetupCheckStore.ListByRepository(ctx, repo.ID)
 			if err != nil {
@@ -2430,9 +2513,32 @@ func (s *Server) repositoryViews(ctx context.Context, repositories []domain.Repo
 			return nil, err
 		}
 		view.RepositoryChecks, view.Branches = groupReadinessChecks(repo, branches, view.SetupChecks)
+		if view.IsSetupIncomplete {
+			view.VerifyAvailable, view.VerifyBlockedReason = verifyActionAvailability(view.SetupChecks)
+		}
 		views = append(views, view)
 	}
 	return views, nil
+}
+
+// verifyActionAvailability decides whether the Verify status posting action
+// is offered based on the latest recorded readiness run. Every mandatory
+// read-only check must be OK; the expected status-posting-untested warning is
+// the only allowed non-OK result.
+func verifyActionAvailability(latest []setupcheck.Check) (bool, string) {
+	if len(latest) == 0 {
+		return false, "Run the read-only readiness checks first. Verification is offered once every mandatory check passes."
+	}
+	for _, check := range latest {
+		if check.Result.Status == setupcheck.StatusOK {
+			continue
+		}
+		if check.Result.Name == setupcheck.CheckStatusPostingUntested && check.Result.Status == setupcheck.StatusWarning {
+			continue
+		}
+		return false, "Fix the failing readiness checks and rerun them. Verification is offered once every mandatory read-only check passes."
+	}
+	return true, ""
 }
 
 func (s *Server) managedBranches(ctx context.Context, repositoryID int64) ([]domain.RepositoryBranch, error) {
@@ -3468,8 +3574,12 @@ const repositoriesTemplate = pageHead + `
             {{ if .Repository.HasStatusToken }}<span class="tg-badge status-ok">status token configured</span>{{ else }}<span class="tg-badge status-warning">status token missing</span>{{ end }}
           </div>
         </div>
-        {{ if not .Repository.EnforcementActive }}
-        <p class="tg-muted">This repository cannot enforce freezes, schedules, or thaws. Readiness checks are read-only; status posting is not tested until the later controlled activation flow.</p>
+        {{ if .IsReady }}
+        <p class="tg-muted">Status posting verified{{ if .StatusPostVerifiedAt }} at {{ .StatusPostVerifiedAt }}{{ end }} with a controlled <code>` + domain.SetupStatusContext + `</code> status. Ready to activate — enforcement stays off until an admin explicitly activates it.</p>
+        {{ else if .IsUnhealthy }}
+        <p class="error">Enforcement is unhealthy: the last activation or readiness run failed. Review the sanitized failure in the audit log, fix the forge setup or credentials, and rerun readiness checks. Automatic recovery is not available yet.</p>
+        {{ else if not .Repository.EnforcementActive }}
+        <p class="tg-muted">This repository cannot enforce freezes, schedules, or thaws. Readiness checks are read-only; status posting is not tested until the controlled verification below.</p>
         {{ end }}
         <dl class="tg-repo-meta">
           <div><span class="tg-meta-icon"><svg class="tg-icon"><use href="#tg-i-git-branch"></use></svg></span><dt>Default branch</dt><dd><code>{{ .Repository.DefaultBranch }}</code></dd></div>
@@ -3614,6 +3724,26 @@ const repositoriesTemplate = pageHead + `
             <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
             <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-health-check"></use></svg>Run readiness checks</button>
           </form>
+          {{ if .IsSetupIncomplete }}
+            {{ if .VerifyAvailable }}
+          <form method="post" action="/repositories/status-verification">
+            <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+            <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
+            <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-check"></use></svg>Verify status posting</button>
+          </form>
+          <p class="tg-muted">Verification reruns the read-only readiness checks, then posts one harmless <code>` + domain.SetupStatusContext + `</code> success status against the current default branch head. It proves the token can post statuses without touching the merge-gating <code>` + domain.RequiredStatusContext + `</code> context.</p>
+            {{ else }}
+          <button type="button" class="tg-btn tg-btn-secondary tg-btn-sm tg-repo-action-btn" disabled>Verify status posting</button>
+          <p class="tg-muted">{{ .VerifyBlockedReason }}</p>
+            {{ end }}
+          {{ end }}
+          {{ if .IsReady }}
+          <form method="post" action="/repositories/activate" data-confirm-submit data-confirm-title="Activate enforcement?" data-confirm-message="Activation reruns readiness and the controlled thawguard/setup status test, synchronizes current open pull requests, publishes real thawguard/freeze statuses for every affected head SHA, and enables freeze, schedule, and thaw operations for this repository." data-confirm-action="Activate enforcement">
+            <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+            <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
+            <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-icy-shield"></use></svg>Activate enforcement</button>
+          </form>
+          {{ end }}
         </div>
         {{ else }}
         <div class="tg-empty-row"><strong>Read-only readiness evidence</strong><span>Ask an admin to change repository credentials or run readiness checks.</span></div>

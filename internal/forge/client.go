@@ -23,6 +23,13 @@ type BranchProtection struct {
 	RequiresStatusCheck bool
 }
 
+// BranchHead is the current commit of one exact branch, fetched read-only for
+// the controlled status-post verification and activation flow.
+type BranchHead struct {
+	Branch string
+	SHA    string
+}
+
 var ErrBranchProtectionNotFound = errors.New("branch protection not found")
 
 type ResponseError struct {
@@ -41,4 +48,5 @@ type Client interface {
 	ListOpenPullRequests(ctx context.Context, owner, repo, targetBranch string) ([]domain.PullRequest, error)
 	PostCommitStatus(ctx context.Context, owner, repo string, status CommitStatus) error
 	ReadBranchProtection(ctx context.Context, owner, repo, branch string) (BranchProtection, error)
+	GetBranchHead(ctx context.Context, owner, repo, branch string) (BranchHead, error)
 }
