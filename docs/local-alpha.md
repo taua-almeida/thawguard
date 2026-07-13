@@ -5,7 +5,7 @@ This runbook starts Thawguard locally with Docker and exercises repository setup
 Alpha scope:
 
 - Thawguard has one operational mode: an enforcement-active repository synchronizes current open PRs from the forge and posts real `thawguard/freeze` commit statuses.
-- Repository enforcement activation is **not implemented yet**. Read-only readiness checks now verify the encrypted status token, pull-request access, every managed branch's protection and exact required context, and recent signed webhook evidence. Status-post permission remains unverified until a later controlled write test, so setup-incomplete repositories stay setup-incomplete.
+- Repository enforcement activation is explicit. Read-only readiness checks verify the encrypted status token, pull-request access, every managed branch's protection and exact required context, and recent signed webhook evidence. Activation reruns readiness, performs a controlled `thawguard/setup` status post, synchronizes current open pull requests, and publishes current policy before changing the repository to active.
 - A setup-incomplete repository can be fully configured: credentials can be stored, and signed webhooks are verified and recorded as setup evidence. It cannot create freezes, schedules, or thaws, and no commit status is posted for it.
 - Thawguard is cooperative enforcement for trusted teams and is not a hard security boundary.
 
@@ -76,7 +76,7 @@ Use a throwaway Forgejo/Codeberg repository, not a production repository.
 3. Set a webhook secret. Use a high-entropy value and save it somewhere local temporarily.
 4. Set a status token with enough forge permission to post commit statuses and read pull requests for the throwaway repository. It is stored encrypted and is required before enforcement can ever be activated.
 
-The repository card shows its enforcement state. New repositories are setup-incomplete and stay that way after read-only readiness checks; activation requires a later controlled status-post test.
+The repository card shows its enforcement state. New repositories are setup-incomplete after read-only readiness checks until an administrator explicitly activates enforcement and the controlled status-post plus initial policy convergence succeed.
 
 The card also lists the repository's managed branches — the exact branch names freezes and scheduled freezes may target. The default branch is always managed and cannot be removed. Admins can add or remove exact branch names (no globs or patterns) while enforcement is inactive; a branch with an active or pending scheduled freeze cannot be removed. An administrator can run read-only readiness checks for all managed branches from the card.
 
@@ -110,13 +110,13 @@ In Thawguard, inspect:
 
 - `/webhooks` — signed delivery receipts should show as verified and processed; system activity shows sanitized audit events.
 - `/repositories` — the repository card shows setup-incomplete enforcement plus configured credentials.
-- `/repositories` — run readiness checks to read the open-PR endpoint and each exact managed branch's protection. The card also shows whether a verified `pull_request` delivery was received in the last 24 hours. Status posting remains warning/unverified because this action performs no write.
+- `/repositories` — run readiness checks to read the open-PR endpoint and each exact managed branch's protection. The card also shows whether a verified `pull_request` delivery was received in the last 24 hours. Then use explicit activation when every prerequisite is ready.
 - `/freezes`, `/scheduled-freezes`, `/decisions` — mutation forms are unavailable and explain that enforcement must be activated first. Server-side validation rejects these actions as well.
 - `/publications` — no publication intents or attempts are created for a setup-incomplete repository.
 
 Codeberg will not show a Thawguard commit status for a setup-incomplete repository.
 
-## 6. Enforcement-active behavior (after activation ships)
+## 6. Enforcement-active behavior
 
 Once a repository is enforcement-active, every freeze lifecycle action follows one invariant:
 
@@ -128,20 +128,22 @@ Thaw approval fetches the selected PR's current head SHA from the forge, stores 
 
 If a policy change commits but live convergence fails, Thawguard marks the repository unhealthy and retains one durable automatic recovery job. Recovery retries the complete current repository state after restart as well as during the running process; the existing admin retry action uses the same proof and job.
 
-Scheduled freeze windows activate from the local Thawguard process. Immediate and scheduled freezes can also have a planned unfreeze. Keep the process running for scheduled starts and planned unfreezes to execute.
+Scheduled freeze windows activate from the local Thawguard process. Admins and Freezers can edit a pending schedule's reason, future start time, and optional planned unfreeze without changing its repository or branch. Clearing the optional value removes the planned unfreeze. **Start Now** activates a still-pending future schedule immediately, preserves a future planned unfreeze exactly, and runs the same current-forge synchronization, repository-wide shared-head evaluation, publication, durable intent, and retry path as automatic activation. If live convergence fails after activation commits, the schedule remains active while repository enforcement becomes unhealthy and one reconciliation job retries with bounded backoff.
+
+Only pending schedules are editable or startable. A planned unfreeze that is no longer in the future must be edited before Start Now. Recurring schedules and archive controls remain deferred. Keep the process running for scheduled starts, retries, and planned unfreezes to execute.
 
 ## Troubleshooting
 
 - No row on `/webhooks`: check the public webhook URL, event type, and whether the tunnel is forwarding `POST /webhooks/forgejo`.
 - Delivery row with an error: check repository owner/name/base URL and whether the webhook secret in Thawguard matches Codeberg.
 - Thawguard cannot decrypt a stored webhook secret or status token: restore the original `THAWGUARD_SECRET_KEY` or recreate the local database volume.
-- Freeze/schedule/thaw forms are unavailable: the repository's enforcement is not active. Read-only readiness checks do not activate it; a later controlled status-post test will own activation.
+- Freeze/schedule/thaw forms are unavailable: the repository's enforcement is not active. Complete readiness and use the explicit activation control on `/repositories`.
 - Inspecting the live SQLite database requires copying the WAL files too: copy `/data/thawguard.db`, `/data/thawguard.db-wal`, and `/data/thawguard.db-shm` to the same local directory before opening the database.
 - Docker cannot reach the app on non-Linux hosts: run `go run ./cmd/thawguard` locally for now. The compose file intentionally uses Linux host networking so first-admin setup stays loopback-only until a local user exists.
 
 ## What this local alpha does not do
 
 - It does not post commit statuses for setup-incomplete repositories, and it has no shadow/dry-run runtime mode.
-- It does not activate repository enforcement yet; activation requires a later controlled status-post test.
+- It does not provide recurring schedules or schedule archive controls.
 - It does not configure Codeberg branch protection.
 - It does not provide production-ready local user authentication.

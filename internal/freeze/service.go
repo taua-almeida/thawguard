@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/taua-almeida/thawguard/internal/audit"
@@ -160,12 +161,61 @@ func (s *Service) CancelScheduled(ctx context.Context, id int64, actor domain.Ac
 	})
 }
 
+func (s *Service) EditScheduled(ctx context.Context, params EditScheduleParams, actor domain.Actor) (domain.BranchFreeze, error) {
+	if s == nil || s.db == nil {
+		return domain.BranchFreeze{}, errors.New("freeze service has no database")
+	}
+	if params.ID <= 0 {
+		return domain.BranchFreeze{}, ValidationError{Message: "scheduled freeze is required"}
+	}
+	before, err := NewStore(s.db).Get(ctx, params.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.BranchFreeze{}, ValidationError{Message: "scheduled freeze is no longer pending"}
+	}
+	if err != nil {
+		return domain.BranchFreeze{}, fmt.Errorf("load scheduled freeze before edit: %w", err)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.BranchFreeze{}, fmt.Errorf("begin scheduled freeze edit: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	store := NewStoreTx(tx)
+	updated, err := store.editScheduled(ctx, params, &before.UpdatedAt)
+	if err != nil {
+		return domain.BranchFreeze{}, err
+	}
+	if err := audit.NewStoreTx(tx).Record(ctx, scheduledFreezeUpdatedEvent(before, updated, actor)); err != nil {
+		return domain.BranchFreeze{}, fmt.Errorf("record freeze_schedule.updated audit event: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.BranchFreeze{}, fmt.Errorf("commit scheduled freeze edit: %w", err)
+	}
+	committed = true
+	return updated, nil
+}
+
 func (s *Service) ActivateScheduled(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error) {
 	if s == nil || s.db == nil {
 		return domain.BranchFreeze{}, errors.New("freeze service has no database")
 	}
 	return s.withScheduledFreezeAudit(ctx, id, actor, audit.ActionFreezeScheduleActivated, true, func(store *Store) (domain.BranchFreeze, error) {
 		return store.ActivateScheduled(ctx, id)
+	})
+}
+
+func (s *Service) StartScheduledNow(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error) {
+	if s == nil || s.db == nil {
+		return domain.BranchFreeze{}, errors.New("freeze service has no database")
+	}
+	return s.withScheduledFreezeAudit(ctx, id, actor, audit.ActionFreezeScheduleStartedNow, true, func(store *Store) (domain.BranchFreeze, error) {
+		return store.StartScheduledNow(ctx, id)
 	})
 }
 
@@ -345,6 +395,53 @@ func scheduledFreezeEvent(freeze domain.BranchFreeze, actor domain.Actor, action
 		SubjectID:   strconv.FormatInt(freeze.ID, 10),
 		DetailsJSON: string(detailsJSON),
 	}
+}
+
+func scheduledFreezeUpdatedEvent(before, after domain.BranchFreeze, actor domain.Actor) audit.Event {
+	details := map[string]string{
+		"actor_kind":             actor.Kind,
+		"actor_role":             actor.Role,
+		"repository_id":          strconv.FormatInt(after.RepositoryID, 10),
+		"branch":                 after.Branch,
+		"status":                 string(after.Status),
+		"reason_before":          scheduleReasonDetail(before.Reason),
+		"reason_after":           scheduleReasonDetail(after.Reason),
+		"starts_at_before":       scheduleTimeDetail(before.StartsAt),
+		"starts_at_after":        scheduleTimeDetail(after.StartsAt),
+		"planned_ends_at_before": scheduleTimeDetail(before.PlannedEndsAt),
+		"planned_ends_at_after":  scheduleTimeDetail(after.PlannedEndsAt),
+	}
+	detailsJSON, err := json.Marshal(details)
+	if err != nil {
+		detailsJSON = []byte(`{}`)
+	}
+	return audit.Event{
+		ActorUserID: actor.UserID,
+		Action:      audit.ActionFreezeScheduleUpdated,
+		SubjectType: audit.SubjectTypeBranchFreeze,
+		SubjectID:   strconv.FormatInt(after.ID, 10),
+		DetailsJSON: string(detailsJSON),
+	}
+}
+
+func scheduleReasonDetail(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > scheduledFreezeReasonMaxLength {
+		return "unavailable"
+	}
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return "unavailable"
+		}
+	}
+	return value
+}
+
+func scheduleTimeDetail(value *time.Time) string {
+	if value == nil {
+		return ""
+	}
+	return value.UTC().Format(time.RFC3339Nano)
 }
 
 func branchFreezeCloseAction(status domain.BranchFreezeStatus) string {

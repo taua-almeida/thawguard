@@ -25,9 +25,11 @@ type freezeLifecycleOperations interface {
 	Get(ctx context.Context, id int64) (domain.BranchFreeze, error)
 	ListScheduled(ctx context.Context, limit int) ([]domain.BranchFreeze, error)
 	CreateScheduled(ctx context.Context, params freeze.ScheduleParams, actor domain.Actor) (domain.BranchFreeze, error)
+	EditScheduled(ctx context.Context, params freeze.EditScheduleParams, actor domain.Actor) (domain.BranchFreeze, error)
 	CancelScheduled(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error)
 	ListDueScheduled(ctx context.Context, limit int) ([]domain.BranchFreeze, error)
 	ActivateScheduled(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error)
+	StartScheduledNow(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error)
 	ListDuePlannedUnfreezes(ctx context.Context, limit int) ([]domain.BranchFreeze, error)
 	ExecutePlannedUnfreeze(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error)
 	ListNeedsRecompute(ctx context.Context, limit int) ([]domain.BranchFreeze, error)
@@ -158,6 +160,14 @@ func (s *freezeRecomputingStore) CancelScheduled(ctx context.Context, id int64, 
 	return lifecycle.CancelScheduled(ctx, id, actor)
 }
 
+func (s *freezeRecomputingStore) EditScheduled(ctx context.Context, params freeze.EditScheduleParams, actor domain.Actor) (domain.BranchFreeze, error) {
+	lifecycle, err := s.freezeLifecycle()
+	if err != nil {
+		return domain.BranchFreeze{}, err
+	}
+	return lifecycle.EditScheduled(ctx, params, actor)
+}
+
 func (s *freezeRecomputingStore) ListDueScheduled(ctx context.Context, limit int) ([]domain.BranchFreeze, error) {
 	lifecycle, err := s.freezeLifecycle()
 	if err != nil {
@@ -191,6 +201,31 @@ func (s *freezeRecomputingStore) ActivateScheduled(ctx context.Context, id int64
 		return activated, err
 	}
 	return activated, nil
+}
+
+func (s *freezeRecomputingStore) StartScheduledNow(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error) {
+	lifecycle, err := s.freezeLifecycle()
+	if err != nil {
+		return domain.BranchFreeze{}, err
+	}
+	target, err := lifecycle.Get(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return domain.BranchFreeze{}, freeze.ValidationError{Message: "scheduled freeze is no longer pending"}
+		}
+		return domain.BranchFreeze{}, fmt.Errorf("load scheduled freeze for Start Now enforcement gating: %w", err)
+	}
+	if err := s.requireEnforcementActive(ctx, target.RepositoryID); err != nil {
+		return domain.BranchFreeze{}, err
+	}
+	started, err := lifecycle.StartScheduledNow(ctx, id, actor)
+	if err != nil {
+		return domain.BranchFreeze{}, err
+	}
+	if err := s.convergeFreeze(ctx, started); err != nil {
+		return started, err
+	}
+	return started, nil
 }
 
 func (s *freezeRecomputingStore) ListDuePlannedUnfreezes(ctx context.Context, limit int) ([]domain.BranchFreeze, error) {

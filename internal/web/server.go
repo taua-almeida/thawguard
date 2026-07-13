@@ -31,6 +31,7 @@ import (
 const defaultWebhookMaxBodyBytes int64 = 1 << 20
 const defaultAuditLogLimit = 25
 const maxAuditLogLimit = 500
+const scheduledFreezeReasonMaxLength = 500
 
 type Config struct {
 	AppName                              string
@@ -112,7 +113,9 @@ type FreezeStore interface {
 type ScheduledFreezeStore interface {
 	ListScheduled(ctx context.Context, limit int) ([]domain.BranchFreeze, error)
 	CreateScheduled(ctx context.Context, params freeze.ScheduleParams, actor domain.Actor) (domain.BranchFreeze, error)
+	EditScheduled(ctx context.Context, params freeze.EditScheduleParams, actor domain.Actor) (domain.BranchFreeze, error)
 	CancelScheduled(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error)
+	StartScheduledNow(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error)
 }
 
 type AuditStore interface {
@@ -207,14 +210,32 @@ type freezeView struct {
 }
 
 type scheduledFreezeView struct {
-	Freeze        domain.BranchFreeze
-	Repository    domain.Repository
-	StartsAt      string
-	PlannedEndsAt string
-	EndedAt       string
-	StatusLabel   string
-	StateClass    string
-	CanCancel     bool
+	Freeze                domain.BranchFreeze
+	Repository            domain.Repository
+	StartsAt              string
+	StartsAtUTC           string
+	PlannedEndsAt         string
+	PlannedEndsAtUTC      string
+	EndedAt               string
+	StatusLabel           string
+	StateClass            string
+	CanCancel             bool
+	CanEdit               bool
+	CanStartNow           bool
+	StartNowBlockedReason string
+	EditOpen              bool
+	EditSubmitted         bool
+	EditReason            string
+	EditStartsAt          string
+	EditPlannedEndsAt     string
+}
+
+type scheduledFreezePageState struct {
+	FormError         string
+	EditScheduleID    int64
+	EditReason        string
+	EditStartsAt      string
+	EditPlannedEndsAt string
 }
 
 type freezeAuditView struct {
@@ -407,6 +428,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /freezes/cancel", s.handleCancelFreeze)
 	s.mux.HandleFunc("GET /scheduled-freezes", s.handleScheduledFreezes)
 	s.mux.HandleFunc("POST /scheduled-freezes", s.handleCreateScheduledFreeze)
+	s.mux.HandleFunc("POST /scheduled-freezes/edit", s.handleEditScheduledFreeze)
+	s.mux.HandleFunc("POST /scheduled-freezes/start-now", s.handleStartScheduledFreezeNow)
 	s.mux.HandleFunc("POST /scheduled-freezes/cancel", s.handleCancelScheduledFreeze)
 	s.mux.HandleFunc("GET /decisions", s.handleDecisions)
 	s.mux.HandleFunc("POST /decisions", s.handleCreateDecision)
@@ -598,7 +621,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		"ActiveFreezeCount":           len(freezes),
 		"ScheduledFreezePreviewCount": len(scheduledFreezes),
 		"Freezes":                     s.freezeViews(repositories, freezes),
-		"ScheduledFreezes":            scheduledFreezeViews(repositories, scheduledFreezes),
+		"ScheduledFreezes":            scheduledFreezeViews(repositories, scheduledFreezes, scheduledFreezePageState{}),
 	})
 }
 
@@ -1318,7 +1341,7 @@ func (s *Server) handleScheduledFreezes(w http.ResponseWriter, r *http.Request) 
 		internalServerError(w)
 		return
 	}
-	s.renderScheduledFreezes(w, repositories, scheduledFreezeViews(repositories, scheduled), branchOptions, "", session)
+	s.renderScheduledFreezes(w, repositories, scheduledFreezeViews(repositories, scheduled, scheduledFreezePageState{}), branchOptions, scheduledFreezePageState{}, session)
 }
 
 func (s *Server) handleCreateScheduledFreeze(w http.ResponseWriter, r *http.Request) {
@@ -1339,14 +1362,59 @@ func (s *Server) handleCreateScheduledFreeze(w http.ResponseWriter, r *http.Requ
 			internalServerError(w)
 			return
 		}
-		repositories, scheduled, branchOptions, dataErr := s.scheduledFreezePageData(r.Context())
-		if dataErr != nil {
+		s.renderScheduledFreezeValidationError(w, r, session, scheduledFreezePageState{FormError: err.Error()})
+		return
+	}
+	http.Redirect(w, r, "/scheduled-freezes", http.StatusSeeOther)
+}
+
+func (s *Server) handleEditScheduledFreeze(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.ScheduledFreezeStore == nil {
+		http.Error(w, "scheduled freeze store is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	session, ok := s.requireScheduleManagerForm(w, r)
+	if !ok {
+		return
+	}
+	state := scheduledFreezePageState{
+		EditScheduleID:    scheduledFreezeIDFromForm(r),
+		EditReason:        strings.TrimSpace(r.PostFormValue("reason")),
+		EditStartsAt:      strings.TrimSpace(r.PostFormValue("starts_at")),
+		EditPlannedEndsAt: strings.TrimSpace(r.PostFormValue("planned_ends_at")),
+	}
+	params, err := scheduledFreezeEditParamsFromForm(r)
+	if err == nil {
+		_, err = s.cfg.ScheduledFreezeStore.EditScheduled(r.Context(), params, session.auditActor())
+	}
+	if err != nil {
+		if !freeze.IsValidationError(err) {
 			internalServerError(w)
 			return
 		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusBadRequest)
-		s.renderScheduledFreezes(w, repositories, scheduledFreezeViews(repositories, scheduled), branchOptions, err.Error(), session)
+		state.FormError = err.Error()
+		s.renderScheduledFreezeValidationError(w, r, session, state)
+		return
+	}
+	http.Redirect(w, r, "/scheduled-freezes", http.StatusSeeOther)
+}
+
+func (s *Server) handleStartScheduledFreezeNow(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.ScheduledFreezeStore == nil {
+		http.Error(w, "scheduled freeze store is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	session, ok := s.requireScheduleManagerForm(w, r)
+	if !ok {
+		return
+	}
+	_, err := s.cfg.ScheduledFreezeStore.StartScheduledNow(r.Context(), scheduledFreezeIDFromForm(r), session.auditActor())
+	if err != nil {
+		if !freeze.IsValidationError(err) {
+			internalServerError(w)
+			return
+		}
+		s.renderScheduledFreezeValidationError(w, r, session, scheduledFreezePageState{FormError: err.Error()})
 		return
 	}
 	http.Redirect(w, r, "/scheduled-freezes", http.StatusSeeOther)
@@ -1361,27 +1429,36 @@ func (s *Server) handleCancelScheduledFreeze(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return
 	}
-	freezeID, err := strconv.ParseInt(strings.TrimSpace(r.PostFormValue("freeze_id")), 10, 64)
-	if err != nil {
-		freezeID = 0
-	}
-	_, err = s.cfg.ScheduledFreezeStore.CancelScheduled(r.Context(), freezeID, session.auditActor())
+	freezeID := scheduledFreezeIDFromForm(r)
+	_, err := s.cfg.ScheduledFreezeStore.CancelScheduled(r.Context(), freezeID, session.auditActor())
 	if err != nil {
 		if !freeze.IsValidationError(err) {
 			internalServerError(w)
 			return
 		}
-		repositories, scheduled, branchOptions, dataErr := s.scheduledFreezePageData(r.Context())
-		if dataErr != nil {
-			internalServerError(w)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusBadRequest)
-		s.renderScheduledFreezes(w, repositories, scheduledFreezeViews(repositories, scheduled), branchOptions, err.Error(), session)
+		s.renderScheduledFreezeValidationError(w, r, session, scheduledFreezePageState{FormError: err.Error()})
 		return
 	}
 	http.Redirect(w, r, "/scheduled-freezes", http.StatusSeeOther)
+}
+
+func (s *Server) renderScheduledFreezeValidationError(w http.ResponseWriter, r *http.Request, session sessionState, state scheduledFreezePageState) {
+	repositories, scheduled, branchOptions, err := s.scheduledFreezePageData(r.Context())
+	if err != nil {
+		internalServerError(w)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusBadRequest)
+	s.renderScheduledFreezes(w, repositories, scheduledFreezeViews(repositories, scheduled, state), branchOptions, state, session)
+}
+
+func scheduledFreezeIDFromForm(r *http.Request) int64 {
+	id, err := strconv.ParseInt(strings.TrimSpace(r.PostFormValue("freeze_id")), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return id
 }
 
 func scheduledFreezeParamsFromForm(r *http.Request) (freeze.ScheduleParams, error) {
@@ -1402,6 +1479,27 @@ func scheduledFreezeParamsFromForm(r *http.Request) (freeze.ScheduleParams, erro
 		return freeze.ScheduleParams{}, err
 	}
 	return freeze.ScheduleParams{RepositoryID: repositoryID, Branch: r.PostFormValue("branch"), Reason: r.PostFormValue("reason"), StartsAt: startsAt, PlannedEndsAt: plannedEndsAt}, nil
+}
+
+func scheduledFreezeEditParamsFromForm(r *http.Request) (freeze.EditScheduleParams, error) {
+	timezoneOffsetMinutes, err := parseBrowserTimezoneOffsetMinutes(r.PostFormValue("timezone_offset_minutes"))
+	if err != nil {
+		return freeze.EditScheduleParams{}, err
+	}
+	startsAt, err := parseScheduledFreezeFormTime(r.PostFormValue("starts_at"), timezoneOffsetMinutes)
+	if err != nil {
+		return freeze.EditScheduleParams{}, err
+	}
+	plannedEndsAt, err := parseOptionalPlannedUnfreeze(r.PostFormValue("planned_ends_at"), timezoneOffsetMinutes)
+	if err != nil {
+		return freeze.EditScheduleParams{}, err
+	}
+	return freeze.EditScheduleParams{
+		ID:            scheduledFreezeIDFromForm(r),
+		Reason:        r.PostFormValue("reason"),
+		StartsAt:      startsAt,
+		PlannedEndsAt: plannedEndsAt,
+	}, nil
 }
 
 func freezeCreateParamsFromForm(r *http.Request) (freeze.CreateParams, error) {
@@ -1736,6 +1834,12 @@ func (s *Server) requireRepositoryManagerForm(w http.ResponseWriter, r *http.Req
 
 func (s *Server) requireFreezerForm(w http.ResponseWriter, r *http.Request) (sessionState, bool) {
 	return s.requireRoleForm(w, r, func(roles auth.RoleSet) bool { return roles.CanFreeze() })
+}
+
+func (s *Server) requireScheduleManagerForm(w http.ResponseWriter, r *http.Request) (sessionState, bool) {
+	return s.requireRoleForm(w, r, func(roles auth.RoleSet) bool {
+		return roles.CanManageRepositories() || roles.CanFreeze()
+	})
 }
 
 func (s *Server) requireThawApproverForm(w http.ResponseWriter, r *http.Request) (sessionState, bool) {
@@ -2401,6 +2505,22 @@ func systemAuditEventViewForEvent(repositoriesByID map[int64]domain.Repository, 
 		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "branch")
 		view.Detail = "Starts " + auditDetailOrDash(details, "starts_at") + ", planned end " + auditDetailOrDash(details, "planned_ends_at") + " — " + auditDetailOrDash(details, "reason")
 		view.StateClass = "pending"
+	case audit.ActionFreezeScheduleUpdated:
+		view.Label = "Freeze schedule updated"
+		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "branch")
+		reasonBefore, reasonBeforeOK := auditTextDetail(details, "reason_before", scheduledFreezeReasonMaxLength)
+		reasonAfter, reasonAfterOK := auditTextDetail(details, "reason_after", scheduledFreezeReasonMaxLength)
+		startsBefore, startsBeforeOK := auditTimeDetail(details, "starts_at_before", false)
+		startsAfter, startsAfterOK := auditTimeDetail(details, "starts_at_after", false)
+		plannedBefore, plannedBeforeOK := auditTimeDetail(details, "planned_ends_at_before", true)
+		plannedAfter, plannedAfterOK := auditTimeDetail(details, "planned_ends_at_after", true)
+		if !reasonBeforeOK || !reasonAfterOK || !startsBeforeOK || !startsAfterOK || !plannedBeforeOK || !plannedAfterOK {
+			view.Detail = "Schedule update details unavailable"
+			view.StateClass = "warning"
+			break
+		}
+		view.Detail = "Reason " + reasonBefore + " → " + reasonAfter + "; starts " + startsBefore + " → " + startsAfter + "; planned unfreeze " + plannedBefore + " → " + plannedAfter
+		view.StateClass = "info"
 	case audit.ActionFreezeScheduleCancelled:
 		view.Label = "Schedule cancelled"
 		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "branch")
@@ -2410,6 +2530,19 @@ func systemAuditEventViewForEvent(repositoriesByID map[int64]domain.Repository, 
 		view.Label = "Scheduled freeze activated"
 		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "branch")
 		view.Detail = "Started " + auditDetailOrDash(details, "starts_at") + " — " + auditDetailOrDash(details, "reason")
+		view.StateClass = "failed"
+	case audit.ActionFreezeScheduleStartedNow:
+		view.Label = "Scheduled freeze started now"
+		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "branch")
+		reason, reasonOK := auditTextDetail(details, "reason", scheduledFreezeReasonMaxLength)
+		startsAt, startsAtOK := auditTimeDetail(details, "starts_at", false)
+		plannedEndsAt, plannedEndsAtOK := auditTimeDetail(details, "planned_ends_at", true)
+		if !reasonOK || !startsAtOK || !plannedEndsAtOK {
+			view.Detail = "Start Now details unavailable"
+			view.StateClass = "warning"
+			break
+		}
+		view.Detail = "Started " + startsAt + "; planned unfreeze " + plannedEndsAt + " — " + reason
 		view.StateClass = "failed"
 	case audit.ActionFreezeSchedulePlannedUnfreeze:
 		view.Label = "Planned unfreeze executed"
@@ -2531,6 +2664,22 @@ func auditTextDetail(details map[string]string, key string, maxLength int) (stri
 		}
 	}
 	return value, true
+}
+
+func auditTimeDetail(details map[string]string, key string, optional bool) (string, bool) {
+	raw, exists := details[key]
+	value := strings.TrimSpace(raw)
+	if !exists || value == "" {
+		if optional {
+			return "none", true
+		}
+		return "", false
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return "", false
+	}
+	return parsed.UTC().Format("2006-01-02 15:04 UTC"), true
 }
 
 func auditHeadSHA(details map[string]string, key string) (string, bool) {
@@ -2680,21 +2829,48 @@ func (s *Server) freezeViews(repositories []domain.Repository, freezes []domain.
 	return views
 }
 
-func scheduledFreezeViews(repositories []domain.Repository, freezes []domain.BranchFreeze) []scheduledFreezeView {
+func scheduledFreezeViews(repositories []domain.Repository, freezes []domain.BranchFreeze, state scheduledFreezePageState) []scheduledFreezeView {
 	repositoriesByID := repositoriesByID(repositories)
 	views := make([]scheduledFreezeView, 0, len(freezes))
+	now := time.Now().UTC()
 	for _, scheduled := range freezes {
 		label, stateClass := scheduledFreezeStatus(scheduled.Status)
-		views = append(views, scheduledFreezeView{
-			Freeze:        scheduled,
-			Repository:    repositoriesByID[scheduled.RepositoryID],
-			StartsAt:      optionalScheduleTime(scheduled.StartsAt),
-			PlannedEndsAt: optionalScheduleTime(scheduled.PlannedEndsAt),
-			EndedAt:       optionalScheduleTime(scheduled.EndsAt),
-			StatusLabel:   label,
-			StateClass:    stateClass,
-			CanCancel:     scheduled.Status == domain.BranchFreezeStatusScheduled,
-		})
+		repo := repositoriesByID[scheduled.RepositoryID]
+		pending := scheduled.Scheduled && scheduled.Status == domain.BranchFreezeStatusScheduled
+		view := scheduledFreezeView{
+			Freeze:           scheduled,
+			Repository:       repo,
+			StartsAt:         optionalScheduleTime(scheduled.StartsAt),
+			StartsAtUTC:      optionalScheduleRFC3339(scheduled.StartsAt),
+			PlannedEndsAt:    optionalScheduleTime(scheduled.PlannedEndsAt),
+			PlannedEndsAtUTC: optionalScheduleRFC3339(scheduled.PlannedEndsAt),
+			EndedAt:          optionalScheduleTime(scheduled.EndsAt),
+			StatusLabel:      label,
+			StateClass:       stateClass,
+			CanCancel:        pending,
+			CanEdit:          pending,
+			EditReason:       scheduled.Reason,
+		}
+		if pending {
+			switch {
+			case !repo.EnforcementActive():
+				view.StartNowBlockedReason = "Start Now unavailable: activate repository enforcement first."
+			case scheduled.StartsAt == nil || !scheduled.StartsAt.After(now):
+				view.StartNowBlockedReason = "Start Now unavailable: the scheduled start has arrived."
+			case scheduled.PlannedEndsAt != nil && !scheduled.PlannedEndsAt.After(now):
+				view.StartNowBlockedReason = "Edit the planned unfreeze before using Start Now."
+			default:
+				view.CanStartNow = true
+			}
+		}
+		if pending && state.EditScheduleID == scheduled.ID {
+			view.EditOpen = true
+			view.EditSubmitted = true
+			view.EditReason = state.EditReason
+			view.EditStartsAt = state.EditStartsAt
+			view.EditPlannedEndsAt = state.EditPlannedEndsAt
+		}
+		views = append(views, view)
 	}
 	return views
 }
@@ -2762,6 +2938,13 @@ func optionalScheduleTime(value *time.Time) string {
 	return value.UTC().Format("2006-01-02 15:04 UTC")
 }
 
+func optionalScheduleRFC3339(value *time.Time) string {
+	if value == nil || value.IsZero() {
+		return ""
+	}
+	return value.UTC().Format(time.RFC3339)
+}
+
 func (s *Server) freezeAuditViews(ctx context.Context, repositories []domain.Repository) ([]freezeAuditView, error) {
 	if s.cfg.AuditStore == nil {
 		return nil, nil
@@ -2799,7 +2982,7 @@ func (s *Server) freezeAuditViews(ctx context.Context, repositories []domain.Rep
 
 func isFreezeAuditAction(action string) bool {
 	switch action {
-	case audit.ActionBranchFreezeCreated, audit.ActionBranchFreezeEnded, audit.ActionBranchFreezeCancelled, audit.ActionBranchFreezePlannedUnfreeze, audit.ActionFreezeScheduleCreated, audit.ActionFreezeScheduleCancelled, audit.ActionFreezeScheduleActivated, audit.ActionFreezeSchedulePlannedUnfreeze:
+	case audit.ActionBranchFreezeCreated, audit.ActionBranchFreezeEnded, audit.ActionBranchFreezeCancelled, audit.ActionBranchFreezePlannedUnfreeze, audit.ActionFreezeScheduleCreated, audit.ActionFreezeScheduleUpdated, audit.ActionFreezeScheduleCancelled, audit.ActionFreezeScheduleActivated, audit.ActionFreezeScheduleStartedNow, audit.ActionFreezeSchedulePlannedUnfreeze:
 		return true
 	default:
 		return false
@@ -3115,7 +3298,7 @@ func enforcementActiveRepositories(repositories []domain.Repository) []domain.Re
 	return enforceable
 }
 
-func (s *Server) renderScheduledFreezes(w http.ResponseWriter, repositories []domain.Repository, scheduled []scheduledFreezeView, branchOptions []managedBranchOption, formError string, session sessionState) {
+func (s *Server) renderScheduledFreezes(w http.ResponseWriter, repositories []domain.Repository, scheduled []scheduledFreezeView, branchOptions []managedBranchOption, state scheduledFreezePageState, session sessionState) {
 	s.render(w, scheduledFreezesTemplate, map[string]any{
 		"AppName":                 s.cfg.AppName,
 		"ActivePage":              "scheduled",
@@ -3123,7 +3306,7 @@ func (s *Server) renderScheduledFreezes(w http.ResponseWriter, repositories []do
 		"EnforceableRepositories": enforcementActiveRepositories(repositories),
 		"BranchOptions":           branchOptions,
 		"ScheduledFreezes":        scheduled,
-		"FormError":               formError,
+		"FormError":               state.FormError,
 		"CSRFToken":               session.CSRFToken,
 	})
 }
@@ -4511,7 +4694,7 @@ const scheduledFreezesTemplate = pageHead + `
         <div class="tg-panel-head tg-panel-head-stacked">
           <div>
             <h2>Create scheduled freeze</h2>
-            <p class="tg-panel-subtitle">Times are interpreted as UTC for the local alpha. Recurring schedules are intentionally out of scope for v1.</p>
+            <p class="tg-panel-subtitle">Times use your browser's local timezone and are stored as UTC. Recurring schedules are intentionally out of scope for v1.</p>
           </div>
         </div>
         {{ if not .CurrentUser.CanFreeze }}
@@ -4579,14 +4762,44 @@ const scheduledFreezesTemplate = pageHead + `
               <td data-label="Status"><span class="status status-{{ .StateClass }}">{{ .StatusLabel }}</span></td>
               <td data-label="Reason">{{ .Freeze.Reason }}</td>
               <td data-label="Ended/cancelled">{{ .EndedAt }}</td>
-              <td data-label="Actions" class="tg-table-actions">
+              <td data-label="Actions" class="tg-table-actions tg-schedule-actions">
+                {{ if and .CanEdit (or $.CurrentUser.CanManageRepositories $.CurrentUser.CanFreeze) }}
+                <details class="tg-schedule-edit"{{ if .EditOpen }} open{{ end }}>
+                  <summary class="tg-btn tg-btn-secondary tg-btn-sm">Edit</summary>
+                  <div class="tg-schedule-edit-panel">
+                    <strong>Edit pending schedule</strong>
+                    <span class="tg-muted">{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Freeze.RepositoryID }}{{ end }} → {{ .Freeze.Branch }} cannot be changed.</span>
+                    <form method="post" action="/scheduled-freezes/edit" class="tg-schedule-edit-form">
+                      <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+                      <input type="hidden" name="freeze_id" value="{{ .Freeze.ID }}">
+                      <input type="hidden" name="timezone_offset_minutes" value="0" data-timezone-offset-minutes>
+                      <label>Reason <input name="reason" value="{{ .EditReason }}" maxlength="500" required></label>
+                      <label>Starts at <input type="datetime-local" name="starts_at" value="{{ .EditStartsAt }}"{{ if and (not .EditSubmitted) .StartsAtUTC }} data-utc-datetime="{{ .StartsAtUTC }}"{{ end }} required></label>
+                      <label>Planned unfreeze <input type="datetime-local" name="planned_ends_at" value="{{ .EditPlannedEndsAt }}"{{ if and (not .EditSubmitted) .PlannedEndsAtUTC }} data-utc-datetime="{{ .PlannedEndsAtUTC }}"{{ end }}></label>
+                      <small class="tg-muted">Leave planned unfreeze empty to clear it.</small>
+                      <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm">Save schedule</button>
+                    </form>
+                  </div>
+                </details>
+                {{ end }}
+                {{ if and .CanStartNow (or $.CurrentUser.CanManageRepositories $.CurrentUser.CanFreeze) }}
+                <form method="post" action="/scheduled-freezes/start-now" data-confirm-submit data-confirm-title="Start this freeze now?" data-confirm-message="Live enforcement begins immediately. Thawguard will synchronize current open pull requests and publish real thawguard/freeze statuses. Any future planned unfreeze remains scheduled." data-confirm-action="Start Now">
+                  <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+                  <input type="hidden" name="freeze_id" value="{{ .Freeze.ID }}">
+                  <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-play"></use></svg>Start Now</button>
+                </form>
+                {{ else if and .CanEdit .StartNowBlockedReason (or $.CurrentUser.CanManageRepositories $.CurrentUser.CanFreeze) }}
+                <small class="tg-muted tg-start-now-blocked">{{ .StartNowBlockedReason }}</small>
+                {{ end }}
                 {{ if and .CanCancel $.CurrentUser.CanFreeze }}
                 <form method="post" action="/scheduled-freezes/cancel" data-confirm-submit data-confirm-title="Cancel scheduled freeze?" data-confirm-message="This cancels a future scheduled freeze before it activates. The action is auditable and no live statuses are changed." data-confirm-action="Cancel schedule">
                   <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
                   <input type="hidden" name="freeze_id" value="{{ .Freeze.ID }}">
                   <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-close"></use></svg>Cancel</button>
                 </form>
-                {{ else }}
+                {{ else if not (or $.CurrentUser.CanManageRepositories $.CurrentUser.CanFreeze) }}
+                  <span class="tg-muted">Read only</span>
+                {{ else if not .CanEdit }}
                   <span class="tg-muted">—</span>
                 {{ end }}
               </td>
@@ -4595,6 +4808,61 @@ const scheduledFreezesTemplate = pageHead + `
           </tbody>
         </table>
       </div>
+      <div class="tg-mobile-card-list" aria-label="Scheduled freeze mobile cards">
+        {{ range .ScheduledFreezes }}
+        <article class="tg-mobile-card">
+          <div class="tg-mobile-card-head">
+            <div><span class="tg-mobile-card-kicker">{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Freeze.RepositoryID }}{{ end }}</span><h3>{{ .Freeze.Branch }}</h3></div>
+            <span class="status status-{{ .StateClass }}">{{ .StatusLabel }}</span>
+          </div>
+          <dl class="tg-mobile-card-grid">
+            <div><dt>Starts</dt><dd>{{ .StartsAt }}</dd></div>
+            <div><dt>Planned unfreeze</dt><dd>{{ .PlannedEndsAt }}</dd></div>
+            <div><dt>Ended/cancelled</dt><dd>{{ .EndedAt }}</dd></div>
+          </dl>
+          <p class="tg-mobile-card-detail">{{ .Freeze.Reason }}</p>
+          <div class="tg-table-actions tg-schedule-actions">
+            {{ if and .CanEdit (or $.CurrentUser.CanManageRepositories $.CurrentUser.CanFreeze) }}
+            <details class="tg-schedule-edit"{{ if .EditOpen }} open{{ end }}>
+              <summary class="tg-btn tg-btn-secondary tg-btn-sm">Edit</summary>
+              <div class="tg-schedule-edit-panel">
+                <strong>Edit pending schedule</strong>
+                <span class="tg-muted">{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Freeze.RepositoryID }}{{ end }} → {{ .Freeze.Branch }} cannot be changed.</span>
+                <form method="post" action="/scheduled-freezes/edit" class="tg-schedule-edit-form">
+                  <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+                  <input type="hidden" name="freeze_id" value="{{ .Freeze.ID }}">
+                  <input type="hidden" name="timezone_offset_minutes" value="0" data-timezone-offset-minutes>
+                  <label>Reason <input name="reason" value="{{ .EditReason }}" maxlength="500" required></label>
+                  <label>Starts at <input type="datetime-local" name="starts_at" value="{{ .EditStartsAt }}"{{ if and (not .EditSubmitted) .StartsAtUTC }} data-utc-datetime="{{ .StartsAtUTC }}"{{ end }} required></label>
+                  <label>Planned unfreeze <input type="datetime-local" name="planned_ends_at" value="{{ .EditPlannedEndsAt }}"{{ if and (not .EditSubmitted) .PlannedEndsAtUTC }} data-utc-datetime="{{ .PlannedEndsAtUTC }}"{{ end }}></label>
+                  <small class="tg-muted">Leave planned unfreeze empty to clear it.</small>
+                  <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm">Save schedule</button>
+                </form>
+              </div>
+            </details>
+            {{ end }}
+            {{ if and .CanStartNow (or $.CurrentUser.CanManageRepositories $.CurrentUser.CanFreeze) }}
+            <form method="post" action="/scheduled-freezes/start-now" data-confirm-submit data-confirm-title="Start this freeze now?" data-confirm-message="Live enforcement begins immediately. Thawguard will synchronize current open pull requests and publish real thawguard/freeze statuses. Any future planned unfreeze remains scheduled." data-confirm-action="Start Now">
+              <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+              <input type="hidden" name="freeze_id" value="{{ .Freeze.ID }}">
+              <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-play"></use></svg>Start Now</button>
+            </form>
+            {{ else if and .CanEdit .StartNowBlockedReason (or $.CurrentUser.CanManageRepositories $.CurrentUser.CanFreeze) }}
+            <small class="tg-muted tg-start-now-blocked">{{ .StartNowBlockedReason }}</small>
+            {{ end }}
+            {{ if and .CanCancel $.CurrentUser.CanFreeze }}
+            <form method="post" action="/scheduled-freezes/cancel" data-confirm-submit data-confirm-title="Cancel scheduled freeze?" data-confirm-message="This cancels a future scheduled freeze before it activates. The action is auditable and no live statuses are changed." data-confirm-action="Cancel schedule">
+              <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+              <input type="hidden" name="freeze_id" value="{{ .Freeze.ID }}">
+              <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-close"></use></svg>Cancel</button>
+            </form>
+            {{ else if not (or $.CurrentUser.CanManageRepositories $.CurrentUser.CanFreeze) }}
+            <span class="tg-muted">Read only</span>
+            {{ end }}
+          </div>
+        </article>
+        {{ end }}
+      </div>
       {{ else }}
         <div class="tg-empty-row"><strong>No scheduled freezes yet</strong><span>Create a one-time window to have Thawguard freeze a branch later.</span></div>
       {{ end }}
@@ -4602,8 +4870,18 @@ const scheduledFreezesTemplate = pageHead + `
   </main>
   <script>
     (() => {` + branchFilterScript + `
-      const field = document.querySelector('[data-timezone-offset-minutes]');
-      if (field) field.value = String(new Date().getTimezoneOffset());
+      document.querySelectorAll('[data-timezone-offset-minutes]').forEach((field) => {
+        field.value = String(new Date().getTimezoneOffset());
+      });
+      const localDateTimeValue = (raw) => {
+        const value = new Date(raw);
+        if (Number.isNaN(value.getTime())) return '';
+        const pad = (part) => String(part).padStart(2, '0');
+        return value.getFullYear() + '-' + pad(value.getMonth() + 1) + '-' + pad(value.getDate()) + 'T' + pad(value.getHours()) + ':' + pad(value.getMinutes());
+      };
+      document.querySelectorAll('[data-utc-datetime]').forEach((field) => {
+        field.value = localDateTimeValue(field.getAttribute('data-utc-datetime'));
+      });
       const repo = document.querySelector('[data-scheduled-repository]');
       const branch = document.querySelector('[data-scheduled-branch]');
       if (repo) repo.addEventListener('change', () => filterBranchOptions(repo, branch));

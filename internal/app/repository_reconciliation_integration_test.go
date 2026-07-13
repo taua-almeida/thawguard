@@ -180,6 +180,16 @@ func TestScheduledActivationAndPlannedUnfreezeFailuresRetainDurableRecovery(t *t
 			_, err = store.ActivateScheduled(ctx, scheduled.ID, h.admin)
 			return err
 		}},
+		{name: "scheduled Start Now", mutate: func(ctx context.Context, h *enforcementHarness, store *freezeRecomputingStore) error {
+			start := time.Now().UTC().Add(time.Hour)
+			scheduled, err := freeze.NewService(h.database).CreateScheduled(ctx, freeze.ScheduleParams{RepositoryID: h.repo.ID, Branch: "main", Reason: "window", StartsAt: start}, h.admin)
+			if err != nil {
+				return err
+			}
+			h.forge.failFreezePost = true
+			_, err = store.StartScheduledNow(ctx, scheduled.ID, h.admin)
+			return err
+		}},
 		{name: "planned unfreeze", mutate: func(ctx context.Context, h *enforcementHarness, store *freezeRecomputingStore) error {
 			planned := time.Now().UTC().Add(time.Hour)
 			created, err := store.CreateActive(ctx, freeze.CreateParams{RepositoryID: h.repo.ID, Branch: "main", Reason: "release", PlannedEndsAt: &planned}, h.admin)
@@ -212,6 +222,91 @@ func TestScheduledActivationAndPlannedUnfreezeFailuresRetainDurableRecovery(t *t
 			}
 		})
 	}
+}
+
+func TestStartScheduledNowSynchronizesSharedHeadsAndCompletesDurableIntent(t *testing.T) {
+	ctx := context.Background()
+	h := newEnforcementHarness(t, ctx)
+	h.setState(t, ctx, domain.EnforcementActive)
+	h.forge.openPRs = []forgejoPullRequestResponse{
+		newAppPullRequestResponse(42, "open", "main", "AAA111BBB222"),
+		newAppPullRequestResponse(43, "open", "develop", "AAA111BBB222"),
+	}
+	store := runtimeFreezeStore(h)
+	planned := time.Now().UTC().Add(3 * time.Hour)
+	scheduled, err := freeze.NewService(h.database).CreateScheduled(ctx, freeze.ScheduleParams{
+		RepositoryID:  h.repo.ID,
+		Branch:        "main",
+		Reason:        "release window",
+		StartsAt:      time.Now().UTC().Add(2 * time.Hour),
+		PlannedEndsAt: &planned,
+	}, h.admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	started, err := store.StartScheduledNow(ctx, scheduled.ID, h.admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started.Status != domain.BranchFreezeStatusActive || started.StartsAt == nil || !started.StartsAt.Before(scheduled.StartsAt.UTC()) || started.PlannedEndsAt == nil || !started.PlannedEndsAt.Equal(planned) {
+		t.Fatalf("expected converged active schedule with preserved planned end, got %+v", started)
+	}
+	converged, err := freeze.NewService(h.database).Get(ctx, scheduled.ID)
+	if err != nil || converged.NeedsRecompute {
+		t.Fatalf("expected successful repository convergence to clear recompute state, freeze=%+v err=%v", converged, err)
+	}
+	posts := h.freezeContextPosts()
+	if len(posts) != 1 || posts[0].SHA != "aaa111bbb222" || posts[0].State != string(domain.CommitStatusFailure) {
+		t.Fatalf("expected one repository-wide shared-head failure publication, got %+v", posts)
+	}
+	assertNoReconciliationJob(t, ctx, jobs.NewStore(h.database), h.repo.ID)
+}
+
+func TestStartScheduledNowRefreshesGenerationHeldByReconciliationWorker(t *testing.T) {
+	ctx := context.Background()
+	h := newEnforcementHarness(t, ctx)
+	h.setState(t, ctx, domain.EnforcementActive)
+	h.forge.openPRs = []forgejoPullRequestResponse{newAppPullRequestResponse(42, "open", "main", "AAA111BBB222")}
+	jobStore := jobs.NewStore(h.database)
+	if _, err := jobStore.EnqueueReconciliation(ctx, h.repo.ID); err != nil {
+		t.Fatal(err)
+	}
+	workerClaim, claimed, err := jobStore.ClaimRepository(ctx, h.repo.ID)
+	if err != nil || !claimed {
+		t.Fatalf("expected worker claim, claim=%+v claimed=%v err=%v", workerClaim, claimed, err)
+	}
+	scheduled, err := freeze.NewService(h.database).CreateScheduled(ctx, freeze.ScheduleParams{
+		RepositoryID: h.repo.ID,
+		Branch:       "main",
+		Reason:       "release window",
+		StartsAt:     time.Now().UTC().Add(2 * time.Hour),
+	}, h.admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := runtimeFreezeStore(h).StartScheduledNow(ctx, scheduled.ID, h.admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started.Status != domain.BranchFreezeStatusActive {
+		t.Fatalf("expected committed active schedule, got %+v", started)
+	}
+	refreshed, err := jobStore.GetReconciliation(ctx, h.repo.ID)
+	if err != nil || refreshed.Generation != workerClaim.Generation+1 || refreshed.LockedAt == nil {
+		t.Fatalf("expected Start Now generation retained under worker lease, job=%+v err=%v", refreshed, err)
+	}
+	if completed, err := jobStore.CompleteClaim(ctx, workerClaim); err != nil || completed {
+		t.Fatalf("old worker must not consume Start Now generation, completed=%v err=%v", completed, err)
+	}
+	if err := newRepositoryReconciliationRunner(jobStore, h.service, nil).RunDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	converged, err := freeze.NewService(h.database).Get(ctx, scheduled.ID)
+	if err != nil || converged.NeedsRecompute {
+		t.Fatalf("expected refreshed generation to converge and clear marker, freeze=%+v err=%v", converged, err)
+	}
+	assertNoReconciliationJob(t, ctx, jobStore, h.repo.ID)
 }
 
 func TestRepositoryReconciliationRunnerReconcilesActiveWriteAheadJob(t *testing.T) {

@@ -871,6 +871,63 @@ code,
   margin: 0;
 }
 
+.tg-schedule-actions {
+  flex-wrap: wrap;
+  min-width: 190px;
+}
+
+.tg-schedule-edit {
+  width: min(340px, 100%);
+}
+
+.tg-schedule-edit summary {
+  width: max-content;
+  list-style: none;
+  cursor: pointer;
+}
+
+.tg-schedule-edit summary::-webkit-details-marker {
+  display: none;
+}
+
+.tg-schedule-edit-panel {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+  border: 1px solid var(--tg-border);
+  border-radius: var(--tg-radius-sm);
+  padding: 12px;
+  text-align: left;
+  background: var(--tg-bg-card);
+}
+
+.tg-schedule-edit-form {
+  display: grid !important;
+  gap: 8px;
+  width: 100%;
+}
+
+.tg-schedule-edit-form label {
+  display: grid;
+  gap: 5px;
+  color: var(--tg-text-secondary);
+  font-size: 12px;
+}
+
+.tg-schedule-edit-form input {
+  width: 100%;
+}
+
+.tg-start-now-blocked {
+  flex: 1 1 100%;
+  max-width: 340px;
+  line-height: 1.4;
+}
+
+.tg-mobile-card .tg-schedule-actions {
+  justify-content: flex-start;
+}
+
 .tg-impact-card {
   align-self: start;
 }
@@ -2413,6 +2470,12 @@ select:focus-visible {
   .tg-freeze-form-actions .tg-btn,
   .tg-form-actions .tg-btn,
   .tg-table-actions .tg-btn {
+    width: 100%;
+  }
+
+  .tg-schedule-edit,
+  .tg-schedule-edit summary,
+  .tg-schedule-actions form {
     width: 100%;
   }
 

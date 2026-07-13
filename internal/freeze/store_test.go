@@ -4,9 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -346,6 +349,179 @@ func TestStoreCancelsScheduledFreezeBeforeActivation(t *testing.T) {
 	}
 }
 
+func TestStoreEditsPendingScheduledFreezeWithoutChangingTarget(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	store := NewStore(database)
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+	originalStart := now.Add(2 * time.Hour)
+	originalEnd := originalStart.Add(time.Hour)
+	scheduled, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repo.ID, Branch: "main", Reason: "original", StartsAt: originalStart, PlannedEndsAt: &originalEnd})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	replacementStart := now.Add(3 * time.Hour)
+	replacementEnd := replacementStart.Add(2 * time.Hour)
+	updated, err := store.EditScheduled(ctx, EditScheduleParams{ID: scheduled.ID, Reason: " updated reason ", StartsAt: replacementStart, PlannedEndsAt: &replacementEnd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.RepositoryID != repo.ID || updated.Branch != "main" || updated.Reason != "updated reason" || updated.Status != domain.BranchFreezeStatusScheduled || updated.NeedsRecompute {
+		t.Fatalf("expected target and state to remain unchanged, got %+v", updated)
+	}
+	if updated.StartsAt == nil || !updated.StartsAt.Equal(replacementStart) || updated.PlannedEndsAt == nil || !updated.PlannedEndsAt.Equal(replacementEnd) {
+		t.Fatalf("expected replacement schedule times, got %+v", updated)
+	}
+
+	cleared, err := store.EditScheduled(ctx, EditScheduleParams{ID: scheduled.ID, Reason: "no expiry", StartsAt: replacementStart.Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleared.PlannedEndsAt != nil {
+		t.Fatalf("expected empty planned unfreeze to clear value, got %+v", cleared)
+	}
+}
+
+func TestStoreRejectsInvalidOrNonPendingScheduledFreezeEdits(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	store := NewStore(database)
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+
+	for _, start := range []time.Time{now, now.Add(-time.Nanosecond)} {
+		if _, err := store.EditScheduled(ctx, EditScheduleParams{ID: 1, Reason: "release", StartsAt: start}); !IsValidationError(err) {
+			t.Fatalf("expected start %s to be rejected, got %v", start, err)
+		}
+	}
+	start := now.Add(time.Hour)
+	for _, planned := range []time.Time{start, start.Add(-time.Nanosecond)} {
+		if _, err := store.EditScheduled(ctx, EditScheduleParams{ID: 1, Reason: "release", StartsAt: start, PlannedEndsAt: &planned}); !IsValidationError(err) {
+			t.Fatalf("expected planned unfreeze %s to be rejected, got %v", planned, err)
+		}
+	}
+
+	for _, status := range []domain.BranchFreezeStatus{domain.BranchFreezeStatusActive, domain.BranchFreezeStatusEnded, domain.BranchFreezeStatusCancelled} {
+		t.Run(string(status), func(t *testing.T) {
+			scheduled, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repo.ID, Branch: string(status), Reason: "original", StartsAt: now.Add(2 * time.Hour)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := database.ExecContext(ctx, `UPDATE branch_freezes SET status = ? WHERE id = ?`, status, scheduled.ID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.EditScheduled(ctx, EditScheduleParams{ID: scheduled.ID, Reason: "changed", StartsAt: now.Add(3 * time.Hour)}); !IsValidationError(err) {
+				t.Fatalf("expected %s schedule edit to be rejected, got %v", status, err)
+			}
+			unchanged, err := store.Get(ctx, scheduled.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if unchanged.Reason != "original" {
+				t.Fatalf("expected rejected edit to preserve reason, got %+v", unchanged)
+			}
+		})
+	}
+}
+
+func TestStoreRejectsScheduledEditWithStaleAuditPreimage(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	store := NewStore(database)
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+	scheduled, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repo.ID, Branch: "main", Reason: "original", StartsAt: now.Add(2 * time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleUpdatedAt := scheduled.UpdatedAt
+	if _, err := store.editScheduled(ctx, EditScheduleParams{ID: scheduled.ID, Reason: "first edit", StartsAt: now.Add(3 * time.Hour)}, &staleUpdatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.editScheduled(ctx, EditScheduleParams{ID: scheduled.ID, Reason: "stale edit", StartsAt: now.Add(4 * time.Hour)}, &staleUpdatedAt); !IsValidationError(err) {
+		t.Fatalf("expected stale edit preimage to lose safely, got %v", err)
+	}
+	current, err := store.Get(ctx, scheduled.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Reason != "first edit" {
+		t.Fatalf("expected stale edit not to overwrite current schedule, got %+v", current)
+	}
+}
+
+func TestStoreStartsPendingScheduleNowAndPreservesPlannedUnfreeze(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	store := NewStore(database)
+	now := time.Date(2026, 7, 8, 12, 0, 0, 123, time.UTC)
+	store.now = func() time.Time { return now }
+	if _, err := store.CreateActive(ctx, CreateParams{RepositoryID: repo.ID, Branch: "main", Reason: "existing freeze"}); err != nil {
+		t.Fatal(err)
+	}
+	planned := now.Add(4 * time.Hour)
+	scheduled, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repo.ID, Branch: "main", Reason: "release", StartsAt: now.Add(2 * time.Hour), PlannedEndsAt: &planned})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	started, err := store.StartScheduledNow(ctx, scheduled.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started.Status != domain.BranchFreezeStatusActive || !started.Active || !started.Scheduled || !started.NeedsRecompute || started.StartsAt == nil || !started.StartsAt.Equal(now) {
+		t.Fatalf("expected active schedule at current time, got %+v", started)
+	}
+	if started.RepositoryID != repo.ID || started.Branch != "main" || started.Reason != "release" || started.PlannedEndsAt == nil || !started.PlannedEndsAt.Equal(planned) {
+		t.Fatalf("expected immutable fields and planned unfreeze preserved, got %+v", started)
+	}
+	if _, err := store.StartScheduledNow(ctx, scheduled.ID); !IsValidationError(err) {
+		t.Fatalf("expected duplicate Start Now to be rejected, got %v", err)
+	}
+	active, err := store.ListActive(ctx)
+	if err != nil || len(active) != 2 {
+		t.Fatalf("expected Start Now alongside existing active freeze, active=%+v err=%v", active, err)
+	}
+	store.now = func() time.Time { return planned.Add(time.Minute) }
+	ended, err := store.ExecutePlannedUnfreeze(ctx, scheduled.ID)
+	if err != nil || ended.Status != domain.BranchFreezeStatusEnded {
+		t.Fatalf("expected preserved planned unfreeze to execute, ended=%+v err=%v", ended, err)
+	}
+}
+
+func TestStoreRejectsStartNowForExpiredPlannedUnfreezeAndNonPendingSchedule(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	store := NewStore(database)
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+
+	expired, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repo.ID, Branch: "main", Reason: "release", StartsAt: now.Add(2 * time.Hour), PlannedEndsAt: timePointer(now.Add(3 * time.Hour))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `UPDATE branch_freezes SET planned_ends_at = ? WHERE id = ?`, now.Add(-time.Minute).Format(sqliteTimestampFormat), expired.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartScheduledNow(ctx, expired.ID); !IsValidationError(err) || !strings.Contains(err.Error(), "edit the schedule") {
+		t.Fatalf("expected expired planned unfreeze remediation, got %v", err)
+	}
+
+	if _, err := database.ExecContext(ctx, `UPDATE branch_freezes SET status = ? WHERE id = ?`, domain.BranchFreezeStatusCancelled, expired.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartScheduledNow(ctx, expired.ID); !IsValidationError(err) {
+		t.Fatalf("expected non-pending schedule to be rejected, got %v", err)
+	}
+}
+
 func TestStoreMarksActiveScheduledFreezeForRecomputeWhenManuallyClosed(t *testing.T) {
 	ctx := context.Background()
 	database := newTestDB(t, ctx)
@@ -566,6 +742,209 @@ func TestServiceScheduledFreezeLifecycleRecordsAuditEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertLatestFreezeAudit(t, ctx, database, audit.ActionFreezeScheduleCancelled, cancelled)
+}
+
+func TestServiceEditsScheduledFreezeWithAuditAndNoReconciliation(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	service := NewService(database)
+	actor := domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}
+	start := time.Now().UTC().Add(2 * time.Hour)
+	planned := start.Add(time.Hour)
+	scheduled, err := service.CreateScheduled(ctx, ScheduleParams{RepositoryID: repo.ID, Branch: "main", Reason: "before", StartsAt: start, PlannedEndsAt: &planned}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterStart := start.Add(time.Hour)
+	afterPlanned := afterStart.Add(2 * time.Hour)
+	updated, err := service.EditScheduled(ctx, EditScheduleParams{ID: scheduled.ID, Reason: "after", StartsAt: afterStart, PlannedEndsAt: &afterPlanned}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Reason != "after" {
+		t.Fatalf("expected edited schedule, got %+v", updated)
+	}
+	events, err := audit.NewStore(database).List(ctx, 1)
+	if err != nil || len(events) != 1 || events[0].Action != audit.ActionFreezeScheduleUpdated {
+		t.Fatalf("expected update audit event, events=%+v err=%v", events, err)
+	}
+	var details map[string]string
+	if err := json.Unmarshal([]byte(events[0].DetailsJSON), &details); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{
+		"repository_id":          strconv.FormatInt(repo.ID, 10),
+		"branch":                 "main",
+		"reason_before":          "before",
+		"reason_after":           "after",
+		"starts_at_before":       start.Format(time.RFC3339Nano),
+		"starts_at_after":        afterStart.Format(time.RFC3339Nano),
+		"planned_ends_at_before": planned.Format(time.RFC3339Nano),
+		"planned_ends_at_after":  afterPlanned.Format(time.RFC3339Nano),
+	} {
+		if details[key] != want {
+			t.Fatalf("audit detail %s: want %q, got %q", key, want, details[key])
+		}
+	}
+	if _, err := jobs.NewStore(database).GetReconciliation(ctx, repo.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected edit not to enqueue reconciliation, got %v", err)
+	}
+}
+
+func TestServiceRollsBackScheduledEditWhenAuditFails(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	service := NewService(database)
+	start := time.Now().UTC().Add(2 * time.Hour)
+	scheduled, err := service.CreateScheduled(ctx, ScheduleParams{RepositoryID: repo.ID, Branch: "main", Reason: "before", StartsAt: start}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	missingUserID := int64(999)
+	if _, err := service.EditScheduled(ctx, EditScheduleParams{ID: scheduled.ID, Reason: "after", StartsAt: start.Add(time.Hour)}, domain.Actor{UserID: &missingUserID, Kind: domain.ActorKindUser, Role: "freezer"}); err == nil {
+		t.Fatal("expected audit foreign-key error")
+	}
+	unchanged, err := service.Get(ctx, scheduled.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.Reason != "before" || unchanged.StartsAt == nil || !unchanged.StartsAt.Equal(start) {
+		t.Fatalf("expected failed audit to roll back edit, got %+v", unchanged)
+	}
+}
+
+func TestServiceStartsScheduledFreezeNowAtomicallyAndOnlyOnce(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	service := NewService(database)
+	actor := domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}
+	start := time.Now().UTC().Add(2 * time.Hour)
+	planned := start.Add(time.Hour)
+	scheduled, err := service.CreateScheduled(ctx, ScheduleParams{RepositoryID: repo.ID, Branch: "main", Reason: "release", StartsAt: start, PlannedEndsAt: &planned}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := service.StartScheduledNow(ctx, scheduled.ID, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started.Status != domain.BranchFreezeStatusActive || !started.NeedsRecompute || started.PlannedEndsAt == nil || !started.PlannedEndsAt.Equal(planned) {
+		t.Fatalf("unexpected Start Now result: %+v", started)
+	}
+	if _, err := service.StartScheduledNow(ctx, scheduled.ID, actor); !IsValidationError(err) {
+		t.Fatalf("expected duplicate Start Now rejection, got %v", err)
+	}
+	var auditCount, jobCount int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM audit_events WHERE action = ? AND subject_id = ?`, audit.ActionFreezeScheduleStartedNow, strconv.FormatInt(scheduled.ID, 10)).Scan(&auditCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM jobs WHERE type = ? AND repository_id = ?`, jobs.ReconcileRepositoryEnforcement, repo.ID).Scan(&jobCount); err != nil {
+		t.Fatal(err)
+	}
+	if auditCount != 1 || jobCount != 1 {
+		t.Fatalf("expected one Start Now audit and durable intent, audit=%d jobs=%d", auditCount, jobCount)
+	}
+}
+
+func TestServiceConcurrentStartNowCommitsOneTransitionAndAudit(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	service := NewService(database)
+	actor := domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}
+	scheduled, err := service.CreateScheduled(ctx, ScheduleParams{RepositoryID: repo.ID, Branch: "main", Reason: "release", StartsAt: time.Now().UTC().Add(2 * time.Hour)}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errs := make(chan error, 2)
+	var ready sync.WaitGroup
+	ready.Add(2)
+	start := make(chan struct{})
+	for range 2 {
+		go func() {
+			ready.Done()
+			<-start
+			_, err := service.StartScheduledNow(ctx, scheduled.ID, actor)
+			errs <- err
+		}()
+	}
+	ready.Wait()
+	close(start)
+	first, second := <-errs, <-errs
+	successes := 0
+	validationFailures := 0
+	for _, err := range []error{first, second} {
+		switch {
+		case err == nil:
+			successes++
+		case IsValidationError(err):
+			validationFailures++
+		default:
+			t.Fatalf("expected losing request to receive validation error, got %v", err)
+		}
+	}
+	if successes != 1 || validationFailures != 1 {
+		t.Fatalf("expected one success and one safe losing request, success=%d validation=%d errors=%v, %v", successes, validationFailures, first, second)
+	}
+	var auditCount int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM audit_events WHERE action = ? AND subject_id = ?`, audit.ActionFreezeScheduleStartedNow, strconv.FormatInt(scheduled.ID, 10)).Scan(&auditCount); err != nil {
+		t.Fatal(err)
+	}
+	if auditCount != 1 {
+		t.Fatalf("expected one Start Now audit event, got %d", auditCount)
+	}
+}
+
+func TestServiceRollsBackStartNowWhenAuditOrJobFails(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		prepare func(*testing.T, context.Context, *sql.DB) domain.Actor
+	}{
+		{name: "audit", prepare: func(t *testing.T, ctx context.Context, database *sql.DB) domain.Actor {
+			missingUserID := int64(999)
+			return domain.Actor{UserID: &missingUserID, Kind: domain.ActorKindUser, Role: "freezer"}
+		}},
+		{name: "job", prepare: func(t *testing.T, ctx context.Context, database *sql.DB) domain.Actor {
+			if _, err := database.ExecContext(ctx, `CREATE TRIGGER fail_reconciliation_enqueue BEFORE INSERT ON jobs BEGIN SELECT RAISE(ABORT, 'job enqueue failed'); END`); err != nil {
+				t.Fatal(err)
+			}
+			return domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			database := newTestDB(t, ctx)
+			repo := createTestRepository(t, ctx, database)
+			service := NewService(database)
+			start := time.Now().UTC().Add(2 * time.Hour)
+			scheduled, err := service.CreateScheduled(ctx, ScheduleParams{RepositoryID: repo.ID, Branch: "main", Reason: "release", StartsAt: start}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			actor := test.prepare(t, ctx, database)
+			if _, err := service.StartScheduledNow(ctx, scheduled.ID, actor); err == nil {
+				t.Fatal("expected Start Now transaction failure")
+			}
+			unchanged, err := service.Get(ctx, scheduled.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if unchanged.Status != domain.BranchFreezeStatusScheduled || unchanged.NeedsRecompute || unchanged.StartsAt == nil || !unchanged.StartsAt.Equal(start) {
+				t.Fatalf("expected failed Start Now to roll back transition, got %+v", unchanged)
+			}
+			var auditCount int
+			if err := database.QueryRowContext(ctx, `SELECT count(*) FROM audit_events WHERE action = ?`, audit.ActionFreezeScheduleStartedNow).Scan(&auditCount); err != nil {
+				t.Fatal(err)
+			}
+			if auditCount != 0 {
+				t.Fatalf("expected no committed Start Now audit, got %d", auditCount)
+			}
+		})
+	}
 }
 
 func TestServicePlannedUnfreezeUsesTruthfulAuditActionForImmediateAndScheduledFreezes(t *testing.T) {

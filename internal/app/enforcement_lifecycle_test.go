@@ -327,6 +327,84 @@ func TestScheduledFreezeActivationAndPlannedUnfreezeUseSyncInvariant(t *testing.
 	}
 }
 
+func TestScheduledFreezeEditRemainsAvailableWithoutActiveEnforcement(t *testing.T) {
+	ctx := context.Background()
+	freezes := &fakeScheduledFreezeOperations{}
+	syncer := &fakeRecomputeSyncer{}
+	store := newFreezeRecomputingStore(
+		freezes,
+		&fakeOpenPRRepositoryGetter{repo: newRecomputeTestRepository(7, domain.EnforcementUnhealthy)},
+		syncer,
+		&fakeOpenPullRequestBranchLister{},
+		&fakeSharedHeadStatusRunner{},
+		&fakeStatusPublisher{},
+	)
+	start := time.Now().UTC().Add(time.Hour)
+
+	updated, err := store.EditScheduled(ctx, freeze.EditScheduleParams{ID: 3, Reason: "updated", StartsAt: start}, domain.Actor{Kind: domain.ActorKindUser, Role: "freezer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Reason != "updated" || freezes.editCalls != 1 || len(syncer.calls) != 0 {
+		t.Fatalf("expected local-only edit without enforcement convergence, updated=%+v edits=%d sync=%+v", updated, freezes.editCalls, syncer.calls)
+	}
+}
+
+func TestStartScheduledNowRejectsEveryInactiveEnforcementStateBeforeMutation(t *testing.T) {
+	for _, state := range []domain.EnforcementState{domain.EnforcementSetupIncomplete, domain.EnforcementReady, domain.EnforcementUnhealthy} {
+		t.Run(string(state), func(t *testing.T) {
+			ctx := context.Background()
+			freezes := &fakeScheduledFreezeOperations{}
+			store := newFreezeRecomputingStore(
+				freezes,
+				&fakeOpenPRRepositoryGetter{repo: newRecomputeTestRepository(7, state)},
+				&fakeRecomputeSyncer{},
+				&fakeOpenPullRequestBranchLister{},
+				&fakeSharedHeadStatusRunner{},
+				&fakeStatusPublisher{},
+			)
+
+			_, err := store.StartScheduledNow(ctx, 3, domain.Actor{Kind: domain.ActorKindUser, Role: "freezer"})
+			if !freeze.IsValidationError(err) || err.Error() != domain.EnforcementNotActiveMessage {
+				t.Fatalf("expected enforcement validation for %s, got %v", state, err)
+			}
+			if freezes.startNowCalls != 0 {
+				t.Fatalf("expected no Start Now mutation for %s, got %d", state, freezes.startNowCalls)
+			}
+		})
+	}
+}
+
+func TestStartScheduledNowUsesScheduledActivationConvergence(t *testing.T) {
+	ctx := context.Background()
+	planned := time.Now().UTC().Add(2 * time.Hour)
+	freezes := &fakeScheduledFreezeOperations{startedNow: domain.BranchFreeze{
+		ID: 3, RepositoryID: 7, Branch: "main", Status: domain.BranchFreezeStatusActive,
+		Active: true, Scheduled: true, NeedsRecompute: true, PlannedEndsAt: &planned,
+	}}
+	pulls := &fakeOpenPullRequestBranchLister{}
+	syncer := &fakeRecomputeSyncer{onSync: func() {
+		pulls.prs = []domain.PullRequest{{RepositoryID: 7, Index: 1, State: "open", TargetBranch: "main", HeadSHA: "aaa111"}}
+	}}
+	publisher := &fakeStatusPublisher{}
+	store := newFreezeRecomputingStore(
+		freezes,
+		&fakeOpenPRRepositoryGetter{repo: newRecomputeTestRepository(7, domain.EnforcementActive)},
+		syncer,
+		pulls,
+		&fakeSharedHeadStatusRunner{},
+		publisher,
+	)
+
+	started, err := store.StartScheduledNow(ctx, 3, domain.Actor{Kind: domain.ActorKindUser, Role: "freezer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started.PlannedEndsAt == nil || !started.PlannedEndsAt.Equal(planned) || freezes.startNowCalls != 1 || len(syncer.calls) != 1 || len(publisher.results) != 1 || len(freezes.markCalls) != 1 {
+		t.Fatalf("expected Start Now to preserve plan and fully converge, started=%+v calls=%d sync=%+v publish=%+v marks=%+v", started, freezes.startNowCalls, syncer.calls, publisher.results, freezes.markCalls)
+	}
+}
+
 func TestImmediatePlannedUnfreezeRecomputesAndClearsMarkerAfterSuccess(t *testing.T) {
 	ctx := context.Background()
 	freezes := &fakeScheduledFreezeOperations{
@@ -459,8 +537,11 @@ func TestFreezeRecomputingStoreRejectsScheduledCreateWithoutActiveEnforcement(t 
 type fakeScheduledFreezeOperations struct {
 	fakeFreezeOperations
 	activated     domain.BranchFreeze
+	startedNow    domain.BranchFreeze
 	ended         domain.BranchFreeze
 	scheduleCalls int
+	editCalls     int
+	startNowCalls int
 	recomputedIDs map[string]int64
 	markCalls     []int64
 }
@@ -478,6 +559,11 @@ func (f *fakeScheduledFreezeOperations) CreateScheduled(ctx context.Context, par
 	return domain.BranchFreeze{}, nil
 }
 
+func (f *fakeScheduledFreezeOperations) EditScheduled(ctx context.Context, params freeze.EditScheduleParams, actor domain.Actor) (domain.BranchFreeze, error) {
+	f.editCalls++
+	return domain.BranchFreeze{ID: params.ID, RepositoryID: 7, Branch: "main", Status: domain.BranchFreezeStatusScheduled, Scheduled: true, Reason: params.Reason, StartsAt: &params.StartsAt, PlannedEndsAt: params.PlannedEndsAt}, nil
+}
+
 func (f *fakeScheduledFreezeOperations) CancelScheduled(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error) {
 	return domain.BranchFreeze{}, nil
 }
@@ -488,6 +574,11 @@ func (f *fakeScheduledFreezeOperations) ListDueScheduled(ctx context.Context, li
 
 func (f *fakeScheduledFreezeOperations) ActivateScheduled(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error) {
 	return f.activated, nil
+}
+
+func (f *fakeScheduledFreezeOperations) StartScheduledNow(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error) {
+	f.startNowCalls++
+	return f.startedNow, nil
 }
 
 func (f *fakeScheduledFreezeOperations) ListDuePlannedUnfreezes(ctx context.Context, limit int) ([]domain.BranchFreeze, error) {

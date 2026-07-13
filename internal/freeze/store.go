@@ -12,6 +12,7 @@ import (
 )
 
 const sqliteTimestampFormat = "2006-01-02T15:04:05.000000000Z"
+const scheduledFreezeReasonMaxLength = 500
 
 type database interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
@@ -50,6 +51,13 @@ type ScheduleParams struct {
 	StartsAt        time.Time
 	PlannedEndsAt   *time.Time
 	CreatedByUserID *int64
+}
+
+type EditScheduleParams struct {
+	ID            int64
+	Reason        string
+	StartsAt      time.Time
+	PlannedEndsAt *time.Time
 }
 
 type CloseParams struct {
@@ -409,6 +417,54 @@ WHERE id = ? AND scheduled = 1 AND status = ?`, domain.BranchFreezeStatusCancell
 	return s.Get(ctx, id)
 }
 
+func (s *Store) EditScheduled(ctx context.Context, params EditScheduleParams) (domain.BranchFreeze, error) {
+	return s.editScheduled(ctx, params, nil)
+}
+
+func (s *Store) editScheduled(ctx context.Context, params EditScheduleParams, expectedUpdatedAt *time.Time) (domain.BranchFreeze, error) {
+	if s == nil || s.db == nil {
+		return domain.BranchFreeze{}, errors.New("freeze store has no database")
+	}
+	params = normalizeEditScheduleParams(params)
+	now := s.now().UTC()
+	if expectedUpdatedAt != nil && !now.After(expectedUpdatedAt.UTC()) {
+		now = expectedUpdatedAt.UTC().Add(time.Nanosecond)
+	}
+	if err := validateEditScheduleParams(params, now); err != nil {
+		return domain.BranchFreeze{}, err
+	}
+	var plannedEndsAt any
+	if params.PlannedEndsAt != nil {
+		plannedEndsAt = params.PlannedEndsAt.Format(sqliteTimestampFormat)
+	}
+	var expectedUpdatedAtText any
+	if expectedUpdatedAt != nil {
+		expectedUpdatedAtText = expectedUpdatedAt.UTC().Format(sqliteTimestampFormat)
+	}
+	result, err := s.db.ExecContext(ctx, `
+UPDATE branch_freezes
+SET reason = ?, starts_at = ?, planned_ends_at = ?, updated_at = ?
+WHERE id = ? AND scheduled = 1 AND status = ? AND starts_at > ?
+  AND (? IS NULL OR updated_at = ?)`,
+		params.Reason,
+		params.StartsAt.Format(sqliteTimestampFormat),
+		plannedEndsAt,
+		now.Format(sqliteTimestampFormat),
+		params.ID,
+		domain.BranchFreezeStatusScheduled,
+		now.Format(sqliteTimestampFormat),
+		expectedUpdatedAtText,
+		expectedUpdatedAtText,
+	)
+	if err != nil {
+		return domain.BranchFreeze{}, fmt.Errorf("edit scheduled freeze: %w", err)
+	}
+	if err := requireAffectedFreeze(result, "scheduled freeze is no longer pending"); err != nil {
+		return domain.BranchFreeze{}, err
+	}
+	return s.Get(ctx, params.ID)
+}
+
 func (s *Store) ActivateScheduled(ctx context.Context, id int64) (domain.BranchFreeze, error) {
 	if s == nil || s.db == nil {
 		return domain.BranchFreeze{}, errors.New("freeze store has no database")
@@ -426,6 +482,57 @@ WHERE id = ? AND scheduled = 1 AND status = ? AND starts_at <= ?`, domain.Branch
 	}
 	if err := requireAffectedFreeze(result, "scheduled freeze is not due"); err != nil {
 		return domain.BranchFreeze{}, err
+	}
+	return s.Get(ctx, id)
+}
+
+func (s *Store) StartScheduledNow(ctx context.Context, id int64) (domain.BranchFreeze, error) {
+	if s == nil || s.db == nil {
+		return domain.BranchFreeze{}, errors.New("freeze store has no database")
+	}
+	if id <= 0 {
+		return domain.BranchFreeze{}, ValidationError{Message: "scheduled freeze is required"}
+	}
+	now := s.now().UTC()
+	nowText := now.Format(sqliteTimestampFormat)
+	result, err := s.db.ExecContext(ctx, `
+UPDATE branch_freezes
+SET status = ?, starts_at = ?, needs_recompute = 1, updated_at = ?
+WHERE id = ? AND scheduled = 1 AND status = ? AND starts_at > ?
+  AND (planned_ends_at IS NULL OR planned_ends_at > ?)`,
+		domain.BranchFreezeStatusActive,
+		nowText,
+		nowText,
+		id,
+		domain.BranchFreezeStatusScheduled,
+		nowText,
+		nowText,
+	)
+	if err != nil {
+		return domain.BranchFreeze{}, createActiveFreezeError(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return domain.BranchFreeze{}, fmt.Errorf("start scheduled freeze now rows affected: %w", err)
+	}
+	if affected == 0 {
+		target, err := s.Get(ctx, id)
+		if errors.Is(err, sql.ErrNoRows) {
+			return domain.BranchFreeze{}, ValidationError{Message: "scheduled freeze is no longer pending"}
+		}
+		if err != nil {
+			return domain.BranchFreeze{}, err
+		}
+		if !target.Scheduled || target.Status != domain.BranchFreezeStatusScheduled {
+			return domain.BranchFreeze{}, ValidationError{Message: "scheduled freeze is no longer pending"}
+		}
+		if target.StartsAt == nil || !target.StartsAt.After(now) {
+			return domain.BranchFreeze{}, ValidationError{Message: "scheduled freeze has reached its start time"}
+		}
+		if target.PlannedEndsAt != nil && !target.PlannedEndsAt.After(now) {
+			return domain.BranchFreeze{}, ValidationError{Message: "planned unfreeze is no longer in the future; edit the schedule before starting it now"}
+		}
+		return domain.BranchFreeze{}, ValidationError{Message: "scheduled freeze is no longer pending"}
 	}
 	return s.Get(ctx, id)
 }
@@ -566,6 +673,16 @@ func normalizeScheduleParams(params ScheduleParams) ScheduleParams {
 	return params
 }
 
+func normalizeEditScheduleParams(params EditScheduleParams) EditScheduleParams {
+	params.Reason = strings.TrimSpace(params.Reason)
+	params.StartsAt = params.StartsAt.UTC()
+	if params.PlannedEndsAt != nil {
+		plannedEndsAt := params.PlannedEndsAt.UTC()
+		params.PlannedEndsAt = &plannedEndsAt
+	}
+	return params
+}
+
 func validateScheduleParams(params ScheduleParams, now time.Time) error {
 	var missing []string
 	if params.RepositoryID <= 0 {
@@ -583,11 +700,48 @@ func validateScheduleParams(params ScheduleParams, now time.Time) error {
 	if len(missing) > 0 {
 		return ValidationError{Message: fmt.Sprintf("missing required scheduled freeze fields: %s", strings.Join(missing, ", "))}
 	}
+	if err := validateScheduledFreezeReason(params.Reason); err != nil {
+		return err
+	}
 	if !params.StartsAt.After(now) {
 		return ValidationError{Message: "scheduled freeze start time must be in the future"}
 	}
 	if params.PlannedEndsAt != nil && !params.PlannedEndsAt.After(params.StartsAt) {
 		return ValidationError{Message: "planned unfreeze time must be after the scheduled start"}
+	}
+	return nil
+}
+
+func validateEditScheduleParams(params EditScheduleParams, now time.Time) error {
+	if params.ID <= 0 {
+		return ValidationError{Message: "scheduled freeze is required"}
+	}
+	if params.Reason == "" {
+		return ValidationError{Message: "scheduled freeze reason is required"}
+	}
+	if params.StartsAt.IsZero() {
+		return ValidationError{Message: "scheduled freeze start time is required"}
+	}
+	if err := validateScheduledFreezeReason(params.Reason); err != nil {
+		return err
+	}
+	if !params.StartsAt.After(now) {
+		return ValidationError{Message: "scheduled freeze start time must be in the future"}
+	}
+	if params.PlannedEndsAt != nil && !params.PlannedEndsAt.After(params.StartsAt) {
+		return ValidationError{Message: "planned unfreeze time must be after the scheduled start"}
+	}
+	return nil
+}
+
+func validateScheduledFreezeReason(reason string) error {
+	if len(reason) > scheduledFreezeReasonMaxLength {
+		return ValidationError{Message: "scheduled freeze reason must be 500 characters or fewer"}
+	}
+	for _, r := range reason {
+		if r < 0x20 || r == 0x7f {
+			return ValidationError{Message: "scheduled freeze reason contains unsupported control characters"}
+		}
 	}
 	return nil
 }
