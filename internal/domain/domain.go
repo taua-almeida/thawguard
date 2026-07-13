@@ -52,12 +52,14 @@ const (
 	EnforcementFailureOpenPRSync      = "open pull request synchronization failed"
 	EnforcementFailureEvaluation      = "status decision evaluation failed"
 	EnforcementFailurePublication     = "status publication failed"
+	EnforcementFailureRuntime         = "runtime enforcement convergence failed"
 )
 
 func ValidEnforcementFailureReason(reason string) bool {
 	switch reason {
 	case EnforcementFailureReadinessChecks, EnforcementFailureSetupStatusPost,
-		EnforcementFailureOpenPRSync, EnforcementFailureEvaluation, EnforcementFailurePublication:
+		EnforcementFailureOpenPRSync, EnforcementFailureEvaluation, EnforcementFailurePublication,
+		EnforcementFailureRuntime:
 		return true
 	default:
 		return false

@@ -11,6 +11,7 @@ import (
 
 	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/jobs"
 )
 
 type Service struct {
@@ -70,6 +71,13 @@ func (s *Service) MarkRecomputed(ctx context.Context, id int64) (domain.BranchFr
 	return NewStore(s.db).MarkRecomputed(ctx, id)
 }
 
+func (s *Service) MarkRepositoryRecomputed(ctx context.Context, repositoryID int64) error {
+	if s == nil || s.db == nil {
+		return errors.New("freeze service has no database")
+	}
+	return NewStore(s.db).MarkRepositoryRecomputed(ctx, repositoryID)
+}
+
 func (s *Service) CreateActive(ctx context.Context, params CreateParams, actor domain.Actor) (domain.BranchFreeze, error) {
 	if s == nil || s.db == nil {
 		return domain.BranchFreeze{}, errors.New("freeze service has no database")
@@ -93,6 +101,9 @@ func (s *Service) CreateActive(ctx context.Context, params CreateParams, actor d
 	}
 	if err := audit.NewStoreTx(tx).Record(ctx, branchFreezeCreatedEvent(created, actor)); err != nil {
 		return domain.BranchFreeze{}, fmt.Errorf("record branch_freeze.created audit event: %w", err)
+	}
+	if _, err := jobs.NewStoreTx(tx).EnqueueReconciliation(ctx, created.RepositoryID); err != nil {
+		return domain.BranchFreeze{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return domain.BranchFreeze{}, fmt.Errorf("commit freeze creation: %w", err)
@@ -144,7 +155,7 @@ func (s *Service) CancelScheduled(ctx context.Context, id int64, actor domain.Ac
 	if s == nil || s.db == nil {
 		return domain.BranchFreeze{}, errors.New("freeze service has no database")
 	}
-	return s.withScheduledFreezeAudit(ctx, id, actor, audit.ActionFreezeScheduleCancelled, func(store *Store) (domain.BranchFreeze, error) {
+	return s.withScheduledFreezeAudit(ctx, id, actor, audit.ActionFreezeScheduleCancelled, false, func(store *Store) (domain.BranchFreeze, error) {
 		return store.CancelScheduled(ctx, id)
 	})
 }
@@ -153,7 +164,7 @@ func (s *Service) ActivateScheduled(ctx context.Context, id int64, actor domain.
 	if s == nil || s.db == nil {
 		return domain.BranchFreeze{}, errors.New("freeze service has no database")
 	}
-	return s.withScheduledFreezeAudit(ctx, id, actor, audit.ActionFreezeScheduleActivated, func(store *Store) (domain.BranchFreeze, error) {
+	return s.withScheduledFreezeAudit(ctx, id, actor, audit.ActionFreezeScheduleActivated, true, func(store *Store) (domain.BranchFreeze, error) {
 		return store.ActivateScheduled(ctx, id)
 	})
 }
@@ -184,6 +195,9 @@ func (s *Service) ExecutePlannedUnfreeze(ctx context.Context, id int64, actor do
 	if err := audit.NewStoreTx(tx).Record(ctx, scheduledFreezeEvent(ended, actor, action)); err != nil {
 		return domain.BranchFreeze{}, fmt.Errorf("record planned unfreeze audit event: %w", err)
 	}
+	if _, err := jobs.NewStoreTx(tx).EnqueueReconciliation(ctx, ended.RepositoryID); err != nil {
+		return domain.BranchFreeze{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return domain.BranchFreeze{}, fmt.Errorf("commit planned unfreeze: %w", err)
 	}
@@ -191,7 +205,7 @@ func (s *Service) ExecutePlannedUnfreeze(ctx context.Context, id int64, actor do
 	return ended, nil
 }
 
-func (s *Service) withScheduledFreezeAudit(ctx context.Context, id int64, actor domain.Actor, action string, mutate func(*Store) (domain.BranchFreeze, error)) (domain.BranchFreeze, error) {
+func (s *Service) withScheduledFreezeAudit(ctx context.Context, id int64, actor domain.Actor, action string, enqueue bool, mutate func(*Store) (domain.BranchFreeze, error)) (domain.BranchFreeze, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return domain.BranchFreeze{}, fmt.Errorf("begin scheduled freeze update: %w", err)
@@ -209,6 +223,11 @@ func (s *Service) withScheduledFreezeAudit(ctx context.Context, id int64, actor 
 	}
 	if err := audit.NewStoreTx(tx).Record(ctx, scheduledFreezeEvent(updated, actor, action)); err != nil {
 		return domain.BranchFreeze{}, fmt.Errorf("record scheduled freeze audit event: %w", err)
+	}
+	if enqueue {
+		if _, err := jobs.NewStoreTx(tx).EnqueueReconciliation(ctx, updated.RepositoryID); err != nil {
+			return domain.BranchFreeze{}, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return domain.BranchFreeze{}, fmt.Errorf("commit scheduled freeze update: %w", err)
@@ -239,6 +258,9 @@ func (s *Service) close(ctx context.Context, id int64, actor domain.Actor, statu
 	}
 	if err := audit.NewStoreTx(tx).Record(ctx, branchFreezeClosedEvent(closed, actor)); err != nil {
 		return domain.BranchFreeze{}, fmt.Errorf("record branch freeze close audit event: %w", err)
+	}
+	if _, err := jobs.NewStoreTx(tx).EnqueueReconciliation(ctx, closed.RepositoryID); err != nil {
+		return domain.BranchFreeze{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return domain.BranchFreeze{}, fmt.Errorf("commit freeze close: %w", err)

@@ -12,6 +12,7 @@ import (
 
 	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/jobs"
 	"github.com/taua-almeida/thawguard/internal/repository"
 	"github.com/taua-almeida/thawguard/internal/webhook"
 )
@@ -218,10 +219,12 @@ func (s *Service) persistRun(ctx context.Context, repo domain.Repository, reposi
 		if _, err := repositoryStore.SetEnforcementState(ctx, repo.ID, domain.EnforcementUnhealthy); err != nil {
 			return err
 		}
-		// The stored failure keeps the repository page truthful about why
-		// enforcement became unhealthy; only the explicit recovery action
-		// clears it.
+		// The stored failure keeps the repository page truthful while the
+		// durable runner or an explicit retry performs the full recovery proof.
 		if _, err := repositoryStore.SetEnforcementFailure(ctx, repo.ID, domain.EnforcementFailureReadinessChecks, checkedAt); err != nil {
+			return err
+		}
+		if _, err := jobs.NewStoreTx(tx).EnsureReconciliationFailure(ctx, repo.ID, domain.EnforcementFailureReadinessChecks); err != nil {
 			return err
 		}
 	}

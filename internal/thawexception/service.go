@@ -12,6 +12,7 @@ import (
 
 	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/jobs"
 )
 
 type Service struct {
@@ -52,6 +53,9 @@ func (s *Service) Approve(ctx context.Context, params ApproveParams, actor domai
 	}
 	if err := audit.NewStoreTx(tx).Record(ctx, thawExceptionApprovedEvent(approved, actor)); err != nil {
 		return domain.ThawException{}, fmt.Errorf("record thaw_exception.approved audit event: %w", err)
+	}
+	if _, err := jobs.NewStoreTx(tx).EnqueueReconciliation(ctx, approved.RepositoryID); err != nil {
+		return domain.ThawException{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return domain.ThawException{}, fmt.Errorf("commit thaw exception approval: %w", err)
@@ -102,6 +106,9 @@ func (s *Service) ApproveSharedHead(ctx context.Context, params ApproveSharedHea
 	}
 	if err := audit.NewStoreTx(tx).Record(ctx, thawExceptionSharedHeadApprovedEvent(params, created, alreadyCovered, actor)); err != nil {
 		return nil, fmt.Errorf("record thaw_exception.shared_head_approved audit event: %w", err)
+	}
+	if _, err := jobs.NewStoreTx(tx).EnqueueReconciliation(ctx, params.RepositoryID); err != nil {
+		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit shared-head thaw approval: %w", err)

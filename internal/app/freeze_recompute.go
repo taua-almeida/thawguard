@@ -9,6 +9,7 @@ import (
 
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/freeze"
+	"github.com/taua-almeida/thawguard/internal/jobs"
 	"github.com/taua-almeida/thawguard/internal/statuspublication"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
 )
@@ -65,6 +66,7 @@ type freezeRecomputingStore struct {
 	pullRequests openPullRequestBranchLister
 	statuses     sharedHeadStatusRunner
 	publisher    statusPublisher
+	convergence  enforcementConvergence
 }
 
 func newFreezeRecomputingStore(freezes freezeOperations, repositories recomputeRepositoryGetter, syncer openPullRequestSyncer, pullRequests openPullRequestBranchLister, statuses sharedHeadStatusRunner, publisher statusPublisher) *freezeRecomputingStore {
@@ -92,7 +94,7 @@ func (s *freezeRecomputingStore) CreateActive(ctx context.Context, params freeze
 	if err != nil {
 		return domain.BranchFreeze{}, err
 	}
-	if _, err := s.recomputeBranch(ctx, created.RepositoryID, created.Branch); err != nil {
+	if err := s.convergeFreeze(ctx, created); err != nil {
 		return created, err
 	}
 	return created, nil
@@ -106,14 +108,8 @@ func (s *freezeRecomputingStore) End(ctx context.Context, id int64, actor domain
 	if err != nil {
 		return domain.BranchFreeze{}, err
 	}
-	converged, err := s.recomputeBranch(ctx, ended.RepositoryID, ended.Branch)
-	if err != nil {
+	if err := s.convergeFreeze(ctx, ended); err != nil {
 		return ended, err
-	}
-	if converged {
-		if err := s.markRecomputedIfNeeded(ctx, ended); err != nil {
-			return ended, err
-		}
 	}
 	return ended, nil
 }
@@ -126,14 +122,8 @@ func (s *freezeRecomputingStore) Cancel(ctx context.Context, id int64, actor dom
 	if err != nil {
 		return domain.BranchFreeze{}, err
 	}
-	converged, err := s.recomputeBranch(ctx, cancelled.RepositoryID, cancelled.Branch)
-	if err != nil {
+	if err := s.convergeFreeze(ctx, cancelled); err != nil {
 		return cancelled, err
-	}
-	if converged {
-		if err := s.markRecomputedIfNeeded(ctx, cancelled); err != nil {
-			return cancelled, err
-		}
 	}
 	return cancelled, nil
 }
@@ -197,14 +187,8 @@ func (s *freezeRecomputingStore) ActivateScheduled(ctx context.Context, id int64
 	if err != nil {
 		return domain.BranchFreeze{}, err
 	}
-	converged, err := s.recomputeBranch(ctx, activated.RepositoryID, activated.Branch)
-	if err != nil {
+	if err := s.convergeFreeze(ctx, activated); err != nil {
 		return activated, err
-	}
-	if converged {
-		if _, err := lifecycle.MarkRecomputed(ctx, activated.ID); err != nil {
-			return activated, err
-		}
 	}
 	return activated, nil
 }
@@ -234,32 +218,50 @@ func (s *freezeRecomputingStore) ExecutePlannedUnfreeze(ctx context.Context, id 
 	if err != nil {
 		return domain.BranchFreeze{}, err
 	}
-	converged, err := s.recomputeBranch(ctx, ended.RepositoryID, ended.Branch)
-	if err != nil {
+	if err := s.convergeFreeze(ctx, ended); err != nil {
 		return ended, err
-	}
-	if converged {
-		if _, err := lifecycle.MarkRecomputed(ctx, ended.ID); err != nil {
-			return ended, err
-		}
 	}
 	return ended, nil
 }
 
 func (s *freezeRecomputingStore) RetryRecompute(ctx context.Context, pending domain.BranchFreeze) error {
-	lifecycle, err := s.freezeLifecycle()
-	if err != nil {
-		return err
+	if s.convergence != nil {
+		// Repository-scoped reconciliation owns durable retries. A branch-only
+		// retry must not consume its job before the full repository converges.
+		return nil
 	}
-	converged, err := s.recomputeBranch(ctx, pending.RepositoryID, pending.Branch)
+	return s.convergeFreeze(ctx, pending)
+}
+
+func (s *freezeRecomputingStore) convergeFreeze(ctx context.Context, changed domain.BranchFreeze) error {
+	var claim jobs.Job
+	if s.convergence != nil {
+		var claimed bool
+		var err error
+		claim, claimed, err = s.convergence.Claim(ctx, changed.RepositoryID)
+		if err != nil {
+			return err
+		}
+		if !claimed {
+			return nil
+		}
+	}
+	converged, err := s.recomputeBranch(ctx, changed.RepositoryID, changed.Branch)
 	if err != nil {
-		return err
+		return failRuntimeConvergence(ctx, s.convergence, claim, err)
 	}
 	if !converged {
 		return nil
 	}
-	_, err = lifecycle.MarkRecomputed(ctx, pending.ID)
-	return err
+	if err := s.markRecomputedIfNeeded(ctx, changed); err != nil {
+		return failRuntimeConvergence(ctx, s.convergence, claim, convergenceError(domain.EnforcementFailureRuntime, err))
+	}
+	if s.convergence != nil {
+		if err := s.convergence.Complete(ctx, claim); err != nil {
+			return failRuntimeConvergence(ctx, s.convergence, claim, convergenceError(domain.EnforcementFailureRuntime, err))
+		}
+	}
+	return nil
 }
 
 func (s *freezeRecomputingStore) markRecomputedIfNeeded(ctx context.Context, freeze domain.BranchFreeze) error {
@@ -350,11 +352,11 @@ func (s *freezeRecomputingStore) recomputeBranch(ctx context.Context, repository
 	// the sync fails (missing token, forge error), no stale cached status is
 	// recomputed or published.
 	if err := s.syncer.SyncOpenPullRequests(ctx, repositoryID, ""); err != nil {
-		return false, fmt.Errorf("sync open pull requests for freeze recomputation: %w", err)
+		return false, convergenceError(domain.EnforcementFailureOpenPRSync, fmt.Errorf("sync open pull requests for freeze recomputation: %w", err))
 	}
 	branchPRs, err := s.pullRequests.ListOpenByTargetBranch(ctx, repositoryID, branch)
 	if err != nil {
-		return false, fmt.Errorf("list cached open pull requests for freeze recomputation: %w", err)
+		return false, convergenceError(domain.EnforcementFailureRuntime, fmt.Errorf("list cached open pull requests for freeze recomputation: %w", err))
 	}
 	// One decision per affected head SHA; the status runner expands each group
 	// to every cached open PR in the repository sharing the head, including
@@ -365,10 +367,10 @@ func (s *freezeRecomputingStore) recomputeBranch(ctx context.Context, repository
 		}
 		result, err := s.statuses.RunForSharedHead(ctx, group, group[0].Index)
 		if err != nil {
-			return false, fmt.Errorf("recompute freeze status for cached pull requests: %w", err)
+			return false, convergenceError(domain.EnforcementFailureEvaluation, fmt.Errorf("recompute freeze status for cached pull requests: %w", err))
 		}
 		if _, err := s.publisher.Publish(ctx, result); err != nil {
-			return false, fmt.Errorf("publish freeze status for cached pull requests: %w", err)
+			return false, convergenceError(domain.EnforcementFailurePublication, fmt.Errorf("publish freeze status for cached pull requests: %w", err))
 		}
 	}
 	return true, nil

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/jobs"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
 	"github.com/taua-almeida/thawguard/internal/thawexception"
 )
@@ -57,6 +58,7 @@ type thawApprovalService struct {
 	publisher    statusPublisher
 	syncer       openPullRequestSyncer
 	clientFor    thawApprovalForgeClientFactory
+	convergence  enforcementConvergence
 }
 
 func newThawApprovalService(repositories thawApprovalRepositoryGetter, tokens thawApprovalStatusTokenGetter, pullRequests thawApprovalPullRequestCache, exceptions thawApprovalExceptionApprover, freezes thawApprovalFreezeLister, statuses thawApprovalStatusRunner, publisher statusPublisher, syncer openPullRequestSyncer, clientFor thawApprovalForgeClientFactory) *thawApprovalService {
@@ -160,12 +162,30 @@ func (s *thawApprovalService) ApproveThaw(ctx context.Context, params statusresu
 			return statusresult.ThawApprovalOutcome{}, thawApprovalExceptionError(err, token)
 		}
 	}
+	var claim jobs.Job
+	if s.convergence != nil {
+		var claimed bool
+		claim, claimed, err = s.convergence.Claim(ctx, repo.ID)
+		if err != nil {
+			return statusresult.ThawApprovalOutcome{}, err
+		}
+		if !claimed {
+			return statusresult.ThawApprovalOutcome{}, nil
+		}
+	}
 	result, err := s.statuses.RunForSharedHead(ctx, openPRs, cached.Index)
 	if err != nil {
-		return statusresult.ThawApprovalOutcome{}, safeThawApprovalError(err, token)
+		convergenceErr := convergenceError(domain.EnforcementFailureEvaluation, safeThawApprovalError(err, token))
+		return statusresult.ThawApprovalOutcome{}, failRuntimeConvergence(ctx, s.convergence, claim, convergenceErr)
 	}
 	if _, err := s.publisher.Publish(ctx, result); err != nil {
-		return statusresult.ThawApprovalOutcome{}, safeThawApprovalError(err, token)
+		convergenceErr := convergenceError(domain.EnforcementFailurePublication, safeThawApprovalError(err, token))
+		return statusresult.ThawApprovalOutcome{}, failRuntimeConvergence(ctx, s.convergence, claim, convergenceErr)
+	}
+	if s.convergence != nil {
+		if err := s.convergence.Complete(ctx, claim); err != nil {
+			return statusresult.ThawApprovalOutcome{}, failRuntimeConvergence(ctx, s.convergence, claim, convergenceError(domain.EnforcementFailureRuntime, err))
+		}
 	}
 	return statusresult.ThawApprovalOutcome{Result: &result}, nil
 }

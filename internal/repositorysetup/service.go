@@ -34,7 +34,8 @@ func IsValidationError(err error) bool {
 
 // ActiveStatusTokenLockedMessage rejects status-token replacement for
 // enforcement-active repositories: an untested token must never sit behind a
-// healthy-looking active state, and there is no recovery flow yet.
+// healthy-looking active state. Recovery always reuses the previously verified
+// token and reruns the complete proof.
 const ActiveStatusTokenLockedMessage = "Deactivate repository enforcement before replacing the status token."
 
 type ConfigurationError struct {

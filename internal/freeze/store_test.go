@@ -13,6 +13,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/db"
 	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/jobs"
 	"github.com/taua-almeida/thawguard/internal/repository"
 )
 
@@ -499,6 +500,10 @@ func TestServiceCreatesFreezeAndAuditEventAtomically(t *testing.T) {
 	if details["planned_ends_at"] != created.PlannedEndsAt.UTC().Format(time.RFC3339Nano) {
 		t.Fatalf("expected planned end in creation audit details, got %s", event.DetailsJSON)
 	}
+	job, err := jobs.NewStore(database).GetReconciliation(ctx, repo.ID)
+	if err != nil || job.Generation != 1 {
+		t.Fatalf("expected freeze and durable intent to commit together, job=%+v err=%v", job, err)
+	}
 }
 
 func TestServiceEndsFreezeAndRecordsAuditEvent(t *testing.T) {
@@ -712,6 +717,9 @@ func TestServiceRollsBackFreezeWhenAuditFails(t *testing.T) {
 	}
 	if len(freezes) != 0 {
 		t.Fatalf("expected rollback to leave no freezes, got %d", len(freezes))
+	}
+	if _, err := jobs.NewStore(database).GetReconciliation(ctx, repo.ID); err == nil {
+		t.Fatal("expected rollback to leave no reconciliation job")
 	}
 }
 

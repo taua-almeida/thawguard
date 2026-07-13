@@ -4,14 +4,17 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/freeze"
+	"github.com/taua-almeida/thawguard/internal/jobs"
 	"github.com/taua-almeida/thawguard/internal/pullrequest"
 	"github.com/taua-almeida/thawguard/internal/repository"
 	"github.com/taua-almeida/thawguard/internal/repositorysetup"
@@ -48,10 +51,14 @@ type fakeEnforcementReadiness struct {
 	results []setupcheck.Result
 	err     error
 	runs    int
+	onRun   func()
 }
 
 func (f *fakeEnforcementReadiness) Run(ctx context.Context, repo domain.Repository) ([]setupcheck.Result, error) {
 	f.runs++
+	if f.onRun != nil {
+		f.onRun()
+	}
 	return f.results, f.err
 }
 
@@ -406,6 +413,42 @@ func TestActivateEnforcementSyncFailureStaysReadyWithoutPublication(t *testing.T
 	if len(events) != 1 || !strings.Contains(events[0].DetailsJSON, "synchronization failed") {
 		t.Fatalf("expected activation failure audit for sync, got %+v", events)
 	}
+	if _, err := jobs.NewStore(h.database).GetReconciliation(ctx, h.repo.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("ready activation sync failure must not retain retry work, got %v", err)
+	}
+}
+
+func TestActivateEnforcementStaysReadyWhenReconciliationLeaseIsOwned(t *testing.T) {
+	ctx := context.Background()
+	h := newEnforcementHarness(t, ctx)
+	if _, err := h.service.VerifyStatusPosting(ctx, h.repo.ID, h.admin); err != nil {
+		t.Fatal(err)
+	}
+	jobStore := jobs.NewStore(h.database)
+	if _, err := jobStore.EnqueueReconciliation(ctx, h.repo.ID); err != nil {
+		t.Fatal(err)
+	}
+	workerClaim, claimed, err := jobStore.ClaimRepository(ctx, h.repo.ID)
+	if err != nil || !claimed {
+		t.Fatalf("expected existing worker claim, claim=%+v claimed=%v err=%v", workerClaim, claimed, err)
+	}
+
+	_, err = h.service.ActivateEnforcement(ctx, h.repo.ID, h.admin)
+	if !repository.IsValidationError(err) || !strings.Contains(err.Error(), "already in progress") {
+		t.Fatalf("expected activation-in-progress response, got %v", err)
+	}
+	if repo := h.currentRepo(t, ctx); repo.EnforcementState != domain.EnforcementReady {
+		t.Fatalf("activation without publication ownership must remain ready, got %+v", repo)
+	}
+	job, err := jobStore.GetReconciliation(ctx, h.repo.ID)
+	if err != nil || job.Generation != workerClaim.Generation || job.LockedAt == nil || !job.LockedAt.Equal(*workerClaim.LockedAt) {
+		t.Fatalf("activation rollback must preserve the worker claim, job=%+v claim=%+v err=%v", job, workerClaim, err)
+	}
+	for _, post := range h.forge.posted {
+		if post.Context == domain.RequiredStatusContext {
+			t.Fatalf("activation without a lease must not publish freeze status, got %+v", h.forge.posted)
+		}
+	}
 }
 
 func TestActivateEnforcementWithNoOpenPullRequestsBecomesActive(t *testing.T) {
@@ -554,6 +597,7 @@ func TestActivateEnforcementPublicationFailureBecomesUnhealthy(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.forge.failFreezePost = true
+	before := time.Now().UTC()
 
 	_, err := h.service.ActivateEnforcement(ctx, h.repo.ID, h.admin)
 	if !repository.IsValidationError(err) || strings.Contains(err.Error(), enforcementTestToken) {
@@ -562,6 +606,9 @@ func TestActivateEnforcementPublicationFailureBecomesUnhealthy(t *testing.T) {
 	repo := h.currentRepo(t, ctx)
 	if repo.EnforcementState != domain.EnforcementUnhealthy {
 		t.Fatalf("expected unhealthy repository, got %s", repo.EnforcementState)
+	}
+	if job, err := jobs.NewStore(h.database).GetReconciliation(ctx, h.repo.ID); err != nil || job.Generation != 1 || job.Attempts != 1 || job.LockedAt != nil || job.RunAt.Before(before.Add(14*time.Second)) {
+		t.Fatalf("expected activation failure to retain write-ahead job, job=%+v err=%v", job, err)
 	}
 	events := h.auditEvents(t, ctx, audit.ActionRepositoryEnforcementActivateFail)
 	if len(events) != 1 {

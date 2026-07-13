@@ -19,6 +19,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/auth"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/freeze"
+	"github.com/taua-almeida/thawguard/internal/jobs"
 	"github.com/taua-almeida/thawguard/internal/repository"
 	"github.com/taua-almeida/thawguard/internal/repositorysetup"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
@@ -48,6 +49,7 @@ type Config struct {
 	WebhookMaxBodyBytes                  int64
 	AuthService                          AuthService
 	EnforcementService                   EnforcementService
+	ReconciliationJobStore               ReconciliationJobStore
 }
 
 // EnforcementService performs the explicit admin transitions of the
@@ -61,6 +63,10 @@ type EnforcementService interface {
 	ActivateEnforcement(ctx context.Context, repositoryID int64, actor domain.Actor) (domain.Repository, error)
 	ReconcileEnforcement(ctx context.Context, repositoryID int64, actor domain.Actor) (domain.Repository, error)
 	RecoverEnforcement(ctx context.Context, repositoryID int64, actor domain.Actor) (domain.Repository, error)
+}
+
+type ReconciliationJobStore interface {
+	ListReconciliations(ctx context.Context) ([]jobs.Job, error)
 }
 
 type AuthService interface {
@@ -153,6 +159,9 @@ type repositoryView struct {
 	// stable reason category) for the unhealthy state.
 	EnforcementFailedAt string
 	FailureRemediation  string
+	RecoveryInProgress  bool
+	RecoveryAttempts    int
+	NextRecoveryAt      string
 	// VerifyAvailable is true when the latest recorded readiness run has
 	// every mandatory read-only check OK; the POST re-runs readiness, so this
 	// only controls whether the action is offered.
@@ -2126,6 +2135,11 @@ func systemAuditEventViewForEvent(repositoriesByID map[int64]domain.Repository, 
 		view.Summary = auditRepositoryLabel(view.Repository, details)
 		view.Detail = auditDetailOrDash(details, "reason") + " — state " + auditDetailOrDash(details, "enforcement_state")
 		view.StateClass = "failed"
+	case audit.ActionRepositoryRuntimeConvergenceFail:
+		view.Label = "Runtime convergence failed"
+		view.Summary = auditRepositoryLabel(view.Repository, details)
+		view.Detail = auditDetailOrDash(details, "reason") + " — automatic recovery pending"
+		view.StateClass = "failed"
 	case audit.ActionBranchFreezeCreated:
 		view.Label = "Freeze created"
 		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "branch")
@@ -2572,6 +2586,16 @@ func (s *Server) repositoryByID(ctx context.Context, id int64) (domain.Repositor
 }
 
 func (s *Server) repositoryViews(ctx context.Context, repositories []domain.Repository) ([]repositoryView, error) {
+	jobsByRepository := make(map[int64]jobs.Job)
+	if s.cfg.ReconciliationJobStore != nil {
+		pending, err := s.cfg.ReconciliationJobStore.ListReconciliations(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, job := range pending {
+			jobsByRepository[job.RepositoryID] = job
+		}
+	}
 	views := make([]repositoryView, 0, len(repositories))
 	for _, repo := range repositories {
 		view := repositoryView{Repository: repo}
@@ -2587,6 +2611,13 @@ func (s *Server) repositoryViews(ctx context.Context, repositories []domain.Repo
 		}
 		if view.IsUnhealthy {
 			view.FailureRemediation = enforcementFailureRemediation(repo.EnforcementFailureReason)
+			if job, ok := jobsByRepository[repo.ID]; ok {
+				view.RecoveryAttempts = job.Attempts
+				view.RecoveryInProgress = job.LeaseActive(time.Now().UTC())
+				if !view.RecoveryInProgress {
+					view.NextRecoveryAt = formatReadinessTime(job.RunAt)
+				}
+			}
 		}
 		if s.cfg.SetupCheckStore != nil {
 			checks, err := s.cfg.SetupCheckStore.ListByRepository(ctx, repo.ID)
@@ -2701,6 +2732,8 @@ func enforcementFailureRemediation(reason string) string {
 		return "The current freeze policy could not be evaluated. Review the audit log for the failed run, then retry enforcement recovery."
 	case domain.EnforcementFailurePublication:
 		return "One or more " + domain.RequiredStatusContext + " statuses could not be posted. Check forge availability and token permissions, then retry enforcement recovery."
+	case domain.EnforcementFailureRuntime:
+		return "Runtime convergence bookkeeping did not complete. Automatic recovery will rerun the complete current repository policy."
 	default:
 		return "Review the sanitized failure in the audit log, fix the forge setup or credentials, then retry enforcement recovery."
 	}
@@ -3688,7 +3721,12 @@ const repositoriesTemplate = pageHead + `
         {{ else if .IsReady }}
         <p class="tg-muted">Status posting verified{{ if .StatusPostVerifiedAt }} at {{ .StatusPostVerifiedAt }}{{ end }} with a controlled <code>` + domain.SetupStatusContext + `</code> status. Ready to activate — enforcement stays off until an admin explicitly activates it.</p>
         {{ else if .IsUnhealthy }}
-        <p class="error">Enforcement is unhealthy{{ if .Repository.EnforcementFailureReason }}: {{ .Repository.EnforcementFailureReason }}{{ if .EnforcementFailedAt }} ({{ .EnforcementFailedAt }}){{ end }}{{ else }}: the last enforcement run failed{{ end }}. Freeze, schedule, and thaw actions stay disabled until an admin retries enforcement recovery.</p>
+        <p class="error">Enforcement is unhealthy{{ if .Repository.EnforcementFailureReason }}: {{ .Repository.EnforcementFailureReason }}{{ if .EnforcementFailedAt }} ({{ .EnforcementFailedAt }}){{ end }}{{ else }}: the last enforcement run failed{{ end }}. Freeze, schedule, and thaw actions stay disabled while recovery reruns the complete enforcement proof.</p>
+        {{ if .RecoveryInProgress }}
+        <p class="tg-muted">Recovery in progress. Attempt count: {{ .RecoveryAttempts }}.</p>
+        {{ else }}
+        <p class="tg-muted">Automatic recovery is pending. Attempt count: {{ .RecoveryAttempts }}{{ if .NextRecoveryAt }}. Next retry: {{ .NextRecoveryAt }}{{ end }}.</p>
+        {{ end }}
         <p class="tg-muted">{{ .FailureRemediation }}</p>
         {{ else if not .Repository.EnforcementActive }}
         <p class="tg-muted">This repository cannot enforce freezes, schedules, or thaws. Readiness checks are read-only; status posting is not tested until the controlled verification below.</p>

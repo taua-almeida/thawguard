@@ -76,6 +76,10 @@ func TestOpenAndApplyMigrationsAgainstSQLite(t *testing.T) {
 		t.Fatalf("expected generalized active planned-unfreeze index, got %q", indexSQL)
 	}
 	assertIndexDoesNotExist(t, database, "idx_branch_freezes_scheduled_recompute")
+	assertColumnExists(t, database, "jobs", "repository_id")
+	assertColumnExists(t, database, "jobs", "generation")
+	assertIndexExists(t, database, "idx_jobs_one_repository_reconciliation")
+	assertIndexExists(t, database, "idx_jobs_repository_reconciliation_due")
 	assertColumnExists(t, database, "sessions", "csrf_token")
 	assertIndexExists(t, database, "idx_sessions_expires_at")
 	assertTableExists(t, database, "user_roles")
@@ -611,10 +615,10 @@ func TestImmediatePlannedUnfreezeMigrationPreservesFreezeDataAndAppliesOnce(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(migrations) == 0 || migrations[len(migrations)-1].Name != "0023_immediate_planned_unfreezes.sql" {
+	if len(migrations) < 2 || migrations[len(migrations)-2].Name != "0023_immediate_planned_unfreezes.sql" {
 		t.Fatalf("expected immediate planned-unfreeze migration last, got %+v", migrations)
 	}
-	if err := ApplyMigrations(ctx, database, migrations[:len(migrations)-1]); err != nil {
+	if err := ApplyMigrations(ctx, database, migrations[:len(migrations)-2]); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.ExecContext(ctx, `
@@ -627,7 +631,7 @@ VALUES
 		t.Fatal(err)
 	}
 
-	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+	if err := ApplyMigrations(ctx, database, migrations[:len(migrations)-1]); err != nil {
 		t.Fatal(err)
 	}
 	assertIndexExists(t, database, "idx_branch_freezes_planned_unfreeze_due")
@@ -648,6 +652,69 @@ VALUES
 	}
 	if applied != 1 {
 		t.Fatalf("expected migration recorded once, got %d", applied)
+	}
+}
+
+func TestRepositoryReconciliationMigrationPreservesExistingJobsAndAppliesOnce(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-test.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(migrations) == 0 || migrations[len(migrations)-1].Name != "0024_repository_reconciliation_jobs.sql" {
+		t.Fatalf("expected reconciliation migration last, got %+v", migrations)
+	}
+	if err := ApplyMigrations(ctx, database, migrations[:len(migrations)-1]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO jobs(id, type, payload_json, run_at, locked_at, attempts, last_error, created_at)
+VALUES (77, 'legacy_job', '{"safe":true}', '2026-07-13T10:00:00.000000000Z', NULL, 2, 'legacy safe error', '2026-07-13T09:00:00.000000000Z');
+INSERT INTO repositories(id, forge, base_url, owner, name, default_branch, active, enforcement_state, created_at, updated_at)
+VALUES
+  (78, 'forgejo', 'https://codeberg.org', 'example', 'unhealthy', 'main', 1, 'unhealthy', '2026-07-13T09:00:00.000000000Z', '2026-07-13T09:00:00.000000000Z'),
+  (79, 'forgejo', 'https://codeberg.org', 'example', 'pending-marker', 'main', 1, 'active', '2026-07-13T09:00:00.000000000Z', '2026-07-13T09:00:00.000000000Z');
+INSERT INTO branch_freezes(id, repository_id, branch, status, reason, starts_at, needs_recompute, created_at, updated_at)
+VALUES (790, 79, 'main', 'ended', 'pending convergence', '2026-07-13T08:00:00.000000000Z', 1, '2026-07-13T08:00:00.000000000Z', '2026-07-13T09:00:00.000000000Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+		t.Fatal(err)
+	}
+	assertColumnExists(t, database, "jobs", "repository_id")
+	assertColumnExists(t, database, "jobs", "generation")
+	assertIndexExists(t, database, "idx_jobs_one_repository_reconciliation")
+	assertIndexExists(t, database, "idx_jobs_repository_reconciliation_due")
+	var payload string
+	var repositoryID sql.NullInt64
+	var generation, attempts int
+	if err := database.QueryRowContext(ctx, `SELECT payload_json, repository_id, generation, attempts FROM jobs WHERE id = 77`).Scan(&payload, &repositoryID, &generation, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if payload != `{"safe":true}` || repositoryID.Valid || generation != 0 || attempts != 2 {
+		t.Fatalf("expected legacy job preserved, payload=%q repository=%+v generation=%d attempts=%d", payload, repositoryID, generation, attempts)
+	}
+	var backfilled int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM jobs WHERE type = 'reconcile_repository_enforcement' AND repository_id IN (78, 79) AND generation = 1`).Scan(&backfilled); err != nil {
+		t.Fatal(err)
+	}
+	if backfilled != 2 {
+		t.Fatalf("expected unhealthy and pending-marker repositories backfilled, got %d", backfilled)
+	}
+	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+		t.Fatal(err)
+	}
+	var applied int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = '0024_repository_reconciliation_jobs'`).Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected reconciliation migration applied once, got %d", applied)
 	}
 }
 

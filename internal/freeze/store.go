@@ -363,6 +363,23 @@ WHERE id = ? AND needs_recompute = 1`, now, id)
 	return s.Get(ctx, id)
 }
 
+func (s *Store) MarkRepositoryRecomputed(ctx context.Context, repositoryID int64) error {
+	if s == nil || s.db == nil {
+		return errors.New("freeze store has no database")
+	}
+	if repositoryID <= 0 {
+		return ValidationError{Message: "repository is required"}
+	}
+	now := s.now().UTC().Format(sqliteTimestampFormat)
+	if _, err := s.db.ExecContext(ctx, `
+UPDATE branch_freezes
+SET needs_recompute = 0, updated_at = ?
+WHERE repository_id = ? AND needs_recompute = 1`, now, repositoryID); err != nil {
+		return fmt.Errorf("mark repository freezes recomputed: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) End(ctx context.Context, id int64) (domain.BranchFreeze, error) {
 	return s.closeActive(ctx, CloseParams{ID: id, Status: domain.BranchFreezeStatusEnded})
 }

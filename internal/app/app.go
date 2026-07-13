@@ -15,6 +15,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/forge/forgejo"
 	"github.com/taua-almeida/thawguard/internal/freeze"
+	"github.com/taua-almeida/thawguard/internal/jobs"
 	"github.com/taua-almeida/thawguard/internal/pullrequest"
 	"github.com/taua-almeida/thawguard/internal/repository"
 	"github.com/taua-almeida/thawguard/internal/repositorysetup"
@@ -80,10 +81,15 @@ func (a *App) Run(ctx context.Context) error {
 	statusPublicationStore := statuspublication.NewStore(database)
 	statusPublisher := newRuntimeStatusPublisher(statusPublicationStore, repositoryStore, repositorySetup)
 	openPullRequestSyncer := newForgeOpenPullRequestSyncer(repositoryStore, repositorySetup, pullRequestStore, forgejoPullRequestClientForRepository, auditStore)
-	freezeStoreForWeb := newFreezeRecomputingStore(freezeStore, repositoryStore, openPullRequestSyncer, pullRequestStore, statusDecisionStore, statusPublisher)
 	enforcementService := newEnforcementService(database, repositorySetup, setupCheckRunner, forgejoEnforcementClientForRepository, openPullRequestSyncer, pullRequestStore, statusDecisionStore, statusPublisher)
+	jobStore := jobs.NewStore(database)
+	convergence := newRuntimeConvergenceService(jobStore, enforcementService)
+	freezeStoreForWeb := newFreezeRecomputingStore(freezeStore, repositoryStore, openPullRequestSyncer, pullRequestStore, statusDecisionStore, statusPublisher)
+	freezeStoreForWeb.convergence = convergence
 	thawApprovalStore := newThawApprovalService(repositoryStore, repositorySetup, pullRequestStore, thawExceptionStore, freezeStore, statusDecisionStore, statusPublisher, openPullRequestSyncer, forgejoThawApprovalClientForRepository)
+	thawApprovalStore.convergence = convergence
 	pullRequestWebhookProcessor := webhook.NewPullRequestProcessor(repositoryStore, pullRequestStore, statusDecisionStore, statusPublisher)
+	pullRequestWebhookProcessor.SetConvergence(convergence)
 	server := &http.Server{
 		Addr: a.cfg.HTTPAddr,
 		Handler: web.NewServer(web.Config{
@@ -102,6 +108,7 @@ func (a *App) Run(ctx context.Context) error {
 			PullRequestWebhookProcessor:          pullRequestWebhookProcessor,
 			AuthService:                          authService,
 			EnforcementService:                   enforcementService,
+			ReconciliationJobStore:               jobStore,
 		}).Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
@@ -109,6 +116,7 @@ func (a *App) Run(ctx context.Context) error {
 
 	errc := make(chan error, 1)
 	go newFreezeLifecycleRunner(freezeStoreForWeb, a.logger).Start(ctx)
+	go newRepositoryReconciliationRunner(jobStore, enforcementService, a.logger).Start(ctx)
 	go func() {
 		a.logger.Info("starting thawguard", "addr", a.cfg.HTTPAddr, "db", a.cfg.DatabasePath, "public_url", a.cfg.PublicURL)
 		errc <- server.ListenAndServe()

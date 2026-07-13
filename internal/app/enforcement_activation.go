@@ -14,6 +14,8 @@ import (
 	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/forge"
+	"github.com/taua-almeida/thawguard/internal/freeze"
+	"github.com/taua-almeida/thawguard/internal/jobs"
 	"github.com/taua-almeida/thawguard/internal/repository"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
 )
@@ -50,6 +52,7 @@ type enforcementService struct {
 	pullRequests openPullRequestBranchLister
 	statuses     sharedHeadStatusRunner
 	publisher    statusPublisher
+	jobs         *jobs.Store
 	now          func() time.Time
 }
 
@@ -63,6 +66,7 @@ func newEnforcementService(db *sql.DB, tokens enforcementStatusTokenGetter, read
 		pullRequests: pullRequests,
 		statuses:     statuses,
 		publisher:    publisher,
+		jobs:         jobs.NewStore(db),
 		now:          func() time.Time { return time.Now().UTC() },
 	}
 }
@@ -127,7 +131,7 @@ func (s *enforcementService) ActivateEnforcement(ctx context.Context, repository
 		return domain.Repository{}, repository.ValidationError{Message: "Activation stopped: the controlled thawguard/setup status could not be posted. The repository returned to setup-incomplete; fix the token or forge setup and verify again."}
 	}
 	verifiedAt := s.now().UTC()
-	counts, reason, policyErr := s.reconcileCurrentPolicy(ctx, repo, &verifiedAt)
+	counts, reason, claim, policyErr := s.reconcileCurrentPolicy(ctx, repo, &verifiedAt, true)
 	if policyErr != nil {
 		if reason == domain.EnforcementFailureOpenPRSync {
 			// The forge cache never refreshed and enforcement never flipped:
@@ -139,18 +143,33 @@ func (s *enforcementService) ActivateEnforcement(ctx context.Context, repository
 			return domain.Repository{}, repository.ValidationError{Message: "Activation stopped: current open pull requests could not be synchronized from the forge. The repository stays ready and nothing was published."}
 		}
 		if reason == "" {
-			return domain.Repository{}, policyErr
+			if claim.ID == 0 {
+				if errors.Is(policyErr, jobs.ErrReconciliationInProgress) {
+					return domain.Repository{}, repository.ValidationError{Message: "Enforcement activation is already in progress."}
+				}
+				return domain.Repository{}, policyErr
+			}
+			return domain.Repository{}, s.failClaimedActivation(ctx, repo, actor, claim, domain.EnforcementFailureRuntime, policyErr)
 		}
-		failure := enforcementFailure{action: audit.ActionRepositoryEnforcementActivateFail, resultState: domain.EnforcementUnhealthy, reason: reason, counts: &counts, persistFailure: true}
+		failure := enforcementFailure{action: audit.ActionRepositoryEnforcementActivateFail, resultState: domain.EnforcementUnhealthy, reason: reason, counts: &counts, persistFailure: true, preserveJobGeneration: true}
 		if err := s.recordEnforcementFailure(ctx, repo, actor, failure); err != nil {
-			return domain.Repository{}, err
+			return domain.Repository{}, s.failClaimedActivation(ctx, repo, actor, claim, domain.EnforcementFailureRuntime, err)
 		}
-		return domain.Repository{}, repository.ValidationError{Message: "Activation failed while publishing initial thawguard/freeze statuses. The repository is marked unhealthy; statuses already posted were not rolled back."}
+		_, rescheduleErr := s.jobs.RescheduleClaim(ctx, claim, reason)
+		return domain.Repository{}, errors.Join(repository.ValidationError{Message: "Activation failed while publishing initial thawguard/freeze statuses. The repository is marked unhealthy; statuses already posted were not rolled back."}, rescheduleErr)
 	}
-	return s.recordEnforcementSuccess(ctx, repo, actor, audit.ActionRepositoryEnforcementActivated, map[string]string{
+	updated, err := s.recordEnforcementSuccess(ctx, repo, actor, audit.ActionRepositoryEnforcementActivated, map[string]string{
 		"default_branch": repo.DefaultBranch,
 		"head_sha":       abbreviateSHA(head.SHA),
-	}, counts)
+	}, counts, claim)
+	if err != nil {
+		if category, ok := convergenceStateChangeCategory(err); ok {
+			_, rescheduleErr := s.jobs.RescheduleClaim(ctx, claim, category)
+			return domain.Repository{}, errors.Join(err, rescheduleErr)
+		}
+		return domain.Repository{}, s.failClaimedActivation(ctx, repo, actor, claim, domain.EnforcementFailureRuntime, err)
+	}
+	return updated, nil
 }
 
 // reconcileCurrentPolicy is the one shared implementation of enforcement
@@ -163,20 +182,22 @@ func (s *enforcementService) ActivateEnforcement(ctx context.Context, repository
 // refresh and the first publication; callers own reverting the state on
 // failure. It stops at the first failed group and returns its stable failure
 // reason with truthful counts; already-posted statuses are never rolled back.
-func (s *enforcementService) reconcileCurrentPolicy(ctx context.Context, repo domain.Repository, activateVerifiedAt *time.Time) (activationCounts, string, error) {
+func (s *enforcementService) reconcileCurrentPolicy(ctx context.Context, repo domain.Repository, activateVerifiedAt *time.Time, enqueueActivationIntent bool) (activationCounts, string, jobs.Job, error) {
 	counts := activationCounts{}
 	if err := s.syncer.syncRepository(ctx, repo, ""); err != nil {
-		return counts, domain.EnforcementFailureOpenPRSync, err
+		return counts, domain.EnforcementFailureOpenPRSync, jobs.Job{}, err
 	}
 	openPRs, managedBranches, err := s.openManagedBranchPullRequests(ctx, repo)
 	if err != nil {
-		return counts, domain.EnforcementFailureOpenPRSync, err
+		return counts, domain.EnforcementFailureOpenPRSync, jobs.Job{}, err
 	}
 	counts.managedBranches = managedBranches
 	counts.openPullRequests = len(openPRs)
+	claim := jobs.Job{}
 	if activateVerifiedAt != nil {
-		if err := s.markActive(ctx, repo.ID, *activateVerifiedAt); err != nil {
-			return counts, "", err
+		claim, _, err = s.markActive(ctx, repo.ID, *activateVerifiedAt, enqueueActivationIntent)
+		if err != nil {
+			return counts, "", jobs.Job{}, err
 		}
 	}
 	for _, group := range pullRequestsByHead(openPRs) {
@@ -184,15 +205,15 @@ func (s *enforcementService) reconcileCurrentPolicy(ctx context.Context, repo do
 		result, err := s.statuses.RunForSharedHead(ctx, group, group[0].Index)
 		if err != nil {
 			counts.statusesFailed++
-			return counts, domain.EnforcementFailureEvaluation, err
+			return counts, domain.EnforcementFailureEvaluation, claim, err
 		}
 		if _, err := s.publisher.Publish(ctx, result); err != nil {
 			counts.statusesFailed++
-			return counts, domain.EnforcementFailurePublication, err
+			return counts, domain.EnforcementFailurePublication, claim, err
 		}
 		counts.statusesPosted++
 	}
-	return counts, "", nil
+	return counts, "", claim, nil
 }
 
 func (s *enforcementService) configured() error {
@@ -377,12 +398,13 @@ type activationCounts struct {
 // the repository's stored failure (only unhealthy results persist it), and
 // which audit action records it.
 type enforcementFailure struct {
-	action            string
-	resultState       domain.EnforcementState
-	clearVerification bool
-	reason            string
-	counts            *activationCounts
-	persistFailure    bool
+	action                string
+	resultState           domain.EnforcementState
+	clearVerification     bool
+	reason                string
+	counts                *activationCounts
+	persistFailure        bool
+	preserveJobGeneration bool
 }
 
 func (s *enforcementService) recordEnforcementFailure(ctx context.Context, repo domain.Repository, actor domain.Actor, failure enforcementFailure) error {
@@ -408,6 +430,16 @@ func (s *enforcementService) recordEnforcementFailure(ctx context.Context, repo 
 				return err
 			}
 		}
+		if failure.resultState == domain.EnforcementUnhealthy {
+			jobStore := jobs.NewStoreTx(tx)
+			if failure.preserveJobGeneration {
+				if _, err := jobStore.EnsureReconciliationFailure(ctx, repo.ID, failure.reason); err != nil {
+					return err
+				}
+			} else if _, err := jobStore.EnqueueReconciliationFailure(ctx, repo.ID, failure.reason); err != nil {
+				return err
+			}
+		}
 		event := enforcementEvent(failure.action, updated, actor, map[string]string{
 			"default_branch": repo.DefaultBranch,
 			"reason":         failure.reason,
@@ -419,8 +451,28 @@ func (s *enforcementService) recordEnforcementFailure(ctx context.Context, repo 
 	})
 }
 
-func (s *enforcementService) markActive(ctx context.Context, repositoryID int64, verifiedAt time.Time) error {
-	return s.inTx(ctx, func(tx *sql.Tx) error {
+func (s *enforcementService) recordRuntimeFailure(ctx context.Context, repositoryID int64, reason string, actor domain.Actor, preserveJobGeneration bool) error {
+	if !domain.ValidEnforcementFailureReason(reason) {
+		reason = domain.EnforcementFailureRuntime
+	}
+	repo, err := s.loadRepository(ctx, repositoryID)
+	if err != nil {
+		return err
+	}
+	failure := enforcementFailure{
+		action:                audit.ActionRepositoryRuntimeConvergenceFail,
+		resultState:           domain.EnforcementUnhealthy,
+		reason:                reason,
+		persistFailure:        true,
+		preserveJobGeneration: preserveJobGeneration,
+	}
+	return s.recordEnforcementFailure(ctx, repo, actor, failure)
+}
+
+func (s *enforcementService) markActive(ctx context.Context, repositoryID int64, verifiedAt time.Time, enqueueIntent bool) (jobs.Job, bool, error) {
+	claim := jobs.Job{}
+	claimed := false
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
 		store := repository.NewStoreTx(tx)
 		if _, err := store.SetStatusPostVerifiedAt(ctx, repositoryID, &verifiedAt); err != nil {
 			return err
@@ -428,17 +480,69 @@ func (s *enforcementService) markActive(ctx context.Context, repositoryID int64,
 		if _, err := store.SetEnforcementState(ctx, repositoryID, domain.EnforcementActive); err != nil {
 			return err
 		}
+		if enqueueIntent {
+			jobStore := jobs.NewStoreTx(tx)
+			if _, err := jobStore.EnqueueReconciliation(ctx, repositoryID); err != nil {
+				return err
+			}
+			var claimErr error
+			claim, claimed, claimErr = jobStore.ClaimRepository(ctx, repositoryID)
+			if claimErr != nil {
+				return claimErr
+			}
+			if !claimed {
+				return jobs.ErrReconciliationInProgress
+			}
+		}
 		return nil
 	})
+	return claim, claimed, err
+}
+
+func (s *enforcementService) failClaimedActivation(ctx context.Context, repo domain.Repository, actor domain.Actor, claim jobs.Job, category string, cause error) error {
+	recordErr := s.recordRuntimeFailure(ctx, repo.ID, category, actor, true)
+	_, rescheduleErr := s.jobs.RescheduleClaim(ctx, claim, category)
+	return errors.Join(cause, recordErr, rescheduleErr)
+}
+
+type convergenceStateChangeError struct {
+	category string
+}
+
+func (e convergenceStateChangeError) Error() string {
+	return "repository enforcement changed while convergence was running"
+}
+
+func convergenceStateChangeCategory(err error) (string, bool) {
+	var stateErr convergenceStateChangeError
+	if !errors.As(err, &stateErr) {
+		return "", false
+	}
+	return stateErr.category, true
 }
 
 // recordEnforcementSuccess clears the stored failure state and records the
 // success audit event after a fully successful activation, recovery, or
 // reconciliation run.
-func (s *enforcementService) recordEnforcementSuccess(ctx context.Context, repo domain.Repository, actor domain.Actor, action string, extra map[string]string, counts activationCounts) (domain.Repository, error) {
+func (s *enforcementService) recordEnforcementSuccess(ctx context.Context, repo domain.Repository, actor domain.Actor, action string, extra map[string]string, counts activationCounts, claim jobs.Job) (domain.Repository, error) {
 	var updated domain.Repository
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
-		result, err := repository.NewStoreTx(tx).ClearEnforcementFailure(ctx, repo.ID)
+		repositoryStore := repository.NewStoreTx(tx)
+		current, err := repositoryStore.Get(ctx, repo.ID)
+		if err != nil {
+			return err
+		}
+		if !current.Active || current.EnforcementState != domain.EnforcementActive {
+			category := current.EnforcementFailureReason
+			if !domain.ValidEnforcementFailureReason(category) {
+				category = domain.EnforcementFailureRuntime
+			}
+			return convergenceStateChangeError{category: category}
+		}
+		if err := freeze.NewStoreTx(tx).MarkRepositoryRecomputed(ctx, repo.ID); err != nil {
+			return err
+		}
+		result, err := repositoryStore.ClearEnforcementFailure(ctx, repo.ID)
 		if err != nil {
 			return err
 		}
@@ -446,6 +550,9 @@ func (s *enforcementService) recordEnforcementSuccess(ctx context.Context, repo 
 		event := enforcementEvent(action, updated, actor, extra, &counts)
 		if err := audit.NewStoreTx(tx).Record(ctx, event); err != nil {
 			return fmt.Errorf("record %s audit event: %w", action, err)
+		}
+		if _, err := jobs.NewStoreTx(tx).CompleteClaim(ctx, claim); err != nil {
+			return err
 		}
 		return nil
 	})

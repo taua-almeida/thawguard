@@ -11,6 +11,7 @@ import (
 
 	"github.com/taua-almeida/thawguard/internal/auth"
 	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/jobs"
 	"github.com/taua-almeida/thawguard/internal/repository"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
 )
@@ -201,6 +202,41 @@ func TestRepositoriesPageOffersRecoveryForUnhealthyRepository(t *testing.T) {
 	}
 	if strings.Contains(body, `action="/repositories/reconcile"`) {
 		t.Fatalf("expected no reconcile action for unhealthy repository, got %q", body)
+	}
+}
+
+func TestRepositoriesPageShowsSafeAutomaticRecoveryState(t *testing.T) {
+	repo := enforcementTestRepository(domain.EnforcementUnhealthy)
+	nextRun := time.Now().UTC().Add(5 * time.Minute).Truncate(time.Minute)
+	for _, test := range []struct {
+		name string
+		job  jobs.Job
+		want []string
+	}{
+		{name: "pending", job: jobs.Job{ID: 99, RepositoryID: repo.ID, Attempts: 3, RunAt: nextRun, LastError: "secret-token raw forge body"}, want: []string{"Automatic recovery is pending", "Attempt count: 3", "Next retry: " + nextRun.Format("2006-01-02 15:04 UTC")}},
+		{name: "in progress", job: jobs.Job{ID: 100, RepositoryID: repo.ID, Attempts: 4, RunAt: nextRun, LockedAt: timePointerForWeb(time.Now().UTC()), LastError: "secret-token raw forge body"}, want: []string{"Recovery in progress", "Attempt count: 4"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := NewServer(Config{
+				AppName:                "Thawguard",
+				RepositoryStore:        &fakeRepositoryStore{repositories: []domain.Repository{repo}},
+				EnforcementService:     &fakeEnforcementService{},
+				ReconciliationJobStore: fakeReconciliationJobStore{jobs: []jobs.Job{test.job}},
+			})
+			recorder := httptest.NewRecorder()
+			server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+			body := recorder.Body.String()
+			for _, want := range test.want {
+				if !strings.Contains(body, want) {
+					t.Fatalf("expected %q in %q", want, body)
+				}
+			}
+			for _, secret := range []string{"secret-token", "raw forge body", `{"token":"secret"}`, "job_id", "locked_at"} {
+				if strings.Contains(body, secret) {
+					t.Fatalf("job internals leaked %q in %q", secret, body)
+				}
+			}
+		})
 	}
 }
 
@@ -472,3 +508,14 @@ func TestEnforcementActionsForbiddenForNonAdmin(t *testing.T) {
 		t.Fatalf("expected no service calls for viewer, got %+v", service)
 	}
 }
+
+type fakeReconciliationJobStore struct {
+	jobs []jobs.Job
+	err  error
+}
+
+func (s fakeReconciliationJobStore) ListReconciliations(context.Context) ([]jobs.Job, error) {
+	return s.jobs, s.err
+}
+
+func timePointerForWeb(value time.Time) *time.Time { return &value }

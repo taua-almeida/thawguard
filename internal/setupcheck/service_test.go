@@ -10,6 +10,7 @@ import (
 
 	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/jobs"
 	"github.com/taua-almeida/thawguard/internal/repository"
 	"github.com/taua-almeida/thawguard/internal/webhook"
 )
@@ -219,6 +220,14 @@ func TestReadinessServiceDefinitiveFailureMakesActiveRepositoryUnhealthy(t *test
 		t.Fatal(err)
 	}
 	active.HasStatusToken = true
+	jobStore := jobs.NewStore(database)
+	if _, err := jobStore.EnqueueReconciliation(ctx, repo.ID); err != nil {
+		t.Fatal(err)
+	}
+	claim, claimed, err := jobStore.ClaimRepository(ctx, repo.ID)
+	if err != nil || !claimed {
+		t.Fatalf("expected claimed reconciliation before readiness drift, claim=%+v claimed=%v err=%v", claim, claimed, err)
+	}
 	inspector := healthyInspector()
 	inspector.inspections["main"] = unprotectedInspection("main")
 	service := readinessService(database, inspector, fakeTokenProvider{token: "token", found: true}, recentWebhook(repo.ID))
@@ -232,13 +241,24 @@ func TestReadinessServiceDefinitiveFailureMakesActiveRepositoryUnhealthy(t *test
 	if stored.EnforcementState != domain.EnforcementUnhealthy {
 		t.Fatalf("expected unhealthy state, got %s", stored.EnforcementState)
 	}
-	// The flip stores the sanitized reason so the repository page can explain
-	// the unhealthy state; only explicit recovery clears it.
+	// The flip stores the sanitized reason and durable automatic recovery work.
 	if stored.EnforcementFailureReason != domain.EnforcementFailureReadinessChecks {
 		t.Fatalf("expected stored readiness failure reason, got %q", stored.EnforcementFailureReason)
 	}
 	if stored.EnforcementFailedAt == nil {
 		t.Fatal("expected stored failure timestamp")
+	}
+	job, err := jobStore.GetReconciliation(ctx, repo.ID)
+	if err != nil || job.Generation != claim.Generation || job.LockedAt == nil {
+		t.Fatalf("expected readiness drift to preserve the claimed generation, job=%+v claim=%+v err=%v", job, claim, err)
+	}
+	before := time.Now().UTC()
+	if rescheduled, err := jobStore.RescheduleClaim(ctx, claim, domain.EnforcementFailureReadinessChecks); err != nil || !rescheduled {
+		t.Fatalf("expected readiness claimant to apply backoff, rescheduled=%v err=%v", rescheduled, err)
+	}
+	job, err = jobStore.GetReconciliation(ctx, repo.ID)
+	if err != nil || job.LockedAt != nil || job.RunAt.Before(before.Add(14*time.Second)) {
+		t.Fatalf("expected released 15-second readiness retry, job=%+v err=%v", job, err)
 	}
 }
 

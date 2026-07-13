@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/jobs"
 	"github.com/taua-almeida/thawguard/internal/repository"
 	"github.com/taua-almeida/thawguard/internal/statuspublication"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
@@ -51,11 +52,19 @@ type StatusPublisher interface {
 	Publish(ctx context.Context, result statusresult.Result) (statuspublication.Publication, error)
 }
 
+type EnforcementConvergence interface {
+	Enqueue(ctx context.Context, repositoryID int64) error
+	Claim(ctx context.Context, repositoryID int64) (jobs.Job, bool, error)
+	Complete(ctx context.Context, claim jobs.Job) error
+	Fail(ctx context.Context, claim jobs.Job, category string) error
+}
+
 type PullRequestProcessor struct {
 	repositories RepositoryFinder
 	cache        PullRequestCache
 	statuses     StatusRunner
 	publisher    StatusPublisher
+	convergence  EnforcementConvergence
 }
 
 type ValidationError struct {
@@ -71,6 +80,12 @@ func IsValidationError(err error) bool {
 
 func NewPullRequestProcessor(repositories RepositoryFinder, cache PullRequestCache, statuses StatusRunner, publisher StatusPublisher) *PullRequestProcessor {
 	return &PullRequestProcessor{repositories: repositories, cache: cache, statuses: statuses, publisher: publisher}
+}
+
+func (p *PullRequestProcessor) SetConvergence(convergence EnforcementConvergence) {
+	if p != nil {
+		p.convergence = convergence
+	}
 }
 
 func (p *PullRequestProcessor) Process(ctx context.Context, body []byte) (PullRequestProcessResult, error) {
@@ -101,21 +116,47 @@ func (p *PullRequestProcessor) Process(ctx context.Context, body []byte) (PullRe
 		}
 		return PullRequestProcessResult{Event: event, Repository: repo, PullRequest: cached}, nil
 	}
+	var claim jobs.Job
+	if p.convergence != nil {
+		if err = p.convergence.Enqueue(ctx, repo.ID); err != nil {
+			return PullRequestProcessResult{}, err
+		}
+		var claimed bool
+		claim, claimed, err = p.convergence.Claim(ctx, repo.ID)
+		if err != nil {
+			return PullRequestProcessResult{}, err
+		}
+		if !claimed {
+			if err := p.convergence.Enqueue(ctx, repo.ID); err != nil {
+				return PullRequestProcessResult{}, err
+			}
+			cached, err := p.cache.Upsert(ctx, pr)
+			if err != nil {
+				return PullRequestProcessResult{}, err
+			}
+			return PullRequestProcessResult{Event: event, Repository: repo, PullRequest: cached}, nil
+		}
+	}
 	previous, previousFound, err := p.previousPullRequest(ctx, repo.ID, pr.Index)
 	if err != nil {
-		return PullRequestProcessResult{}, err
+		return PullRequestProcessResult{}, p.failConvergence(ctx, claim, domain.EnforcementFailureRuntime, err)
 	}
 	plans, err := p.recomputePlans(ctx, repo.ID, pr, previous, previousFound)
 	if err != nil {
-		return PullRequestProcessResult{}, err
+		return PullRequestProcessResult{}, p.failConvergence(ctx, claim, domain.EnforcementFailureRuntime, err)
 	}
-	results, publications, err := p.recomputeAndPublish(ctx, plans)
+	results, publications, category, err := p.recomputeAndPublish(ctx, plans)
 	if err != nil {
-		return PullRequestProcessResult{}, err
+		return PullRequestProcessResult{}, p.failConvergence(ctx, claim, category, err)
 	}
 	cached, err := p.cache.Upsert(ctx, pr)
 	if err != nil {
-		return PullRequestProcessResult{}, err
+		return PullRequestProcessResult{}, p.failConvergence(ctx, claim, domain.EnforcementFailureRuntime, err)
+	}
+	if p.convergence != nil {
+		if err := p.convergence.Complete(ctx, claim); err != nil {
+			return PullRequestProcessResult{}, p.failConvergence(ctx, claim, domain.EnforcementFailureRuntime, err)
+		}
 	}
 	if len(results) == 0 {
 		return PullRequestProcessResult{Event: event, Repository: repo, PullRequest: cached}, nil
@@ -175,22 +216,32 @@ func (p *PullRequestProcessor) openPullRequestsForHead(ctx context.Context, repo
 	return filtered, nil
 }
 
-func (p *PullRequestProcessor) recomputeAndPublish(ctx context.Context, plans []recomputePlan) ([]statusresult.Result, []statuspublication.Publication, error) {
+func (p *PullRequestProcessor) recomputeAndPublish(ctx context.Context, plans []recomputePlan) ([]statusresult.Result, []statuspublication.Publication, string, error) {
 	results := make([]statusresult.Result, 0, len(plans))
 	publications := make([]statuspublication.Publication, 0, len(plans))
 	for _, plan := range plans {
 		status, err := p.statuses.RunForSharedHead(ctx, plan.PullRequests, plan.PreferredIndex)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, domain.EnforcementFailureEvaluation, err
 		}
 		publication, err := p.publisher.Publish(ctx, status)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, domain.EnforcementFailurePublication, err
 		}
 		results = append(results, status)
 		publications = append(publications, publication)
 	}
-	return results, publications, nil
+	return results, publications, "", nil
+}
+
+func (p *PullRequestProcessor) failConvergence(ctx context.Context, claim jobs.Job, category string, cause error) error {
+	if p.convergence == nil {
+		return cause
+	}
+	if err := p.convergence.Fail(ctx, claim, category); err != nil {
+		return errors.Join(cause, fmt.Errorf("record webhook convergence failure: %w", err))
+	}
+	return cause
 }
 
 func ParsePullRequestEvent(body []byte) (PullRequestEvent, error) {

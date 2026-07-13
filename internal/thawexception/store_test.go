@@ -12,6 +12,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/db"
 	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/jobs"
 	"github.com/taua-almeida/thawguard/internal/repository"
 )
 
@@ -116,6 +117,10 @@ func TestServiceApprovesAndRecordsAuditEvent(t *testing.T) {
 	event := events[0]
 	if event.Action != audit.ActionThawExceptionApproved || event.SubjectType != audit.SubjectTypeThawException || event.SubjectID != "1" {
 		t.Fatalf("unexpected audit event: %+v", event)
+	}
+	job, err := jobs.NewStore(database).GetReconciliation(ctx, repo.ID)
+	if err != nil || job.Generation != 1 {
+		t.Fatalf("expected thaw exception and durable intent to commit together, job=%+v err=%v", job, err)
 	}
 	var details map[string]string
 	if err := json.Unmarshal([]byte(event.DetailsJSON), &details); err != nil {

@@ -294,8 +294,8 @@ func TestActiveFreezeMissingTokenFailsSyncClosedWithoutStalePublication(t *testi
 func TestScheduledFreezeActivationAndPlannedUnfreezeUseSyncInvariant(t *testing.T) {
 	ctx := context.Background()
 	freezes := &fakeScheduledFreezeOperations{
-		activated: domain.BranchFreeze{ID: 3, RepositoryID: 7, Branch: "main", Status: domain.BranchFreezeStatusActive, Active: true, Scheduled: true},
-		ended:     domain.BranchFreeze{ID: 3, RepositoryID: 7, Branch: "main", Status: domain.BranchFreezeStatusEnded, Scheduled: true},
+		activated: domain.BranchFreeze{ID: 3, RepositoryID: 7, Branch: "main", Status: domain.BranchFreezeStatusActive, Active: true, Scheduled: true, NeedsRecompute: true},
+		ended:     domain.BranchFreeze{ID: 3, RepositoryID: 7, Branch: "main", Status: domain.BranchFreezeStatusEnded, Scheduled: true, NeedsRecompute: true},
 	}
 	pulls := &fakeOpenPullRequestBranchLister{}
 	syncer := &fakeRecomputeSyncer{onSync: func() {
@@ -421,6 +421,23 @@ func TestPlannedUnfreezeDoesNotClearMarkerWhileEnforcementInactive(t *testing.T)
 	}
 	if len(freezes.markCalls) != 0 {
 		t.Fatalf("expected unhealthy repository to preserve pending recompute, got marks %+v", freezes.markCalls)
+	}
+}
+
+func TestBranchRetryDefersToRepositoryReconciliation(t *testing.T) {
+	ctx := context.Background()
+	pending := domain.BranchFreeze{ID: 8, RepositoryID: 7, Branch: "main", Status: domain.BranchFreezeStatusEnded, NeedsRecompute: true}
+	freezes := &fakeScheduledFreezeOperations{}
+	syncer := &fakeRecomputeSyncer{}
+	publisher := &fakeStatusPublisher{}
+	store := newFreezeRecomputingStore(freezes, &fakeOpenPRRepositoryGetter{repo: newRecomputeTestRepository(7, domain.EnforcementActive)}, syncer, &fakeOpenPullRequestBranchLister{}, &fakeSharedHeadStatusRunner{}, publisher)
+	store.convergence = &runtimeConvergenceService{}
+
+	if err := store.RetryRecompute(ctx, pending); err != nil {
+		t.Fatal(err)
+	}
+	if len(syncer.calls) != 0 || len(publisher.results) != 0 || len(freezes.markCalls) != 0 {
+		t.Fatalf("expected repository reconciliation to retain retry ownership, sync=%+v publish=%+v marks=%+v", syncer.calls, publisher.results, freezes.markCalls)
 	}
 }
 

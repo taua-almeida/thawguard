@@ -26,6 +26,7 @@ const (
 	ActionRepositoryEnforcementReconcileFail = "repository.enforcement_reconcile_failed"
 	ActionRepositoryEnforcementRecovered     = "repository.enforcement_recovery_succeeded"
 	ActionRepositoryEnforcementRecoverFail   = "repository.enforcement_recovery_failed"
+	ActionRepositoryRuntimeConvergenceFail   = "repository.runtime_convergence_failed"
 	ActionBranchFreezeCreated                = "branch_freeze.created"
 	ActionBranchFreezeEnded                  = "branch_freeze.ended"
 	ActionBranchFreezeCancelled              = "branch_freeze.cancelled"

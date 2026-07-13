@@ -10,6 +10,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/freeze"
+	"github.com/taua-almeida/thawguard/internal/jobs"
 	"github.com/taua-almeida/thawguard/internal/pullrequest"
 	"github.com/taua-almeida/thawguard/internal/repository"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
@@ -297,6 +298,9 @@ func TestReconcileEnforcementPublicationFailureBecomesUnhealthyKeepingPartialPos
 	repo := h.currentRepo(t, ctx)
 	if repo.EnforcementState != domain.EnforcementUnhealthy || repo.EnforcementFailureReason != domain.EnforcementFailurePublication {
 		t.Fatalf("expected unhealthy repository with publication reason, got %+v", repo)
+	}
+	if job, err := jobs.NewStore(h.database).GetReconciliation(ctx, h.repo.ID); err != nil || job.Generation < 1 {
+		t.Fatalf("expected reconciliation failure to enqueue durable work, job=%+v err=%v", job, err)
 	}
 	posts := h.freezeContextPosts()
 	if len(posts) != 1 || posts[0].SHA != "aaa111bbb222" {
