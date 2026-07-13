@@ -302,3 +302,53 @@ func (p *fakeStatusPublisher) Publish(ctx context.Context, result statusresult.R
 	}
 	return statuspublication.Publication{ID: int64(len(p.results)), StatusResultID: result.ID, RepositoryID: result.RepositoryID, PullRequestIndex: result.PullRequestIndex, TargetBranch: result.TargetBranch, HeadSHA: result.HeadSHA, Context: result.Context, State: result.State, Description: result.Description}, nil
 }
+
+func TestFreezeRecomputingStoreRejectsCreateForUnmanagedBranch(t *testing.T) {
+	ctx := context.Background()
+	freezes := &fakeFreezeOperations{}
+	syncer := &fakeRecomputeSyncer{}
+	statuses := &fakeSharedHeadStatusRunner{}
+	publisher := &fakeStatusPublisher{}
+	repositories := &fakeOpenPRRepositoryGetter{repo: newRecomputeTestRepository(7, domain.EnforcementActive), unmanagedBranches: map[string]bool{"release/2.0": true}}
+	store := newFreezeRecomputingStore(freezes, repositories, syncer, &fakeOpenPullRequestBranchLister{}, statuses, publisher)
+
+	_, err := store.CreateActive(ctx, freeze.CreateParams{RepositoryID: 7, Branch: "release/2.0", Reason: "release freeze"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+	if !freeze.IsValidationError(err) || err.Error() != domain.BranchNotManagedMessage {
+		t.Fatalf("expected managed branch validation error, got %v", err)
+	}
+	if freezes.createCalls != 0 {
+		t.Fatalf("expected no freeze mutation for unmanaged branch, got %d", freezes.createCalls)
+	}
+	if len(syncer.calls) != 0 || len(statuses.calls) != 0 || len(publisher.results) != 0 {
+		t.Fatalf("expected no sync/recompute/publish for rejected freeze, sync=%+v statuses=%+v publish=%+v", syncer.calls, statuses.calls, publisher.results)
+	}
+
+	if _, err := store.CreateActive(ctx, freeze.CreateParams{RepositoryID: 7, Branch: "main", Reason: "release freeze"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); err != nil {
+		t.Fatalf("expected managed branch freeze to proceed, got %v", err)
+	}
+	if freezes.createCalls != 1 {
+		t.Fatalf("expected managed branch freeze mutation, got %d", freezes.createCalls)
+	}
+}
+
+func TestFreezeRecomputingStoreRejectsScheduledCreateForUnmanagedBranch(t *testing.T) {
+	ctx := context.Background()
+	freezes := &fakeScheduledFreezeOperations{}
+	repositories := &fakeOpenPRRepositoryGetter{repo: newRecomputeTestRepository(7, domain.EnforcementActive), unmanagedBranches: map[string]bool{"release/2.0": true}}
+	store := newFreezeRecomputingStore(freezes, repositories, &fakeRecomputeSyncer{}, &fakeOpenPullRequestBranchLister{}, &fakeSharedHeadStatusRunner{}, &fakeStatusPublisher{})
+
+	_, err := store.CreateScheduled(ctx, freeze.ScheduleParams{RepositoryID: 7, Branch: "release/2.0", Reason: "window"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+	if !freeze.IsValidationError(err) || err.Error() != domain.BranchNotManagedMessage {
+		t.Fatalf("expected managed branch validation error, got %v", err)
+	}
+	if freezes.scheduleCalls != 0 {
+		t.Fatalf("expected no schedule mutation for unmanaged branch, got %d", freezes.scheduleCalls)
+	}
+
+	if _, err := store.CreateScheduled(ctx, freeze.ScheduleParams{RepositoryID: 7, Branch: "main", Reason: "window"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); err != nil {
+		t.Fatalf("expected managed branch schedule to proceed, got %v", err)
+	}
+	if freezes.scheduleCalls != 1 {
+		t.Fatalf("expected managed branch schedule mutation, got %d", freezes.scheduleCalls)
+	}
+}

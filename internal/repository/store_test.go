@@ -4,6 +4,8 @@ import (
 	"context"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/taua-almeida/thawguard/internal/db"
@@ -259,6 +261,152 @@ func TestStoreRejectsInvalidEnforcementState(t *testing.T) {
 	}
 	if _, err := store.SetEnforcementState(ctx, 0, domain.EnforcementActive); !IsValidationError(err) {
 		t.Fatalf("expected repository id validation error, got %v", err)
+	}
+}
+
+func TestStoreCreateInsertsDefaultManagedBranch(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+
+	repo, err := store.Create(ctx, CreateParams{Owner: "example-owner", Name: "example-repo", DefaultBranch: "release/1.4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	branches, err := store.ListBranches(ctx, repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(branches) != 1 || branches[0].Name != "release/1.4" {
+		t.Fatalf("expected default branch to be managed, got %+v", branches)
+	}
+	if branches[0].Protected || branches[0].SetupStatus != "unknown" || branches[0].LastCheckedAt != nil {
+		t.Fatalf("expected unverified managed branch defaults, got %+v", branches[0])
+	}
+}
+
+func TestStoreListBranchesIsDeterministicallyOrdered(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	repo, err := store.Create(ctx, CreateParams{Owner: "example-owner", Name: "example-repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"release/1.4", "production", "Develop"} {
+		if _, err := store.AddBranch(ctx, repo.ID, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	branches, err := store.ListBranches(ctx, repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 0, len(branches))
+	for _, branch := range branches {
+		got = append(got, branch.Name)
+	}
+	if want := []string{"Develop", "main", "production", "release/1.4"}; !slices.Equal(got, want) {
+		t.Fatalf("expected branches %v, got %v", want, got)
+	}
+}
+
+func TestStoreBranchManagedMatchesExactNamesOnly(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	repo, err := store.Create(ctx, CreateParams{Owner: "example-owner", Name: "example-repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddBranch(ctx, repo.ID, "release/1.4"); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := map[string]bool{
+		"main":        true,
+		"release/1.4": true,
+		"Main":        false,
+		"release/*":   false,
+		"release/1":   false,
+		"":            false,
+	}
+	for name, want := range cases {
+		managed, err := store.BranchManaged(ctx, repo.ID, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if managed != want {
+			t.Fatalf("BranchManaged(%q): want %v, got %v", name, want, managed)
+		}
+	}
+	managed, err := store.BranchManaged(ctx, repo.ID+1, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if managed {
+		t.Fatal("expected branch of another repository not to be managed")
+	}
+}
+
+func TestStoreAddBranchValidatesNames(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	repo, err := store.Create(ctx, CreateParams{Owner: "example-owner", Name: "example-repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	added, err := store.AddBranch(ctx, repo.ID, "  release/1.4  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if added.Name != "release/1.4" {
+		t.Fatalf("expected trimmed exact branch name, got %q", added.Name)
+	}
+	if _, err := store.AddBranch(ctx, repo.ID, "release/1.4"); !IsValidationError(err) || err.Error() != "branch is already managed" {
+		t.Fatalf("expected duplicate managed branch validation error, got %v", err)
+	}
+	if _, err := store.AddBranch(ctx, repo.ID, "  "); !IsValidationError(err) {
+		t.Fatalf("expected empty branch name validation error, got %v", err)
+	}
+	if _, err := store.AddBranch(ctx, repo.ID, "bad\tbranch"); !IsValidationError(err) {
+		t.Fatalf("expected control character validation error, got %v", err)
+	}
+	if _, err := store.AddBranch(ctx, repo.ID, strings.Repeat("b", 256)); !IsValidationError(err) {
+		t.Fatalf("expected long branch name validation error, got %v", err)
+	}
+	preserved, err := store.AddBranch(ctx, repo.ID, "Release/CASE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preserved.Name != "Release/CASE" {
+		t.Fatalf("expected branch case to be preserved, got %q", preserved.Name)
+	}
+}
+
+func TestStoreRemoveBranchReportsUnknownBranch(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	repo, err := store.Create(ctx, CreateParams{Owner: "example-owner", Name: "example-repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.RemoveBranch(ctx, repo.ID, "missing"); !IsValidationError(err) || err.Error() != "managed branch not found" {
+		t.Fatalf("expected managed branch not found error, got %v", err)
+	}
+	if _, err := store.AddBranch(ctx, repo.ID, "release/1.4"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RemoveBranch(ctx, repo.ID, "release/1.4"); err != nil {
+		t.Fatal(err)
+	}
+	managed, err := store.BranchManaged(ctx, repo.ID, "release/1.4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if managed {
+		t.Fatal("expected removed branch not to be managed")
 	}
 }
 

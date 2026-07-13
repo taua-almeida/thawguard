@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/freeze"
@@ -46,6 +47,7 @@ type statusPublisher interface {
 
 type recomputeRepositoryGetter interface {
 	Get(ctx context.Context, id int64) (domain.Repository, error)
+	BranchManaged(ctx context.Context, repositoryID int64, branch string) (bool, error)
 }
 
 // freezeRecomputingStore wraps freeze lifecycle mutations with the one
@@ -81,6 +83,9 @@ func (s *freezeRecomputingStore) CreateActive(ctx context.Context, params freeze
 		return domain.BranchFreeze{}, errors.New("freeze recomputing store has no freeze store")
 	}
 	if err := s.requireEnforcementActive(ctx, params.RepositoryID); err != nil {
+		return domain.BranchFreeze{}, err
+	}
+	if err := s.requireManagedBranch(ctx, params.RepositoryID, params.Branch); err != nil {
 		return domain.BranchFreeze{}, err
 	}
 	created, err := s.freezes.CreateActive(ctx, params, actor)
@@ -141,6 +146,9 @@ func (s *freezeRecomputingStore) CreateScheduled(ctx context.Context, params fre
 		return domain.BranchFreeze{}, err
 	}
 	if err := s.requireEnforcementActive(ctx, params.RepositoryID); err != nil {
+		return domain.BranchFreeze{}, err
+	}
+	if err := s.requireManagedBranch(ctx, params.RepositoryID, params.Branch); err != nil {
 		return domain.BranchFreeze{}, err
 	}
 	return scheduled.CreateScheduled(ctx, params, actor)
@@ -268,6 +276,29 @@ func (s *freezeRecomputingStore) requireEnforcementActive(ctx context.Context, r
 	}
 	if !repo.EnforcementActive() {
 		return freeze.ValidationError{Message: domain.EnforcementNotActiveMessage}
+	}
+	return nil
+}
+
+// requireManagedBranch is the one managed-branch gate for freeze and
+// scheduled-freeze creation: only exact managed branch names are accepted,
+// checked before any mutation. End/cancel cleanup is intentionally not gated
+// so historical freezes stay closable even if a branch was removed.
+func (s *freezeRecomputingStore) requireManagedBranch(ctx context.Context, repositoryID int64, branch string) error {
+	if s == nil || s.repositories == nil {
+		return errors.New("freeze recomputing store has no repository store")
+	}
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		// Let store-level validation report the missing field.
+		return nil
+	}
+	managed, err := s.repositories.BranchManaged(ctx, repositoryID, branch)
+	if err != nil {
+		return fmt.Errorf("check managed branch for freeze creation: %w", err)
+	}
+	if !managed {
+		return freeze.ValidationError{Message: domain.BranchNotManagedMessage}
 	}
 	return nil
 }

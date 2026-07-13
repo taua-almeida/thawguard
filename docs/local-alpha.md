@@ -78,6 +78,8 @@ Use a throwaway Forgejo/Codeberg repository, not a production repository.
 
 The repository card shows its enforcement state. New repositories are setup-incomplete and stay that way in current builds; the activation step lands with the readiness-check feature.
 
+The card also lists the repository's managed branches — the exact branch names freezes and scheduled freezes may target. The default branch is always managed and cannot be removed. Admins can add or remove exact branch names (no globs or patterns) while enforcement is inactive; a branch with an active or pending scheduled freeze cannot be removed. Newly added branches show as unverified until readiness checks ship.
+
 ## 4. Connect Forgejo/Codeberg webhooks safely
 
 Codeberg must reach `POST /webhooks/forgejo` to send real webhooks. For local testing, use a tunnel or reverse proxy you trust, with HTTPS/TLS enabled.

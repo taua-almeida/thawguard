@@ -14,6 +14,8 @@ const (
 	ActionRepositoryWebhookSecretConfigured = "repository.webhook_secret_configured"
 	ActionRepositoryStatusTokenConfigured   = "repository.status_token_configured"
 	ActionRepositoryOpenPullRequestsSynced  = "repository.open_pull_requests_synced"
+	ActionRepositoryBranchAdded             = "repository.branch_added"
+	ActionRepositoryBranchRemoved           = "repository.branch_removed"
 	ActionBranchFreezeCreated               = "branch_freeze.created"
 	ActionBranchFreezeEnded                 = "branch_freeze.ended"
 	ActionBranchFreezeCancelled             = "branch_freeze.cancelled"

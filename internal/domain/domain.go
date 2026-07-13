@@ -64,6 +64,23 @@ func (r Repository) EnforcementActive() bool {
 	return r.EnforcementState == EnforcementActive
 }
 
+// BranchNotManagedMessage is the single operator-facing message for freeze and
+// scheduled-freeze creation against a branch outside the repository's managed
+// branch scope.
+const BranchNotManagedMessage = "Branch is not managed for this repository. Add it in repository setup before creating a freeze."
+
+// RepositoryBranch is one exact managed branch name for a repository. Managed
+// branches are the only branches freezes and scheduled freezes may target.
+// SetupStatus stays "unknown" until real readiness checks verify the branch.
+type RepositoryBranch struct {
+	ID            int64
+	RepositoryID  int64
+	Name          string
+	Protected     bool
+	SetupStatus   string
+	LastCheckedAt *time.Time
+}
+
 type Actor struct {
 	UserID *int64
 	Kind   string

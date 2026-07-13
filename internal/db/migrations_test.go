@@ -72,6 +72,7 @@ func TestOpenAndApplyMigrationsAgainstSQLite(t *testing.T) {
 	assertTableExists(t, database, "user_roles")
 	assertColumnExists(t, database, "repositories", "enforcement_state")
 	assertEnforcementStateConstraint(t, database)
+	assertTableExists(t, database, "repository_branches")
 
 	var applied int
 	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = ?`, "0001_initial").Scan(&applied); err != nil {
@@ -111,7 +112,17 @@ func TestApplyMigrationsAddsSetupChecksToExistingInitialDatabase(t *testing.T) {
 	if _, err := database.ExecContext(ctx, `
 CREATE TABLE repositories (
   id INTEGER PRIMARY KEY,
+  default_branch TEXT NOT NULL DEFAULT '',
   active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE repository_branches (
+  id INTEGER PRIMARY KEY,
+  repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  protected INTEGER NOT NULL DEFAULT 0,
+  setup_status TEXT NOT NULL DEFAULT 'unknown',
+  last_checked_at TEXT,
+  UNIQUE (repository_id, name)
 );
 CREATE TABLE users (
   id INTEGER PRIMARY KEY,
@@ -149,15 +160,20 @@ CREATE TABLE audit_events (
   details_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL
 );
-INSERT INTO repositories(id, active) VALUES (7001, 1);
+INSERT INTO repositories(id, default_branch, active) VALUES (7001, 'main', 1), (7002, '', 1);
+INSERT INTO repository_branches(repository_id, name, protected, setup_status, last_checked_at)
+VALUES (7001, 'production', 1, 'ok', '2026-07-01T00:00:00Z');
 INSERT INTO users(id, email, display_name, password_hash, role, created_at, updated_at)
 VALUES
   (101, 'admin@example.test', 'Admin', 'hash', 'admin', '2026-07-08T12:00:00Z', '2026-07-08T12:00:00Z'),
   (102, 'freezer@example.test', 'Freezer', 'hash', 'freezer', '2026-07-08T12:00:00Z', '2026-07-08T12:00:00Z');
 INSERT INTO sessions(id, user_id, expires_at, created_at)
 VALUES ('legacy-session', 101, '2026-07-09T12:00:00Z', '2026-07-08T12:00:00Z');
-INSERT INTO branch_freezes(id, repository_id, branch, status, reason, starts_at, created_at, updated_at)
-VALUES (7001, 7001, 'main', 'scheduled', 'future freeze', '2026-07-10T18:00:00Z', '2026-07-08T12:00:00Z', '2026-07-08T12:00:00Z');`); err != nil {
+INSERT INTO branch_freezes(id, repository_id, branch, status, reason, starts_at, ends_at, created_at, updated_at)
+VALUES
+  (7001, 7001, 'main', 'scheduled', 'future freeze', '2026-07-10T18:00:00Z', NULL, '2026-07-08T12:00:00Z', '2026-07-08T12:00:00Z'),
+  (7002, 7001, 'release/1.4', 'ended', 'historical freeze', '2026-06-01T18:00:00Z', '2026-06-02T18:00:00Z', '2026-06-01T12:00:00Z', '2026-06-02T18:00:00Z'),
+  (7003, 7001, 'main', 'ended', 'older duplicate freeze', '2026-05-01T18:00:00Z', '2026-05-02T18:00:00Z', '2026-05-01T12:00:00Z', '2026-05-02T18:00:00Z');`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)`, "0001_initial", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
@@ -284,6 +300,37 @@ VALUES (7001, 7001, 'main', 'scheduled', 'future freeze', '2026-07-10T18:00:00Z'
 	if enforcementState != "setup_incomplete" {
 		t.Fatalf("expected existing repository to migrate to setup_incomplete enforcement, got %q", enforcementState)
 	}
+
+	assertManagedBranch(t, database, 7001, "main", 0, "unknown")
+	assertManagedBranch(t, database, 7001, "release/1.4", 0, "unknown")
+	assertManagedBranch(t, database, 7001, "production", 1, "ok")
+	var branchCount int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM repository_branches WHERE repository_id = 7001`).Scan(&branchCount); err != nil {
+		t.Fatal(err)
+	}
+	if branchCount != 3 {
+		t.Fatalf("expected duplicate default/freeze branches to backfill once each, got %d rows", branchCount)
+	}
+	var lastCheckedAt sql.NullString
+	if err := database.QueryRowContext(ctx, `SELECT last_checked_at FROM repository_branches WHERE repository_id = 7001 AND name = 'production'`).Scan(&lastCheckedAt); err != nil {
+		t.Fatal(err)
+	}
+	if !lastCheckedAt.Valid || lastCheckedAt.String != "2026-07-01T00:00:00Z" {
+		t.Fatalf("expected existing branch setup evidence to be preserved, got %+v", lastCheckedAt)
+	}
+	var emptyDefaultBranches int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM repository_branches WHERE repository_id = 7002`).Scan(&emptyDefaultBranches); err != nil {
+		t.Fatal(err)
+	}
+	if emptyDefaultBranches != 0 {
+		t.Fatalf("expected no managed branch for repository with empty default branch, got %d rows", emptyDefaultBranches)
+	}
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = ?`, "0020_backfill_managed_repository_branches").Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected managed branch backfill migration to be recorded once, got %d", applied)
+	}
 	assertWebhookDeliveriesAreRepositoryScoped(t, database)
 	assertIndexExists(t, database, "idx_audit_events_subject_type_id")
 	assertIndexExists(t, database, "idx_status_publication_intents_idempotency")
@@ -310,7 +357,17 @@ func TestApplyMigrationsDedupesStatusPublicationIntents(t *testing.T) {
 	if _, err := database.ExecContext(ctx, `
 CREATE TABLE repositories (
   id INTEGER PRIMARY KEY,
+  default_branch TEXT NOT NULL DEFAULT '',
   active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE repository_branches (
+  id INTEGER PRIMARY KEY,
+  repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  protected INTEGER NOT NULL DEFAULT 0,
+  setup_status TEXT NOT NULL DEFAULT 'unknown',
+  last_checked_at TEXT,
+  UNIQUE (repository_id, name)
 );
 CREATE TABLE users (
   id INTEGER PRIMARY KEY,
@@ -418,7 +475,17 @@ func TestApplyMigrationsRebuildsWebhookDeliveriesForRepositoryScopedClaims(t *te
 	if _, err := database.ExecContext(ctx, `
 CREATE TABLE repositories (
   id INTEGER PRIMARY KEY,
+  default_branch TEXT NOT NULL DEFAULT '',
   active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE repository_branches (
+  id INTEGER PRIMARY KEY,
+  repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  protected INTEGER NOT NULL DEFAULT 0,
+  setup_status TEXT NOT NULL DEFAULT 'unknown',
+  last_checked_at TEXT,
+  UNIQUE (repository_id, name)
 );
 CREATE TABLE users (
   id INTEGER PRIMARY KEY,
@@ -534,6 +601,18 @@ func assertEnforcementStateConstraint(t *testing.T, database *sql.DB) {
 	}
 	if enforcementState != "setup_incomplete" {
 		t.Fatalf("expected setup_incomplete default enforcement state, got %q", enforcementState)
+	}
+}
+
+func assertManagedBranch(t *testing.T, database *sql.DB, repositoryID int64, name string, protected int, setupStatus string) {
+	t.Helper()
+	var gotProtected int
+	var gotSetupStatus string
+	if err := database.QueryRow(`SELECT protected, setup_status FROM repository_branches WHERE repository_id = ? AND name = ?`, repositoryID, name).Scan(&gotProtected, &gotSetupStatus); err != nil {
+		t.Fatalf("expected managed branch %d/%s to exist: %v", repositoryID, name, err)
+	}
+	if gotProtected != protected || gotSetupStatus != setupStatus {
+		t.Fatalf("managed branch %d/%s: want protected=%d setup_status=%q, got protected=%d setup_status=%q", repositoryID, name, protected, setupStatus, gotProtected, gotSetupStatus)
 	}
 }
 

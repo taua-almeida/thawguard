@@ -1731,6 +1731,62 @@ code,
   justify-content: flex-end;
 }
 
+.tg-repo-branches {
+  display: grid;
+  gap: 8px;
+  border: 1px solid rgba(42, 58, 92, 0.58);
+  border-radius: var(--tg-radius-sm);
+  padding: 12px;
+  background: rgba(15, 23, 41, 0.26);
+}
+
+.tg-repo-branches-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.tg-repo-branches-head strong {
+  color: var(--tg-text-primary);
+  font-size: 13px;
+}
+
+.tg-branch-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.tg-branch-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.tg-branch-row form {
+  margin-left: auto;
+}
+
+.tg-branch-add-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.tg-branch-add-form input[name="branch"] {
+  flex: 1 1 160px;
+  min-width: 0;
+  min-height: 34px;
+  padding: 7px 10px;
+  font-size: 13px;
+}
+
 .tg-credential-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

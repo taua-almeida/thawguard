@@ -118,6 +118,11 @@ func TestActiveFreezeLifecycleCrossBranchSharedHeadCannotPublishAccidentalSucces
 		newAppPullRequestResponse(2, "open", "develop", "ABC123"),
 	}
 	h := newEnforcementLifecycleHarness(t, ctx, openPRs)
+	// Manage develop directly at the store layer: the service guard blocks
+	// branch-scope changes once enforcement is active.
+	if _, err := repository.NewStore(h.database).AddBranch(ctx, h.repo.ID, "develop"); err != nil {
+		t.Fatal(err)
+	}
 
 	mainFreeze, err := h.store.CreateActive(ctx, freeze.CreateParams{RepositoryID: h.repo.ID, Branch: "main", Reason: "release freeze"}, admin)
 	if err != nil {

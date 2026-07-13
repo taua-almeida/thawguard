@@ -64,6 +64,9 @@ type RepositoryStore interface {
 	Create(ctx context.Context, params repository.CreateParams, actor domain.Actor) (domain.Repository, error)
 	SetWebhookSecret(ctx context.Context, repositoryID int64, secret string, actor domain.Actor) (domain.Repository, error)
 	SetStatusToken(ctx context.Context, repositoryID int64, token string, actor domain.Actor) (domain.Repository, error)
+	ListBranches(ctx context.Context, repositoryID int64) ([]domain.RepositoryBranch, error)
+	AddBranch(ctx context.Context, repositoryID int64, branch string, actor domain.Actor) (domain.RepositoryBranch, error)
+	RemoveBranch(ctx context.Context, repositoryID int64, branch string, actor domain.Actor) error
 }
 
 type SetupCheckStore interface {
@@ -122,6 +125,20 @@ type PullRequestWebhookProcessor interface {
 type repositoryView struct {
 	Repository  domain.Repository
 	SetupChecks []setupcheck.Check
+	Branches    []repositoryBranchView
+}
+
+type repositoryBranchView struct {
+	Name       string
+	IsDefault  bool
+	SetupLabel string
+}
+
+// managedBranchOption is one (repository, exact branch) choice for the freeze
+// and scheduled-freeze forms; POST validation stays authoritative.
+type managedBranchOption struct {
+	RepositoryID int64
+	Name         string
 }
 
 type repositoryOverview struct {
@@ -308,6 +325,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /", s.handleDashboard)
 	s.mux.HandleFunc("GET /repositories", s.handleRepositories)
 	s.mux.HandleFunc("POST /repositories", s.handleCreateRepository)
+	s.mux.HandleFunc("POST /repositories/branches", s.handleAddRepositoryBranch)
+	s.mux.HandleFunc("POST /repositories/branches/remove", s.handleRemoveRepositoryBranch)
 	s.mux.HandleFunc("POST /repositories/webhook-secret", s.handleSetRepositoryWebhookSecret)
 	s.mux.HandleFunc("POST /repositories/status-token", s.handleSetRepositoryStatusToken)
 	s.mux.HandleFunc("POST /repositories/setup-check", s.handleRunRepositorySetupCheck)
@@ -910,6 +929,61 @@ func (s *Server) handleCreateRepository(w http.ResponseWriter, r *http.Request) 
 	http.Redirect(w, r, "/repositories", http.StatusSeeOther)
 }
 
+func (s *Server) handleAddRepositoryBranch(w http.ResponseWriter, r *http.Request) {
+	s.handleRepositoryBranchMutation(w, r, func(ctx context.Context, repositoryID int64, branch string, actor domain.Actor) error {
+		_, err := s.cfg.RepositoryStore.AddBranch(ctx, repositoryID, branch, actor)
+		return err
+	})
+}
+
+func (s *Server) handleRemoveRepositoryBranch(w http.ResponseWriter, r *http.Request) {
+	s.handleRepositoryBranchMutation(w, r, func(ctx context.Context, repositoryID int64, branch string, actor domain.Actor) error {
+		return s.cfg.RepositoryStore.RemoveBranch(ctx, repositoryID, branch, actor)
+	})
+}
+
+func (s *Server) handleRepositoryBranchMutation(w http.ResponseWriter, r *http.Request, mutate func(ctx context.Context, repositoryID int64, branch string, actor domain.Actor) error) {
+	if s.cfg.RepositoryStore == nil {
+		http.Error(w, "repository store is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	session, ok := s.requireRepositoryManagerForm(w, r)
+	if !ok {
+		return
+	}
+	repositoryID, err := strconv.ParseInt(strings.TrimSpace(r.PostFormValue("repository_id")), 10, 64)
+	if err != nil {
+		repositoryID = 0
+	}
+	if err := mutate(r.Context(), repositoryID, r.PostFormValue("branch"), session.auditActor()); err != nil {
+		s.renderRepositoriesValidationError(w, r, err, session)
+		return
+	}
+	http.Redirect(w, r, "/repositories", http.StatusSeeOther)
+}
+
+// renderRepositoriesValidationError re-renders the repositories page for a
+// typed validation error and hides internal error details.
+func (s *Server) renderRepositoriesValidationError(w http.ResponseWriter, r *http.Request, err error, session sessionState) {
+	if !repository.IsValidationError(err) && !repositorysetup.IsValidationError(err) {
+		internalServerError(w)
+		return
+	}
+	repositories, listErr := s.repositories(r.Context())
+	if listErr != nil {
+		internalServerError(w)
+		return
+	}
+	views, viewErr := s.repositoryViews(r.Context(), repositories)
+	if viewErr != nil {
+		internalServerError(w)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusBadRequest)
+	s.renderRepositories(w, views, err.Error(), session)
+}
+
 func (s *Server) handleSetRepositoryWebhookSecret(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.RepositoryStore == nil {
 		http.Error(w, "repository store is not configured", http.StatusServiceUnavailable)
@@ -1005,12 +1079,12 @@ func (s *Server) handleFreezes(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	repositories, freezes, auditEvents, err := s.freezePageData(r.Context())
+	repositories, freezes, auditEvents, branchOptions, err := s.freezePageData(r.Context())
 	if err != nil {
 		internalServerError(w)
 		return
 	}
-	s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), auditEvents, "", session)
+	s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), auditEvents, branchOptions, "", session)
 }
 
 func (s *Server) handleCreateFreeze(w http.ResponseWriter, r *http.Request) {
@@ -1037,14 +1111,14 @@ func (s *Server) handleCreateFreeze(w http.ResponseWriter, r *http.Request) {
 			internalServerError(w)
 			return
 		}
-		repositories, freezes, auditEvents, dataErr := s.freezePageData(r.Context())
+		repositories, freezes, auditEvents, branchOptions, dataErr := s.freezePageData(r.Context())
 		if dataErr != nil {
 			internalServerError(w)
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
-		s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), auditEvents, err.Error(), session)
+		s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), auditEvents, branchOptions, err.Error(), session)
 		return
 	}
 	http.Redirect(w, r, "/freezes", http.StatusSeeOther)
@@ -1077,14 +1151,14 @@ func (s *Server) handleCloseFreeze(w http.ResponseWriter, r *http.Request, close
 			internalServerError(w)
 			return
 		}
-		repositories, freezes, auditEvents, dataErr := s.freezePageData(r.Context())
+		repositories, freezes, auditEvents, branchOptions, dataErr := s.freezePageData(r.Context())
 		if dataErr != nil {
 			internalServerError(w)
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
-		s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), auditEvents, err.Error(), session)
+		s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), auditEvents, branchOptions, err.Error(), session)
 		return
 	}
 	http.Redirect(w, r, "/freezes", http.StatusSeeOther)
@@ -1109,12 +1183,12 @@ func (s *Server) handleScheduledFreezes(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	repositories, scheduled, err := s.scheduledFreezePageData(r.Context())
+	repositories, scheduled, branchOptions, err := s.scheduledFreezePageData(r.Context())
 	if err != nil {
 		internalServerError(w)
 		return
 	}
-	s.renderScheduledFreezes(w, repositories, scheduledFreezeViews(repositories, scheduled), "", session)
+	s.renderScheduledFreezes(w, repositories, scheduledFreezeViews(repositories, scheduled), branchOptions, "", session)
 }
 
 func (s *Server) handleCreateScheduledFreeze(w http.ResponseWriter, r *http.Request) {
@@ -1135,14 +1209,14 @@ func (s *Server) handleCreateScheduledFreeze(w http.ResponseWriter, r *http.Requ
 			internalServerError(w)
 			return
 		}
-		repositories, scheduled, dataErr := s.scheduledFreezePageData(r.Context())
+		repositories, scheduled, branchOptions, dataErr := s.scheduledFreezePageData(r.Context())
 		if dataErr != nil {
 			internalServerError(w)
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
-		s.renderScheduledFreezes(w, repositories, scheduledFreezeViews(repositories, scheduled), err.Error(), session)
+		s.renderScheduledFreezes(w, repositories, scheduledFreezeViews(repositories, scheduled), branchOptions, err.Error(), session)
 		return
 	}
 	http.Redirect(w, r, "/scheduled-freezes", http.StatusSeeOther)
@@ -1167,14 +1241,14 @@ func (s *Server) handleCancelScheduledFreeze(w http.ResponseWriter, r *http.Requ
 			internalServerError(w)
 			return
 		}
-		repositories, scheduled, dataErr := s.scheduledFreezePageData(r.Context())
+		repositories, scheduled, branchOptions, dataErr := s.scheduledFreezePageData(r.Context())
 		if dataErr != nil {
 			internalServerError(w)
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
-		s.renderScheduledFreezes(w, repositories, scheduledFreezeViews(repositories, scheduled), err.Error(), session)
+		s.renderScheduledFreezes(w, repositories, scheduledFreezeViews(repositories, scheduled), branchOptions, err.Error(), session)
 		return
 	}
 	http.Redirect(w, r, "/scheduled-freezes", http.StatusSeeOther)
@@ -2115,32 +2189,40 @@ func (s *Server) scheduledFreezes(ctx context.Context, limit int) ([]domain.Bran
 	return s.cfg.ScheduledFreezeStore.ListScheduled(ctx, limit)
 }
 
-func (s *Server) scheduledFreezePageData(ctx context.Context) ([]domain.Repository, []domain.BranchFreeze, error) {
+func (s *Server) scheduledFreezePageData(ctx context.Context) ([]domain.Repository, []domain.BranchFreeze, []managedBranchOption, error) {
 	repositories, err := s.repositories(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	scheduled, err := s.scheduledFreezes(ctx, 100)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return repositories, scheduled, nil
-}
-
-func (s *Server) freezePageData(ctx context.Context) ([]domain.Repository, []domain.BranchFreeze, []freezeAuditView, error) {
-	repositories, err := s.repositories(ctx)
+	branchOptions, err := s.managedBranchOptions(ctx, repositories)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+	return repositories, scheduled, branchOptions, nil
+}
+
+func (s *Server) freezePageData(ctx context.Context) ([]domain.Repository, []domain.BranchFreeze, []freezeAuditView, []managedBranchOption, error) {
+	repositories, err := s.repositories(ctx)
+	if err != nil {
+		return nil, nil, nil, nil, err
 	}
 	freezes, err := s.activeFreezes(ctx)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	auditEvents, err := s.freezeAuditViews(ctx, repositories)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
-	return repositories, freezes, auditEvents, nil
+	branchOptions, err := s.managedBranchOptions(ctx, repositories)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	return repositories, freezes, auditEvents, branchOptions, nil
 }
 
 func (s *Server) freezeViews(repositories []domain.Repository, freezes []domain.BranchFreeze) []freezeView {
@@ -2332,9 +2414,56 @@ func (s *Server) repositoryViews(ctx context.Context, repositories []domain.Repo
 			}
 			view.SetupChecks = latestSetupChecks(checks)
 		}
+		branches, err := s.managedBranches(ctx, repo.ID)
+		if err != nil {
+			return nil, err
+		}
+		view.Branches = repositoryBranchViews(repo, branches)
 		views = append(views, view)
 	}
 	return views, nil
+}
+
+func (s *Server) managedBranches(ctx context.Context, repositoryID int64) ([]domain.RepositoryBranch, error) {
+	if s.cfg.RepositoryStore == nil {
+		return nil, nil
+	}
+	return s.cfg.RepositoryStore.ListBranches(ctx, repositoryID)
+}
+
+func repositoryBranchViews(repo domain.Repository, branches []domain.RepositoryBranch) []repositoryBranchView {
+	views := make([]repositoryBranchView, 0, len(branches))
+	for _, branch := range branches {
+		label := "setup not verified"
+		if branch.SetupStatus != "" && branch.SetupStatus != "unknown" {
+			label = "setup " + branch.SetupStatus
+		}
+		views = append(views, repositoryBranchView{
+			Name:       branch.Name,
+			IsDefault:  branch.Name == repo.DefaultBranch,
+			SetupLabel: label,
+		})
+	}
+	return views
+}
+
+// managedBranchOptions lists the exact managed branches of every
+// enforcement-active repository for the freeze and schedule forms.
+func (s *Server) managedBranchOptions(ctx context.Context, repositories []domain.Repository) ([]managedBranchOption, error) {
+	options := make([]managedBranchOption, 0)
+	for _, repo := range repositories {
+		if !repo.EnforcementActive() {
+			continue
+		}
+		branches, err := s.managedBranches(ctx, repo.ID)
+		if err != nil {
+			return nil, err
+		}
+		for _, branch := range branches {
+			options = append(options, managedBranchOption{RepositoryID: repo.ID, Name: branch.Name})
+		}
+	}
+	return options, nil
 }
 
 func latestSetupChecks(checks []setupcheck.Check) []setupcheck.Check {
@@ -2382,12 +2511,13 @@ func (s *Server) renderRepositories(w http.ResponseWriter, views []repositoryVie
 	})
 }
 
-func (s *Server) renderFreezes(w http.ResponseWriter, repositories []domain.Repository, freezes []freezeView, auditEvents []freezeAuditView, formError string, session sessionState) {
+func (s *Server) renderFreezes(w http.ResponseWriter, repositories []domain.Repository, freezes []freezeView, auditEvents []freezeAuditView, branchOptions []managedBranchOption, formError string, session sessionState) {
 	s.render(w, freezesTemplate, map[string]any{
 		"AppName":                 s.cfg.AppName,
 		"ActivePage":              "freezes",
 		"CurrentUser":             currentUserFromSession(session),
 		"EnforceableRepositories": enforcementActiveRepositories(repositories),
+		"BranchOptions":           branchOptions,
 		"Freezes":                 freezes,
 		"AuditEvents":             auditEvents,
 		"FormError":               formError,
@@ -2407,12 +2537,13 @@ func enforcementActiveRepositories(repositories []domain.Repository) []domain.Re
 	return enforceable
 }
 
-func (s *Server) renderScheduledFreezes(w http.ResponseWriter, repositories []domain.Repository, scheduled []scheduledFreezeView, formError string, session sessionState) {
+func (s *Server) renderScheduledFreezes(w http.ResponseWriter, repositories []domain.Repository, scheduled []scheduledFreezeView, branchOptions []managedBranchOption, formError string, session sessionState) {
 	s.render(w, scheduledFreezesTemplate, map[string]any{
 		"AppName":                 s.cfg.AppName,
 		"ActivePage":              "scheduled",
 		"CurrentUser":             currentUserFromSession(session),
 		"EnforceableRepositories": enforcementActiveRepositories(repositories),
+		"BranchOptions":           branchOptions,
 		"ScheduledFreezes":        scheduled,
 		"FormError":               formError,
 		"CSRFToken":               session.CSRFToken,
@@ -3263,7 +3394,7 @@ const repositoriesTemplate = pageHead + `
 
     {{ if .RepositoryViews }}
     <section class="tg-repo-grid" aria-label="Configured repositories">
-      {{ range .RepositoryViews }}
+      {{ range $view := .RepositoryViews }}
       <article class="tg-repo-card">
         <div class="tg-repo-card-head">
           <div>
@@ -3292,6 +3423,46 @@ const repositoriesTemplate = pageHead + `
             {{ end }}
           {{ else }}
             <p class="tg-muted">Run a local setup check to record placeholder readiness results. Live forge verification is not wired yet.</p>
+          {{ end }}
+        </div>
+        <div class="tg-repo-branches">
+          <div class="tg-repo-branches-head">
+            <strong>Managed branches</strong>
+            <span class="tg-badge tg-badge-info">exact names only</span>
+          </div>
+          <p class="tg-muted">Freezes and scheduled freezes only apply to these exact branch names. Branch setup stays unverified until readiness checks ship.</p>
+          {{ if .Branches }}
+          <ul class="tg-branch-list">
+            {{ range .Branches }}
+            <li class="tg-branch-row">
+              <code class="tg-branch">{{ .Name }}</code>
+              {{ if .IsDefault }}<span class="tg-badge tg-badge-info">default</span>{{ end }}
+              <span class="tg-badge status-warning">{{ .SetupLabel }}</span>
+              {{ if and $.CurrentUser.CanManageRepositories (not .IsDefault) (not $view.Repository.EnforcementActive) }}
+              <form method="post" action="/repositories/branches/remove" data-confirm-submit data-confirm-title="Remove managed branch?" data-confirm-message="Freezes and schedules can no longer target this branch. Removal is rejected while the branch has an active or scheduled freeze." data-confirm-action="Remove branch">
+                <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+                <input type="hidden" name="repository_id" value="{{ $view.Repository.ID }}">
+                <input type="hidden" name="branch" value="{{ .Name }}">
+                <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-close"></use></svg>Remove</button>
+              </form>
+              {{ end }}
+            </li>
+            {{ end }}
+          </ul>
+          {{ else }}
+          <p class="tg-muted">No managed branches are recorded for this repository. Add the exact branch names Thawguard should manage.</p>
+          {{ end }}
+          {{ if $.CurrentUser.CanManageRepositories }}
+            {{ if .Repository.EnforcementActive }}
+            <p class="tg-muted">Branch editing is disabled while enforcement is active. Deactivate repository enforcement before changing managed branches.</p>
+            {{ else }}
+            <form method="post" action="/repositories/branches" class="tg-branch-add-form">
+              <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+              <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
+              <input name="branch" maxlength="255" placeholder="release/1.4" aria-label="Add managed branch for {{ .Repository.FullName }}" required>
+              <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-git-branch"></use></svg>Add branch</button>
+            </form>
+            {{ end }}
           {{ end }}
         </div>
         {{ if $.CurrentUser.CanManageRepositories }}
@@ -3428,7 +3599,11 @@ const freezesTemplate = pageHead + `
             {{ range .EnforceableRepositories }}<option value="{{ .ID }}">{{ .FullName }}</option>{{ end }}
             </select>
           </label>
-          <label>Branch <input name="branch" placeholder="main" value="main" required data-freeze-branch></label>
+          <label>Branch
+            <select name="branch" required data-freeze-branch>
+            {{ range .BranchOptions }}<option value="{{ .Name }}" data-repository="{{ .RepositoryID }}">{{ .Name }}</option>{{ end }}
+            </select>
+          </label>
           <label class="tg-field-wide">Reason <input name="reason" placeholder="Release cut 2026-07 — QA verification in progress" required></label>
           <div class="tg-freeze-form-footer tg-field-wide">
             <span class="tg-muted"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-audit"></use></svg>Every freeze is written to the audit log.</span>
@@ -3509,7 +3684,7 @@ const freezesTemplate = pageHead + `
     </section>
   </main>
   <script>
-    (() => {
+    (() => {` + branchFilterScript + `
       const form = document.querySelector('[data-freeze-form]');
       if (!form) return;
       const repo = form.querySelector('[data-freeze-repository]');
@@ -3520,12 +3695,30 @@ const freezesTemplate = pageHead + `
         if (repoOut && repo) repoOut.textContent = repo.options[repo.selectedIndex]?.textContent?.trim() || 'Selected repository';
         if (branchOut && branch) branchOut.textContent = branch.value.trim() || 'branch';
       };
-      repo.addEventListener('change', update);
-      branch.addEventListener('input', update);
+      repo.addEventListener('change', () => { filterBranchOptions(repo, branch); update(); });
+      branch.addEventListener('change', update);
+      filterBranchOptions(repo, branch);
       update();
     })();
   </script>
 ` + pageFoot
+
+// branchFilterScript keeps the managed-branch select scoped to the selected
+// repository. Server-side (repository_id, branch) validation stays
+// authoritative when JavaScript is unavailable.
+const branchFilterScript = `
+      const filterBranchOptions = (repo, branch) => {
+        if (!repo || !branch) return;
+        let first = null;
+        for (const option of branch.options) {
+          const match = option.dataset.repository === repo.value;
+          option.hidden = !match;
+          option.disabled = !match;
+          if (match && first === null) first = option;
+        }
+        const selected = branch.options[branch.selectedIndex];
+        if ((!selected || selected.disabled) && first !== null) branch.value = first.value;
+      };`
 
 const scheduledFreezesTemplate = pageHead + `
   <main class="tg-main tg-setup-page tg-freezes-page">
@@ -3557,11 +3750,15 @@ const scheduledFreezesTemplate = pageHead + `
           <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
           <input type="hidden" name="timezone_offset_minutes" value="0" data-timezone-offset-minutes>
           <label>Repository
-            <select name="repository_id" required>
+            <select name="repository_id" required data-scheduled-repository>
             {{ range .EnforceableRepositories }}<option value="{{ .ID }}">{{ .FullName }}</option>{{ end }}
             </select>
           </label>
-          <label>Branch <input name="branch" placeholder="main" value="main" required></label>
+          <label>Branch
+            <select name="branch" required data-scheduled-branch>
+            {{ range .BranchOptions }}<option value="{{ .Name }}" data-repository="{{ .RepositoryID }}">{{ .Name }}</option>{{ end }}
+            </select>
+          </label>
           <label>Starts at <input type="datetime-local" name="starts_at" required></label>
           <label>Planned unfreeze <input type="datetime-local" name="planned_ends_at" aria-describedby="planned-unfreeze-help"></label>
           <small id="planned-unfreeze-help" class="tg-muted tg-field-wide">Optional. Times use your browser's local timezone and are stored as UTC.</small>
@@ -3630,9 +3827,13 @@ const scheduledFreezesTemplate = pageHead + `
     </section>
   </main>
   <script>
-    (() => {
+    (() => {` + branchFilterScript + `
       const field = document.querySelector('[data-timezone-offset-minutes]');
       if (field) field.value = String(new Date().getTimezoneOffset());
+      const repo = document.querySelector('[data-scheduled-repository]');
+      const branch = document.querySelector('[data-scheduled-branch]');
+      if (repo) repo.addEventListener('change', () => filterBranchOptions(repo, branch));
+      filterBranchOptions(repo, branch);
     })();
   </script>` + pageFoot
 

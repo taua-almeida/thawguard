@@ -21,6 +21,16 @@ Thawguard has one operational mode. Each repository carries a persisted enforcem
 
 Activation is not implemented yet: it ships with the upcoming readiness checks, which will require the encrypted status token, the required branch context, a verified signed webhook, and passing readiness checks. Current builds therefore leave every repository setup-incomplete. There is no shadow or dry-run runtime mode.
 
+## Managed branches
+
+Each repository has an explicit list of managed branches: the exact branch names Thawguard may freeze or schedule. There are no globs, patterns, prefixes, or rules — `release/1.4` manages exactly the branch named `release/1.4`, and `release/*` would be a literal branch name, never a pattern.
+
+- Every repository always manages at least its default branch; the default branch cannot be removed.
+- Admins add or remove exact branch names on `/repositories`. Removal is rejected while the branch has an active or pending scheduled freeze; ended or cancelled history never blocks removal.
+- Branch scope is locked while a repository is enforcement-active.
+- Freeze and scheduled-freeze creation are rejected server-side for any branch that is not managed for the selected repository.
+- Newly added branches are unverified until the upcoming readiness checks confirm their setup.
+
 ## Local development
 
 ```sh
@@ -45,7 +55,7 @@ Current local pages:
 - `/` dashboard
 - `/setup` first local admin setup when no users exist; the first account starts with all MVP roles for local bootstrap
 - `/login` and `/logout` local user session flow
-- `/repositories` repository setup form, enforcement state, and manual setup checklist
+- `/repositories` repository setup form, enforcement state, managed branch scope, and manual setup checklist
 - `/freezes` active branch-freeze form and list (requires an enforcement-active repository)
 - `/scheduled-freezes` one-time scheduled freeze windows with optional planned unfreeze (requires an enforcement-active repository)
 - `/decisions` immediate thaw approval; fetches the current PR head from the forge and scopes the thaw to that PR/head SHA (requires an enforcement-active repository)

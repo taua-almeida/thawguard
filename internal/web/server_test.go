@@ -2647,6 +2647,16 @@ type fakeRepositoryStore struct {
 	statusTokens        []statusTokenUpdate
 	statusTokenActors   []domain.Actor
 	statusTokenErr      error
+	branches            map[int64][]domain.RepositoryBranch
+	branchAdds          []branchUpdate
+	branchRemovals      []branchUpdate
+	branchActors        []domain.Actor
+	branchErr           error
+}
+
+type branchUpdate struct {
+	repositoryID int64
+	branch       string
 }
 
 type webhookSecretUpdate struct {
@@ -2862,6 +2872,38 @@ func (s *fakeRepositoryStore) Create(ctx context.Context, params repository.Crea
 	repo := domain.Repository{ID: int64(len(s.repositories) + 1), Forge: params.Forge, BaseURL: params.BaseURL, Owner: params.Owner, Name: params.Name, DefaultBranch: params.DefaultBranch, Active: true}
 	s.repositories = append(s.repositories, repo)
 	return repo, nil
+}
+
+// ListBranches falls back to each repository's default branch so pages render
+// realistic managed-branch data without per-test setup.
+func (s *fakeRepositoryStore) ListBranches(ctx context.Context, repositoryID int64) ([]domain.RepositoryBranch, error) {
+	if s.branches != nil {
+		return s.branches[repositoryID], nil
+	}
+	for _, repo := range s.repositories {
+		if repo.ID == repositoryID && repo.DefaultBranch != "" {
+			return []domain.RepositoryBranch{{ID: 1, RepositoryID: repositoryID, Name: repo.DefaultBranch, SetupStatus: "unknown"}}, nil
+		}
+	}
+	return nil, nil
+}
+
+func (s *fakeRepositoryStore) AddBranch(ctx context.Context, repositoryID int64, branch string, actor domain.Actor) (domain.RepositoryBranch, error) {
+	if s.branchErr != nil {
+		return domain.RepositoryBranch{}, s.branchErr
+	}
+	s.branchAdds = append(s.branchAdds, branchUpdate{repositoryID: repositoryID, branch: branch})
+	s.branchActors = append(s.branchActors, actor)
+	return domain.RepositoryBranch{ID: int64(len(s.branchAdds)), RepositoryID: repositoryID, Name: branch, SetupStatus: "unknown"}, nil
+}
+
+func (s *fakeRepositoryStore) RemoveBranch(ctx context.Context, repositoryID int64, branch string, actor domain.Actor) error {
+	if s.branchErr != nil {
+		return s.branchErr
+	}
+	s.branchRemovals = append(s.branchRemovals, branchUpdate{repositoryID: repositoryID, branch: branch})
+	s.branchActors = append(s.branchActors, actor)
+	return nil
 }
 
 func (s *fakeRepositoryStore) SetWebhookSecret(ctx context.Context, repositoryID int64, secret string, actor domain.Actor) (domain.Repository, error) {

@@ -88,6 +88,14 @@ INSERT INTO repositories(forge, base_url, owner, name, default_branch, active, c
 	if err != nil {
 		return domain.Repository{}, fmt.Errorf("created repository id: %w", err)
 	}
+	// A repository always has at least its default branch managed. Callers
+	// create repositories inside the setup transaction, so a failure here
+	// rolls back the repository row as well.
+	if _, err := s.db.ExecContext(ctx, `
+INSERT INTO repository_branches(repository_id, name)
+VALUES (?, ?)`, id, params.DefaultBranch); err != nil {
+		return domain.Repository{}, fmt.Errorf("create default managed branch: %w", err)
+	}
 	return s.Get(ctx, id)
 }
 
@@ -379,7 +387,7 @@ func validateCreateParams(params CreateParams) error {
 	if len(missing) > 0 {
 		return ValidationError{Message: fmt.Sprintf("missing required repository fields: %s", strings.Join(missing, ", "))}
 	}
-	return nil
+	return validateBranchName(params.DefaultBranch)
 }
 
 type scanner interface {
