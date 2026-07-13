@@ -16,11 +16,15 @@ import (
 )
 
 type fakeEnforcementService struct {
-	verified    []int64
-	activated   []int64
-	actors      []domain.Actor
-	verifyErr   error
-	activateErr error
+	verified     []int64
+	activated    []int64
+	reconciled   []int64
+	recovered    []int64
+	actors       []domain.Actor
+	verifyErr    error
+	activateErr  error
+	reconcileErr error
+	recoverErr   error
 }
 
 func (s *fakeEnforcementService) VerifyStatusPosting(ctx context.Context, repositoryID int64, actor domain.Actor) (domain.Repository, error) {
@@ -41,11 +45,34 @@ func (s *fakeEnforcementService) ActivateEnforcement(ctx context.Context, reposi
 	return domain.Repository{ID: repositoryID, EnforcementState: domain.EnforcementActive}, nil
 }
 
+func (s *fakeEnforcementService) ReconcileEnforcement(ctx context.Context, repositoryID int64, actor domain.Actor) (domain.Repository, error) {
+	if s.reconcileErr != nil {
+		return domain.Repository{}, s.reconcileErr
+	}
+	s.reconciled = append(s.reconciled, repositoryID)
+	s.actors = append(s.actors, actor)
+	return domain.Repository{ID: repositoryID, EnforcementState: domain.EnforcementActive}, nil
+}
+
+func (s *fakeEnforcementService) RecoverEnforcement(ctx context.Context, repositoryID int64, actor domain.Actor) (domain.Repository, error) {
+	if s.recoverErr != nil {
+		return domain.Repository{}, s.recoverErr
+	}
+	s.recovered = append(s.recovered, repositoryID)
+	s.actors = append(s.actors, actor)
+	return domain.Repository{ID: repositoryID, EnforcementState: domain.EnforcementActive}, nil
+}
+
 func enforcementTestRepository(state domain.EnforcementState) domain.Repository {
 	repo := domain.Repository{ID: 7, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", HasWebhookSecret: true, HasStatusToken: true, EnforcementState: state}
 	if state == domain.EnforcementReady || state == domain.EnforcementActive {
 		verifiedAt := time.Date(2026, 7, 12, 9, 0, 0, 0, time.UTC)
 		repo.StatusPostVerifiedAt = &verifiedAt
+	}
+	if state == domain.EnforcementUnhealthy {
+		failedAt := time.Date(2026, 7, 12, 11, 30, 0, 0, time.UTC)
+		repo.EnforcementFailureReason = domain.EnforcementFailurePublication
+		repo.EnforcementFailedAt = &failedAt
 	}
 	return repo
 }
@@ -128,6 +155,84 @@ func TestRepositoriesPageShowsActivateActionOnlyWhenReady(t *testing.T) {
 	}
 }
 
+func TestRepositoriesPageOffersReconcileActionForActiveRepository(t *testing.T) {
+	server := newEnforcementTestServer(enforcementTestRepository(domain.EnforcementActive), passingReadinessChecks(time.Now().UTC()), &fakeEnforcementService{})
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+
+	body := recorder.Body.String()
+	if !strings.Contains(body, `action="/repositories/reconcile"`) || !strings.Contains(body, "Reconcile now") {
+		t.Fatalf("expected reconcile action for active repository, got %q", body)
+	}
+	if !strings.Contains(body, `data-confirm-title="Reconcile enforcement now?"`) ||
+		!strings.Contains(body, "refreshes current open pull requests") ||
+		!strings.Contains(body, "republishes the current thawguard/freeze policy") ||
+		!strings.Contains(body, "marked unhealthy") {
+		t.Fatalf("expected reconcile confirmation metadata, got %q", body)
+	}
+	if !strings.Contains(body, "Enforcement is active") || !strings.Contains(body, "2026-07-12 09:00 UTC") {
+		t.Fatalf("expected active state copy with verification time, got %q", body)
+	}
+	if strings.Contains(body, `action="/repositories/recover"`) {
+		t.Fatalf("expected no recovery action for active repository, got %q", body)
+	}
+}
+
+func TestRepositoriesPageOffersRecoveryForUnhealthyRepository(t *testing.T) {
+	server := newEnforcementTestServer(enforcementTestRepository(domain.EnforcementUnhealthy), passingReadinessChecks(time.Now().UTC()), &fakeEnforcementService{})
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+
+	body := recorder.Body.String()
+	if !strings.Contains(body, `action="/repositories/recover"`) || !strings.Contains(body, "Retry enforcement recovery") {
+		t.Fatalf("expected recovery action for unhealthy repository, got %q", body)
+	}
+	if !strings.Contains(body, `data-confirm-title="Retry enforcement recovery?"`) ||
+		!strings.Contains(body, "reruns every read-only readiness check") ||
+		!strings.Contains(body, "controlled thawguard/setup status post") ||
+		!strings.Contains(body, "returns to active only after complete success") {
+		t.Fatalf("expected recovery confirmation metadata, got %q", body)
+	}
+	if !strings.Contains(body, domain.EnforcementFailurePublication) || !strings.Contains(body, "2026-07-12 11:30 UTC") {
+		t.Fatalf("expected stored failure reason and timestamp, got %q", body)
+	}
+	if !strings.Contains(body, "then retry enforcement recovery") {
+		t.Fatalf("expected concrete remediation copy, got %q", body)
+	}
+	if strings.Contains(body, `action="/repositories/reconcile"`) {
+		t.Fatalf("expected no reconcile action for unhealthy repository, got %q", body)
+	}
+}
+
+func TestRepositoriesPageEscapesStoredFailureReason(t *testing.T) {
+	repo := enforcementTestRepository(domain.EnforcementUnhealthy)
+	repo.EnforcementFailureReason = `<script>alert("x")</script>`
+	server := newEnforcementTestServer(repo, nil, &fakeEnforcementService{})
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+
+	body := recorder.Body.String()
+	if strings.Contains(body, `<script>alert`) {
+		t.Fatalf("failure reason rendered unescaped: %q", body)
+	}
+	if !strings.Contains(body, "&lt;script&gt;") {
+		t.Fatalf("expected HTML-escaped failure reason, got %q", body)
+	}
+}
+
+func TestRepositoriesPageHidesReconcileAndRecoveryBeforeActivation(t *testing.T) {
+	for _, state := range []domain.EnforcementState{domain.EnforcementSetupIncomplete, domain.EnforcementReady} {
+		server := newEnforcementTestServer(enforcementTestRepository(state), passingReadinessChecks(time.Now().UTC()), &fakeEnforcementService{})
+		recorder := httptest.NewRecorder()
+		server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+
+		body := recorder.Body.String()
+		if strings.Contains(body, `action="/repositories/reconcile"`) || strings.Contains(body, `action="/repositories/recover"`) {
+			t.Fatalf("expected no reconcile/recovery actions for %s repository, got %q", state, body)
+		}
+	}
+}
+
 func TestRepositoriesPageHidesEnforcementActionsForActiveAndUnhealthy(t *testing.T) {
 	for _, state := range []domain.EnforcementState{domain.EnforcementActive, domain.EnforcementUnhealthy} {
 		server := newEnforcementTestServer(enforcementTestRepository(state), passingReadinessChecks(time.Now().UTC()), &fakeEnforcementService{})
@@ -184,6 +289,73 @@ func TestActivateEnforcementHandlerRedirectsAfterSuccess(t *testing.T) {
 	}
 }
 
+func TestReconcileAndRecoverHandlersRedirectAfterSuccess(t *testing.T) {
+	for path, state := range map[string]domain.EnforcementState{
+		"/repositories/reconcile": domain.EnforcementActive,
+		"/repositories/recover":   domain.EnforcementUnhealthy,
+	} {
+		service := &fakeEnforcementService{}
+		server := newEnforcementTestServer(enforcementTestRepository(state), passingReadinessChecks(time.Now().UTC()), service)
+		cookie, csrfToken := getRepositoryForm(t, server)
+
+		form := url.Values{"repository_id": {"7"}, csrfFormField: {csrfToken}}
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(form.Encode()))
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		request.AddCookie(cookie)
+		server.Routes().ServeHTTP(recorder, request)
+
+		if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != "/repositories" {
+			t.Fatalf("expected PRG redirect for %s, status=%d location=%q", path, recorder.Code, recorder.Header().Get("Location"))
+		}
+		calls := service.reconciled
+		if path == "/repositories/recover" {
+			calls = service.recovered
+		}
+		if len(calls) != 1 || calls[0] != 7 {
+			t.Fatalf("expected one %s call for repository 7, got %+v", path, calls)
+		}
+	}
+}
+
+func TestReconcileAndRecoverHandlersRenderStateGateErrorsSafely(t *testing.T) {
+	service := &fakeEnforcementService{
+		reconcileErr: repository.ValidationError{Message: "Manual reconciliation is only available while repository enforcement is active."},
+		recoverErr:   repository.ValidationError{Message: "Enforcement recovery is only available for an unhealthy repository. <script>"},
+	}
+	server := newEnforcementTestServer(enforcementTestRepository(domain.EnforcementReady), passingReadinessChecks(time.Now().UTC()), service)
+	cookie, csrfToken := getRepositoryForm(t, server)
+
+	for path, message := range map[string]string{
+		"/repositories/reconcile": "only available while repository enforcement is active",
+		"/repositories/recover":   "only available for an unhealthy repository",
+	} {
+		form := url.Values{"repository_id": {"7"}, csrfFormField: {csrfToken}}
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(form.Encode()))
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		request.AddCookie(cookie)
+		server.Routes().ServeHTTP(recorder, request)
+
+		if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), message) {
+			t.Fatalf("expected typed validation re-render for %s, status=%d body=%q", path, recorder.Code, recorder.Body.String())
+		}
+	}
+	if len(service.reconciled) != 0 || len(service.recovered) != 0 {
+		t.Fatalf("expected no successful transitions, got %+v %+v", service.reconciled, service.recovered)
+	}
+
+	form := url.Values{"repository_id": {"7"}, csrfFormField: {csrfToken}}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/repositories/recover", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+	if !strings.Contains(recorder.Body.String(), "&lt;script&gt;") {
+		t.Fatalf("expected error message to be HTML-escaped, got %q", recorder.Body.String())
+	}
+}
+
 func TestEnforcementHandlersRenderTypedValidationErrorsSafely(t *testing.T) {
 	service := &fakeEnforcementService{
 		verifyErr:   repository.ValidationError{Message: "Status-post verification failed: the controlled thawguard/setup status could not be posted with the stored token. <script>"},
@@ -223,7 +395,7 @@ func TestEnforcementHandlersRejectInvalidCSRF(t *testing.T) {
 	server := newEnforcementTestServer(enforcementTestRepository(domain.EnforcementReady), nil, service)
 	cookie, _ := getRepositoryForm(t, server)
 
-	for _, path := range []string{"/repositories/status-verification", "/repositories/activate"} {
+	for _, path := range []string{"/repositories/status-verification", "/repositories/activate", "/repositories/reconcile", "/repositories/recover"} {
 		form := url.Values{"repository_id": {"7"}, csrfFormField: {"not-the-session-token"}}
 		recorder := httptest.NewRecorder()
 		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(form.Encode()))
@@ -234,8 +406,8 @@ func TestEnforcementHandlersRejectInvalidCSRF(t *testing.T) {
 			t.Fatalf("expected CSRF rejection for %s, got %d", path, recorder.Code)
 		}
 	}
-	if len(service.verified) != 0 || len(service.activated) != 0 {
-		t.Fatalf("expected no service calls after CSRF rejection, got %+v %+v", service.verified, service.activated)
+	if len(service.verified) != 0 || len(service.activated) != 0 || len(service.reconciled) != 0 || len(service.recovered) != 0 {
+		t.Fatalf("expected no service calls after CSRF rejection, got %+v", service)
 	}
 }
 
@@ -254,10 +426,13 @@ func TestEnforcementActionsForbiddenForNonAdmin(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := &fakeEnforcementService{}
+	unhealthy := enforcementTestRepository(domain.EnforcementUnhealthy)
+	unhealthy.ID = 8
+	unhealthy.Name = "thawguard-unhealthy"
 	server := NewServer(Config{
 		AppName:            "Thawguard",
 		AuthService:        authService,
-		RepositoryStore:    &fakeRepositoryStore{repositories: []domain.Repository{enforcementTestRepository(domain.EnforcementReady)}},
+		RepositoryStore:    &fakeRepositoryStore{repositories: []domain.Repository{enforcementTestRepository(domain.EnforcementReady), unhealthy}},
 		SetupCheckStore:    &fakeSetupCheckStore{checks: map[int64][]setupcheck.Check{7: passingReadinessChecks(time.Now().UTC())}},
 		EnforcementService: service,
 	})
@@ -274,11 +449,15 @@ func TestEnforcementActionsForbiddenForNonAdmin(t *testing.T) {
 	if !strings.Contains(body, "Status posting verified") {
 		t.Fatalf("expected viewer to see enforcement state evidence, got %q", body)
 	}
-	if strings.Contains(body, `action="/repositories/status-verification"`) || strings.Contains(body, `action="/repositories/activate"`) {
+	if !strings.Contains(body, domain.EnforcementFailurePublication) {
+		t.Fatalf("expected viewer to see the stored failure reason, got %q", body)
+	}
+	if strings.Contains(body, `action="/repositories/status-verification"`) || strings.Contains(body, `action="/repositories/activate"`) ||
+		strings.Contains(body, `action="/repositories/reconcile"`) || strings.Contains(body, `action="/repositories/recover"`) {
 		t.Fatalf("expected no actionable enforcement forms for viewer, got %q", body)
 	}
 
-	for _, path := range []string{"/repositories/status-verification", "/repositories/activate"} {
+	for _, path := range []string{"/repositories/status-verification", "/repositories/activate", "/repositories/reconcile", "/repositories/recover"} {
 		form := url.Values{"repository_id": {"7"}, csrfFormField: {viewerSession.CSRFToken}}
 		recorder := httptest.NewRecorder()
 		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(form.Encode()))
@@ -289,7 +468,7 @@ func TestEnforcementActionsForbiddenForNonAdmin(t *testing.T) {
 			t.Fatalf("expected viewer %s to be forbidden, got %d", path, recorder.Code)
 		}
 	}
-	if len(service.verified) != 0 || len(service.activated) != 0 {
-		t.Fatalf("expected no service calls for viewer, got %+v %+v", service.verified, service.activated)
+	if len(service.verified) != 0 || len(service.activated) != 0 || len(service.reconciled) != 0 || len(service.recovered) != 0 {
+		t.Fatalf("expected no service calls for viewer, got %+v", service)
 	}
 }

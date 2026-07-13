@@ -123,7 +123,7 @@ func (s *Store) Get(ctx context.Context, id int64) (domain.Repository, error) {
 SELECT id, forge, base_url, owner, name, default_branch, active, enforcement_state,
   EXISTS(SELECT 1 FROM repository_webhook_secrets WHERE repository_id = repositories.id),
   EXISTS(SELECT 1 FROM repository_status_tokens WHERE repository_id = repositories.id),
-  status_post_verified_at, created_at, updated_at
+  status_post_verified_at, enforcement_failure_reason, enforcement_failed_at, created_at, updated_at
 FROM repositories
 WHERE id = ?`, id)
 	return scanRepository(row)
@@ -137,7 +137,7 @@ func (s *Store) List(ctx context.Context) ([]domain.Repository, error) {
 SELECT id, forge, base_url, owner, name, default_branch, active, enforcement_state,
   EXISTS(SELECT 1 FROM repository_webhook_secrets WHERE repository_id = repositories.id),
   EXISTS(SELECT 1 FROM repository_status_tokens WHERE repository_id = repositories.id),
-  status_post_verified_at, created_at, updated_at
+  status_post_verified_at, enforcement_failure_reason, enforcement_failed_at, created_at, updated_at
 FROM repositories
 ORDER BY owner, name`)
 	if err != nil {
@@ -171,7 +171,7 @@ func (s *Store) FindActiveByRemote(ctx context.Context, params RemoteParams) (do
 SELECT id, forge, base_url, owner, name, default_branch, active, enforcement_state,
   EXISTS(SELECT 1 FROM repository_webhook_secrets WHERE repository_id = repositories.id),
   EXISTS(SELECT 1 FROM repository_status_tokens WHERE repository_id = repositories.id),
-  status_post_verified_at, created_at, updated_at
+  status_post_verified_at, enforcement_failure_reason, enforcement_failed_at, created_at, updated_at
 FROM repositories
 	WHERE forge = ? AND base_url = ? AND owner = ? AND name = ? AND active = 1`, params.Forge, params.BaseURL, params.Owner, params.Name)
 	repo, err := scanRepository(row)
@@ -239,6 +239,54 @@ WHERE id = ?`, verifiedAtValue, updatedAt, repositoryID)
 	affected, err := result.RowsAffected()
 	if err != nil {
 		return domain.Repository{}, fmt.Errorf("set repository status post verification rows: %w", err)
+	}
+	if affected == 0 {
+		return domain.Repository{}, sql.ErrNoRows
+	}
+	return s.Get(ctx, repositoryID)
+}
+
+// SetEnforcementFailure stores the latest sanitized enforcement failure.
+// Only the stable bounded reason categories are accepted, so raw errors,
+// forge response bodies, and credentials cannot reach repository state.
+func (s *Store) SetEnforcementFailure(ctx context.Context, repositoryID int64, reason string, failedAt time.Time) (domain.Repository, error) {
+	if !domain.ValidEnforcementFailureReason(reason) {
+		return domain.Repository{}, ValidationError{Message: "enforcement failure reason is not a known category"}
+	}
+	if failedAt.IsZero() {
+		return domain.Repository{}, ValidationError{Message: "enforcement failure time is required"}
+	}
+	return s.setEnforcementFailure(ctx, repositoryID, reason, failedAt.UTC().Format(time.RFC3339Nano))
+}
+
+// ClearEnforcementFailure removes the stored failure after a fully
+// successful activation, recovery, or reconciliation.
+func (s *Store) ClearEnforcementFailure(ctx context.Context, repositoryID int64) (domain.Repository, error) {
+	return s.setEnforcementFailure(ctx, repositoryID, "", nil)
+}
+
+func (s *Store) setEnforcementFailure(ctx context.Context, repositoryID int64, reason string, failedAt any) (domain.Repository, error) {
+	if s == nil || s.db == nil {
+		return domain.Repository{}, errors.New("repository store has no database")
+	}
+	if repositoryID <= 0 {
+		return domain.Repository{}, ValidationError{Message: "repository id is required"}
+	}
+	var reasonValue any
+	if reason != "" {
+		reasonValue = reason
+	}
+	updatedAt := s.now().UTC().Format(time.RFC3339Nano)
+	result, err := s.db.ExecContext(ctx, `
+UPDATE repositories
+SET enforcement_failure_reason = ?, enforcement_failed_at = ?, updated_at = ?
+WHERE id = ?`, reasonValue, failedAt, updatedAt, repositoryID)
+	if err != nil {
+		return domain.Repository{}, fmt.Errorf("set repository enforcement failure: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return domain.Repository{}, fmt.Errorf("set repository enforcement failure rows: %w", err)
 	}
 	if affected == 0 {
 		return domain.Repository{}, sql.ErrNoRows
@@ -432,9 +480,9 @@ func scanRepository(row scanner) (domain.Repository, error) {
 	var repo domain.Repository
 	var active, hasWebhookSecret, hasStatusToken int
 	var enforcementState string
-	var statusPostVerifiedAt sql.NullString
+	var statusPostVerifiedAt, enforcementFailureReason, enforcementFailedAt sql.NullString
 	var createdAt, updatedAt string
-	if err := row.Scan(&repo.ID, &repo.Forge, &repo.BaseURL, &repo.Owner, &repo.Name, &repo.DefaultBranch, &active, &enforcementState, &hasWebhookSecret, &hasStatusToken, &statusPostVerifiedAt, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&repo.ID, &repo.Forge, &repo.BaseURL, &repo.Owner, &repo.Name, &repo.DefaultBranch, &active, &enforcementState, &hasWebhookSecret, &hasStatusToken, &statusPostVerifiedAt, &enforcementFailureReason, &enforcementFailedAt, &createdAt, &updatedAt); err != nil {
 		return domain.Repository{}, fmt.Errorf("scan repository: %w", err)
 	}
 	repo.Active = active != 0
@@ -447,6 +495,14 @@ func scanRepository(row scanner) (domain.Repository, error) {
 			return domain.Repository{}, fmt.Errorf("parse repository status_post_verified_at: %w", err)
 		}
 		repo.StatusPostVerifiedAt = &parsed
+	}
+	repo.EnforcementFailureReason = enforcementFailureReason.String
+	if enforcementFailedAt.Valid {
+		parsed, err := time.Parse(time.RFC3339Nano, enforcementFailedAt.String)
+		if err != nil {
+			return domain.Repository{}, fmt.Errorf("parse repository enforcement_failed_at: %w", err)
+		}
+		repo.EnforcementFailedAt = &parsed
 	}
 
 	parsedCreatedAt, err := time.Parse(time.RFC3339Nano, createdAt)

@@ -120,54 +120,79 @@ func (s *enforcementService) ActivateEnforcement(ctx context.Context, repository
 	if postErr != nil {
 		// The token can no longer prove it posts statuses, so ready is no
 		// longer truthful: clear the evidence and return to setup.
-		failure := activationFailure{resultState: domain.EnforcementSetupIncomplete, clearVerification: true, reason: "setup status post failed"}
-		if err := s.recordActivationFailure(ctx, repo, actor, failure); err != nil {
+		failure := enforcementFailure{action: audit.ActionRepositoryEnforcementActivateFail, resultState: domain.EnforcementSetupIncomplete, clearVerification: true, reason: domain.EnforcementFailureSetupStatusPost}
+		if err := s.recordEnforcementFailure(ctx, repo, actor, failure); err != nil {
 			return domain.Repository{}, err
 		}
 		return domain.Repository{}, repository.ValidationError{Message: "Activation stopped: the controlled thawguard/setup status could not be posted. The repository returned to setup-incomplete; fix the token or forge setup and verify again."}
 	}
-	if err := s.syncer.syncRepository(ctx, repo, ""); err != nil {
-		failure := activationFailure{resultState: domain.EnforcementReady, reason: "open pull request synchronization failed"}
-		if err := s.recordActivationFailure(ctx, repo, actor, failure); err != nil {
+	verifiedAt := s.now().UTC()
+	counts, reason, policyErr := s.reconcileCurrentPolicy(ctx, repo, &verifiedAt)
+	if policyErr != nil {
+		if reason == domain.EnforcementFailureOpenPRSync {
+			// The forge cache never refreshed and enforcement never flipped:
+			// the repository stays ready and nothing was published.
+			failure := enforcementFailure{action: audit.ActionRepositoryEnforcementActivateFail, resultState: domain.EnforcementReady, reason: reason}
+			if err := s.recordEnforcementFailure(ctx, repo, actor, failure); err != nil {
+				return domain.Repository{}, err
+			}
+			return domain.Repository{}, repository.ValidationError{Message: "Activation stopped: current open pull requests could not be synchronized from the forge. The repository stays ready and nothing was published."}
+		}
+		if reason == "" {
+			return domain.Repository{}, policyErr
+		}
+		failure := enforcementFailure{action: audit.ActionRepositoryEnforcementActivateFail, resultState: domain.EnforcementUnhealthy, reason: reason, counts: &counts, persistFailure: true}
+		if err := s.recordEnforcementFailure(ctx, repo, actor, failure); err != nil {
 			return domain.Repository{}, err
 		}
-		return domain.Repository{}, repository.ValidationError{Message: "Activation stopped: current open pull requests could not be synchronized from the forge. The repository stays ready and nothing was published."}
+		return domain.Repository{}, repository.ValidationError{Message: "Activation failed while publishing initial thawguard/freeze statuses. The repository is marked unhealthy; statuses already posted were not rolled back."}
+	}
+	return s.recordEnforcementSuccess(ctx, repo, actor, audit.ActionRepositoryEnforcementActivated, map[string]string{
+		"default_branch": repo.DefaultBranch,
+		"head_sha":       abbreviateSHA(head.SHA),
+	}, counts)
+}
+
+// reconcileCurrentPolicy is the one shared implementation of enforcement
+// convergence used by activation, unhealthy recovery, and manual
+// reconciliation: it synchronizes current open pull requests from the forge,
+// groups them by repository-wide shared head, and evaluates and publishes the
+// current thawguard/freeze policy once per group. Real publication is gated
+// on active enforcement, so when activateVerifiedAt is set the repository
+// flips to active (with fresh verification evidence) between the cache
+// refresh and the first publication; callers own reverting the state on
+// failure. It stops at the first failed group and returns its stable failure
+// reason with truthful counts; already-posted statuses are never rolled back.
+func (s *enforcementService) reconcileCurrentPolicy(ctx context.Context, repo domain.Repository, activateVerifiedAt *time.Time) (activationCounts, string, error) {
+	counts := activationCounts{}
+	if err := s.syncer.syncRepository(ctx, repo, ""); err != nil {
+		return counts, domain.EnforcementFailureOpenPRSync, err
 	}
 	openPRs, managedBranches, err := s.openManagedBranchPullRequests(ctx, repo)
 	if err != nil {
-		failure := activationFailure{resultState: domain.EnforcementReady, reason: "open pull request lookup failed"}
-		if recordErr := s.recordActivationFailure(ctx, repo, actor, failure); recordErr != nil {
-			return domain.Repository{}, recordErr
+		return counts, domain.EnforcementFailureOpenPRSync, err
+	}
+	counts.managedBranches = managedBranches
+	counts.openPullRequests = len(openPRs)
+	if activateVerifiedAt != nil {
+		if err := s.markActive(ctx, repo.ID, *activateVerifiedAt); err != nil {
+			return counts, "", err
 		}
-		return domain.Repository{}, repository.ValidationError{Message: "Activation stopped: synchronized open pull requests could not be loaded. The repository stays ready and nothing was published."}
 	}
-	groups := pullRequestsByHead(openPRs)
-
-	// Publication requires active enforcement, so the state flips first; a
-	// publication failure immediately becomes unhealthy instead of silently
-	// reporting a successful activation.
-	verifiedAt := s.now().UTC()
-	if err := s.markActive(ctx, repo.ID, verifiedAt); err != nil {
-		return domain.Repository{}, err
-	}
-	counts := activationCounts{managedBranches: managedBranches, openPullRequests: len(openPRs)}
-	for _, group := range groups {
+	for _, group := range pullRequestsByHead(openPRs) {
 		counts.statusesAttempted++
-		result, publishErr := s.statuses.RunForSharedHead(ctx, group, group[0].Index)
-		if publishErr == nil {
-			_, publishErr = s.publisher.Publish(ctx, result)
-		}
-		if publishErr != nil {
+		result, err := s.statuses.RunForSharedHead(ctx, group, group[0].Index)
+		if err != nil {
 			counts.statusesFailed++
-			failure := activationFailure{resultState: domain.EnforcementUnhealthy, reason: "initial freeze status publication failed", counts: &counts}
-			if err := s.recordActivationFailure(ctx, repo, actor, failure); err != nil {
-				return domain.Repository{}, err
-			}
-			return domain.Repository{}, repository.ValidationError{Message: "Activation failed while publishing initial thawguard/freeze statuses. The repository is marked unhealthy; statuses already posted were not rolled back."}
+			return counts, domain.EnforcementFailureEvaluation, err
+		}
+		if _, err := s.publisher.Publish(ctx, result); err != nil {
+			counts.statusesFailed++
+			return counts, domain.EnforcementFailurePublication, err
 		}
 		counts.statusesPosted++
 	}
-	return s.recordActivationSuccess(ctx, repo, head, actor, counts)
+	return counts, "", nil
 }
 
 func (s *enforcementService) configured() error {
@@ -347,36 +372,48 @@ type activationCounts struct {
 	statusesFailed    int
 }
 
-type activationFailure struct {
+// enforcementFailure describes how a failed enforcement run lands: the
+// resulting state, the stable sanitized reason, whether the reason becomes
+// the repository's stored failure (only unhealthy results persist it), and
+// which audit action records it.
+type enforcementFailure struct {
+	action            string
 	resultState       domain.EnforcementState
 	clearVerification bool
 	reason            string
 	counts            *activationCounts
+	persistFailure    bool
 }
 
-func (s *enforcementService) recordActivationFailure(ctx context.Context, repo domain.Repository, actor domain.Actor, failure activationFailure) error {
+func (s *enforcementService) recordEnforcementFailure(ctx context.Context, repo domain.Repository, actor domain.Actor, failure enforcementFailure) error {
+	failedAt := s.now().UTC()
 	return s.inTx(ctx, func(tx *sql.Tx) error {
 		store := repository.NewStoreTx(tx)
-		updated := repo
-		var err error
 		if failure.clearVerification {
-			updated, err = store.SetStatusPostVerifiedAt(ctx, repo.ID, nil)
+			if _, err := store.SetStatusPostVerifiedAt(ctx, repo.ID, nil); err != nil {
+				return err
+			}
+		}
+		// The loaded repo can be stale here: a readiness run may already have
+		// flipped active to unhealthy, and reconcileCurrentPolicy flips to
+		// active before publishing. The result state is therefore always
+		// written instead of being diffed against the stale snapshot.
+		updated, err := store.SetEnforcementState(ctx, repo.ID, failure.resultState)
+		if err != nil {
+			return err
+		}
+		if failure.persistFailure {
+			updated, err = store.SetEnforcementFailure(ctx, repo.ID, failure.reason, failedAt)
 			if err != nil {
 				return err
 			}
 		}
-		if failure.resultState != repo.EnforcementState {
-			updated, err = store.SetEnforcementState(ctx, repo.ID, failure.resultState)
-			if err != nil {
-				return err
-			}
-		}
-		event := enforcementEvent(audit.ActionRepositoryEnforcementActivateFail, updated, actor, map[string]string{
+		event := enforcementEvent(failure.action, updated, actor, map[string]string{
 			"default_branch": repo.DefaultBranch,
 			"reason":         failure.reason,
 		}, failure.counts)
 		if err := audit.NewStoreTx(tx).Record(ctx, event); err != nil {
-			return fmt.Errorf("record repository.enforcement_activation_failed audit event: %w", err)
+			return fmt.Errorf("record %s audit event: %w", failure.action, err)
 		}
 		return nil
 	})
@@ -395,17 +432,25 @@ func (s *enforcementService) markActive(ctx context.Context, repositoryID int64,
 	})
 }
 
-func (s *enforcementService) recordActivationSuccess(ctx context.Context, repo domain.Repository, head forge.BranchHead, actor domain.Actor, counts activationCounts) (domain.Repository, error) {
-	updated, err := repository.NewStore(s.db).Get(ctx, repo.ID)
+// recordEnforcementSuccess clears the stored failure state and records the
+// success audit event after a fully successful activation, recovery, or
+// reconciliation run.
+func (s *enforcementService) recordEnforcementSuccess(ctx context.Context, repo domain.Repository, actor domain.Actor, action string, extra map[string]string, counts activationCounts) (domain.Repository, error) {
+	var updated domain.Repository
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
+		result, err := repository.NewStoreTx(tx).ClearEnforcementFailure(ctx, repo.ID)
+		if err != nil {
+			return err
+		}
+		updated = result
+		event := enforcementEvent(action, updated, actor, extra, &counts)
+		if err := audit.NewStoreTx(tx).Record(ctx, event); err != nil {
+			return fmt.Errorf("record %s audit event: %w", action, err)
+		}
+		return nil
+	})
 	if err != nil {
-		return domain.Repository{}, fmt.Errorf("load repository after enforcement activation: %w", err)
-	}
-	event := enforcementEvent(audit.ActionRepositoryEnforcementActivated, updated, actor, map[string]string{
-		"default_branch": repo.DefaultBranch,
-		"head_sha":       abbreviateSHA(head.SHA),
-	}, &counts)
-	if err := audit.NewStore(s.db).Record(ctx, event); err != nil {
-		return domain.Repository{}, fmt.Errorf("record repository.enforcement_activated audit event: %w", err)
+		return domain.Repository{}, err
 	}
 	return updated, nil
 }

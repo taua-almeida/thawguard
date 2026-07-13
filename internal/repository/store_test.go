@@ -2,6 +2,8 @@ package repository
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -447,7 +449,119 @@ func TestStoreSetsAndClearsStatusPostVerification(t *testing.T) {
 	}
 }
 
+func TestStoreSetsAndClearsEnforcementFailure(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	repo, err := store.Create(ctx, CreateParams{Owner: "taua-almeida", Name: "thawguard"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repo.EnforcementFailureReason != "" || repo.EnforcementFailedAt != nil {
+		t.Fatalf("expected new repository without failure state, got %+v", repo)
+	}
+
+	failedAt := time.Date(2026, 7, 12, 10, 30, 0, 123456789, time.UTC)
+	updated, err := store.SetEnforcementFailure(ctx, repo.ID, domain.EnforcementFailurePublication, failedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.EnforcementFailureReason != domain.EnforcementFailurePublication {
+		t.Fatalf("unexpected stored reason: %q", updated.EnforcementFailureReason)
+	}
+	if updated.EnforcementFailedAt == nil || !updated.EnforcementFailedAt.Equal(failedAt) {
+		t.Fatalf("expected failure timestamp round-trip, got %+v", updated.EnforcementFailedAt)
+	}
+
+	// Updating with a newer failure replaces both fields together.
+	laterAt := failedAt.Add(time.Hour)
+	updated, err = store.SetEnforcementFailure(ctx, repo.ID, domain.EnforcementFailureReadinessChecks, laterAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.EnforcementFailureReason != domain.EnforcementFailureReadinessChecks || !updated.EnforcementFailedAt.Equal(laterAt) {
+		t.Fatalf("expected replaced failure state, got %+v", updated)
+	}
+
+	cleared, err := store.ClearEnforcementFailure(ctx, repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleared.EnforcementFailureReason != "" || cleared.EnforcementFailedAt != nil {
+		t.Fatalf("expected cleared failure state, got %+v", cleared)
+	}
+}
+
+func TestStoreRejectsInvalidEnforcementFailures(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	repo, err := store.Create(ctx, CreateParams{Owner: "taua-almeida", Name: "thawguard"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Only the stable bounded categories may reach repository state: raw
+	// wrapped errors and free-form strings are rejected.
+	for _, reason := range []string{"", "surprise error with token abc123", strings.Repeat("x", 500)} {
+		if _, err := store.SetEnforcementFailure(ctx, repo.ID, reason, time.Now()); !IsValidationError(err) {
+			t.Fatalf("expected validation error for reason %q, got %v", reason, err)
+		}
+	}
+	if _, err := store.SetEnforcementFailure(ctx, repo.ID, domain.EnforcementFailurePublication, time.Time{}); !IsValidationError(err) {
+		t.Fatalf("expected zero-time validation error, got %v", err)
+	}
+	if _, err := store.SetEnforcementFailure(ctx, 999, domain.EnforcementFailurePublication, time.Now()); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected missing repository error, got %v", err)
+	}
+	if _, err := store.ClearEnforcementFailure(ctx, 999); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected missing repository error on clear, got %v", err)
+	}
+	stored, err := store.Get(ctx, repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.EnforcementFailureReason != "" || stored.EnforcementFailedAt != nil {
+		t.Fatalf("expected rejected updates to leave failure state untouched, got %+v", stored)
+	}
+}
+
+func TestStoreEnforcementStateAndFailureRollBackTogether(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDatabase(t, ctx)
+	repo, err := NewStore(database).Create(ctx, CreateParams{Owner: "taua-almeida", Name: "thawguard"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := database.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	txStore := NewStoreTx(tx)
+	if _, err := txStore.SetEnforcementState(ctx, repo.ID, domain.EnforcementUnhealthy); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := txStore.SetEnforcementFailure(ctx, repo.ID, domain.EnforcementFailureOpenPRSync, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	stored, err := NewStore(database).Get(ctx, repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.EnforcementState != domain.EnforcementSetupIncomplete || stored.EnforcementFailureReason != "" || stored.EnforcementFailedAt != nil {
+		t.Fatalf("expected rolled-back state and failure fields, got %+v", stored)
+	}
+}
+
 func newTestStore(t *testing.T, ctx context.Context) *Store {
+	t.Helper()
+	return NewStore(newTestDatabase(t, ctx))
+}
+
+func newTestDatabase(t *testing.T, ctx context.Context) *sql.DB {
 	t.Helper()
 	database, err := db.Open(ctx, db.DefaultConfig(filepath.Join(t.TempDir(), "thawguard-test.db")))
 	if err != nil {
@@ -462,7 +576,7 @@ func newTestStore(t *testing.T, ctx context.Context) *Store {
 	if err := db.ApplyMigrations(ctx, database, migrations); err != nil {
 		t.Fatal(err)
 	}
-	return NewStore(database)
+	return database
 }
 
 func projectMigrationsDir(t *testing.T) string {

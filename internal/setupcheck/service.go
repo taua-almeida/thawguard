@@ -218,6 +218,12 @@ func (s *Service) persistRun(ctx context.Context, repo domain.Repository, reposi
 		if _, err := repositoryStore.SetEnforcementState(ctx, repo.ID, domain.EnforcementUnhealthy); err != nil {
 			return err
 		}
+		// The stored failure keeps the repository page truthful about why
+		// enforcement became unhealthy; only the explicit recovery action
+		// clears it.
+		if _, err := repositoryStore.SetEnforcementFailure(ctx, repo.ID, domain.EnforcementFailureReadinessChecks, checkedAt); err != nil {
+			return err
+		}
 	}
 
 	auditStore := audit.NewStoreTx(tx)

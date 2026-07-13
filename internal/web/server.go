@@ -50,12 +50,17 @@ type Config struct {
 	EnforcementService                   EnforcementService
 }
 
-// EnforcementService performs the two explicit admin transitions of the
-// repository enforcement lifecycle. Both re-run readiness checks and post the
-// controlled thawguard/setup status before changing state.
+// EnforcementService performs the explicit admin transitions of the
+// repository enforcement lifecycle. Every transition re-runs the read-only
+// readiness checks instead of trusting stored evidence; verification,
+// activation, and recovery additionally post the controlled thawguard/setup
+// status, while reconciliation proves posting by republishing the real
+// policy statuses.
 type EnforcementService interface {
 	VerifyStatusPosting(ctx context.Context, repositoryID int64, actor domain.Actor) (domain.Repository, error)
 	ActivateEnforcement(ctx context.Context, repositoryID int64, actor domain.Actor) (domain.Repository, error)
+	ReconcileEnforcement(ctx context.Context, repositoryID int64, actor domain.Actor) (domain.Repository, error)
+	RecoverEnforcement(ctx context.Context, repositoryID int64, actor domain.Actor) (domain.Repository, error)
 }
 
 type AuthService interface {
@@ -143,6 +148,11 @@ type repositoryView struct {
 	IsSetupIncomplete    bool
 	IsReady              bool
 	IsUnhealthy          bool
+	// EnforcementFailedAt and FailureRemediation present the stored sanitized
+	// enforcement failure (timestamp formatted, remediation mapped from the
+	// stable reason category) for the unhealthy state.
+	EnforcementFailedAt string
+	FailureRemediation  string
 	// VerifyAvailable is true when the latest recorded readiness run has
 	// every mandatory read-only check OK; the POST re-runs readiness, so this
 	// only controls whether the action is offered.
@@ -357,6 +367,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /repositories/setup-check", s.handleRunRepositorySetupCheck)
 	s.mux.HandleFunc("POST /repositories/status-verification", s.handleVerifyStatusPosting)
 	s.mux.HandleFunc("POST /repositories/activate", s.handleActivateEnforcement)
+	s.mux.HandleFunc("POST /repositories/reconcile", s.handleReconcileEnforcement)
+	s.mux.HandleFunc("POST /repositories/recover", s.handleRecoverEnforcement)
 	s.mux.HandleFunc("GET /freezes", s.handleFreezes)
 	s.mux.HandleFunc("POST /freezes", s.handleCreateFreeze)
 	s.mux.HandleFunc("POST /freezes/end", s.handleEndFreeze)
@@ -1111,6 +1123,20 @@ func (s *Server) handleVerifyStatusPosting(w http.ResponseWriter, r *http.Reques
 func (s *Server) handleActivateEnforcement(w http.ResponseWriter, r *http.Request) {
 	s.handleEnforcementTransition(w, r, func(ctx context.Context, repositoryID int64, actor domain.Actor) error {
 		_, err := s.cfg.EnforcementService.ActivateEnforcement(ctx, repositoryID, actor)
+		return err
+	})
+}
+
+func (s *Server) handleReconcileEnforcement(w http.ResponseWriter, r *http.Request) {
+	s.handleEnforcementTransition(w, r, func(ctx context.Context, repositoryID int64, actor domain.Actor) error {
+		_, err := s.cfg.EnforcementService.ReconcileEnforcement(ctx, repositoryID, actor)
+		return err
+	})
+}
+
+func (s *Server) handleRecoverEnforcement(w http.ResponseWriter, r *http.Request) {
+	s.handleEnforcementTransition(w, r, func(ctx context.Context, repositoryID int64, actor domain.Actor) error {
+		_, err := s.cfg.EnforcementService.RecoverEnforcement(ctx, repositoryID, actor)
 		return err
 	})
 }
@@ -2052,6 +2078,26 @@ func systemAuditEventViewForEvent(repositoriesByID map[int64]domain.Repository, 
 		view.Summary = auditRepositoryLabel(view.Repository, details)
 		view.Detail = auditDetailOrDash(details, "reason") + " — state " + auditDetailOrDash(details, "enforcement_state")
 		view.StateClass = "failed"
+	case audit.ActionRepositoryEnforcementReconciled:
+		view.Label = "Enforcement reconciled"
+		view.Summary = auditRepositoryLabel(view.Repository, details)
+		view.Detail = auditDetailOrDash(details, "open_pull_request_count") + " open PRs, " + auditDetailOrDash(details, "statuses_posted") + " statuses posted"
+		view.StateClass = "ok"
+	case audit.ActionRepositoryEnforcementReconcileFail:
+		view.Label = "Enforcement reconciliation failed"
+		view.Summary = auditRepositoryLabel(view.Repository, details)
+		view.Detail = auditDetailOrDash(details, "reason") + " — state " + auditDetailOrDash(details, "enforcement_state")
+		view.StateClass = "failed"
+	case audit.ActionRepositoryEnforcementRecovered:
+		view.Label = "Enforcement recovered"
+		view.Summary = auditRepositoryLabel(view.Repository, details)
+		view.Detail = auditDetailOrDash(details, "open_pull_request_count") + " open PRs, " + auditDetailOrDash(details, "statuses_posted") + " statuses posted"
+		view.StateClass = "ok"
+	case audit.ActionRepositoryEnforcementRecoverFail:
+		view.Label = "Enforcement recovery failed"
+		view.Summary = auditRepositoryLabel(view.Repository, details)
+		view.Detail = auditDetailOrDash(details, "reason") + " — state " + auditDetailOrDash(details, "enforcement_state")
+		view.StateClass = "failed"
 	case audit.ActionBranchFreezeCreated:
 		view.Label = "Freeze created"
 		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "branch")
@@ -2498,6 +2544,12 @@ func (s *Server) repositoryViews(ctx context.Context, repositories []domain.Repo
 		if repo.StatusPostVerifiedAt != nil {
 			view.StatusPostVerifiedAt = formatReadinessTime(*repo.StatusPostVerifiedAt)
 		}
+		if repo.EnforcementFailedAt != nil {
+			view.EnforcementFailedAt = formatReadinessTime(*repo.EnforcementFailedAt)
+		}
+		if view.IsUnhealthy {
+			view.FailureRemediation = enforcementFailureRemediation(repo.EnforcementFailureReason)
+		}
 		if s.cfg.SetupCheckStore != nil {
 			checks, err := s.cfg.SetupCheckStore.ListByRepository(ctx, repo.ID)
 			if err != nil {
@@ -2595,6 +2647,25 @@ func readinessStatus(checks []setupcheck.Check) (string, string) {
 		return "warning", "status-warning"
 	}
 	return "passed", "status-ok"
+}
+
+// enforcementFailureRemediation maps the stable stored failure categories to
+// concrete operator guidance shown next to the unhealthy state.
+func enforcementFailureRemediation(reason string) string {
+	switch reason {
+	case domain.EnforcementFailureReadinessChecks:
+		return "Fix the failing read-only readiness checks below (branch protection, required context, webhook evidence, token access), rerun them, then retry enforcement recovery."
+	case domain.EnforcementFailureSetupStatusPost:
+		return "The stored status token could not post a commit status. Fix the token permissions or forge setup, then retry enforcement recovery."
+	case domain.EnforcementFailureOpenPRSync:
+		return "Open pull requests could not be listed from the forge. Check forge availability and token read access, then retry enforcement recovery."
+	case domain.EnforcementFailureEvaluation:
+		return "The current freeze policy could not be evaluated. Review the audit log for the failed run, then retry enforcement recovery."
+	case domain.EnforcementFailurePublication:
+		return "One or more " + domain.RequiredStatusContext + " statuses could not be posted. Check forge availability and token permissions, then retry enforcement recovery."
+	default:
+		return "Review the sanitized failure in the audit log, fix the forge setup or credentials, then retry enforcement recovery."
+	}
 }
 
 func enforcementView(state domain.EnforcementState) (string, string) {
@@ -3574,10 +3645,13 @@ const repositoriesTemplate = pageHead + `
             {{ if .Repository.HasStatusToken }}<span class="tg-badge status-ok">status token configured</span>{{ else }}<span class="tg-badge status-warning">status token missing</span>{{ end }}
           </div>
         </div>
-        {{ if .IsReady }}
+        {{ if .Repository.EnforcementActive }}
+        <p class="tg-muted">Enforcement is active{{ if .StatusPostVerifiedAt }}; status posting last verified at {{ .StatusPostVerifiedAt }}{{ end }}. Freezes, schedules, and thaw approvals publish <code>` + domain.RequiredStatusContext + `</code> statuses for this repository.</p>
+        {{ else if .IsReady }}
         <p class="tg-muted">Status posting verified{{ if .StatusPostVerifiedAt }} at {{ .StatusPostVerifiedAt }}{{ end }} with a controlled <code>` + domain.SetupStatusContext + `</code> status. Ready to activate — enforcement stays off until an admin explicitly activates it.</p>
         {{ else if .IsUnhealthy }}
-        <p class="error">Enforcement is unhealthy: the last activation or readiness run failed. Review the sanitized failure in the audit log, fix the forge setup or credentials, and rerun readiness checks. Automatic recovery is not available yet.</p>
+        <p class="error">Enforcement is unhealthy{{ if .Repository.EnforcementFailureReason }}: {{ .Repository.EnforcementFailureReason }}{{ if .EnforcementFailedAt }} ({{ .EnforcementFailedAt }}){{ end }}{{ else }}: the last enforcement run failed{{ end }}. Freeze, schedule, and thaw actions stay disabled until an admin retries enforcement recovery.</p>
+        <p class="tg-muted">{{ .FailureRemediation }}</p>
         {{ else if not .Repository.EnforcementActive }}
         <p class="tg-muted">This repository cannot enforce freezes, schedules, or thaws. Readiness checks are read-only; status posting is not tested until the controlled verification below.</p>
         {{ end }}
@@ -3742,6 +3816,20 @@ const repositoriesTemplate = pageHead + `
             <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
             <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
             <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-icy-shield"></use></svg>Activate enforcement</button>
+          </form>
+          {{ end }}
+          {{ if .Repository.EnforcementActive }}
+          <form method="post" action="/repositories/reconcile" data-confirm-submit data-confirm-title="Reconcile enforcement now?" data-confirm-message="Reconciliation reruns the read-only readiness checks, refreshes current open pull requests from the forge, and republishes the current thawguard/freeze policy for every affected head SHA. If convergence fails, enforcement is marked unhealthy until recovery succeeds." data-confirm-action="Reconcile now">
+            <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+            <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
+            <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-health-check"></use></svg>Reconcile now</button>
+          </form>
+          {{ end }}
+          {{ if .IsUnhealthy }}
+          <form method="post" action="/repositories/recover" data-confirm-submit data-confirm-title="Retry enforcement recovery?" data-confirm-message="Recovery reruns every read-only readiness check, tests a controlled thawguard/setup status post, synchronizes current open pull requests, and republishes the current thawguard/freeze policy. The repository returns to active only after complete success; any failure keeps it unhealthy." data-confirm-action="Retry recovery">
+            <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+            <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
+            <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-icy-shield"></use></svg>Retry enforcement recovery</button>
           </form>
           {{ end }}
         </div>

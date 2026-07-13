@@ -42,6 +42,28 @@ func (s EnforcementState) Valid() bool {
 	}
 }
 
+// EnforcementFailureReason values are the only persisted enforcement failure
+// categories. They are stable, sanitized, and bounded by construction; raw
+// wrapped errors, forge response bodies, and credentials never reach
+// repository state.
+const (
+	EnforcementFailureReadinessChecks = "readiness checks failed"
+	EnforcementFailureSetupStatusPost = "controlled setup status post failed"
+	EnforcementFailureOpenPRSync      = "open pull request synchronization failed"
+	EnforcementFailureEvaluation      = "status decision evaluation failed"
+	EnforcementFailurePublication     = "status publication failed"
+)
+
+func ValidEnforcementFailureReason(reason string) bool {
+	switch reason {
+	case EnforcementFailureReadinessChecks, EnforcementFailureSetupStatusPost,
+		EnforcementFailureOpenPRSync, EnforcementFailureEvaluation, EnforcementFailurePublication:
+		return true
+	default:
+		return false
+	}
+}
+
 // EnforcementNotActiveMessage is the single operator-facing message for
 // mutations that require active repository enforcement.
 const EnforcementNotActiveMessage = "Repository enforcement is not active. Complete setup and activate enforcement before performing this action."
@@ -65,8 +87,14 @@ type Repository struct {
 	// thawguard/setup status post. It is cleared when the status token
 	// changes.
 	StatusPostVerifiedAt *time.Time
-	CreatedAt            time.Time
-	UpdatedAt            time.Time
+	// EnforcementFailureReason and EnforcementFailedAt describe the latest
+	// sanitized enforcement failure. Both are set together when the
+	// repository becomes unhealthy and cleared together only after a fully
+	// successful activation, recovery, or reconciliation.
+	EnforcementFailureReason string
+	EnforcementFailedAt      *time.Time
+	CreatedAt                time.Time
+	UpdatedAt                time.Time
 }
 
 func (r Repository) EnforcementActive() bool {

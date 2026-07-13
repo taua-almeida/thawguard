@@ -71,6 +71,8 @@ func TestOpenAndApplyMigrationsAgainstSQLite(t *testing.T) {
 	assertIndexExists(t, database, "idx_sessions_expires_at")
 	assertTableExists(t, database, "user_roles")
 	assertColumnExists(t, database, "repositories", "enforcement_state")
+	assertColumnExists(t, database, "repositories", "enforcement_failure_reason")
+	assertColumnExists(t, database, "repositories", "enforcement_failed_at")
 	assertEnforcementStateConstraint(t, database)
 	assertTableExists(t, database, "repository_branches")
 

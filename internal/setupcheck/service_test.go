@@ -232,6 +232,14 @@ func TestReadinessServiceDefinitiveFailureMakesActiveRepositoryUnhealthy(t *test
 	if stored.EnforcementState != domain.EnforcementUnhealthy {
 		t.Fatalf("expected unhealthy state, got %s", stored.EnforcementState)
 	}
+	// The flip stores the sanitized reason so the repository page can explain
+	// the unhealthy state; only explicit recovery clears it.
+	if stored.EnforcementFailureReason != domain.EnforcementFailureReadinessChecks {
+		t.Fatalf("expected stored readiness failure reason, got %q", stored.EnforcementFailureReason)
+	}
+	if stored.EnforcementFailedAt == nil {
+		t.Fatal("expected stored failure timestamp")
+	}
 }
 
 func TestReadinessServiceRollsBackChecksAndAuditWhenBranchSummaryFails(t *testing.T) {

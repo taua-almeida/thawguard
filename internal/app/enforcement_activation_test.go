@@ -37,8 +37,11 @@ type enforcementForgeState struct {
 	failBranchHead bool
 	failSetupPost  bool
 	failFreezePost bool
-	failPulls      bool
-	requests       int
+	// failFreezePostSHA fails only the freeze-status post for this exact
+	// (lowercase) head SHA so partial publication can be exercised.
+	failFreezePostSHA string
+	failPulls         bool
+	requests          int
 }
 
 type fakeEnforcementReadiness struct {
@@ -94,13 +97,15 @@ func newEnforcementHarness(t *testing.T, ctx context.Context) *enforcementHarnes
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Error(err)
 			}
+			postSHA := strings.TrimPrefix(r.URL.Path, "/api/v1/repos/taua-almeida/thawguard/statuses/")
 			if (state.failSetupPost && body["context"] == domain.SetupStatusContext) ||
-				(state.failFreezePost && body["context"] == domain.RequiredStatusContext) {
+				(state.failFreezePost && body["context"] == domain.RequiredStatusContext) ||
+				(state.failFreezePostSHA != "" && body["context"] == domain.RequiredStatusContext && postSHA == state.failFreezePostSHA) {
 				http.Error(w, enforcementTestToken+" status post exploded", http.StatusInternalServerError)
 				return
 			}
 			state.posted = append(state.posted, postedEnforcementStatus{
-				SHA:     strings.TrimPrefix(r.URL.Path, "/api/v1/repos/taua-almeida/thawguard/statuses/"),
+				SHA:     postSHA,
 				State:   body["state"],
 				Context: body["context"],
 			})
