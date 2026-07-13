@@ -126,7 +126,7 @@ Once a repository is enforcement-active, every freeze lifecycle action follows o
 
 Thaw approval fetches the selected PR's current head SHA from the forge, stores the exception for that exact head, recomputes the shared-head status, and publishes the result. If several open PRs share the head SHA, Thawguard pauses for explicit confirmation before approving all of them. A missing status token or a forge failure fails closed: no status is posted, and failures during posting are recorded as sanitized failed attempts.
 
-Scheduled freeze windows activate from the local Thawguard process. Keep the process running for scheduled start/planned unfreeze times to execute.
+Scheduled freeze windows activate from the local Thawguard process. Immediate and scheduled freezes can also have a planned unfreeze. Keep the process running for scheduled starts and planned unfreezes to execute.
 
 ## Troubleshooting
 

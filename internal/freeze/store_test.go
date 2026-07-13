@@ -48,6 +48,114 @@ func TestStoreCreatesAndListsActiveFreezes(t *testing.T) {
 	}
 }
 
+func TestStoreCreatesImmediateFreezeWithUTCPlannedEnd(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	store := NewStore(database)
+	now := time.Date(2026, 7, 12, 12, 0, 0, 123, time.UTC)
+	store.now = func() time.Time { return now }
+	plannedLocal := time.Date(2026, 7, 13, 9, 0, 0, 0, time.FixedZone("browser", -4*60*60))
+
+	created, err := store.CreateActive(ctx, CreateParams{RepositoryID: repo.ID, Branch: "main", Reason: "production deployment", PlannedEndsAt: &plannedLocal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Scheduled || created.PlannedEndsAt == nil {
+		t.Fatalf("expected immediate freeze with planned end, got %+v", created)
+	}
+	if got, want := created.PlannedEndsAt.Format(time.RFC3339Nano), "2026-07-13T13:00:00Z"; got != want {
+		t.Fatalf("expected UTC planned end %s, got %s", want, got)
+	}
+	var stored string
+	if err := database.QueryRowContext(ctx, `SELECT planned_ends_at FROM branch_freezes WHERE id = ?`, created.ID).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != "2026-07-13T13:00:00.000000000Z" {
+		t.Fatalf("expected fixed-width SQLite timestamp, got %q", stored)
+	}
+}
+
+func TestStoreRejectsPastOrEqualImmediatePlannedEnd(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	store := NewStore(database)
+	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+
+	for _, planned := range []time.Time{now, now.Add(-time.Nanosecond)} {
+		if _, err := store.CreateActive(ctx, CreateParams{RepositoryID: repo.ID, Branch: "main", Reason: "release", PlannedEndsAt: &planned}); !IsValidationError(err) {
+			t.Fatalf("expected planned end %s to be rejected, got %v", planned, err)
+		}
+	}
+}
+
+func TestStoreSelectsAndExecutesDuePlannedUnfreezesAcrossFreezeKinds(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	store := NewStore(database)
+	base := time.Date(2026, 7, 12, 10, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return base }
+
+	createImmediate := func(branch string, planned time.Time) domain.BranchFreeze {
+		t.Helper()
+		created, err := store.CreateActive(ctx, CreateParams{RepositoryID: repo.ID, Branch: branch, Reason: branch, PlannedEndsAt: &planned})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return created
+	}
+	immediate := createImmediate("main", base.Add(time.Hour))
+	_ = createImmediate("future", base.Add(10*time.Hour))
+	ended := createImmediate("ended", base.Add(90*time.Minute))
+	if _, err := store.End(ctx, ended.ID); err != nil {
+		t.Fatal(err)
+	}
+	cancelled := createImmediate("cancelled", base.Add(75*time.Minute))
+	if _, err := store.Cancel(ctx, cancelled.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	scheduled, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repo.ID, Branch: "release", Reason: "scheduled", StartsAt: base.Add(30 * time.Minute), PlannedEndsAt: timePointer(base.Add(2 * time.Hour))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.now = func() time.Time { return base.Add(30 * time.Minute) }
+	if _, err := store.ActivateScheduled(ctx, scheduled.ID); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repo.ID, Branch: "later", Reason: "not active", StartsAt: base.Add(4 * time.Hour), PlannedEndsAt: timePointer(base.Add(5 * time.Hour))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `UPDATE branch_freezes SET planned_ends_at = ? WHERE id = ?`, base.Add(2*time.Hour).Format(sqliteTimestampFormat), pending.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	store.now = func() time.Time { return base.Add(3 * time.Hour) }
+	due, err := store.ListDuePlannedUnfreezes(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 2 || due[0].ID != immediate.ID || due[1].ID != scheduled.ID {
+		t.Fatalf("expected deterministic immediate then scheduled due rows, got %+v", due)
+	}
+	endedImmediate, err := store.ExecutePlannedUnfreeze(ctx, immediate.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if endedImmediate.Status != domain.BranchFreezeStatusEnded || endedImmediate.Scheduled || endedImmediate.EndsAt == nil || endedImmediate.PlannedEndsAt == nil || !endedImmediate.NeedsRecompute {
+		t.Fatalf("unexpected ended immediate freeze %+v", endedImmediate)
+	}
+	if _, err := store.ExecutePlannedUnfreeze(ctx, immediate.ID); !IsValidationError(err) {
+		t.Fatalf("expected duplicate execution to be rejected, got %v", err)
+	}
+}
+
+func timePointer(value time.Time) *time.Time { return &value }
+
 func TestStoreRejectsInvalidFreezeParams(t *testing.T) {
 	ctx := context.Background()
 	database := newTestDB(t, ctx)
@@ -184,14 +292,14 @@ func TestStoreCreatesListsActivatesAndEndsScheduledFreeze(t *testing.T) {
 	if activated.Status != domain.BranchFreezeStatusActive || !activated.Active || !activated.Scheduled || !activated.NeedsRecompute {
 		t.Fatalf("expected activated scheduled freeze, got %+v", activated)
 	}
-	recompute, err := store.ListScheduledNeedsRecompute(ctx, 10)
+	recompute, err := store.ListNeedsRecompute(ctx, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(recompute) != 1 || recompute[0].ID != scheduled.ID {
 		t.Fatalf("expected activated schedule to need recompute, got %+v", recompute)
 	}
-	marked, err := store.MarkScheduledRecomputed(ctx, scheduled.ID)
+	marked, err := store.MarkRecomputed(ctx, scheduled.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +361,7 @@ func TestStoreMarksActiveScheduledFreezeForRecomputeWhenManuallyClosed(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.MarkScheduledRecomputed(ctx, activated.ID); err != nil {
+	if _, err := store.MarkRecomputed(ctx, activated.ID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -363,8 +471,9 @@ func TestServiceCreatesFreezeAndAuditEventAtomically(t *testing.T) {
 	database := newTestDB(t, ctx)
 	repo := createTestRepository(t, ctx, database)
 	service := NewService(database)
+	plannedEndsAt := time.Now().UTC().Add(time.Hour)
 
-	created, err := service.CreateActive(ctx, CreateParams{RepositoryID: repo.ID, Branch: "main", Reason: "release window"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+	created, err := service.CreateActive(ctx, CreateParams{RepositoryID: repo.ID, Branch: "main", Reason: "release window", PlannedEndsAt: &plannedEndsAt}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -386,6 +495,9 @@ func TestServiceCreatesFreezeAndAuditEventAtomically(t *testing.T) {
 	}
 	if details["actor_kind"] != domain.ActorKindBootstrapAdmin || details["actor_role"] != "admin" || details["branch"] != created.Branch || details["reason"] != created.Reason {
 		t.Fatalf("unexpected audit details: %s", event.DetailsJSON)
+	}
+	if details["planned_ends_at"] != created.PlannedEndsAt.UTC().Format(time.RFC3339Nano) {
+		t.Fatalf("expected planned end in creation audit details, got %s", event.DetailsJSON)
 	}
 }
 
@@ -449,6 +561,112 @@ func TestServiceScheduledFreezeLifecycleRecordsAuditEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertLatestFreezeAudit(t, ctx, database, audit.ActionFreezeScheduleCancelled, cancelled)
+}
+
+func TestServicePlannedUnfreezeUsesTruthfulAuditActionForImmediateAndScheduledFreezes(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	service := NewService(database)
+	actor := domain.Actor{Kind: domain.ActorKindSystem, Role: "scheduler"}
+	future := time.Now().UTC().Add(time.Hour)
+
+	immediate, err := service.CreateActive(ctx, CreateParams{RepositoryID: repo.ID, Branch: "main", Reason: "deployment", PlannedEndsAt: &future}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeFreezeDue(t, ctx, database, immediate.ID)
+	endedImmediate, err := service.ExecutePlannedUnfreeze(ctx, immediate.ID, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertLatestPlannedUnfreezeAudit(t, ctx, database, audit.ActionBranchFreezePlannedUnfreeze, endedImmediate)
+	if _, err := service.ExecutePlannedUnfreeze(ctx, immediate.ID, actor); !IsValidationError(err) {
+		t.Fatalf("expected duplicate planned unfreeze to be rejected, got %v", err)
+	}
+	var immediateAuditCount int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM audit_events WHERE action = ? AND subject_id = ?`, audit.ActionBranchFreezePlannedUnfreeze, strconv.FormatInt(immediate.ID, 10)).Scan(&immediateAuditCount); err != nil {
+		t.Fatal(err)
+	}
+	if immediateAuditCount != 1 {
+		t.Fatalf("expected one immediate planned-unfreeze audit event, got %d", immediateAuditCount)
+	}
+
+	startsAt := time.Now().UTC().Add(time.Hour)
+	plannedEndsAt := startsAt.Add(time.Hour)
+	scheduled, err := service.CreateScheduled(ctx, ScheduleParams{RepositoryID: repo.ID, Branch: "release", Reason: "window", StartsAt: startsAt, PlannedEndsAt: &plannedEndsAt}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `UPDATE branch_freezes SET status = 'active' WHERE id = ?`, scheduled.ID); err != nil {
+		t.Fatal(err)
+	}
+	makeFreezeDue(t, ctx, database, scheduled.ID)
+	endedScheduled, err := service.ExecutePlannedUnfreeze(ctx, scheduled.ID, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertLatestPlannedUnfreezeAudit(t, ctx, database, audit.ActionFreezeSchedulePlannedUnfreeze, endedScheduled)
+}
+
+func TestServiceRollsBackPlannedUnfreezeWhenAuditFails(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	service := NewService(database)
+	future := time.Now().UTC().Add(time.Hour)
+	created, err := service.CreateActive(ctx, CreateParams{RepositoryID: repo.ID, Branch: "main", Reason: "deployment", PlannedEndsAt: &future}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeFreezeDue(t, ctx, database, created.ID)
+	missingUserID := int64(999)
+	if _, err := service.ExecutePlannedUnfreeze(ctx, created.ID, domain.Actor{UserID: &missingUserID, Kind: domain.ActorKindSystem, Role: "scheduler"}); err == nil {
+		t.Fatal("expected audit foreign-key error")
+	}
+	unchanged, err := service.Get(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.Status != domain.BranchFreezeStatusActive || unchanged.EndsAt != nil || unchanged.NeedsRecompute {
+		t.Fatalf("expected failed audit to roll back planned unfreeze, got %+v", unchanged)
+	}
+}
+
+func makeFreezeDue(t *testing.T, ctx context.Context, database *sql.DB, id int64) {
+	t.Helper()
+	if _, err := database.ExecContext(ctx, `UPDATE branch_freezes SET planned_ends_at = ? WHERE id = ?`, time.Now().UTC().Add(-time.Minute).Format(sqliteTimestampFormat), id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertLatestPlannedUnfreezeAudit(t *testing.T, ctx context.Context, database *sql.DB, action string, ended domain.BranchFreeze) {
+	t.Helper()
+	events, err := audit.NewStore(database).List(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Action != action {
+		t.Fatalf("expected %s audit event, got %+v", action, events)
+	}
+	var details map[string]string
+	if err := json.Unmarshal([]byte(events[0].DetailsJSON), &details); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{
+		"repository_id":   strconv.FormatInt(ended.RepositoryID, 10),
+		"branch":          ended.Branch,
+		"planned_ends_at": ended.PlannedEndsAt.UTC().Format(time.RFC3339Nano),
+		"ends_at":         ended.EndsAt.UTC().Format(time.RFC3339Nano),
+		"actor_kind":      domain.ActorKindSystem,
+		"actor_role":      "scheduler",
+		"status":          string(domain.BranchFreezeStatusEnded),
+		"reason":          ended.Reason,
+	} {
+		if details[key] != want {
+			t.Fatalf("audit detail %s: want %q, got %q in %s", key, want, details[key], events[0].DetailsJSON)
+		}
+	}
 }
 
 func TestServiceRollsBackEndWhenAuditFails(t *testing.T) {

@@ -20,7 +20,7 @@ type freezeOperations interface {
 	Cancel(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error)
 }
 
-type scheduledFreezeOperations interface {
+type freezeLifecycleOperations interface {
 	Get(ctx context.Context, id int64) (domain.BranchFreeze, error)
 	ListScheduled(ctx context.Context, limit int) ([]domain.BranchFreeze, error)
 	CreateScheduled(ctx context.Context, params freeze.ScheduleParams, actor domain.Actor) (domain.BranchFreeze, error)
@@ -29,8 +29,8 @@ type scheduledFreezeOperations interface {
 	ActivateScheduled(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error)
 	ListDuePlannedUnfreezes(ctx context.Context, limit int) ([]domain.BranchFreeze, error)
 	ExecutePlannedUnfreeze(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error)
-	ListScheduledNeedsRecompute(ctx context.Context, limit int) ([]domain.BranchFreeze, error)
-	MarkScheduledRecomputed(ctx context.Context, id int64) (domain.BranchFreeze, error)
+	ListNeedsRecompute(ctx context.Context, limit int) ([]domain.BranchFreeze, error)
+	MarkRecomputed(ctx context.Context, id int64) (domain.BranchFreeze, error)
 }
 
 type openPullRequestBranchLister interface {
@@ -92,7 +92,7 @@ func (s *freezeRecomputingStore) CreateActive(ctx context.Context, params freeze
 	if err != nil {
 		return domain.BranchFreeze{}, err
 	}
-	if err := s.recomputeBranch(ctx, created.RepositoryID, created.Branch); err != nil {
+	if _, err := s.recomputeBranch(ctx, created.RepositoryID, created.Branch); err != nil {
 		return created, err
 	}
 	return created, nil
@@ -106,11 +106,14 @@ func (s *freezeRecomputingStore) End(ctx context.Context, id int64, actor domain
 	if err != nil {
 		return domain.BranchFreeze{}, err
 	}
-	if err := s.recomputeBranch(ctx, ended.RepositoryID, ended.Branch); err != nil {
+	converged, err := s.recomputeBranch(ctx, ended.RepositoryID, ended.Branch)
+	if err != nil {
 		return ended, err
 	}
-	if err := s.markScheduledRecomputedIfNeeded(ctx, ended); err != nil {
-		return ended, err
+	if converged {
+		if err := s.markRecomputedIfNeeded(ctx, ended); err != nil {
+			return ended, err
+		}
 	}
 	return ended, nil
 }
@@ -123,25 +126,28 @@ func (s *freezeRecomputingStore) Cancel(ctx context.Context, id int64, actor dom
 	if err != nil {
 		return domain.BranchFreeze{}, err
 	}
-	if err := s.recomputeBranch(ctx, cancelled.RepositoryID, cancelled.Branch); err != nil {
+	converged, err := s.recomputeBranch(ctx, cancelled.RepositoryID, cancelled.Branch)
+	if err != nil {
 		return cancelled, err
 	}
-	if err := s.markScheduledRecomputedIfNeeded(ctx, cancelled); err != nil {
-		return cancelled, err
+	if converged {
+		if err := s.markRecomputedIfNeeded(ctx, cancelled); err != nil {
+			return cancelled, err
+		}
 	}
 	return cancelled, nil
 }
 
 func (s *freezeRecomputingStore) ListScheduled(ctx context.Context, limit int) ([]domain.BranchFreeze, error) {
-	scheduled, err := s.scheduledFreezes()
+	lifecycle, err := s.freezeLifecycle()
 	if err != nil {
 		return nil, err
 	}
-	return scheduled.ListScheduled(ctx, limit)
+	return lifecycle.ListScheduled(ctx, limit)
 }
 
 func (s *freezeRecomputingStore) CreateScheduled(ctx context.Context, params freeze.ScheduleParams, actor domain.Actor) (domain.BranchFreeze, error) {
-	scheduled, err := s.scheduledFreezes()
+	lifecycle, err := s.freezeLifecycle()
 	if err != nil {
 		return domain.BranchFreeze{}, err
 	}
@@ -151,33 +157,33 @@ func (s *freezeRecomputingStore) CreateScheduled(ctx context.Context, params fre
 	if err := s.requireManagedBranch(ctx, params.RepositoryID, params.Branch); err != nil {
 		return domain.BranchFreeze{}, err
 	}
-	return scheduled.CreateScheduled(ctx, params, actor)
+	return lifecycle.CreateScheduled(ctx, params, actor)
 }
 
 func (s *freezeRecomputingStore) CancelScheduled(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error) {
-	scheduled, err := s.scheduledFreezes()
+	lifecycle, err := s.freezeLifecycle()
 	if err != nil {
 		return domain.BranchFreeze{}, err
 	}
-	return scheduled.CancelScheduled(ctx, id, actor)
+	return lifecycle.CancelScheduled(ctx, id, actor)
 }
 
 func (s *freezeRecomputingStore) ListDueScheduled(ctx context.Context, limit int) ([]domain.BranchFreeze, error) {
-	scheduled, err := s.scheduledFreezes()
+	lifecycle, err := s.freezeLifecycle()
 	if err != nil {
 		return nil, err
 	}
-	return scheduled.ListDueScheduled(ctx, limit)
+	return lifecycle.ListDueScheduled(ctx, limit)
 }
 
 func (s *freezeRecomputingStore) ActivateScheduled(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error) {
-	scheduled, err := s.scheduledFreezes()
+	lifecycle, err := s.freezeLifecycle()
 	if err != nil {
 		return domain.BranchFreeze{}, err
 	}
 	// A due window on a repository whose enforcement is not active must stay
 	// scheduled: no activation mutation, audit event, recompute, or publication.
-	target, err := scheduled.Get(ctx, id)
+	target, err := lifecycle.Get(ctx, id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return domain.BranchFreeze{}, freeze.ValidationError{Message: "scheduled freeze is not due"}
@@ -187,86 +193,96 @@ func (s *freezeRecomputingStore) ActivateScheduled(ctx context.Context, id int64
 	if err := s.requireEnforcementActive(ctx, target.RepositoryID); err != nil {
 		return domain.BranchFreeze{}, err
 	}
-	activated, err := scheduled.ActivateScheduled(ctx, id, actor)
+	activated, err := lifecycle.ActivateScheduled(ctx, id, actor)
 	if err != nil {
 		return domain.BranchFreeze{}, err
 	}
-	if err := s.recomputeBranch(ctx, activated.RepositoryID, activated.Branch); err != nil {
+	converged, err := s.recomputeBranch(ctx, activated.RepositoryID, activated.Branch)
+	if err != nil {
 		return activated, err
 	}
-	if _, err := scheduled.MarkScheduledRecomputed(ctx, activated.ID); err != nil {
-		return activated, err
+	if converged {
+		if _, err := lifecycle.MarkRecomputed(ctx, activated.ID); err != nil {
+			return activated, err
+		}
 	}
 	return activated, nil
 }
 
 func (s *freezeRecomputingStore) ListDuePlannedUnfreezes(ctx context.Context, limit int) ([]domain.BranchFreeze, error) {
-	scheduled, err := s.scheduledFreezes()
+	lifecycle, err := s.freezeLifecycle()
 	if err != nil {
 		return nil, err
 	}
-	return scheduled.ListDuePlannedUnfreezes(ctx, limit)
+	return lifecycle.ListDuePlannedUnfreezes(ctx, limit)
 }
 
-func (s *freezeRecomputingStore) ListScheduledNeedsRecompute(ctx context.Context, limit int) ([]domain.BranchFreeze, error) {
-	scheduled, err := s.scheduledFreezes()
+func (s *freezeRecomputingStore) ListNeedsRecompute(ctx context.Context, limit int) ([]domain.BranchFreeze, error) {
+	lifecycle, err := s.freezeLifecycle()
 	if err != nil {
 		return nil, err
 	}
-	return scheduled.ListScheduledNeedsRecompute(ctx, limit)
+	return lifecycle.ListNeedsRecompute(ctx, limit)
 }
 
 func (s *freezeRecomputingStore) ExecutePlannedUnfreeze(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error) {
-	scheduled, err := s.scheduledFreezes()
+	lifecycle, err := s.freezeLifecycle()
 	if err != nil {
 		return domain.BranchFreeze{}, err
 	}
-	ended, err := scheduled.ExecutePlannedUnfreeze(ctx, id, actor)
+	ended, err := lifecycle.ExecutePlannedUnfreeze(ctx, id, actor)
 	if err != nil {
 		return domain.BranchFreeze{}, err
 	}
-	if err := s.recomputeBranch(ctx, ended.RepositoryID, ended.Branch); err != nil {
+	converged, err := s.recomputeBranch(ctx, ended.RepositoryID, ended.Branch)
+	if err != nil {
 		return ended, err
 	}
-	if _, err := scheduled.MarkScheduledRecomputed(ctx, ended.ID); err != nil {
-		return ended, err
+	if converged {
+		if _, err := lifecycle.MarkRecomputed(ctx, ended.ID); err != nil {
+			return ended, err
+		}
 	}
 	return ended, nil
 }
 
-func (s *freezeRecomputingStore) RetryScheduledRecompute(ctx context.Context, scheduledFreeze domain.BranchFreeze) error {
-	scheduled, err := s.scheduledFreezes()
+func (s *freezeRecomputingStore) RetryRecompute(ctx context.Context, pending domain.BranchFreeze) error {
+	lifecycle, err := s.freezeLifecycle()
 	if err != nil {
 		return err
 	}
-	if err := s.recomputeBranch(ctx, scheduledFreeze.RepositoryID, scheduledFreeze.Branch); err != nil {
+	converged, err := s.recomputeBranch(ctx, pending.RepositoryID, pending.Branch)
+	if err != nil {
 		return err
 	}
-	_, err = scheduled.MarkScheduledRecomputed(ctx, scheduledFreeze.ID)
-	return err
-}
-
-func (s *freezeRecomputingStore) markScheduledRecomputedIfNeeded(ctx context.Context, freeze domain.BranchFreeze) error {
-	if !freeze.Scheduled {
+	if !converged {
 		return nil
 	}
-	scheduled, err := s.scheduledFreezes()
-	if err != nil {
-		return err
-	}
-	_, err = scheduled.MarkScheduledRecomputed(ctx, freeze.ID)
+	_, err = lifecycle.MarkRecomputed(ctx, pending.ID)
 	return err
 }
 
-func (s *freezeRecomputingStore) scheduledFreezes() (scheduledFreezeOperations, error) {
+func (s *freezeRecomputingStore) markRecomputedIfNeeded(ctx context.Context, freeze domain.BranchFreeze) error {
+	if !freeze.NeedsRecompute {
+		return nil
+	}
+	lifecycle, err := s.freezeLifecycle()
+	if err != nil {
+		return err
+	}
+	_, err = lifecycle.MarkRecomputed(ctx, freeze.ID)
+	return err
+}
+
+func (s *freezeRecomputingStore) freezeLifecycle() (freezeLifecycleOperations, error) {
 	if s == nil || s.freezes == nil {
 		return nil, errors.New("freeze recomputing store has no freeze store")
 	}
-	scheduled, ok := s.freezes.(scheduledFreezeOperations)
+	lifecycle, ok := s.freezes.(freezeLifecycleOperations)
 	if !ok {
-		return nil, errors.New("freeze store does not support scheduled freezes")
+		return nil, errors.New("freeze store does not support lifecycle operations")
 	}
-	return scheduled, nil
+	return lifecycle, nil
 }
 
 func (s *freezeRecomputingStore) requireEnforcementActive(ctx context.Context, repositoryID int64) error {
@@ -317,28 +333,28 @@ func (s *freezeRecomputingStore) loadRepository(ctx context.Context, repositoryI
 	return repo, nil
 }
 
-func (s *freezeRecomputingStore) recomputeBranch(ctx context.Context, repositoryID int64, branch string) error {
+func (s *freezeRecomputingStore) recomputeBranch(ctx context.Context, repositoryID int64, branch string) (bool, error) {
 	if s == nil || s.syncer == nil || s.pullRequests == nil || s.statuses == nil || s.publisher == nil {
-		return errors.New("freeze recomputing store is not configured")
+		return false, errors.New("freeze recomputing store is not configured")
 	}
 	repo, err := s.loadRepository(ctx, repositoryID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	// End/cancel cleanup stays possible for repositories that are not
 	// enforcement-active, but nothing is synced or published for them.
 	if !repo.EnforcementActive() {
-		return nil
+		return false, nil
 	}
 	// Fail closed: an active repository always refreshes forge state first. If
 	// the sync fails (missing token, forge error), no stale cached status is
 	// recomputed or published.
 	if err := s.syncer.SyncOpenPullRequests(ctx, repositoryID, ""); err != nil {
-		return fmt.Errorf("sync open pull requests for freeze recomputation: %w", err)
+		return false, fmt.Errorf("sync open pull requests for freeze recomputation: %w", err)
 	}
 	branchPRs, err := s.pullRequests.ListOpenByTargetBranch(ctx, repositoryID, branch)
 	if err != nil {
-		return fmt.Errorf("list cached open pull requests for freeze recomputation: %w", err)
+		return false, fmt.Errorf("list cached open pull requests for freeze recomputation: %w", err)
 	}
 	// One decision per affected head SHA; the status runner expands each group
 	// to every cached open PR in the repository sharing the head, including
@@ -349,13 +365,13 @@ func (s *freezeRecomputingStore) recomputeBranch(ctx context.Context, repository
 		}
 		result, err := s.statuses.RunForSharedHead(ctx, group, group[0].Index)
 		if err != nil {
-			return fmt.Errorf("recompute freeze status for cached pull requests: %w", err)
+			return false, fmt.Errorf("recompute freeze status for cached pull requests: %w", err)
 		}
 		if _, err := s.publisher.Publish(ctx, result); err != nil {
-			return fmt.Errorf("publish freeze status for cached pull requests: %w", err)
+			return false, fmt.Errorf("publish freeze status for cached pull requests: %w", err)
 		}
 	}
-	return nil
+	return true, nil
 }
 
 func pullRequestsByHead(prs []domain.PullRequest) [][]domain.PullRequest {

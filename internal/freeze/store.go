@@ -39,6 +39,7 @@ type CreateParams struct {
 	RepositoryID    int64
 	Branch          string
 	Reason          string
+	PlannedEndsAt   *time.Time
 	CreatedByUserID *int64
 }
 
@@ -80,7 +81,8 @@ func (s *Store) CreateActive(ctx context.Context, params CreateParams) (domain.B
 	}
 
 	params = normalizeCreateParams(params)
-	if err := validateCreateParams(params); err != nil {
+	now := s.now().UTC()
+	if err := validateCreateParams(params, now); err != nil {
 		return domain.BranchFreeze{}, err
 	}
 	if err := s.requireRepository(ctx, params.RepositoryID); err != nil {
@@ -90,15 +92,18 @@ func (s *Store) CreateActive(ctx context.Context, params CreateParams) (domain.B
 		return domain.BranchFreeze{}, err
 	}
 
-	now := s.now().UTC()
 	nowText := now.Format(sqliteTimestampFormat)
+	var plannedEndsAt any
+	if params.PlannedEndsAt != nil {
+		plannedEndsAt = params.PlannedEndsAt.UTC().Format(sqliteTimestampFormat)
+	}
 	var createdBy any
 	if params.CreatedByUserID != nil {
 		createdBy = *params.CreatedByUserID
 	}
 	result, err := s.db.ExecContext(ctx, `
 INSERT INTO branch_freezes(repository_id, branch, status, reason, starts_at, ends_at, scheduled, planned_ends_at, created_by, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, params.RepositoryID, params.Branch, domain.BranchFreezeStatusActive, params.Reason, nowText, nil, 0, nil, createdBy, nowText, nowText)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, params.RepositoryID, params.Branch, domain.BranchFreezeStatusActive, params.Reason, nowText, nil, 0, plannedEndsAt, createdBy, nowText, nowText)
 	if err != nil {
 		return domain.BranchFreeze{}, createActiveFreezeError(err)
 	}
@@ -283,7 +288,7 @@ func (s *Store) ListDuePlannedUnfreezes(ctx context.Context, limit int) ([]domai
 	rows, err := s.db.QueryContext(ctx, `
 SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, created_at, updated_at
 FROM branch_freezes
-WHERE scheduled = 1 AND status = ? AND planned_ends_at IS NOT NULL AND planned_ends_at <= ?
+WHERE status = ? AND planned_ends_at IS NOT NULL AND planned_ends_at <= ?
 ORDER BY planned_ends_at ASC, id ASC
 LIMIT ?`, domain.BranchFreezeStatusActive, now, limit)
 	if err != nil {
@@ -305,7 +310,7 @@ LIMIT ?`, domain.BranchFreezeStatusActive, now, limit)
 	return freezes, nil
 }
 
-func (s *Store) ListScheduledNeedsRecompute(ctx context.Context, limit int) ([]domain.BranchFreeze, error) {
+func (s *Store) ListNeedsRecompute(ctx context.Context, limit int) ([]domain.BranchFreeze, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("freeze store has no database")
 	}
@@ -315,11 +320,11 @@ func (s *Store) ListScheduledNeedsRecompute(ctx context.Context, limit int) ([]d
 	rows, err := s.db.QueryContext(ctx, `
 SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, created_at, updated_at
 FROM branch_freezes
-WHERE scheduled = 1 AND needs_recompute = 1
+WHERE needs_recompute = 1
 ORDER BY updated_at ASC, id ASC
 LIMIT ?`, limit)
 	if err != nil {
-		return nil, fmt.Errorf("list scheduled freezes needing recompute: %w", err)
+		return nil, fmt.Errorf("list freezes needing recompute: %w", err)
 	}
 	defer rows.Close()
 
@@ -332,27 +337,27 @@ LIMIT ?`, limit)
 		freezes = append(freezes, freeze)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list scheduled freezes needing recompute rows: %w", err)
+		return nil, fmt.Errorf("list freezes needing recompute rows: %w", err)
 	}
 	return freezes, nil
 }
 
-func (s *Store) MarkScheduledRecomputed(ctx context.Context, id int64) (domain.BranchFreeze, error) {
+func (s *Store) MarkRecomputed(ctx context.Context, id int64) (domain.BranchFreeze, error) {
 	if s == nil || s.db == nil {
 		return domain.BranchFreeze{}, errors.New("freeze store has no database")
 	}
 	if id <= 0 {
-		return domain.BranchFreeze{}, ValidationError{Message: "scheduled freeze is required"}
+		return domain.BranchFreeze{}, ValidationError{Message: "freeze is required"}
 	}
 	now := s.now().UTC().Format(sqliteTimestampFormat)
 	result, err := s.db.ExecContext(ctx, `
 UPDATE branch_freezes
 SET needs_recompute = 0, updated_at = ?
-WHERE id = ? AND scheduled = 1`, now, id)
+WHERE id = ? AND needs_recompute = 1`, now, id)
 	if err != nil {
-		return domain.BranchFreeze{}, fmt.Errorf("mark scheduled freeze recomputed: %w", err)
+		return domain.BranchFreeze{}, fmt.Errorf("mark freeze recomputed: %w", err)
 	}
-	if err := requireAffectedScheduledFreeze(result, "scheduled freeze not found"); err != nil {
+	if err := requireAffectedFreeze(result, "freeze does not need recompute"); err != nil {
 		return domain.BranchFreeze{}, err
 	}
 	return s.Get(ctx, id)
@@ -371,7 +376,7 @@ func (s *Store) CancelScheduled(ctx context.Context, id int64) (domain.BranchFre
 		return domain.BranchFreeze{}, errors.New("freeze store has no database")
 	}
 	if id <= 0 {
-		return domain.BranchFreeze{}, ValidationError{Message: "scheduled freeze is required"}
+		return domain.BranchFreeze{}, ValidationError{Message: "freeze is required"}
 	}
 	now := s.now().UTC().Format(sqliteTimestampFormat)
 	result, err := s.db.ExecContext(ctx, `
@@ -381,7 +386,7 @@ WHERE id = ? AND scheduled = 1 AND status = ?`, domain.BranchFreezeStatusCancell
 	if err != nil {
 		return domain.BranchFreeze{}, fmt.Errorf("cancel scheduled freeze: %w", err)
 	}
-	if err := requireAffectedScheduledFreeze(result, "scheduled freeze is not pending"); err != nil {
+	if err := requireAffectedFreeze(result, "scheduled freeze is not pending"); err != nil {
 		return domain.BranchFreeze{}, err
 	}
 	return s.Get(ctx, id)
@@ -402,7 +407,7 @@ WHERE id = ? AND scheduled = 1 AND status = ? AND starts_at <= ?`, domain.Branch
 	if err != nil {
 		return domain.BranchFreeze{}, createActiveFreezeError(err)
 	}
-	if err := requireAffectedScheduledFreeze(result, "scheduled freeze is not due"); err != nil {
+	if err := requireAffectedFreeze(result, "scheduled freeze is not due"); err != nil {
 		return domain.BranchFreeze{}, err
 	}
 	return s.Get(ctx, id)
@@ -413,26 +418,26 @@ func (s *Store) ExecutePlannedUnfreeze(ctx context.Context, id int64) (domain.Br
 		return domain.BranchFreeze{}, errors.New("freeze store has no database")
 	}
 	if id <= 0 {
-		return domain.BranchFreeze{}, ValidationError{Message: "scheduled freeze is required"}
+		return domain.BranchFreeze{}, ValidationError{Message: "freeze is required"}
 	}
 	now := s.now().UTC().Format(sqliteTimestampFormat)
 	result, err := s.db.ExecContext(ctx, `
 UPDATE branch_freezes
 SET status = ?, ends_at = ?, needs_recompute = 1, updated_at = ?
-WHERE id = ? AND scheduled = 1 AND status = ? AND planned_ends_at IS NOT NULL AND planned_ends_at <= ?`, domain.BranchFreezeStatusEnded, now, now, id, domain.BranchFreezeStatusActive, now)
+WHERE id = ? AND status = ? AND planned_ends_at IS NOT NULL AND planned_ends_at <= ?`, domain.BranchFreezeStatusEnded, now, now, id, domain.BranchFreezeStatusActive, now)
 	if err != nil {
 		return domain.BranchFreeze{}, fmt.Errorf("execute planned unfreeze: %w", err)
 	}
-	if err := requireAffectedScheduledFreeze(result, "scheduled freeze is not due for planned unfreeze"); err != nil {
+	if err := requireAffectedFreeze(result, "freeze is not due for planned unfreeze"); err != nil {
 		return domain.BranchFreeze{}, err
 	}
 	return s.Get(ctx, id)
 }
 
-func requireAffectedScheduledFreeze(result sql.Result, message string) error {
+func requireAffectedFreeze(result sql.Result, message string) error {
 	affected, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("scheduled freeze rows affected: %w", err)
+		return fmt.Errorf("freeze rows affected: %w", err)
 	}
 	if affected == 0 {
 		return ValidationError{Message: message}
@@ -451,7 +456,7 @@ func (s *Store) closeActive(ctx context.Context, params CloseParams) (domain.Bra
 	now := s.now().UTC().Format(sqliteTimestampFormat)
 	result, err := s.db.ExecContext(ctx, `
 UPDATE branch_freezes
-SET status = ?, ends_at = ?, needs_recompute = CASE WHEN scheduled = 1 THEN 1 ELSE needs_recompute END, updated_at = ?
+SET status = ?, ends_at = ?, needs_recompute = 1, updated_at = ?
 WHERE id = ? AND status = ?`, params.Status, now, now, params.ID, domain.BranchFreezeStatusActive)
 	if err != nil {
 		return domain.BranchFreeze{}, fmt.Errorf("close branch freeze: %w", err)
@@ -506,10 +511,14 @@ LIMIT 1`, repositoryID, branch, domain.BranchFreezeStatusActive).Scan(&existing)
 func normalizeCreateParams(params CreateParams) CreateParams {
 	params.Branch = strings.TrimSpace(params.Branch)
 	params.Reason = strings.TrimSpace(params.Reason)
+	if params.PlannedEndsAt != nil {
+		plannedEndsAt := params.PlannedEndsAt.UTC()
+		params.PlannedEndsAt = &plannedEndsAt
+	}
 	return params
 }
 
-func validateCreateParams(params CreateParams) error {
+func validateCreateParams(params CreateParams, now time.Time) error {
 	var missing []string
 	if params.RepositoryID <= 0 {
 		missing = append(missing, "repository")
@@ -522,6 +531,9 @@ func validateCreateParams(params CreateParams) error {
 	}
 	if len(missing) > 0 {
 		return ValidationError{Message: fmt.Sprintf("missing required freeze fields: %s", strings.Join(missing, ", "))}
+	}
+	if params.PlannedEndsAt != nil && !params.PlannedEndsAt.After(now) {
+		return ValidationError{Message: "planned unfreeze time must be in the future"}
 	}
 	return nil
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -66,7 +67,15 @@ func TestOpenAndApplyMigrationsAgainstSQLite(t *testing.T) {
 	assertColumnExists(t, database, "branch_freezes", "needs_recompute")
 	assertIndexExists(t, database, "idx_branch_freezes_scheduled_due")
 	assertIndexExists(t, database, "idx_branch_freezes_planned_unfreeze_due")
-	assertIndexExists(t, database, "idx_branch_freezes_scheduled_recompute")
+	assertIndexExists(t, database, "idx_branch_freezes_recompute")
+	var indexSQL string
+	if err := database.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_branch_freezes_planned_unfreeze_due'`).Scan(&indexSQL); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(indexSQL, "scheduled = 1") || !strings.Contains(indexSQL, "status = 'active' AND planned_ends_at IS NOT NULL") {
+		t.Fatalf("expected generalized active planned-unfreeze index, got %q", indexSQL)
+	}
+	assertIndexDoesNotExist(t, database, "idx_branch_freezes_scheduled_recompute")
 	assertColumnExists(t, database, "sessions", "csrf_token")
 	assertIndexExists(t, database, "idx_sessions_expires_at")
 	assertTableExists(t, database, "user_roles")
@@ -339,7 +348,8 @@ VALUES
 	assertIndexExists(t, database, "idx_status_publication_attempts_recent")
 	assertIndexExists(t, database, "idx_branch_freezes_scheduled_due")
 	assertIndexExists(t, database, "idx_branch_freezes_planned_unfreeze_due")
-	assertIndexExists(t, database, "idx_branch_freezes_scheduled_recompute")
+	assertIndexExists(t, database, "idx_branch_freezes_recompute")
+	assertIndexDoesNotExist(t, database, "idx_branch_freezes_scheduled_recompute")
 	assertIndexDoesNotExist(t, database, "idx_branch_freezes_one_active")
 	assertIndexDoesNotExist(t, database, "idx_branch_freezes_one_open")
 	assertStatusPublicationLiveModesAllowed(t, database)
@@ -586,6 +596,58 @@ VALUES
 	}
 	if _, err := database.ExecContext(ctx, `INSERT INTO webhook_deliveries(repository_id, delivery_id, event, received_at, verified) VALUES (2, 'retry-me', 'pull_request', '2026-06-30T12:00:05.000000000Z', 1)`); err != nil {
 		t.Fatalf("expected repository-scoped duplicate delivery id after rebuild: %v", err)
+	}
+}
+
+func TestImmediatePlannedUnfreezeMigrationPreservesFreezeDataAndAppliesOnce(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-test.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(migrations) == 0 || migrations[len(migrations)-1].Name != "0023_immediate_planned_unfreezes.sql" {
+		t.Fatalf("expected immediate planned-unfreeze migration last, got %+v", migrations)
+	}
+	if err := ApplyMigrations(ctx, database, migrations[:len(migrations)-1]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO repositories(id, forge, base_url, owner, name, default_branch, active, created_at, updated_at)
+VALUES (77, 'forgejo', 'https://codeberg.org', 'example', 'release', 'main', 1, '2026-07-12T10:00:00.000000000Z', '2026-07-12T10:00:00.000000000Z');
+INSERT INTO branch_freezes(id, repository_id, branch, status, reason, starts_at, scheduled, planned_ends_at, created_at, updated_at)
+VALUES
+  (701, 77, 'main', 'active', 'immediate', '2026-07-12T10:00:00.000000000Z', 0, '2026-07-13T09:00:00.000000000Z', '2026-07-12T10:00:00.000000000Z', '2026-07-12T10:00:00.000000000Z'),
+  (702, 77, 'release', 'active', 'scheduled', '2026-07-12T11:00:00.000000000Z', 1, '2026-07-13T10:00:00.000000000Z', '2026-07-12T10:00:00.000000000Z', '2026-07-12T11:00:00.000000000Z');`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+		t.Fatal(err)
+	}
+	assertIndexExists(t, database, "idx_branch_freezes_planned_unfreeze_due")
+	assertIndexExists(t, database, "idx_branch_freezes_recompute")
+	var preserved int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM branch_freezes WHERE id IN (701, 702) AND planned_ends_at IS NOT NULL`).Scan(&preserved); err != nil {
+		t.Fatal(err)
+	}
+	if preserved != 2 {
+		t.Fatalf("expected immediate and scheduled planned ends preserved, got %d", preserved)
+	}
+	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+		t.Fatal(err)
+	}
+	var applied int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = '0023_immediate_planned_unfreezes'`).Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected migration recorded once, got %d", applied)
 	}
 }
 

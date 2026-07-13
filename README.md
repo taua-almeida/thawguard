@@ -56,7 +56,7 @@ Current local pages:
 - `/setup` first local admin setup when no users exist; the first account starts with all MVP roles for local bootstrap
 - `/login` and `/logout` local user session flow
 - `/repositories` repository setup form, enforcement state, managed branch scope, and read-only readiness evidence
-- `/freezes` active branch-freeze form and list (requires an enforcement-active repository)
+- `/freezes` immediate branch-freeze form and active list, with an optional planned unfreeze time (requires an enforcement-active repository)
 - `/scheduled-freezes` one-time scheduled freeze windows with optional planned unfreeze (requires an enforcement-active repository)
 - `/decisions` immediate thaw approval; fetches the current PR head from the forge and scopes the thaw to that PR/head SHA (requires an enforcement-active repository)
 - `/publications` latest desired statuses and live posting attempts (posted/failed)

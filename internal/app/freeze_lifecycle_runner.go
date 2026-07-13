@@ -9,31 +9,31 @@ import (
 	"github.com/taua-almeida/thawguard/internal/domain"
 )
 
-const scheduledFreezeRunnerLimit = 25
+const freezeLifecycleRunnerLimit = 25
 
-type scheduledFreezeRuntimeStore interface {
+type freezeLifecycleRuntimeStore interface {
 	ListDueScheduled(ctx context.Context, limit int) ([]domain.BranchFreeze, error)
 	ActivateScheduled(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error)
 	ListDuePlannedUnfreezes(ctx context.Context, limit int) ([]domain.BranchFreeze, error)
 	ExecutePlannedUnfreeze(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error)
-	ListScheduledNeedsRecompute(ctx context.Context, limit int) ([]domain.BranchFreeze, error)
-	RetryScheduledRecompute(ctx context.Context, scheduledFreeze domain.BranchFreeze) error
+	ListNeedsRecompute(ctx context.Context, limit int) ([]domain.BranchFreeze, error)
+	RetryRecompute(ctx context.Context, pending domain.BranchFreeze) error
 }
 
-type scheduledFreezeRunner struct {
-	store    scheduledFreezeRuntimeStore
+type freezeLifecycleRunner struct {
+	store    freezeLifecycleRuntimeStore
 	logger   *slog.Logger
 	interval time.Duration
 }
 
-func newScheduledFreezeRunner(store scheduledFreezeRuntimeStore, logger *slog.Logger) *scheduledFreezeRunner {
+func newFreezeLifecycleRunner(store freezeLifecycleRuntimeStore, logger *slog.Logger) *freezeLifecycleRunner {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &scheduledFreezeRunner{store: store, logger: logger, interval: 15 * time.Second}
+	return &freezeLifecycleRunner{store: store, logger: logger, interval: 15 * time.Second}
 }
 
-func (r *scheduledFreezeRunner) Start(ctx context.Context) {
+func (r *freezeLifecycleRunner) Start(ctx context.Context) {
 	if r == nil || r.store == nil {
 		return
 	}
@@ -54,18 +54,18 @@ func (r *scheduledFreezeRunner) Start(ctx context.Context) {
 	}
 }
 
-func (r *scheduledFreezeRunner) runAndLog(ctx context.Context) {
+func (r *freezeLifecycleRunner) runAndLog(ctx context.Context) {
 	if err := r.RunDue(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		r.logger.Error("scheduled freeze runner failed", "err", err)
+		r.logger.Error("freeze lifecycle runner failed", "err", err)
 	}
 }
 
-func (r *scheduledFreezeRunner) RunDue(ctx context.Context) error {
+func (r *freezeLifecycleRunner) RunDue(ctx context.Context) error {
 	if r == nil || r.store == nil {
 		return nil
 	}
 	actor := domain.Actor{Kind: domain.ActorKindSystem, Role: "scheduler"}
-	dueStarts, err := r.store.ListDueScheduled(ctx, scheduledFreezeRunnerLimit)
+	dueStarts, err := r.store.ListDueScheduled(ctx, freezeLifecycleRunnerLimit)
 	if err != nil {
 		return err
 	}
@@ -75,21 +75,21 @@ func (r *scheduledFreezeRunner) RunDue(ctx context.Context) error {
 			joined = errors.Join(joined, err)
 		}
 	}
-	dueEnds, err := r.store.ListDuePlannedUnfreezes(ctx, scheduledFreezeRunnerLimit)
+	dueEnds, err := r.store.ListDuePlannedUnfreezes(ctx, freezeLifecycleRunnerLimit)
 	if err != nil {
 		return errors.Join(joined, err)
 	}
-	for _, scheduled := range dueEnds {
-		if _, err := r.store.ExecutePlannedUnfreeze(ctx, scheduled.ID, actor); err != nil {
+	for _, dueFreeze := range dueEnds {
+		if _, err := r.store.ExecutePlannedUnfreeze(ctx, dueFreeze.ID, actor); err != nil {
 			joined = errors.Join(joined, err)
 		}
 	}
-	needsRecompute, err := r.store.ListScheduledNeedsRecompute(ctx, scheduledFreezeRunnerLimit)
+	needsRecompute, err := r.store.ListNeedsRecompute(ctx, freezeLifecycleRunnerLimit)
 	if err != nil {
 		return errors.Join(joined, err)
 	}
-	for _, scheduled := range needsRecompute {
-		if err := r.store.RetryScheduledRecompute(ctx, scheduled); err != nil {
+	for _, pending := range needsRecompute {
+		if err := r.store.RetryRecompute(ctx, pending); err != nil {
 			joined = errors.Join(joined, err)
 		}
 	}

@@ -56,18 +56,18 @@ func (s *Service) ListDuePlannedUnfreezes(ctx context.Context, limit int) ([]dom
 	return NewStore(s.db).ListDuePlannedUnfreezes(ctx, limit)
 }
 
-func (s *Service) ListScheduledNeedsRecompute(ctx context.Context, limit int) ([]domain.BranchFreeze, error) {
+func (s *Service) ListNeedsRecompute(ctx context.Context, limit int) ([]domain.BranchFreeze, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("freeze service has no database")
 	}
-	return NewStore(s.db).ListScheduledNeedsRecompute(ctx, limit)
+	return NewStore(s.db).ListNeedsRecompute(ctx, limit)
 }
 
-func (s *Service) MarkScheduledRecomputed(ctx context.Context, id int64) (domain.BranchFreeze, error) {
+func (s *Service) MarkRecomputed(ctx context.Context, id int64) (domain.BranchFreeze, error) {
 	if s == nil || s.db == nil {
 		return domain.BranchFreeze{}, errors.New("freeze service has no database")
 	}
-	return NewStore(s.db).MarkScheduledRecomputed(ctx, id)
+	return NewStore(s.db).MarkRecomputed(ctx, id)
 }
 
 func (s *Service) CreateActive(ctx context.Context, params CreateParams, actor domain.Actor) (domain.BranchFreeze, error) {
@@ -162,9 +162,33 @@ func (s *Service) ExecutePlannedUnfreeze(ctx context.Context, id int64, actor do
 	if s == nil || s.db == nil {
 		return domain.BranchFreeze{}, errors.New("freeze service has no database")
 	}
-	return s.withScheduledFreezeAudit(ctx, id, actor, audit.ActionFreezeSchedulePlannedUnfreeze, func(store *Store) (domain.BranchFreeze, error) {
-		return store.ExecutePlannedUnfreeze(ctx, id)
-	})
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.BranchFreeze{}, fmt.Errorf("begin planned unfreeze: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	ended, err := NewStoreTx(tx).ExecutePlannedUnfreeze(ctx, id)
+	if err != nil {
+		return domain.BranchFreeze{}, err
+	}
+	action := audit.ActionBranchFreezePlannedUnfreeze
+	if ended.Scheduled {
+		action = audit.ActionFreezeSchedulePlannedUnfreeze
+	}
+	if err := audit.NewStoreTx(tx).Record(ctx, scheduledFreezeEvent(ended, actor, action)); err != nil {
+		return domain.BranchFreeze{}, fmt.Errorf("record planned unfreeze audit event: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.BranchFreeze{}, fmt.Errorf("commit planned unfreeze: %w", err)
+	}
+	committed = true
+	return ended, nil
 }
 
 func (s *Service) withScheduledFreezeAudit(ctx context.Context, id int64, actor domain.Actor, action string, mutate func(*Store) (domain.BranchFreeze, error)) (domain.BranchFreeze, error) {
@@ -231,6 +255,9 @@ func branchFreezeCreatedEvent(freeze domain.BranchFreeze, actor domain.Actor) au
 		"branch":        freeze.Branch,
 		"status":        string(freeze.Status),
 		"reason":        freeze.Reason,
+	}
+	if freeze.PlannedEndsAt != nil {
+		details["planned_ends_at"] = freeze.PlannedEndsAt.UTC().Format(time.RFC3339Nano)
 	}
 	detailsJSON, err := json.Marshal(details)
 	if err != nil {

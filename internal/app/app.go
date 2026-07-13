@@ -108,7 +108,7 @@ func (a *App) Run(ctx context.Context) error {
 	}
 
 	errc := make(chan error, 1)
-	go newScheduledFreezeRunner(freezeStoreForWeb, a.logger).Start(ctx)
+	go newFreezeLifecycleRunner(freezeStoreForWeb, a.logger).Start(ctx)
 	go func() {
 		a.logger.Info("starting thawguard", "addr", a.cfg.HTTPAddr, "db", a.cfg.DatabasePath, "public_url", a.cfg.PublicURL)
 		errc <- server.ListenAndServe()

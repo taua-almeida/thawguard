@@ -150,6 +150,8 @@ func TestForgeOpenPullRequestSyncerRedactsTokenFromListErrors(t *testing.T) {
 
 type fakeOpenPRRepositoryGetter struct {
 	repo              domain.Repository
+	repos             []domain.Repository
+	getCalls          int
 	err               error
 	unmanagedBranches map[string]bool
 }
@@ -158,6 +160,12 @@ func (g *fakeOpenPRRepositoryGetter) Get(ctx context.Context, id int64) (domain.
 	if g.err != nil {
 		return domain.Repository{}, g.err
 	}
+	if g.getCalls < len(g.repos) {
+		repo := g.repos[g.getCalls]
+		g.getCalls++
+		return repo, nil
+	}
+	g.getCalls++
 	return g.repo, nil
 }
 

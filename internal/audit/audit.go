@@ -29,6 +29,7 @@ const (
 	ActionBranchFreezeCreated                = "branch_freeze.created"
 	ActionBranchFreezeEnded                  = "branch_freeze.ended"
 	ActionBranchFreezeCancelled              = "branch_freeze.cancelled"
+	ActionBranchFreezePlannedUnfreeze        = "branch_freeze.planned_unfreeze"
 	ActionFreezeScheduleCreated              = "freeze_schedule.created"
 	ActionFreezeScheduleCancelled            = "freeze_schedule.cancelled"
 	ActionFreezeScheduleActivated            = "freeze_schedule.activated"

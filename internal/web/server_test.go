@@ -875,7 +875,9 @@ func TestRunRepositorySetupCheckReportsRunnerError(t *testing.T) {
 
 func TestFreezesPageShowsRepositoriesAndActiveFreezes(t *testing.T) {
 	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "dev", EnforcementState: domain.EnforcementActive}
-	activeFreeze := domain.BranchFreeze{ID: 1, RepositoryID: repo.ID, Branch: "dev", Status: domain.BranchFreezeStatusActive, Active: true, Reason: "QA freeze"}
+	plannedEndsAt := time.Date(2026, 7, 13, 9, 0, 0, 0, time.UTC)
+	activeFreeze := domain.BranchFreeze{ID: 1, RepositoryID: repo.ID, Branch: "dev", Status: domain.BranchFreezeStatusActive, Active: true, Reason: "QA freeze", PlannedEndsAt: &plannedEndsAt}
+	manualFreeze := domain.BranchFreeze{ID: 2, RepositoryID: repo.ID, Branch: "main", Status: domain.BranchFreezeStatusActive, Active: true, Reason: `<script>alert("unsafe")</script>`}
 	auditEvent := audit.Event{
 		Action:      audit.ActionBranchFreezeCreated,
 		SubjectType: audit.SubjectTypeBranchFreeze,
@@ -886,7 +888,7 @@ func TestFreezesPageShowsRepositoriesAndActiveFreezes(t *testing.T) {
 	server := NewServer(Config{
 		AppName:         "Thawguard",
 		RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}},
-		FreezeStore:     &fakeFreezeStore{freezes: []domain.BranchFreeze{activeFreeze}},
+		FreezeStore:     &fakeFreezeStore{freezes: []domain.BranchFreeze{activeFreeze, manualFreeze}},
 		AuditStore:      &fakeAuditStore{events: []audit.Event{auditEvent}},
 	})
 
@@ -902,10 +904,13 @@ func TestFreezesPageShowsRepositoriesAndActiveFreezes(t *testing.T) {
 	if token := csrfTokenFromBody(t, body); token == "" {
 		t.Fatal("expected CSRF token in freeze form")
 	}
-	for _, want := range []string{"Create a freeze", "Preview impact", "3 open PRs", "Active Freezes", "taua-almeida/thawguard", "dev", "QA freeze", "Freeze Branch", "Lift", "Cancel", `<form method="post" action="/freezes/end" data-confirm-submit data-confirm-title="Lift freeze?"`, `data-confirm-action="Lift freeze"`, `<button type="submit" class="tg-btn tg-btn-primary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg>Lift</button>`, `<form method="post" action="/freezes/cancel" data-confirm-submit data-confirm-title="Cancel freeze?"`, `data-confirm-action="Cancel freeze"`, `data-alert-dialog hidden`} {
+	for _, want := range []string{"Create a freeze", "Preview impact", "3 open PRs", "Active Freezes", "taua-almeida/thawguard", "dev", "QA freeze", "Freeze Branch", "Planned unfreeze", `name="planned_ends_at"`, `name="timezone_offset_minutes"`, "Optional. Uses your browser's local timezone and is stored as UTC.", "Planned unfreeze: 2026-07-13 09:00 UTC", "No planned unfreeze", "&lt;script&gt;alert", "Lift", "Cancel", `<form method="post" action="/freezes/end" data-confirm-submit data-confirm-title="Lift freeze?"`, `data-confirm-action="Lift freeze"`, `<button type="submit" class="tg-btn tg-btn-primary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg>Lift</button>`, `<form method="post" action="/freezes/cancel" data-confirm-submit data-confirm-title="Cancel freeze?"`, `data-confirm-action="Cancel freeze"`, `data-alert-dialog hidden`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
+	}
+	if strings.Contains(body, `<script>alert("unsafe")</script>`) {
+		t.Fatalf("expected freeze reason to be HTML escaped, got %q", body)
 	}
 	if strings.Contains(body, "window."+"confirm") {
 		t.Fatalf("expected custom confirmation dialog instead of browser confirm, got %q", body)
@@ -1044,6 +1049,8 @@ func TestCreateFreezePostsToStore(t *testing.T) {
 	store := &fakeFreezeStore{}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, FreezeStore: store})
 	form := freezeCreateForm()
+	form.Set("planned_ends_at", "2026-07-13T09:00")
+	form.Set("timezone_offset_minutes", "240")
 	cookie, csrfToken := getFreezeForm(t, server)
 	form.Set(csrfFormField, csrfToken)
 
@@ -1059,11 +1066,81 @@ func TestCreateFreezePostsToStore(t *testing.T) {
 	if len(store.created) != 1 {
 		t.Fatalf("expected 1 freeze creation, got %d", len(store.created))
 	}
-	if store.created[0].RepositoryID != repo.ID || store.created[0].Branch != "main" || store.created[0].Reason != "release window" {
+	if store.created[0].RepositoryID != repo.ID || store.created[0].Branch != "main" || store.created[0].Reason != "release window" || store.created[0].PlannedEndsAt == nil || store.created[0].PlannedEndsAt.Format(time.RFC3339) != "2026-07-13T13:00:00Z" {
 		t.Fatalf("unexpected freeze params: %+v", store.created[0])
 	}
 	if len(store.actors) != 1 || store.actors[0].Kind != domain.ActorKindBootstrapAdmin || store.actors[0].Role != "admin" {
 		t.Fatalf("unexpected actors: %+v", store.actors)
+	}
+}
+
+func TestCreateFreezeTreatsEmptyPlannedUnfreezeAsNil(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
+	store := &fakeFreezeStore{}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, FreezeStore: store})
+	form := freezeCreateForm()
+	form.Set("planned_ends_at", "")
+	cookie, csrfToken := getFreezeForm(t, server)
+	form.Set(csrfFormField, csrfToken)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/freezes", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusSeeOther || len(store.created) != 1 || store.created[0].PlannedEndsAt != nil {
+		t.Fatalf("expected empty planned end to create nil value, status=%d params=%+v", recorder.Code, store.created)
+	}
+}
+
+func TestCreateFreezeRejectsMalformedPlannedUnfreezeAndTimezoneOffset(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
+	for _, test := range []struct {
+		name  string
+		field string
+		value string
+		want  string
+	}{
+		{name: "malformed datetime", field: "planned_ends_at", value: "not-a-time", want: "planned unfreeze time is invalid"},
+		{name: "invalid timezone", field: "timezone_offset_minutes", value: "841", want: "browser timezone offset is invalid"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeFreezeStore{}
+			server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, FreezeStore: store})
+			form := freezeCreateForm()
+			form.Set("planned_ends_at", "2026-07-13T09:00")
+			form.Set(test.field, test.value)
+			cookie, csrfToken := getFreezeForm(t, server)
+			form.Set(csrfFormField, csrfToken)
+
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "/freezes", strings.NewReader(form.Encode()))
+			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			request.AddCookie(cookie)
+			server.Routes().ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), test.want) || len(store.created) != 0 {
+				t.Fatalf("expected safe validation error %q, status=%d body=%q created=%+v", test.want, recorder.Code, recorder.Body.String(), store.created)
+			}
+		})
+	}
+}
+
+func TestCreateFreezeRendersPastPlannedUnfreezeValidation(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
+	store := &fakeFreezeStore{err: freeze.ValidationError{Message: "planned unfreeze time must be in the future"}}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, FreezeStore: store})
+	form := freezeCreateForm()
+	form.Set("planned_ends_at", "2020-01-01T00:00")
+	cookie, csrfToken := getFreezeForm(t, server)
+	form.Set(csrfFormField, csrfToken)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/freezes", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "planned unfreeze time must be in the future") {
+		t.Fatalf("expected safe past-time validation, status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -2844,7 +2921,7 @@ func (s *fakeFreezeStore) CreateActive(ctx context.Context, params freeze.Create
 	}
 	s.created = append(s.created, params)
 	s.actors = append(s.actors, actor)
-	created := domain.BranchFreeze{ID: int64(len(s.freezes) + 1), RepositoryID: params.RepositoryID, Branch: params.Branch, Status: domain.BranchFreezeStatusActive, Active: true, Reason: params.Reason}
+	created := domain.BranchFreeze{ID: int64(len(s.freezes) + 1), RepositoryID: params.RepositoryID, Branch: params.Branch, Status: domain.BranchFreezeStatusActive, Active: true, Reason: params.Reason, PlannedEndsAt: params.PlannedEndsAt}
 	s.freezes = append(s.freezes, created)
 	return created, nil
 }

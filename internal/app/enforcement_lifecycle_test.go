@@ -109,6 +109,71 @@ func TestActiveFreezeLifecycleSyncsForgePRsAndPostsStatuses(t *testing.T) {
 	}
 }
 
+func TestDueImmediateFreezePublishesThawedPolicyAndClearsRetryMarker(t *testing.T) {
+	ctx := context.Background()
+	admin := domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}
+	openPRs := &[]forgejoPullRequestResponse{newAppPullRequestResponse(42, "open", "main", "ABC123")}
+	h := newEnforcementLifecycleHarness(t, ctx, openPRs)
+	plannedEndsAt := time.Now().UTC().Add(time.Hour)
+
+	created, err := h.store.CreateActive(ctx, freeze.CreateParams{RepositoryID: h.repo.ID, Branch: "main", Reason: "deployment", PlannedEndsAt: &plannedEndsAt}, admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(*h.posted) != 1 || (*h.posted)[0].State != "failure" {
+		t.Fatalf("expected immediate freeze to publish failure before its planned end, got %+v", *h.posted)
+	}
+	if _, err := h.database.ExecContext(ctx, `UPDATE branch_freezes SET planned_ends_at = ? WHERE id = ?`, time.Now().UTC().Add(-time.Minute).Format("2006-01-02T15:04:05.000000000Z"), created.ID); err != nil {
+		t.Fatal(err)
+	}
+	*h.posted = nil
+	ended, err := h.store.ExecutePlannedUnfreeze(ctx, created.ID, domain.Actor{Kind: domain.ActorKindSystem, Role: "scheduler"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(*h.posted) != 1 || (*h.posted)[0].State != "success" {
+		t.Fatalf("expected due immediate freeze to publish current thawed policy, got %+v", *h.posted)
+	}
+	reloaded, err := freeze.NewService(h.database).Get(ctx, ended.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Status != domain.BranchFreezeStatusEnded || reloaded.NeedsRecompute {
+		t.Fatalf("expected successful automatic end to clear retry marker, got %+v", reloaded)
+	}
+}
+
+func TestDueImmediateFreezeKeepsSharedHeadBlockedByAnotherActiveFreeze(t *testing.T) {
+	ctx := context.Background()
+	admin := domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}
+	openPRs := &[]forgejoPullRequestResponse{
+		newAppPullRequestResponse(1, "open", "main", "ABC123"),
+		newAppPullRequestResponse(2, "open", "develop", "ABC123"),
+	}
+	h := newEnforcementLifecycleHarness(t, ctx, openPRs)
+	if _, err := repository.NewStore(h.database).AddBranch(ctx, h.repo.ID, "develop"); err != nil {
+		t.Fatal(err)
+	}
+	plannedEndsAt := time.Now().UTC().Add(time.Hour)
+	mainFreeze, err := h.store.CreateActive(ctx, freeze.CreateParams{RepositoryID: h.repo.ID, Branch: "main", Reason: "deployment", PlannedEndsAt: &plannedEndsAt}, admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.CreateActive(ctx, freeze.CreateParams{RepositoryID: h.repo.ID, Branch: "develop", Reason: "release"}, admin); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.database.ExecContext(ctx, `UPDATE branch_freezes SET planned_ends_at = ? WHERE id = ?`, time.Now().UTC().Add(-time.Minute).Format("2006-01-02T15:04:05.000000000Z"), mainFreeze.ID); err != nil {
+		t.Fatal(err)
+	}
+	*h.posted = nil
+	if _, err := h.store.ExecutePlannedUnfreeze(ctx, mainFreeze.ID, domain.Actor{Kind: domain.ActorKindSystem, Role: "scheduler"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(*h.posted) != 1 || (*h.posted)[0].SHA != "abc123" || (*h.posted)[0].State != "failure" {
+		t.Fatalf("expected remaining active freeze to keep shared-head policy blocked, got %+v", *h.posted)
+	}
+}
+
 func TestActiveFreezeLifecycleCrossBranchSharedHeadCannotPublishAccidentalSuccess(t *testing.T) {
 	ctx := context.Background()
 	admin := domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}
@@ -262,6 +327,103 @@ func TestScheduledFreezeActivationAndPlannedUnfreezeUseSyncInvariant(t *testing.
 	}
 }
 
+func TestImmediatePlannedUnfreezeRecomputesAndClearsMarkerAfterSuccess(t *testing.T) {
+	ctx := context.Background()
+	freezes := &fakeScheduledFreezeOperations{
+		ended: domain.BranchFreeze{ID: 8, RepositoryID: 7, Branch: "main", Status: domain.BranchFreezeStatusEnded, NeedsRecompute: true},
+	}
+	pulls := &fakeOpenPullRequestBranchLister{prs: []domain.PullRequest{{RepositoryID: 7, Index: 1, State: "open", TargetBranch: "main", HeadSHA: "aaa111"}}}
+	syncer := &fakeRecomputeSyncer{}
+	statuses := &fakeSharedHeadStatusRunner{}
+	publisher := &fakeStatusPublisher{}
+	store := newFreezeRecomputingStore(freezes, &fakeOpenPRRepositoryGetter{repo: newRecomputeTestRepository(7, domain.EnforcementActive)}, syncer, pulls, statuses, publisher)
+
+	ended, err := store.ExecutePlannedUnfreeze(ctx, 8, domain.Actor{Kind: domain.ActorKindSystem, Role: "scheduler"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ended.Scheduled || len(syncer.calls) != 1 || len(publisher.results) != 1 || len(freezes.markCalls) != 1 || freezes.markCalls[0] != 8 {
+		t.Fatalf("expected immediate planned end to sync, publish, and clear marker; ended=%+v sync=%+v publish=%+v marks=%+v", ended, syncer.calls, publisher.results, freezes.markCalls)
+	}
+}
+
+func TestScheduledActivationKeepsMarkerIfEnforcementChangesBeforeRecompute(t *testing.T) {
+	ctx := context.Background()
+	activated := domain.BranchFreeze{ID: 3, RepositoryID: 7, Branch: "main", Status: domain.BranchFreezeStatusActive, Active: true, Scheduled: true, NeedsRecompute: true}
+	freezes := &fakeScheduledFreezeOperations{activated: activated}
+	repositories := &fakeOpenPRRepositoryGetter{
+		repo: newRecomputeTestRepository(7, domain.EnforcementActive),
+		repos: []domain.Repository{
+			newRecomputeTestRepository(7, domain.EnforcementActive),
+			newRecomputeTestRepository(7, domain.EnforcementUnhealthy),
+		},
+	}
+	store := newFreezeRecomputingStore(freezes, repositories, &fakeRecomputeSyncer{}, &fakeOpenPullRequestBranchLister{}, &fakeSharedHeadStatusRunner{}, &fakeStatusPublisher{})
+
+	if _, err := store.ActivateScheduled(ctx, activated.ID, domain.Actor{Kind: domain.ActorKindSystem, Role: "scheduler"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(freezes.markCalls) != 0 {
+		t.Fatalf("expected activation marker to remain pending without convergence, got %+v", freezes.markCalls)
+	}
+	if err := store.RetryRecompute(ctx, activated); err != nil {
+		t.Fatal(err)
+	}
+	if len(freezes.markCalls) != 1 || freezes.markCalls[0] != activated.ID {
+		t.Fatalf("expected later active retry to clear marker, got %+v", freezes.markCalls)
+	}
+}
+
+func TestPlannedUnfreezeFailureLeavesMarkerForLaterRetry(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		syncErr    error
+		publishErr error
+	}{
+		{name: "sync failure", syncErr: errors.New("forge unavailable")},
+		{name: "publication failure", publishErr: errors.New("publication failed")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			freezes := &fakeScheduledFreezeOperations{ended: domain.BranchFreeze{ID: 8, RepositoryID: 7, Branch: "main", Status: domain.BranchFreezeStatusEnded, NeedsRecompute: true}}
+			pulls := &fakeOpenPullRequestBranchLister{prs: []domain.PullRequest{{RepositoryID: 7, Index: 1, State: "open", TargetBranch: "main", HeadSHA: "aaa111"}}}
+			syncer := &fakeRecomputeSyncer{err: test.syncErr}
+			publisher := &fakeStatusPublisher{err: test.publishErr}
+			store := newFreezeRecomputingStore(freezes, &fakeOpenPRRepositoryGetter{repo: newRecomputeTestRepository(7, domain.EnforcementActive)}, syncer, pulls, &fakeSharedHeadStatusRunner{}, publisher)
+
+			ended, err := store.ExecutePlannedUnfreeze(ctx, 8, domain.Actor{Kind: domain.ActorKindSystem, Role: "scheduler"})
+			if err == nil || ended.Status != domain.BranchFreezeStatusEnded || len(freezes.markCalls) != 0 {
+				t.Fatalf("expected ended freeze with pending marker after failure, ended=%+v err=%v marks=%+v", ended, err, freezes.markCalls)
+			}
+			syncer.err = nil
+			publisher.err = nil
+			if err := store.RetryRecompute(ctx, ended); err != nil {
+				t.Fatal(err)
+			}
+			if len(freezes.markCalls) != 1 || freezes.markCalls[0] != ended.ID {
+				t.Fatalf("expected successful retry to clear marker, got %+v", freezes.markCalls)
+			}
+		})
+	}
+}
+
+func TestPlannedUnfreezeDoesNotClearMarkerWhileEnforcementInactive(t *testing.T) {
+	ctx := context.Background()
+	ended := domain.BranchFreeze{ID: 8, RepositoryID: 7, Branch: "main", Status: domain.BranchFreezeStatusEnded, NeedsRecompute: true}
+	freezes := &fakeScheduledFreezeOperations{ended: ended}
+	store := newFreezeRecomputingStore(freezes, &fakeOpenPRRepositoryGetter{repo: newRecomputeTestRepository(7, domain.EnforcementUnhealthy)}, &fakeRecomputeSyncer{}, &fakeOpenPullRequestBranchLister{}, &fakeSharedHeadStatusRunner{}, &fakeStatusPublisher{})
+
+	if _, err := store.ExecutePlannedUnfreeze(ctx, ended.ID, domain.Actor{Kind: domain.ActorKindSystem, Role: "scheduler"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RetryRecompute(ctx, ended); err != nil {
+		t.Fatal(err)
+	}
+	if len(freezes.markCalls) != 0 {
+		t.Fatalf("expected unhealthy repository to preserve pending recompute, got marks %+v", freezes.markCalls)
+	}
+}
+
 func TestFreezeRecomputingStoreRejectsScheduledCreateWithoutActiveEnforcement(t *testing.T) {
 	ctx := context.Background()
 	freezes := &fakeScheduledFreezeOperations{}
@@ -283,6 +445,7 @@ type fakeScheduledFreezeOperations struct {
 	ended         domain.BranchFreeze
 	scheduleCalls int
 	recomputedIDs map[string]int64
+	markCalls     []int64
 }
 
 func (f *fakeScheduledFreezeOperations) Get(ctx context.Context, id int64) (domain.BranchFreeze, error) {
@@ -318,11 +481,12 @@ func (f *fakeScheduledFreezeOperations) ExecutePlannedUnfreeze(ctx context.Conte
 	return f.ended, nil
 }
 
-func (f *fakeScheduledFreezeOperations) ListScheduledNeedsRecompute(ctx context.Context, limit int) ([]domain.BranchFreeze, error) {
+func (f *fakeScheduledFreezeOperations) ListNeedsRecompute(ctx context.Context, limit int) ([]domain.BranchFreeze, error) {
 	return nil, nil
 }
 
-func (f *fakeScheduledFreezeOperations) MarkScheduledRecomputed(ctx context.Context, id int64) (domain.BranchFreeze, error) {
+func (f *fakeScheduledFreezeOperations) MarkRecomputed(ctx context.Context, id int64) (domain.BranchFreeze, error) {
+	f.markCalls = append(f.markCalls, id)
 	if f.recomputedIDs == nil {
 		f.recomputedIDs = map[string]int64{}
 	}

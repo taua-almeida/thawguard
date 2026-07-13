@@ -186,8 +186,10 @@ type repositoryOverview struct {
 }
 
 type freezeView struct {
-	Freeze     domain.BranchFreeze
-	Repository domain.Repository
+	Freeze          domain.BranchFreeze
+	Repository      domain.Repository
+	PlannedEndsAt   string
+	HasPlannedEndAt bool
 }
 
 type scheduledFreezeView struct {
@@ -1187,15 +1189,10 @@ func (s *Server) handleCreateFreeze(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	repositoryID, err := strconv.ParseInt(strings.TrimSpace(r.PostFormValue("repository_id")), 10, 64)
-	if err != nil {
-		repositoryID = 0
+	params, err := freezeCreateParamsFromForm(r)
+	if err == nil {
+		_, err = s.cfg.FreezeStore.CreateActive(r.Context(), params, session.auditActor())
 	}
-	_, err = s.cfg.FreezeStore.CreateActive(r.Context(), freeze.CreateParams{
-		RepositoryID: repositoryID,
-		Branch:       r.PostFormValue("branch"),
-		Reason:       r.PostFormValue("reason"),
-	}, session.auditActor())
 	if err != nil {
 		if !freeze.IsValidationError(err) {
 			internalServerError(w)
@@ -1349,32 +1346,59 @@ func scheduledFreezeParamsFromForm(r *http.Request) (freeze.ScheduleParams, erro
 	if err != nil {
 		repositoryID = 0
 	}
-	timezoneOffsetMinutes := parseBrowserTimezoneOffsetMinutes(r.PostFormValue("timezone_offset_minutes"))
+	timezoneOffsetMinutes, err := parseBrowserTimezoneOffsetMinutes(r.PostFormValue("timezone_offset_minutes"))
+	if err != nil {
+		return freeze.ScheduleParams{}, err
+	}
 	startsAt, err := parseScheduledFreezeFormTime(r.PostFormValue("starts_at"), timezoneOffsetMinutes)
 	if err != nil {
 		return freeze.ScheduleParams{}, err
 	}
-	var plannedEndsAt *time.Time
-	plannedEndsAtValue := strings.TrimSpace(r.PostFormValue("planned_ends_at"))
-	if plannedEndsAtValue != "" {
-		parsedPlannedEndsAt, err := parseScheduledFreezeFormTime(plannedEndsAtValue, timezoneOffsetMinutes)
-		if err != nil {
-			return freeze.ScheduleParams{}, freeze.ValidationError{Message: "planned unfreeze time is invalid"}
-		}
-		plannedEndsAt = &parsedPlannedEndsAt
+	plannedEndsAt, err := parseOptionalPlannedUnfreeze(r.PostFormValue("planned_ends_at"), timezoneOffsetMinutes)
+	if err != nil {
+		return freeze.ScheduleParams{}, err
 	}
 	return freeze.ScheduleParams{RepositoryID: repositoryID, Branch: r.PostFormValue("branch"), Reason: r.PostFormValue("reason"), StartsAt: startsAt, PlannedEndsAt: plannedEndsAt}, nil
 }
 
-func parseBrowserTimezoneOffsetMinutes(raw string) int {
-	offset, err := strconv.Atoi(strings.TrimSpace(raw))
+func freezeCreateParamsFromForm(r *http.Request) (freeze.CreateParams, error) {
+	repositoryID, err := strconv.ParseInt(strings.TrimSpace(r.PostFormValue("repository_id")), 10, 64)
 	if err != nil {
-		return 0
+		repositoryID = 0
 	}
-	if offset < -14*60 || offset > 14*60 {
-		return 0
+	timezoneOffsetMinutes, err := parseBrowserTimezoneOffsetMinutes(r.PostFormValue("timezone_offset_minutes"))
+	if err != nil {
+		return freeze.CreateParams{}, err
 	}
-	return offset
+	plannedEndsAt, err := parseOptionalPlannedUnfreeze(r.PostFormValue("planned_ends_at"), timezoneOffsetMinutes)
+	if err != nil {
+		return freeze.CreateParams{}, err
+	}
+	return freeze.CreateParams{RepositoryID: repositoryID, Branch: r.PostFormValue("branch"), Reason: r.PostFormValue("reason"), PlannedEndsAt: plannedEndsAt}, nil
+}
+
+func parseBrowserTimezoneOffsetMinutes(raw string) (int, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return 0, nil
+	}
+	offset, err := strconv.Atoi(value)
+	if err != nil || offset < -14*60 || offset > 14*60 {
+		return 0, freeze.ValidationError{Message: "browser timezone offset is invalid"}
+	}
+	return offset, nil
+}
+
+func parseOptionalPlannedUnfreeze(raw string, timezoneOffsetMinutes int) (*time.Time, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return nil, nil
+	}
+	plannedEndsAt, err := parseScheduledFreezeFormTime(value, timezoneOffsetMinutes)
+	if err != nil {
+		return nil, freeze.ValidationError{Message: "planned unfreeze time is invalid"}
+	}
+	return &plannedEndsAt, nil
 }
 
 func parseScheduledFreezeFormTime(raw string, timezoneOffsetMinutes int) (time.Time, error) {
@@ -1383,6 +1407,10 @@ func parseScheduledFreezeFormTime(raw string, timezoneOffsetMinutes int) (time.T
 		return time.Time{}, freeze.ValidationError{Message: "scheduled freeze start time is required"}
 	}
 	if parsed, err := time.Parse(time.RFC3339, value); err == nil {
+		_, offsetSeconds := parsed.Zone()
+		if offsetSeconds < -14*60*60 || offsetSeconds > 14*60*60 {
+			return time.Time{}, freeze.ValidationError{Message: "scheduled freeze time has an invalid timezone offset"}
+		}
 		return parsed.UTC(), nil
 	}
 	location := time.FixedZone("browser", -timezoneOffsetMinutes*60)
@@ -2113,6 +2141,11 @@ func systemAuditEventViewForEvent(repositoriesByID map[int64]domain.Repository, 
 		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "branch")
 		view.Detail = auditDetailOrDash(details, "reason")
 		view.StateClass = "warning"
+	case audit.ActionBranchFreezePlannedUnfreeze:
+		view.Label = "Planned unfreeze executed"
+		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "branch")
+		view.Detail = "Planned end " + auditDetailOrDash(details, "planned_ends_at") + " — " + auditDetailOrDash(details, "reason")
+		view.StateClass = "ok"
 	case audit.ActionFreezeScheduleCreated:
 		view.Label = "Freeze scheduled"
 		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "branch")
@@ -2362,7 +2395,12 @@ func (s *Server) freezeViews(repositories []domain.Repository, freezes []domain.
 	}
 	views := make([]freezeView, 0, len(freezes))
 	for _, freeze := range freezes {
-		views = append(views, freezeView{Freeze: freeze, Repository: repositoriesByID[freeze.RepositoryID]})
+		views = append(views, freezeView{
+			Freeze:          freeze,
+			Repository:      repositoriesByID[freeze.RepositoryID],
+			PlannedEndsAt:   optionalScheduleTime(freeze.PlannedEndsAt),
+			HasPlannedEndAt: freeze.PlannedEndsAt != nil && !freeze.PlannedEndsAt.IsZero(),
+		})
 	}
 	return views
 }
@@ -2478,7 +2516,7 @@ func (s *Server) freezeAuditViews(ctx context.Context, repositories []domain.Rep
 
 func isFreezeAuditAction(action string) bool {
 	switch action {
-	case audit.ActionBranchFreezeCreated, audit.ActionBranchFreezeEnded, audit.ActionBranchFreezeCancelled, audit.ActionFreezeScheduleCreated, audit.ActionFreezeScheduleCancelled, audit.ActionFreezeScheduleActivated, audit.ActionFreezeSchedulePlannedUnfreeze:
+	case audit.ActionBranchFreezeCreated, audit.ActionBranchFreezeEnded, audit.ActionBranchFreezeCancelled, audit.ActionBranchFreezePlannedUnfreeze, audit.ActionFreezeScheduleCreated, audit.ActionFreezeScheduleCancelled, audit.ActionFreezeScheduleActivated, audit.ActionFreezeSchedulePlannedUnfreeze:
 		return true
 	default:
 		return false
@@ -3884,6 +3922,7 @@ const freezesTemplate = pageHead + `
         {{ else if .EnforceableRepositories }}
         <form method="post" action="/freezes" class="tg-setup-form tg-freeze-form" data-freeze-form>
           <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
+          <input type="hidden" name="timezone_offset_minutes" value="0" data-timezone-offset-minutes>
           <label>Repository
             <select name="repository_id" required data-freeze-repository>
             {{ range .EnforceableRepositories }}<option value="{{ .ID }}">{{ .FullName }}</option>{{ end }}
@@ -3895,6 +3934,8 @@ const freezesTemplate = pageHead + `
             </select>
           </label>
           <label class="tg-field-wide">Reason <input name="reason" placeholder="Release cut 2026-07 — QA verification in progress" required></label>
+          <label>Planned unfreeze <input type="datetime-local" name="planned_ends_at" aria-describedby="immediate-planned-unfreeze-help"></label>
+          <small id="immediate-planned-unfreeze-help" class="tg-muted">Optional. Uses your browser's local timezone and is stored as UTC.</small>
           <div class="tg-freeze-form-footer tg-field-wide">
             <span class="tg-muted"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-audit"></use></svg>Every freeze is written to the audit log.</span>
             <div class="tg-freeze-form-actions">
@@ -3941,7 +3982,7 @@ const freezesTemplate = pageHead + `
             <tr>
               <td><span class="tg-table-repo"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-freeze-branch"></use></svg><code>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Freeze.RepositoryID }}{{ end }}</code><span class="tg-arrow">→</span><code class="tg-branch">{{ .Freeze.Branch }}</code></span></td>
               <td>{{ .Freeze.Reason }}</td>
-              <td><span class="tg-muted">Manual</span></td>
+              <td>{{ if .HasPlannedEndAt }}Planned unfreeze: {{ .PlannedEndsAt }}{{ else }}<span class="tg-muted">No planned unfreeze</span>{{ end }}</td>
               <td><span class="tg-muted">preview</span></td>
               <td><span class="status status-frozen">{{ .Freeze.Status }}</span></td>
               <td class="tg-table-actions">
@@ -3979,6 +4020,8 @@ const freezesTemplate = pageHead + `
       if (!form) return;
       const repo = form.querySelector('[data-freeze-repository]');
       const branch = form.querySelector('[data-freeze-branch]');
+      const timezoneOffset = form.querySelector('[data-timezone-offset-minutes]');
+      if (timezoneOffset) timezoneOffset.value = String(new Date().getTimezoneOffset());
       const repoOut = document.querySelector('[data-preview-repository]');
       const branchOut = document.querySelector('[data-preview-branch]');
       const update = () => {
