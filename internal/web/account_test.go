@@ -278,10 +278,11 @@ func TestForcedPasswordSessionIsGatedToPasswordChangeAndLogout(t *testing.T) {
 		StatusDecisionStore:    &fakeStatusDecisionStore{},
 		StatusPublicationStore: &fakeStatusPublicationStore{},
 		WebhookDeliveryStore:   &fakeWebhookDeliveryStore{},
+		AuditStore:             &fakeAuditStore{},
 	})
 	forcedCookie := &http.Cookie{Name: sessionCookieName, Value: forcedSession.ID}
 
-	for _, path := range []string{"/", "/repositories", "/freezes", "/scheduled-freezes", "/decisions", "/publications", "/webhooks", "/users", "/login"} {
+	for _, path := range []string{"/", "/repositories", "/freezes", "/scheduled-freezes", "/decisions", "/activity", "/publications", "/webhooks", "/users", "/login"} {
 		recorder := httptest.NewRecorder()
 		request := httptest.NewRequest(http.MethodGet, path, nil)
 		request.AddCookie(forcedCookie)

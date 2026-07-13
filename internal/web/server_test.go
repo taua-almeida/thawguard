@@ -998,13 +998,11 @@ func TestFreezesPageHidesNonFreezeAuditEvents(t *testing.T) {
 	}
 }
 
-func TestFreezesPageHidesUnknownFreezeAuditActions(t *testing.T) {
+func TestFreezesPageDoesNotDependOnOrPresentAuditHistory(t *testing.T) {
 	server := NewServer(Config{
 		AppName:     "Thawguard",
 		FreezeStore: &fakeFreezeStore{},
-		AuditStore: &fakeAuditStore{events: []audit.Event{
-			{Action: "branch_freeze.internal", SubjectType: audit.SubjectTypeBranchFreeze, SubjectID: "1", DetailsJSON: `{"branch":"main"}`, CreatedAt: time.Date(2026, 6, 29, 15, 30, 0, 0, time.UTC)},
-		}},
+		AuditStore:  &fakeAuditStore{err: errors.New("audit unavailable")},
 	})
 
 	recorder := httptest.NewRecorder()
@@ -1013,8 +1011,10 @@ func TestFreezesPageHidesUnknownFreezeAuditActions(t *testing.T) {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
 	}
 	body := recorder.Body.String()
-	if strings.Contains(body, "branch_freeze.internal") {
-		t.Fatalf("expected unknown freeze action to be hidden, got %q", body)
+	for _, unwanted := range []string{"Audit Log", "Audit history", "Recent activity"} {
+		if strings.Contains(body, unwanted) {
+			t.Fatalf("expected freezes page not to present duplicate audit history %q, got %q", unwanted, body)
+		}
 	}
 	if !strings.Contains(body, "No active freezes yet") {
 		t.Fatalf("expected empty active freeze state, got %q", body)
@@ -1950,7 +1950,7 @@ func TestPublicationsPageShowsRecentPublicationIntents(t *testing.T) {
 	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
 	createdAt := time.Date(2026, 6, 29, 17, 30, 0, 0, time.UTC)
 	publication := statuspublication.Publication{ID: 1, StatusResultID: 7, RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "Branch is frozen; merge is blocked by Thawguard", DeliveryMode: statuspublication.DeliveryModeForgejoStatus, CreatedAt: createdAt, UpdatedAt: createdAt}
-	attempt := statuspublication.Attempt{ID: 1, PublicationID: publication.ID, StatusResultID: publication.StatusResultID, RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "Branch is frozen; merge is blocked by Thawguard", Mode: statuspublication.AttemptModeForgejoStatus, Result: statuspublication.AttemptResultPosted, AttemptedAt: createdAt.Add(time.Minute)}
+	attempt := statuspublication.Attempt{ID: 1, PublicationID: publication.ID, StatusResultID: publication.StatusResultID, RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "Branch is frozen; merge is blocked by Thawguard", Mode: statuspublication.AttemptModeForgejoStatus, Result: statuspublication.AttemptResultFailed, Error: "permission denied", AttemptedAt: createdAt.Add(time.Minute)}
 	server := NewServer(Config{
 		AppName:                "Thawguard",
 		RepositoryStore:        &fakeRepositoryStore{repositories: []domain.Repository{repo}},
@@ -1967,7 +1967,7 @@ func TestPublicationsPageShowsRecentPublicationIntents(t *testing.T) {
 		t.Fatal("expected session cookie value")
 	}
 	body := recorder.Body.String()
-	for _, want := range []string{"Status publications", "Latest desired statuses", "Recent live posting attempts", "taua-almeida/thawguard", "#42", "main", "abc123", "thawguard/freeze", "failure", "forgejo_status", "posted", "Branch is frozen", "2026-06-29 17:30 UTC", "2026-06-29 17:31 UTC"} {
+	for _, want := range []string{"Status diagnostics", "Latest desired statuses", "Recent publication attempts", "Back to activity", `href="/activity"`, "tg-responsive-table", "tg-mobile-card-list", "taua-almeida/thawguard", "#42", "main", "abc123", "thawguard/freeze", "failure", "forgejo_status", "failed", "permission denied", "Branch is frozen", "2026-06-29 17:30 UTC", "2026-06-29 17:31 UTC"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
@@ -2031,7 +2031,7 @@ func TestWebhooksPageShowsRecentDeliveries(t *testing.T) {
 		t.Fatal("expected session cookie value")
 	}
 	body := recorder.Body.String()
-	for _, want := range []string{"Audit Log", "Recent webhook deliveries", "Sanitized local metadata only", "tg-table-toolbar", "tg-responsive-table", "tg-mobile-card-list", "Rows per page", "Filter audit log", "aria-sort=\"descending\"", "Showing 3 of 3 matching rows", "3 total rows loaded", "sanitized webhook delivery metadata", "taua-almeida/thawguard", "delivery-processed", "pull_request", "opened", "verified", "processed", "delivery-retry", "synchronized", "retryable failure", "webhook processing failed", "delivery-processing", "processing", "2026-06-30 12:00 UTC"} {
+	for _, want := range []string{"Webhook diagnostics", "Signed webhook deliveries", "Back to activity", `href="/activity"`, "Sanitized delivery metadata", "tg-table-toolbar", "tg-responsive-table", "tg-mobile-card-list", "Rows per page", "Filter webhook deliveries", "aria-sort=\"descending\"", "Showing 3 of 3 matching rows", "3 total rows loaded", "taua-almeida/thawguard", "delivery-processed", "pull_request", "opened", "verified", "processed", "delivery-retry", "synchronized", "retryable failure", "webhook processing failed", "delivery-processing", "processing", "2026-06-30 12:00 UTC"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
@@ -2046,19 +2046,16 @@ func TestWebhooksPageShowsRecentDeliveries(t *testing.T) {
 	}
 }
 
-func TestWebhooksPageShowsSystemActivityAndStatusAttempts(t *testing.T) {
+func TestWebhooksPageExcludesActivityAndStatusAttempts(t *testing.T) {
 	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
 	createdAt := time.Date(2026, 7, 6, 12, 0, 0, 0, time.UTC)
-	events := []audit.Event{
-		{Action: audit.ActionThawExceptionApproved, SubjectType: audit.SubjectTypeThawException, SubjectID: "5", DetailsJSON: `{"actor_kind":"bootstrap_admin","actor_role":"admin","repository_id":"1","pull_request_index":"42","target_branch":"main","head_sha":"abc123","reason":"production fix"}`, CreatedAt: createdAt},
-		{Action: audit.ActionRepositoryOpenPullRequestsSynced, SubjectType: audit.SubjectTypeRepository, SubjectID: "1", DetailsJSON: `{"repository_id":"1","full_name":"taua-almeida/thawguard","target_branch":"main","open_count":"2","closed_absent_count":"1"}`, CreatedAt: createdAt.Add(-time.Minute)},
-	}
+	event := audit.Event{Action: audit.ActionThawExceptionApproved, SubjectType: audit.SubjectTypeThawException, SubjectID: "5", DetailsJSON: `{"repository_id":"1","pull_request_index":"42","reason":"activity-only-marker"}`, CreatedAt: createdAt}
 	attempt := statuspublication.Attempt{ID: 9, PublicationID: 8, StatusResultID: 7, RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: domain.CommitStatusSuccess, Description: "PR is explicitly thawed during an active freeze", Mode: statuspublication.AttemptModeForgejoStatus, Result: statuspublication.AttemptResultPosted, AttemptedAt: createdAt.Add(time.Minute)}
 	server := NewServer(Config{
 		AppName:                "Thawguard",
 		RepositoryStore:        &fakeRepositoryStore{repositories: []domain.Repository{repo}},
 		WebhookDeliveryStore:   &fakeWebhookDeliveryStore{},
-		AuditStore:             &fakeAuditStore{events: events},
+		AuditStore:             &fakeAuditStore{events: []audit.Event{event}},
 		StatusPublicationStore: &fakeStatusPublicationStore{attempts: []statuspublication.Attempt{attempt}},
 	})
 
@@ -2069,133 +2066,224 @@ func TestWebhooksPageShowsSystemActivityAndStatusAttempts(t *testing.T) {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
 	}
 	body := recorder.Body.String()
-	for _, want := range []string{"System activity", "Status publication attempts", "Thaw approved", "Open PRs synced", "taua-almeida/thawguard PR #42", "Head abc123 on main", "production fix", "2 open from forge, 1 cached closed", "forgejo_status", "posted", "PR is explicitly thawed during an active freeze"} {
-		if !strings.Contains(body, want) {
-			t.Fatalf("expected body to contain %q, got %q", want, body)
+	for _, unwanted := range []string{"System activity", "Status publication attempts", "activity-only-marker", "PR is explicitly thawed during an active freeze", "forgejo_status"} {
+		if strings.Contains(body, unwanted) {
+			t.Fatalf("expected webhook diagnostics not to contain %q, got %q", unwanted, body)
 		}
 	}
-	if strings.Contains(body, "secret-token") || strings.Contains(body, "X-Hub-Signature") {
-		t.Fatalf("expected activity page not to render sensitive details, got %q", body)
-	}
-}
-
-func TestSystemAuditEventViewShowsTruthfulSharedHeadApproval(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard"}
-	repositories := map[int64]domain.Repository{repo.ID: repo}
-	for _, test := range []struct {
-		name        string
-		detailsJSON string
-		wantLabel   string
-		wantSummary string
-	}{
-		{
-			name:        "all newly created",
-			detailsJSON: `{"repository_id":"1","created_pull_request_indexes":"42,43","already_covered_pull_request_indexes":"","created_pull_request_count":"2","already_covered_pull_request_count":"0","head_sha":"abc123","reason":"production fix"}`,
-			wantLabel:   "Shared-head thaw approved",
-			wantSummary: "taua-almeida/thawguard · New exceptions: #42, #43",
-		},
-		{
-			name:        "mixed created and covered",
-			detailsJSON: `{"repository_id":"1","created_pull_request_indexes":"43","already_covered_pull_request_indexes":"42","created_pull_request_count":"1","already_covered_pull_request_count":"1","head_sha":"abc123","reason":"production fix"}`,
-			wantLabel:   "Shared-head thaw approved",
-			wantSummary: "taua-almeida/thawguard · New exceptions: #43 · Already covered: #42",
-		},
-		{
-			name:        "all already covered",
-			detailsJSON: `{"repository_id":"1","created_pull_request_indexes":"","already_covered_pull_request_indexes":"42,43","created_pull_request_count":"0","already_covered_pull_request_count":"2","head_sha":"abc123","reason":"confirmed shared impact"}`,
-			wantLabel:   "Shared head already covered",
-			wantSummary: "taua-almeida/thawguard · Active exceptions: #42, #43",
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			view, ok := systemAuditEventViewForEvent(repositories, audit.Event{Action: audit.ActionThawExceptionSharedHeadApproved, DetailsJSON: test.detailsJSON})
-			if !ok {
-				t.Fatal("expected shared-head audit event to be allowlisted")
-			}
-			if view.Label != test.wantLabel || view.Summary != test.wantSummary {
-				t.Fatalf("unexpected shared-head view: %+v", view)
-			}
-			if !strings.Contains(view.Detail, "Head abc123 — Confirmation reason:") {
-				t.Fatalf("expected reason to be scoped to the confirmation, got %q", view.Detail)
-			}
-		})
+	if !strings.Contains(body, "Webhook diagnostics") || !strings.Contains(body, `href="/activity"`) {
+		t.Fatalf("expected dedicated webhook diagnostics with activity link, got %q", body)
 	}
 }
 
-func TestSystemAuditEventViewSharedHeadMalformedDetailsFailSafely(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard"}
-	repositories := map[int64]domain.Repository{repo.ID: repo}
-	for _, detailsJSON := range []string{
-		`{"repository_id":"1","raw":"raw-secret-marker"`,
-		`{"repository_id":"1","created_pull_request_indexes":"42","already_covered_pull_request_indexes":"","already_covered_pull_request_count":"0","head_sha":"abc123","reason":"raw-secret-marker"}`,
-		`{"repository_id":"1","created_pull_request_indexes":"42,raw-secret-marker","already_covered_pull_request_indexes":"","created_pull_request_count":"2","already_covered_pull_request_count":"0","head_sha":"abc123","reason":"production fix"}`,
-		`{"repository_id":"1","created_pull_request_indexes":"42","already_covered_pull_request_indexes":"","created_pull_request_count":"1","already_covered_pull_request_count":"0","head_sha":"raw-secret-marker","reason":"production fix"}`,
-	} {
-		view, ok := systemAuditEventViewForEvent(repositories, audit.Event{Action: audit.ActionThawExceptionSharedHeadApproved, DetailsJSON: detailsJSON})
-		if !ok {
-			t.Fatal("expected malformed shared-head event to remain allowlisted")
-		}
-		if view.Label != "Shared-head confirmation recorded" || (view.Summary != "taua-almeida/thawguard" && view.Summary != "Repository") || view.Detail != "Approval details unavailable" || view.StateClass != "warning" {
-			t.Fatalf("expected safe fallback view, got %+v", view)
-		}
-		visible := view.Label + view.Summary + view.Detail
-		if strings.Contains(visible, "raw-secret-marker") || strings.Contains(visible, detailsJSON) {
-			t.Fatalf("expected malformed/raw details to stay hidden, got %q", visible)
+func TestActivityMappingsCoverEveryKnownAuditAction(t *testing.T) {
+	if len(activityActionDefinitions) != len(audit.KnownActions()) {
+		t.Fatalf("expected %d activity definitions, got %d", len(audit.KnownActions()), len(activityActionDefinitions))
+	}
+	for _, action := range audit.KnownActions() {
+		view := activityEventViewForEvent(nil, nil, audit.Event{Action: action, SubjectType: audit.SubjectTypeRepository, SubjectID: "1", DetailsJSON: `{}`})
+		if view.ActionLabel == "Unrecognized activity" || view.ActionLabel == "" || view.Outcome == "" || view.Target == "" || view.Detail == "" {
+			t.Fatalf("audit action %q lacks a complete curated activity mapping: %+v", action, view)
 		}
 	}
 }
 
-func TestSystemAuditEventViewDistinguishesScheduleEditAndStartNow(t *testing.T) {
+func TestActivityMappingCoversCurrentFamilies(t *testing.T) {
 	repositories := map[int64]domain.Repository{1: {ID: 1, Owner: "taua-almeida", Name: "thawguard"}}
-	for _, test := range []struct {
+	users := map[int64]auth.User{42: {ID: 42, DisplayName: "Ada Operator"}}
+	cases := []struct {
 		name        string
 		action      string
-		detailsJSON string
-		wantLabel   string
-		wantDetail  string
+		subjectType string
+		subjectID   string
+		details     string
+		outcome     string
+		contains    []string
 	}{
-		{
-			name:        "edit",
-			action:      audit.ActionFreezeScheduleUpdated,
-			detailsJSON: `{"repository_id":"1","branch":"main","reason_before":"before","reason_after":"after","starts_at_before":"2026-07-13T10:00:00Z","starts_at_after":"2026-07-13T11:00:00Z","planned_ends_at_before":"","planned_ends_at_after":"2026-07-13T12:00:00Z"}`,
-			wantLabel:   "Freeze schedule updated",
-			wantDetail:  "Reason before → after",
-		},
-		{
-			name:        "start now",
-			action:      audit.ActionFreezeScheduleStartedNow,
-			detailsJSON: `{"repository_id":"1","branch":"main","reason":"release","starts_at":"2026-07-13T10:00:00Z","planned_ends_at":"2026-07-13T12:00:00Z"}`,
-			wantLabel:   "Scheduled freeze started now",
-			wantDetail:  "planned unfreeze 2026-07-13 12:00 UTC",
-		},
-	} {
+		{name: "repository creation", action: audit.ActionRepositoryCreated, subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"default_branch":"main"}`, outcome: "Added", contains: []string{"taua-almeida/thawguard", "Default branch main"}},
+		{name: "readiness check", action: audit.ActionRepositorySetupCheckRun, subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"repository_id":1,"managed_branch_count":2,"ok_count":7,"warning_count":1,"failed_count":0,"webhook_evidence_fresh":true}`, outcome: "Checked", contains: []string{"7 passed", "2 managed branches", "webhook evidence fresh"}},
+		{name: "enforcement success", action: audit.ActionRepositoryEnforcementActivated, subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"repository_id":"1","open_pull_request_count":"3","statuses_posted":"2","statuses_failed":"0"}`, outcome: "Succeeded", contains: []string{"3 open PRs", "2 statuses posted"}},
+		{name: "enforcement failure", action: audit.ActionRepositoryEnforcementActivateFail, subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"repository_id":"1","reason":"status publication failed","enforcement_state":"unhealthy"}`, outcome: "Failed", contains: []string{"status publication failed", "state unhealthy"}},
+		{name: "runtime failure", action: audit.ActionRepositoryRuntimeConvergenceFail, subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"repository_id":"1","reason":"runtime enforcement convergence failed","enforcement_state":"unhealthy"}`, outcome: "Failed", contains: []string{"Automatic recovery remains pending"}},
+		{name: "freeze create", action: audit.ActionBranchFreezeCreated, subjectType: audit.SubjectTypeBranchFreeze, subjectID: "7", details: `{"repository_id":"1","branch":"main","reason":"release"}`, outcome: "Frozen", contains: []string{"main", "release"}},
+		{name: "freeze lift", action: audit.ActionBranchFreezeEnded, subjectType: audit.SubjectTypeBranchFreeze, subjectID: "7", details: `{"repository_id":"1","branch":"main","reason":"release"}`, outcome: "Lifted", contains: []string{"main"}},
+		{name: "freeze cancel", action: audit.ActionBranchFreezeCancelled, subjectType: audit.SubjectTypeBranchFreeze, subjectID: "7", details: `{"repository_id":"1","branch":"main","reason":"mistake"}`, outcome: "Cancelled", contains: []string{"mistake"}},
+		{name: "schedule create", action: audit.ActionFreezeScheduleCreated, subjectType: audit.SubjectTypeBranchFreeze, subjectID: "8", details: `{"repository_id":"1","branch":"release","starts_at":"2026-07-14T10:00:00Z","planned_ends_at":"2026-07-14T12:00:00Z","reason":"window"}`, outcome: "Scheduled", contains: []string{"2026-07-14 10:00 UTC", "window"}},
+		{name: "schedule edit", action: audit.ActionFreezeScheduleUpdated, subjectType: audit.SubjectTypeBranchFreeze, subjectID: "8", details: `{"repository_id":"1","branch":"release","reason_before":"before","reason_after":"after","starts_at_before":"2026-07-14T10:00:00Z","starts_at_after":"2026-07-14T11:00:00Z","planned_ends_at_before":"","planned_ends_at_after":"2026-07-14T13:00:00Z"}`, outcome: "Changed", contains: []string{"Reason before → after", "planned unfreeze none → 2026-07-14 13:00 UTC"}},
+		{name: "automatic schedule activation", action: audit.ActionFreezeScheduleActivated, subjectType: audit.SubjectTypeBranchFreeze, subjectID: "8", details: `{"repository_id":"1","branch":"release","starts_at":"2026-07-14T10:00:00Z","reason":"window"}`, outcome: "Started", contains: []string{"Started 2026-07-14 10:00 UTC"}},
+		{name: "start now", action: audit.ActionFreezeScheduleStartedNow, subjectType: audit.SubjectTypeBranchFreeze, subjectID: "8", details: `{"repository_id":"1","branch":"release","starts_at":"2026-07-13T10:00:00Z","planned_ends_at":"2026-07-14T13:00:00Z","reason":"window"}`, outcome: "Started", contains: []string{"planned unfreeze 2026-07-14 13:00 UTC"}},
+		{name: "planned unfreeze", action: audit.ActionFreezeSchedulePlannedUnfreeze, subjectType: audit.SubjectTypeBranchFreeze, subjectID: "8", details: `{"repository_id":"1","branch":"release","planned_ends_at":"2026-07-14T13:00:00Z","reason":"window"}`, outcome: "Completed", contains: []string{"Planned unfreeze 2026-07-14 13:00 UTC"}},
+		{name: "single thaw", action: audit.ActionThawExceptionApproved, subjectType: audit.SubjectTypeThawException, subjectID: "9", details: `{"repository_id":"1","pull_request_index":"42","target_branch":"main","head_sha":"abcdef1234567890","reason":"production fix"}`, outcome: "Approved", contains: []string{"PR #42", "abcdef123456", "production fix"}},
+		{name: "shared thaw", action: audit.ActionThawExceptionSharedHeadApproved, subjectType: audit.SubjectTypeThawException, subjectID: "1:abcdef", details: `{"repository_id":"1","created_pull_request_indexes":"42,43","already_covered_pull_request_indexes":"","created_pull_request_count":"2","already_covered_pull_request_count":"0","head_sha":"abcdef123456","reason":"shared fix"}`, outcome: "Approved", contains: []string{"shared head abcdef123456", "New exceptions: #42, #43", "Confirmation reason: shared fix"}},
+		{name: "roles", action: audit.ActionUserRolesUpdated, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"roles_before":"viewer","roles_after":"freezer,viewer"}`, outcome: "Changed", contains: []string{"Ada Operator (User #42)", "Viewer → Freezer, Viewer"}},
+		{name: "disabled", action: audit.ActionUserDisabled, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{}`, outcome: "Disabled", contains: []string{"sessions revoked"}},
+		{name: "enabled", action: audit.ActionUserEnabled, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{}`, outcome: "Enabled", contains: []string{"sessions were not restored"}},
+		{name: "password changed", action: audit.ActionUserPasswordChanged, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{}`, outcome: "Changed", contains: []string{"Self-service password change"}},
+		{name: "password reset", action: audit.ActionUserPasswordReset, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{}`, outcome: "Reset", contains: []string{"required at next login"}},
+	}
+	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
-			view, ok := systemAuditEventViewForEvent(repositories, audit.Event{Action: test.action, DetailsJSON: test.detailsJSON})
-			if !ok || view.Label != test.wantLabel || !strings.Contains(view.Detail, test.wantDetail) {
-				t.Fatalf("unexpected schedule audit view: ok=%v view=%+v", ok, view)
+			view := activityEventViewForEvent(repositories, users, audit.Event{Action: test.action, SubjectType: test.subjectType, SubjectID: test.subjectID, DetailsJSON: test.details})
+			if view.Outcome != test.outcome {
+				t.Fatalf("expected outcome %q, got %+v", test.outcome, view)
+			}
+			visible := view.ActionLabel + " " + view.Target + " " + view.Detail
+			for _, want := range test.contains {
+				if !strings.Contains(visible, want) {
+					t.Fatalf("expected mapping to contain %q, got %+v", want, view)
+				}
 			}
 		})
 	}
 }
 
-func TestWebhooksPageEscapesSharedHeadAuditDetails(t *testing.T) {
+func TestActivityActorAndMissingTargetResolution(t *testing.T) {
+	actorID := int64(42)
+	users := map[int64]auth.User{42: {ID: 42, DisplayName: "Ada Operator"}}
+	base := audit.Event{ActorUserID: &actorID, Action: audit.ActionRepositoryCreated, SubjectType: audit.SubjectTypeRepository, SubjectID: "99", DetailsJSON: `{}`}
+	view := activityEventViewForEvent(nil, users, base)
+	if view.Actor != "Ada Operator" || view.Target != "Repository #99" {
+		t.Fatalf("unexpected current-user or missing-repository resolution: %+v", view)
+	}
+
+	missingActorID := int64(77)
+	base.ActorUserID = &missingActorID
+	base.Action = audit.ActionUserDisabled
+	base.SubjectType = audit.SubjectTypeUser
+	base.SubjectID = "88"
+	view = activityEventViewForEvent(nil, users, base)
+	if view.Actor != "User #77" || view.Target != "User #88" {
+		t.Fatalf("unexpected missing-user fallbacks: %+v", view)
+	}
+
+	for _, test := range []struct {
+		details string
+		actor   string
+	}{
+		{details: `{"actor_kind":"bootstrap_admin"}`, actor: "Bootstrap admin"},
+		{details: `{"actor_kind":"system","actor_role":"scheduler"}`, actor: "Scheduler"},
+		{details: `{"actor_kind":"system","actor_role":"reconciliation_runner"}`, actor: "Reconciliation runner"},
+		{details: `{"actor_kind":"system","actor_role":"runtime"}`, actor: "Runtime process"},
+		{details: `{"actor_kind":"untrusted-actor","actor_role":"secret-token"}`, actor: "Unknown system actor"},
+	} {
+		view = activityEventViewForEvent(nil, nil, audit.Event{Action: audit.ActionRepositoryCreated, SubjectType: audit.SubjectTypeRepository, SubjectID: "1", DetailsJSON: test.details})
+		if view.Actor != test.actor || strings.Contains(view.Actor, "secret-token") {
+			t.Fatalf("unexpected allowlisted system actor for %s: %+v", test.details, view)
+		}
+	}
+}
+
+func TestActivityUnknownAndMalformedEventsFailSafely(t *testing.T) {
+	actorID := int64(42)
+	for _, event := range []audit.Event{
+		{ActorUserID: &actorID, Action: "repository.future_secret_action", SubjectType: audit.SubjectTypeRepository, SubjectID: "7", DetailsJSON: `{"token":"raw-secret-marker"}`},
+		{ActorUserID: &actorID, Action: audit.ActionRepositoryCreated, SubjectType: audit.SubjectTypeRepository, SubjectID: "7", DetailsJSON: `{"token":"raw-secret-marker"`},
+	} {
+		view := activityEventViewForEvent(nil, nil, event)
+		visible := view.Actor + view.ActionLabel + view.Target + view.Outcome + view.Detail
+		if view.ActionLabel != "Unrecognized activity" || view.Outcome != "Unknown" || view.Detail != "Stored audit details could not be displayed safely." || !strings.Contains(view.Target, "Repository #7") {
+			t.Fatalf("expected safe fallback, got %+v", view)
+		}
+		for _, raw := range []string{"future_secret_action", "raw-secret-marker", event.DetailsJSON} {
+			if strings.Contains(visible, raw) {
+				t.Fatalf("safe fallback leaked %q in %q", raw, visible)
+			}
+		}
+	}
+}
+
+func TestActivityPageRendersPrimaryChronologicalFeedWithoutDiagnostics(t *testing.T) {
 	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard"}
-	event := audit.Event{Action: audit.ActionThawExceptionSharedHeadApproved, DetailsJSON: `{"repository_id":"1","created_pull_request_indexes":"42,43","already_covered_pull_request_indexes":"","created_pull_request_count":"2","already_covered_pull_request_count":"0","head_sha":"abc123","reason":"fix <b>now</b>"}`}
+	newest := audit.Event{ID: 2, Action: audit.ActionThawExceptionApproved, SubjectType: audit.SubjectTypeThawException, SubjectID: "9", DetailsJSON: `{"actor_kind":"bootstrap_admin","repository_id":"1","pull_request_index":"42","target_branch":"main","head_sha":"abcdef123456","reason":"fix <b>now</b>","token":"secret-token"}`, CreatedAt: time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)}
+	older := audit.Event{ID: 1, Action: audit.ActionRepositoryCreated, SubjectType: audit.SubjectTypeRepository, SubjectID: "1", DetailsJSON: `{"actor_kind":"system","actor_role":"runtime","default_branch":"main"}`, CreatedAt: time.Date(2026, 7, 13, 11, 0, 0, 0, time.UTC)}
+	auditStore := &fakeAuditStore{events: []audit.Event{newest, older}}
 	server := NewServer(Config{
-		AppName:              "Thawguard",
-		RepositoryStore:      &fakeRepositoryStore{repositories: []domain.Repository{repo}},
-		WebhookDeliveryStore: &fakeWebhookDeliveryStore{},
-		AuditStore:           &fakeAuditStore{events: []audit.Event{event}},
+		AppName:         "Thawguard",
+		RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}},
+		AuditStore:      auditStore,
 	})
 
 	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/webhooks", nil))
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/activity", nil))
 	body := recorder.Body.String()
-	if recorder.Code != http.StatusOK || !strings.Contains(body, "fix &lt;b&gt;now&lt;/b&gt;") {
-		t.Fatalf("expected escaped shared-head reason, status=%d body=%q", recorder.Code, body)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected activity without diagnostic stores, status=%d body=%q", recorder.Code, body)
 	}
-	if strings.Contains(body, "fix <b>now</b>") {
-		t.Fatalf("expected template escaping to prevent raw markup, got %q", body)
+	if auditStore.requestedLimit != 100 {
+		t.Fatalf("expected activity to request a bounded 100 events, got %d", auditStore.requestedLimit)
+	}
+	for _, want := range []string{"Activity", "Chronological audit history", "Recent activity", "Latest 100 events at most", "Time", "Actor", "Action", "Target", "Outcome", "Details", "Bootstrap admin", "Single-PR thaw", "taua-almeida/thawguard → PR #42", "Approved", "fix &lt;b&gt;now&lt;/b&gt;", "Runtime process", "Repository added", "2026-07-13 12:00 UTC", "tg-responsive-table", "Recent activity mobile cards", "Webhook diagnostics", `href="/webhooks"`, "Status diagnostics", `href="/publications"`, `href="/activity"`, ">Activity</a>"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected activity body to contain %q, got %q", want, body)
+		}
+	}
+	if strings.Index(body, "Single-PR thaw") > strings.Index(body, "Repository added") {
+		t.Fatalf("expected newest event first, got %q", body)
+	}
+	for _, unwanted := range []string{"secret-token", "raw webhook payload", "X-Hub-Signature", "repository.future_secret_action", "fix <b>now</b>"} {
+		if strings.Contains(body, unwanted) {
+			t.Fatalf("activity leaked or rendered unsafe value %q", unwanted)
+		}
+	}
+}
+
+func TestPrimaryNavigationAndDashboardLinkToActivity(t *testing.T) {
+	server := NewServer(Config{AppName: "Thawguard"})
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusOK || !strings.Contains(body, `<a class="tg-nav-item" href="/activity"`) || !strings.Contains(body, `<a class="tg-btn tg-btn-secondary tg-btn-sm" href="/activity">View All</a>`) {
+		t.Fatalf("expected primary navigation and dashboard preview to link to activity, status=%d body=%q", recorder.Code, body)
+	}
+	for _, unwanted := range []string{`href="/webhooks"><svg class="tg-icon"><use href="#tg-i-audit"></use></svg>Audit Log`, `class="tg-nav-item" href="/publications"`} {
+		if strings.Contains(body, unwanted) {
+			t.Fatalf("expected diagnostics to stay out of primary navigation, found %q", unwanted)
+		}
+	}
+}
+
+func TestActivityPageRequiresAuditStoreAndHandlesEmptyAndFailureStates(t *testing.T) {
+	server := NewServer(Config{AppName: "Thawguard"})
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/activity", nil))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected missing audit store to return 503, got %d", recorder.Code)
+	}
+
+	server = NewServer(Config{AppName: "Thawguard", AuditStore: &fakeAuditStore{}})
+	recorder = httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/activity", nil))
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "No activity yet") {
+		t.Fatalf("expected clear empty state, status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+
+	server = NewServer(Config{AppName: "Thawguard", AuditStore: &fakeAuditStore{err: errors.New("database failed with secret-token")}})
+	recorder = httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/activity", nil))
+	if recorder.Code != http.StatusInternalServerError || strings.Contains(recorder.Body.String(), "secret-token") {
+		t.Fatalf("expected generic activity failure, status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestActivityPageAllowsViewer(t *testing.T) {
+	ctx := context.Background()
+	database := newWebTestDB(t, ctx)
+	authService := auth.NewService(database)
+	mustSetupWebAdmin(t, ctx, authService)
+	if _, err := authService.CreateUser(ctx, auth.CreateUserParams{Email: "viewer@example.test", DisplayName: "Viewer", Password: "correct horse battery staple", Roles: []auth.Role{auth.RoleViewer}}); err != nil {
+		t.Fatal(err)
+	}
+	viewerSession, err := authService.Login(ctx, auth.LoginParams{Email: "viewer@example.test", Password: "correct horse battery staple"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(Config{AppName: "Thawguard", AuthService: authService, AuditStore: &fakeAuditStore{}})
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/activity", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: viewerSession.ID})
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "Activity") {
+		t.Fatalf("expected viewer activity access, status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -3109,12 +3197,13 @@ func (s *fakeStatusPublicationStore) ListRecentAttempts(ctx context.Context, lim
 }
 
 type fakeAuditStore struct {
-	events               []audit.Event
-	err                  error
-	requestedSubjectType string
+	events         []audit.Event
+	err            error
+	requestedLimit int
 }
 
 func (s *fakeAuditStore) List(ctx context.Context, limit int) ([]audit.Event, error) {
+	s.requestedLimit = limit
 	if s.err != nil {
 		return nil, s.err
 	}
@@ -3122,23 +3211,6 @@ func (s *fakeAuditStore) List(ctx context.Context, limit int) ([]audit.Event, er
 		return s.events[:limit], nil
 	}
 	return s.events, nil
-}
-
-func (s *fakeAuditStore) ListBySubjectType(ctx context.Context, subjectType string, limit int) ([]audit.Event, error) {
-	if s.err != nil {
-		return nil, s.err
-	}
-	s.requestedSubjectType = subjectType
-	filtered := make([]audit.Event, 0, len(s.events))
-	for _, event := range s.events {
-		if event.SubjectType == subjectType {
-			filtered = append(filtered, event)
-		}
-	}
-	if limit > 0 && len(filtered) > limit {
-		return filtered[:limit], nil
-	}
-	return filtered, nil
 }
 
 type fakeFreezeStore struct {

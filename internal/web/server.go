@@ -120,7 +120,6 @@ type ScheduledFreezeStore interface {
 
 type AuditStore interface {
 	List(ctx context.Context, limit int) ([]audit.Event, error)
-	ListBySubjectType(ctx context.Context, subjectType string, limit int) ([]audit.Event, error)
 }
 
 type StatusDecisionStore interface {
@@ -238,18 +237,6 @@ type scheduledFreezePageState struct {
 	EditPlannedEndsAt string
 }
 
-type freezeAuditView struct {
-	Action       string
-	SubjectID    string
-	RepositoryID string
-	Repository   domain.Repository
-	Branch       string
-	Status       string
-	Reason       string
-	Actor        string
-	CreatedAt    string
-}
-
 type statusResultView struct {
 	Result     statusresult.Result
 	Repository domain.Repository
@@ -281,15 +268,14 @@ type webhookDeliveryView struct {
 	VerificationStateClass string
 }
 
-type systemAuditEventView struct {
-	Event      audit.Event
-	Repository domain.Repository
-	CreatedAt  string
-	Label      string
-	Summary    string
-	Detail     string
-	Actor      string
-	StateClass string
+type activityEventView struct {
+	CreatedAt    string
+	Actor        string
+	ActionLabel  string
+	Target       string
+	Outcome      string
+	OutcomeClass string
+	Detail       string
 }
 
 type currentUserView struct {
@@ -341,8 +327,6 @@ type auditLogControls struct {
 
 type auditLogView struct {
 	Deliveries              []webhookDeliveryView
-	SystemEvents            []systemAuditEventView
-	StatusAttempts          []statusPublicationAttemptView
 	Filters                 auditLogFilterView
 	RepositoryFilterOptions []auditLogOption
 	EventFilterOptions      []auditLogOption
@@ -433,6 +417,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /scheduled-freezes/cancel", s.handleCancelScheduledFreeze)
 	s.mux.HandleFunc("GET /decisions", s.handleDecisions)
 	s.mux.HandleFunc("POST /decisions", s.handleCreateDecision)
+	s.mux.HandleFunc("GET /activity", s.handleActivity)
 	s.mux.HandleFunc("GET /publications", s.handlePublications)
 	s.mux.HandleFunc("GET /webhooks", s.handleWebhooks)
 	s.mux.HandleFunc("POST /webhooks/forgejo", s.handleForgejoWebhook)
@@ -766,6 +751,23 @@ func (s *Server) handlePublications(w http.ResponseWriter, r *http.Request) {
 	s.renderPublications(w, s.statusPublicationViews(repositories, publications), statusPublicationAttemptViews(repositories, attempts), session)
 }
 
+func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.AuditStore == nil {
+		http.Error(w, "audit store is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	session, ok := s.requireView(w, r)
+	if !ok {
+		return
+	}
+	events, repositories, users, err := s.activityPageData(r.Context())
+	if err != nil {
+		internalServerError(w)
+		return
+	}
+	s.renderActivity(w, activityEventViews(repositories, users, events), session)
+}
+
 func (s *Server) handleWebhooks(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.WebhookDeliveryStore == nil {
 		http.Error(w, "webhook delivery store is not configured", http.StatusServiceUnavailable)
@@ -776,12 +778,12 @@ func (s *Server) handleWebhooks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	controls := parseAuditLogControls(r)
-	repositories, deliveries, events, attempts, err := s.webhookDeliveryPageData(r.Context())
+	repositories, deliveries, err := s.webhookDeliveryPageData(r.Context())
 	if err != nil {
 		internalServerError(w)
 		return
 	}
-	s.renderWebhookDeliveries(w, auditLogViewData(controls, repositories, deliveries, events, attempts), session)
+	s.renderWebhookDeliveries(w, auditLogViewData(controls, repositories, deliveries), session)
 }
 
 func (s *Server) handleForgejoWebhook(w http.ResponseWriter, r *http.Request) {
@@ -1237,12 +1239,12 @@ func (s *Server) handleFreezes(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	repositories, freezes, auditEvents, branchOptions, err := s.freezePageData(r.Context())
+	repositories, freezes, branchOptions, err := s.freezePageData(r.Context())
 	if err != nil {
 		internalServerError(w)
 		return
 	}
-	s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), auditEvents, branchOptions, "", session)
+	s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), branchOptions, "", session)
 }
 
 func (s *Server) handleCreateFreeze(w http.ResponseWriter, r *http.Request) {
@@ -1264,14 +1266,14 @@ func (s *Server) handleCreateFreeze(w http.ResponseWriter, r *http.Request) {
 			internalServerError(w)
 			return
 		}
-		repositories, freezes, auditEvents, branchOptions, dataErr := s.freezePageData(r.Context())
+		repositories, freezes, branchOptions, dataErr := s.freezePageData(r.Context())
 		if dataErr != nil {
 			internalServerError(w)
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
-		s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), auditEvents, branchOptions, err.Error(), session)
+		s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), branchOptions, err.Error(), session)
 		return
 	}
 	http.Redirect(w, r, "/freezes", http.StatusSeeOther)
@@ -1304,14 +1306,14 @@ func (s *Server) handleCloseFreeze(w http.ResponseWriter, r *http.Request, close
 			internalServerError(w)
 			return
 		}
-		repositories, freezes, auditEvents, branchOptions, dataErr := s.freezePageData(r.Context())
+		repositories, freezes, branchOptions, dataErr := s.freezePageData(r.Context())
 		if dataErr != nil {
 			internalServerError(w)
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
-		s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), auditEvents, branchOptions, err.Error(), session)
+		s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), branchOptions, err.Error(), session)
 		return
 	}
 	http.Redirect(w, r, "/freezes", http.StatusSeeOther)
@@ -2017,31 +2019,35 @@ func (s *Server) webhookDeliveries(ctx context.Context) ([]webhook.Delivery, err
 	return s.cfg.WebhookDeliveryStore.ListRecent(ctx, maxAuditLogLimit)
 }
 
-func (s *Server) systemAuditEvents(ctx context.Context) ([]audit.Event, error) {
-	if s.cfg.AuditStore == nil {
-		return nil, nil
+func (s *Server) activityPageData(ctx context.Context) ([]audit.Event, []domain.Repository, []auth.User, error) {
+	events, err := s.cfg.AuditStore.List(ctx, 100)
+	if err != nil {
+		return nil, nil, nil, err
 	}
-	return s.cfg.AuditStore.List(ctx, 25)
-}
-
-func (s *Server) webhookDeliveryPageData(ctx context.Context) ([]domain.Repository, []webhook.Delivery, []audit.Event, []statuspublication.Attempt, error) {
 	repositories, err := s.repositories(ctx)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, err
+	}
+	var users []auth.User
+	if s.cfg.AuthService != nil {
+		users, err = s.cfg.AuthService.ListUsers(ctx)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	return events, repositories, users, nil
+}
+
+func (s *Server) webhookDeliveryPageData(ctx context.Context) ([]domain.Repository, []webhook.Delivery, error) {
+	repositories, err := s.repositories(ctx)
+	if err != nil {
+		return nil, nil, err
 	}
 	deliveries, err := s.webhookDeliveries(ctx)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, err
 	}
-	events, err := s.systemAuditEvents(ctx)
-	if err != nil {
-		return nil, nil, nil, nil, err
-	}
-	attempts, err := s.statusPublicationAttempts(ctx)
-	if err != nil {
-		return nil, nil, nil, nil, err
-	}
-	return repositories, deliveries, events, attempts, nil
+	return repositories, deliveries, nil
 }
 
 func parseAuditLogControls(r *http.Request) auditLogControls {
@@ -2073,7 +2079,7 @@ func parseAuditLogControls(r *http.Request) auditLogControls {
 	return controls
 }
 
-func auditLogViewData(controls auditLogControls, repositories []domain.Repository, deliveries []webhook.Delivery, events []audit.Event, attempts []statuspublication.Attempt) auditLogView {
+func auditLogViewData(controls auditLogControls, repositories []domain.Repository, deliveries []webhook.Delivery) auditLogView {
 	filtered := filterAuditLogDeliveries(deliveries, controls)
 	sortAuditLogDeliveries(filtered, controls)
 	limited := filtered
@@ -2100,8 +2106,6 @@ func auditLogViewData(controls auditLogControls, repositories []domain.Repositor
 	}
 	return auditLogView{
 		Deliveries:              webhookDeliveryViews(repositories, limited),
-		SystemEvents:            systemAuditEventViews(repositories, events),
-		StatusAttempts:          statusPublicationAttemptViews(repositories, attempts),
 		Filters:                 filterView,
 		RepositoryFilterOptions: auditLogRepositoryOptions(repositories, controls.RepositoryID),
 		EventFilterOptions:      auditLogEventOptions(deliveries, controls.Event),
@@ -2383,279 +2387,337 @@ func webhookDeliveryViews(repositories []domain.Repository, deliveries []webhook
 	return views
 }
 
-func systemAuditEventViews(repositories []domain.Repository, events []audit.Event) []systemAuditEventView {
+type activityDetails map[string]json.RawMessage
+
+type activityActionDefinition struct {
+	Label        string
+	Outcome      string
+	OutcomeClass string
+}
+
+var activityActionDefinitions = map[string]activityActionDefinition{
+	audit.ActionRepositoryCreated:                  {Label: "Repository added", Outcome: "Added", OutcomeClass: "ok"},
+	audit.ActionRepositoryWebhookSecretConfigured:  {Label: "Webhook secret configuration", Outcome: "Configured", OutcomeClass: "ok"},
+	audit.ActionRepositoryStatusTokenConfigured:    {Label: "Status token configuration", Outcome: "Configured", OutcomeClass: "ok"},
+	audit.ActionRepositoryOpenPullRequestsSynced:   {Label: "Open pull request sync", Outcome: "Succeeded", OutcomeClass: "ok"},
+	audit.ActionRepositoryBranchAdded:              {Label: "Managed branch addition", Outcome: "Added", OutcomeClass: "ok"},
+	audit.ActionRepositoryBranchRemoved:            {Label: "Managed branch removal", Outcome: "Removed", OutcomeClass: "warning"},
+	audit.ActionRepositorySetupCheckRun:            {Label: "Readiness check", Outcome: "Checked", OutcomeClass: "ok"},
+	audit.ActionRepositorySetupDriftDetected:       {Label: "Setup drift", Outcome: "Detected", OutcomeClass: "warning"},
+	audit.ActionRepositoryStatusPostVerified:       {Label: "Status-post verification", Outcome: "Succeeded", OutcomeClass: "ok"},
+	audit.ActionRepositoryStatusPostVerifyFailed:   {Label: "Status-post verification", Outcome: "Failed", OutcomeClass: "failed"},
+	audit.ActionRepositoryEnforcementActivated:     {Label: "Enforcement activation", Outcome: "Succeeded", OutcomeClass: "ok"},
+	audit.ActionRepositoryEnforcementActivateFail:  {Label: "Enforcement activation", Outcome: "Failed", OutcomeClass: "failed"},
+	audit.ActionRepositoryEnforcementReconciled:    {Label: "Enforcement reconciliation", Outcome: "Succeeded", OutcomeClass: "ok"},
+	audit.ActionRepositoryEnforcementReconcileFail: {Label: "Enforcement reconciliation", Outcome: "Failed", OutcomeClass: "failed"},
+	audit.ActionRepositoryEnforcementRecovered:     {Label: "Enforcement recovery", Outcome: "Succeeded", OutcomeClass: "ok"},
+	audit.ActionRepositoryEnforcementRecoverFail:   {Label: "Enforcement recovery", Outcome: "Failed", OutcomeClass: "failed"},
+	audit.ActionRepositoryRuntimeConvergenceFail:   {Label: "Runtime convergence", Outcome: "Failed", OutcomeClass: "failed"},
+	audit.ActionBranchFreezeCreated:                {Label: "Branch freeze", Outcome: "Frozen", OutcomeClass: "frozen"},
+	audit.ActionBranchFreezeEnded:                  {Label: "Branch freeze", Outcome: "Lifted", OutcomeClass: "ok"},
+	audit.ActionBranchFreezeCancelled:              {Label: "Branch freeze", Outcome: "Cancelled", OutcomeClass: "warning"},
+	audit.ActionBranchFreezePlannedUnfreeze:        {Label: "Planned unfreeze", Outcome: "Lifted", OutcomeClass: "ok"},
+	audit.ActionFreezeScheduleCreated:              {Label: "Freeze schedule", Outcome: "Scheduled", OutcomeClass: "pending"},
+	audit.ActionFreezeScheduleUpdated:              {Label: "Freeze schedule", Outcome: "Changed", OutcomeClass: "frozen"},
+	audit.ActionFreezeScheduleCancelled:            {Label: "Freeze schedule", Outcome: "Cancelled", OutcomeClass: "warning"},
+	audit.ActionFreezeScheduleActivated:            {Label: "Scheduled freeze", Outcome: "Started", OutcomeClass: "frozen"},
+	audit.ActionFreezeScheduleStartedNow:           {Label: "Scheduled freeze Start Now", Outcome: "Started", OutcomeClass: "frozen"},
+	audit.ActionFreezeSchedulePlannedUnfreeze:      {Label: "Scheduled planned unfreeze", Outcome: "Completed", OutcomeClass: "ok"},
+	audit.ActionThawExceptionApproved:              {Label: "Single-PR thaw", Outcome: "Approved", OutcomeClass: "ok"},
+	audit.ActionThawExceptionSharedHeadApproved:    {Label: "Shared-head thaw", Outcome: "Approved", OutcomeClass: "ok"},
+	audit.ActionUserRolesUpdated:                   {Label: "User roles", Outcome: "Changed", OutcomeClass: "frozen"},
+	audit.ActionUserDisabled:                       {Label: "User access", Outcome: "Disabled", OutcomeClass: "warning"},
+	audit.ActionUserEnabled:                        {Label: "User access", Outcome: "Enabled", OutcomeClass: "ok"},
+	audit.ActionUserPasswordChanged:                {Label: "User password", Outcome: "Changed", OutcomeClass: "ok"},
+	audit.ActionUserPasswordReset:                  {Label: "User password", Outcome: "Reset", OutcomeClass: "warning"},
+}
+
+func activityEventViews(repositories []domain.Repository, users []auth.User, events []audit.Event) []activityEventView {
+	usersByID := make(map[int64]auth.User, len(users))
+	for _, user := range users {
+		usersByID[user.ID] = user
+	}
 	repositoriesByID := repositoriesByID(repositories)
-	views := make([]systemAuditEventView, 0, len(events))
+	views := make([]activityEventView, 0, len(events))
 	for _, event := range events {
-		view, ok := systemAuditEventViewForEvent(repositoriesByID, event)
-		if ok {
-			views = append(views, view)
-		}
+		views = append(views, activityEventViewForEvent(repositoriesByID, usersByID, event))
 	}
 	return views
 }
 
-func systemAuditEventViewForEvent(repositoriesByID map[int64]domain.Repository, event audit.Event) (systemAuditEventView, bool) {
-	details := map[string]string{}
-	if strings.TrimSpace(event.DetailsJSON) != "" {
-		if err := json.Unmarshal([]byte(event.DetailsJSON), &details); err != nil {
-			details = map[string]string{}
-		}
+func activityEventViewForEvent(repositories map[int64]domain.Repository, users map[int64]auth.User, event audit.Event) activityEventView {
+	details, detailsOK := parseActivityDetails(event.DetailsJSON)
+	definition, actionOK := activityActionDefinitions[event.Action]
+	if !detailsOK || !actionOK {
+		return fallbackActivityEventView(users, event, details, detailsOK)
 	}
-	view := systemAuditEventView{
-		Event:      event,
-		CreatedAt:  event.CreatedAt.UTC().Format("2006-01-02 15:04 UTC"),
-		Actor:      actorLabelForEvent(event, details["actor_kind"], details["actor_role"]),
-		StateClass: "info",
+
+	view := activityEventView{
+		CreatedAt:    activityCreatedAt(event.CreatedAt),
+		Actor:        activityActor(users, event, details),
+		ActionLabel:  definition.Label,
+		Outcome:      definition.Outcome,
+		OutcomeClass: definition.OutcomeClass,
 	}
-	if repositoryID, ok := auditDetailInt64(details, "repository_id"); ok {
-		view.Repository = repositoriesByID[repositoryID]
-	}
-	if view.Actor == "unknown" {
-		view.Actor = "system"
-	}
+
 	switch event.Action {
 	case audit.ActionRepositoryCreated:
-		view.Label = "Repository added"
-		view.Summary = auditRepositoryLabel(view.Repository, details)
-		view.Detail = "Default branch " + auditDetailOrDash(details, "default_branch")
-		view.StateClass = "ok"
+		view.Target = activityRepositoryTarget(repositories, event, details, "")
+		view.Detail = "Default branch " + activityTextOrUnavailable(details, "default_branch", 255) + "."
 	case audit.ActionRepositoryWebhookSecretConfigured:
-		view.Label = "Webhook secret configured"
-		view.Summary = auditRepositoryLabel(view.Repository, details)
-		view.Detail = auditRotationDetail(details, "webhook_secret_was_configured")
-		view.StateClass = "ok"
+		view.Target = activityRepositoryTarget(repositories, event, details, "")
+		view.Detail = activityCredentialDetail(details, "webhook_secret_was_configured", "Webhook secret")
 	case audit.ActionRepositoryStatusTokenConfigured:
-		view.Label = "Status token configured"
-		view.Summary = auditRepositoryLabel(view.Repository, details)
-		view.Detail = auditRotationDetail(details, "status_token_was_configured")
-		view.StateClass = "ok"
+		view.Target = activityRepositoryTarget(repositories, event, details, "")
+		view.Detail = activityCredentialDetail(details, "status_token_was_configured", "Status token")
 	case audit.ActionRepositoryOpenPullRequestsSynced:
-		view.Label = "Open PRs synced"
-		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "target_branch")
-		view.Detail = auditDetailOrDash(details, "open_count") + " open from forge, " + auditDetailOrDash(details, "closed_absent_count") + " cached closed"
-		view.StateClass = "ok"
+		view.Target = activityRepositoryTarget(repositories, event, details, "target_branch")
+		view.Detail = activityCountOrUnknown(details, "open_count") + " open PRs synchronized; " + activityCountOrUnknown(details, "closed_absent_count") + " cached PRs marked closed."
+	case audit.ActionRepositoryBranchAdded:
+		view.Target = activityRepositoryTarget(repositories, event, details, "branch")
+		view.Detail = "Exact managed branch added."
+	case audit.ActionRepositoryBranchRemoved:
+		view.Target = activityRepositoryTarget(repositories, event, details, "branch")
+		view.Detail = "Exact managed branch removed."
+	case audit.ActionRepositorySetupCheckRun:
+		view.Target = activityRepositoryTarget(repositories, event, details, "")
+		view.Detail = activitySetupCheckDetail(details)
+	case audit.ActionRepositorySetupDriftDetected:
+		view.Target = activityRepositoryTarget(repositories, event, details, "")
+		view.Detail = activityCountOrUnknown(details, "drifted_branches") + " managed branches reported setup drift."
 	case audit.ActionRepositoryStatusPostVerified:
-		view.Label = "Status posting verified"
-		view.Summary = auditRepositoryLabel(view.Repository, details)
-		view.Detail = "Controlled " + domain.SetupStatusContext + " post on " + auditDetailOrDash(details, "default_branch") + " head " + auditDetailOrDash(details, "head_sha")
-		view.StateClass = "ok"
+		view.Target = activityRepositoryTarget(repositories, event, details, "default_branch")
+		view.Detail = "Controlled " + domain.SetupStatusContext + " post verified at head " + activityHeadOrUnavailable(details, "head_sha") + "."
 	case audit.ActionRepositoryStatusPostVerifyFailed:
-		view.Label = "Status-post verification failed"
-		view.Summary = auditRepositoryLabel(view.Repository, details)
-		view.Detail = auditDetailOrDash(details, "reason") + " — state " + auditDetailOrDash(details, "enforcement_state")
-		view.StateClass = "failed"
-	case audit.ActionRepositoryEnforcementActivated:
-		view.Label = "Enforcement activated"
-		view.Summary = auditRepositoryLabel(view.Repository, details)
-		view.Detail = auditDetailOrDash(details, "open_pull_request_count") + " open PRs, " + auditDetailOrDash(details, "statuses_posted") + " statuses posted"
-		view.StateClass = "ok"
-	case audit.ActionRepositoryEnforcementActivateFail:
-		view.Label = "Enforcement activation failed"
-		view.Summary = auditRepositoryLabel(view.Repository, details)
-		view.Detail = auditDetailOrDash(details, "reason") + " — state " + auditDetailOrDash(details, "enforcement_state")
-		view.StateClass = "failed"
-	case audit.ActionRepositoryEnforcementReconciled:
-		view.Label = "Enforcement reconciled"
-		view.Summary = auditRepositoryLabel(view.Repository, details)
-		view.Detail = auditDetailOrDash(details, "open_pull_request_count") + " open PRs, " + auditDetailOrDash(details, "statuses_posted") + " statuses posted"
-		view.StateClass = "ok"
-	case audit.ActionRepositoryEnforcementReconcileFail:
-		view.Label = "Enforcement reconciliation failed"
-		view.Summary = auditRepositoryLabel(view.Repository, details)
-		view.Detail = auditDetailOrDash(details, "reason") + " — state " + auditDetailOrDash(details, "enforcement_state")
-		view.StateClass = "failed"
-	case audit.ActionRepositoryEnforcementRecovered:
-		view.Label = "Enforcement recovered"
-		view.Summary = auditRepositoryLabel(view.Repository, details)
-		view.Detail = auditDetailOrDash(details, "open_pull_request_count") + " open PRs, " + auditDetailOrDash(details, "statuses_posted") + " statuses posted"
-		view.StateClass = "ok"
-	case audit.ActionRepositoryEnforcementRecoverFail:
-		view.Label = "Enforcement recovery failed"
-		view.Summary = auditRepositoryLabel(view.Repository, details)
-		view.Detail = auditDetailOrDash(details, "reason") + " — state " + auditDetailOrDash(details, "enforcement_state")
-		view.StateClass = "failed"
+		view.Target = activityRepositoryTarget(repositories, event, details, "default_branch")
+		view.Detail = activityFailureDetail(details)
+	case audit.ActionRepositoryEnforcementActivated, audit.ActionRepositoryEnforcementReconciled, audit.ActionRepositoryEnforcementRecovered:
+		view.Target = activityRepositoryTarget(repositories, event, details, "")
+		view.Detail = activityEnforcementSuccessDetail(details)
+	case audit.ActionRepositoryEnforcementActivateFail, audit.ActionRepositoryEnforcementReconcileFail, audit.ActionRepositoryEnforcementRecoverFail:
+		view.Target = activityRepositoryTarget(repositories, event, details, "")
+		view.Detail = activityFailureDetail(details)
 	case audit.ActionRepositoryRuntimeConvergenceFail:
-		view.Label = "Runtime convergence failed"
-		view.Summary = auditRepositoryLabel(view.Repository, details)
-		view.Detail = auditDetailOrDash(details, "reason") + " — automatic recovery pending"
-		view.StateClass = "failed"
-	case audit.ActionBranchFreezeCreated:
-		view.Label = "Freeze created"
-		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "branch")
-		view.Detail = auditDetailOrDash(details, "reason")
-		view.StateClass = "failed"
-	case audit.ActionBranchFreezeEnded:
-		view.Label = "Freeze lifted"
-		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "branch")
-		view.Detail = auditDetailOrDash(details, "reason")
-		view.StateClass = "ok"
-	case audit.ActionBranchFreezeCancelled:
-		view.Label = "Freeze cancelled"
-		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "branch")
-		view.Detail = auditDetailOrDash(details, "reason")
-		view.StateClass = "warning"
-	case audit.ActionBranchFreezePlannedUnfreeze:
-		view.Label = "Planned unfreeze executed"
-		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "branch")
-		view.Detail = "Planned end " + auditDetailOrDash(details, "planned_ends_at") + " — " + auditDetailOrDash(details, "reason")
-		view.StateClass = "ok"
+		view.Target = activityRepositoryTarget(repositories, event, details, "")
+		view.Detail = activityFailureDetail(details) + " Automatic recovery remains pending."
+	case audit.ActionBranchFreezeCreated, audit.ActionBranchFreezeEnded, audit.ActionBranchFreezeCancelled:
+		view.Target = activityRepositoryTarget(repositories, event, details, "branch")
+		view.Detail = "Reason: " + activityTextOrUnavailable(details, "reason", scheduledFreezeReasonMaxLength) + "."
+	case audit.ActionBranchFreezePlannedUnfreeze, audit.ActionFreezeSchedulePlannedUnfreeze:
+		view.Target = activityRepositoryTarget(repositories, event, details, "branch")
+		view.Detail = "Planned unfreeze " + activityTimeOrUnavailable(details, "planned_ends_at", false) + ". Reason: " + activityTextOrUnavailable(details, "reason", scheduledFreezeReasonMaxLength) + "."
 	case audit.ActionFreezeScheduleCreated:
-		view.Label = "Freeze scheduled"
-		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "branch")
-		view.Detail = "Starts " + auditDetailOrDash(details, "starts_at") + ", planned end " + auditDetailOrDash(details, "planned_ends_at") + " — " + auditDetailOrDash(details, "reason")
-		view.StateClass = "pending"
+		view.Target = activityRepositoryTarget(repositories, event, details, "branch")
+		view.Detail = "Starts " + activityTimeOrUnavailable(details, "starts_at", false) + "; planned unfreeze " + activityTimeOrUnavailable(details, "planned_ends_at", true) + ". Reason: " + activityTextOrUnavailable(details, "reason", scheduledFreezeReasonMaxLength) + "."
 	case audit.ActionFreezeScheduleUpdated:
-		view.Label = "Freeze schedule updated"
-		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "branch")
-		reasonBefore, reasonBeforeOK := auditTextDetail(details, "reason_before", scheduledFreezeReasonMaxLength)
-		reasonAfter, reasonAfterOK := auditTextDetail(details, "reason_after", scheduledFreezeReasonMaxLength)
-		startsBefore, startsBeforeOK := auditTimeDetail(details, "starts_at_before", false)
-		startsAfter, startsAfterOK := auditTimeDetail(details, "starts_at_after", false)
-		plannedBefore, plannedBeforeOK := auditTimeDetail(details, "planned_ends_at_before", true)
-		plannedAfter, plannedAfterOK := auditTimeDetail(details, "planned_ends_at_after", true)
-		if !reasonBeforeOK || !reasonAfterOK || !startsBeforeOK || !startsAfterOK || !plannedBeforeOK || !plannedAfterOK {
-			view.Detail = "Schedule update details unavailable"
-			view.StateClass = "warning"
-			break
-		}
-		view.Detail = "Reason " + reasonBefore + " → " + reasonAfter + "; starts " + startsBefore + " → " + startsAfter + "; planned unfreeze " + plannedBefore + " → " + plannedAfter
-		view.StateClass = "info"
+		view.Target = activityRepositoryTarget(repositories, event, details, "branch")
+		view.Detail = activityScheduleUpdateDetail(details)
 	case audit.ActionFreezeScheduleCancelled:
-		view.Label = "Schedule cancelled"
-		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "branch")
-		view.Detail = auditDetailOrDash(details, "reason")
-		view.StateClass = "warning"
-	case audit.ActionFreezeScheduleActivated:
-		view.Label = "Scheduled freeze activated"
-		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "branch")
-		view.Detail = "Started " + auditDetailOrDash(details, "starts_at") + " — " + auditDetailOrDash(details, "reason")
-		view.StateClass = "failed"
-	case audit.ActionFreezeScheduleStartedNow:
-		view.Label = "Scheduled freeze started now"
-		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "branch")
-		reason, reasonOK := auditTextDetail(details, "reason", scheduledFreezeReasonMaxLength)
-		startsAt, startsAtOK := auditTimeDetail(details, "starts_at", false)
-		plannedEndsAt, plannedEndsAtOK := auditTimeDetail(details, "planned_ends_at", true)
-		if !reasonOK || !startsAtOK || !plannedEndsAtOK {
-			view.Detail = "Start Now details unavailable"
-			view.StateClass = "warning"
-			break
-		}
-		view.Detail = "Started " + startsAt + "; planned unfreeze " + plannedEndsAt + " — " + reason
-		view.StateClass = "failed"
-	case audit.ActionFreezeSchedulePlannedUnfreeze:
-		view.Label = "Planned unfreeze executed"
-		view.Summary = auditRepositoryLabel(view.Repository, details) + " → " + auditDetailOrDash(details, "branch")
-		view.Detail = "Planned end " + auditDetailOrDash(details, "planned_ends_at") + " — " + auditDetailOrDash(details, "reason")
-		view.StateClass = "ok"
+		view.Target = activityRepositoryTarget(repositories, event, details, "branch")
+		view.Detail = "Reason: " + activityTextOrUnavailable(details, "reason", scheduledFreezeReasonMaxLength) + "."
+	case audit.ActionFreezeScheduleActivated, audit.ActionFreezeScheduleStartedNow:
+		view.Target = activityRepositoryTarget(repositories, event, details, "branch")
+		view.Detail = "Started " + activityTimeOrUnavailable(details, "starts_at", false) + "; planned unfreeze " + activityTimeOrUnavailable(details, "planned_ends_at", true) + ". Reason: " + activityTextOrUnavailable(details, "reason", scheduledFreezeReasonMaxLength) + "."
 	case audit.ActionThawExceptionApproved:
-		view.Label = "Thaw approved"
-		view.Summary = auditRepositoryLabel(view.Repository, details) + " PR #" + auditDetailOrDash(details, "pull_request_index")
-		view.Detail = "Head " + auditDetailOrDash(details, "head_sha") + " on " + auditDetailOrDash(details, "target_branch") + " — " + auditDetailOrDash(details, "reason")
-		view.StateClass = "ok"
+		view.Target = activityPullRequestTarget(repositories, event, details)
+		view.Detail = "Branch " + activityTextOrUnavailable(details, "target_branch", 255) + "; head " + activityHeadOrUnavailable(details, "head_sha") + ". Reason: " + activityTextOrUnavailable(details, "reason", 500) + "."
 	case audit.ActionThawExceptionSharedHeadApproved:
-		created, createdCount, createdOK := auditPullRequestIndexList(details, "created_pull_request_indexes")
-		alreadyCovered, alreadyCoveredCount, alreadyCoveredOK := auditPullRequestIndexList(details, "already_covered_pull_request_indexes")
-		declaredCreatedCount, declaredCreatedOK := auditNonnegativeInt(details, "created_pull_request_count")
-		declaredCoveredCount, declaredCoveredOK := auditNonnegativeInt(details, "already_covered_pull_request_count")
-		headSHA, headOK := auditHeadSHA(details, "head_sha")
-		reason, reasonOK := auditTextDetail(details, "reason", 500)
-		repositoryLabel := auditSharedHeadRepositoryLabel(view.Repository, details)
-		if !createdOK || !alreadyCoveredOK || !declaredCreatedOK || !declaredCoveredOK || !headOK || !reasonOK || declaredCreatedCount != createdCount || declaredCoveredCount != alreadyCoveredCount || createdCount+alreadyCoveredCount == 0 {
-			view.Label = "Shared-head confirmation recorded"
-			view.Summary = repositoryLabel
-			view.Detail = "Approval details unavailable"
-			view.StateClass = "warning"
-			break
-		}
-		if createdCount == 0 {
-			view.Label = "Shared head already covered"
-			view.Summary = repositoryLabel + " · Active exceptions: " + alreadyCovered
-		} else {
-			view.Label = "Shared-head thaw approved"
-			view.Summary = repositoryLabel + " · New exceptions: " + created
-			if alreadyCoveredCount > 0 {
-				view.Summary += " · Already covered: " + alreadyCovered
+		view.Target = activitySharedHeadTarget(repositories, event, details)
+		view.Detail = activitySharedHeadDetail(details)
+	case audit.ActionUserRolesUpdated:
+		view.Target = activityUserTarget(users, event.SubjectID)
+		view.Detail = "Roles " + activityRolesOrUnavailable(details, "roles_before") + " → " + activityRolesOrUnavailable(details, "roles_after") + "."
+	case audit.ActionUserDisabled:
+		view.Target = activityUserTarget(users, event.SubjectID)
+		view.Detail = "Login blocked and all sessions revoked."
+	case audit.ActionUserEnabled:
+		view.Target = activityUserTarget(users, event.SubjectID)
+		view.Detail = "Login allowed again; previous sessions were not restored."
+	case audit.ActionUserPasswordChanged:
+		view.Target = activityUserTarget(users, event.SubjectID)
+		view.Detail = "Self-service password change; previous sessions revoked."
+	case audit.ActionUserPasswordReset:
+		view.Target = activityUserTarget(users, event.SubjectID)
+		view.Detail = "Temporary password set by an admin; all sessions revoked and a new password is required at next login."
+	default:
+		return fallbackActivityEventView(users, event, details, true)
+	}
+	return view
+}
+
+func fallbackActivityEventView(users map[int64]auth.User, event audit.Event, details activityDetails, detailsOK bool) activityEventView {
+	if !detailsOK {
+		details = activityDetails{}
+	}
+	return activityEventView{
+		CreatedAt:    activityCreatedAt(event.CreatedAt),
+		Actor:        activityActor(users, event, details),
+		ActionLabel:  "Unrecognized activity",
+		Target:       activityFallbackTarget(event),
+		Outcome:      "Unknown",
+		OutcomeClass: "warning",
+		Detail:       "Stored audit details could not be displayed safely.",
+	}
+}
+
+func parseActivityDetails(raw string) (activityDetails, bool) {
+	if strings.TrimSpace(raw) == "" {
+		return activityDetails{}, true
+	}
+	var details activityDetails
+	if err := json.Unmarshal([]byte(raw), &details); err != nil || details == nil {
+		return nil, false
+	}
+	return details, true
+}
+
+func activityCreatedAt(createdAt time.Time) string {
+	if createdAt.IsZero() {
+		return "Time unavailable"
+	}
+	return createdAt.UTC().Format("2006-01-02 15:04 UTC")
+}
+
+func activityActor(users map[int64]auth.User, event audit.Event, details activityDetails) string {
+	if event.ActorUserID != nil && *event.ActorUserID > 0 {
+		if user, ok := users[*event.ActorUserID]; ok {
+			if displayName, ok := safeActivityText(user.DisplayName, 120); ok {
+				return displayName
 			}
 		}
-		view.Detail = "Head " + headSHA + " — Confirmation reason: " + reason
-		view.StateClass = "ok"
-	case audit.ActionUserRolesUpdated:
-		view.Label = "User roles updated"
-		view.Summary = "User #" + event.SubjectID
-		view.Detail = "Roles " + auditDetailOrDash(details, "roles_before") + " → " + auditDetailOrDash(details, "roles_after")
-		view.StateClass = "info"
-	case audit.ActionUserDisabled:
-		view.Label = "User disabled"
-		view.Summary = "User #" + event.SubjectID
-		view.Detail = "Login blocked and all sessions revoked"
-		view.StateClass = "warning"
-	case audit.ActionUserEnabled:
-		view.Label = "User re-enabled"
-		view.Summary = "User #" + event.SubjectID
-		view.Detail = "Login allowed again; no sessions restored"
-		view.StateClass = "ok"
-	case audit.ActionUserPasswordChanged:
-		view.Label = "Password changed"
-		view.Summary = "User #" + event.SubjectID
-		view.Detail = "Self-service change; previous sessions revoked"
-		view.StateClass = "ok"
-	case audit.ActionUserPasswordReset:
-		view.Label = "Password reset"
-		view.Summary = "User #" + event.SubjectID
-		view.Detail = "Temporary password set by an admin; all sessions revoked and a new password is required at next login"
-		view.StateClass = "warning"
+		return "User #" + strconv.FormatInt(*event.ActorUserID, 10)
+	}
+	kind, _ := activityTextDetail(details, "actor_kind", 64)
+	role, _ := activityTextDetail(details, "actor_role", 64)
+	switch kind {
+	case domain.ActorKindBootstrapAdmin:
+		return "Bootstrap admin"
+	case domain.ActorKindSystem:
+		switch role {
+		case "scheduler":
+			return "Scheduler"
+		case "reconciliation_runner":
+			return "Reconciliation runner"
+		case "runtime":
+			return "Runtime process"
+		case "":
+			return "System process"
+		default:
+			return "Unknown system actor"
+		}
 	default:
-		return systemAuditEventView{}, false
+		return "Unknown system actor"
 	}
-	return view, true
 }
 
-func auditDetailInt64(details map[string]string, key string) (int64, bool) {
-	value, err := strconv.ParseInt(strings.TrimSpace(details[key]), 10, 64)
-	return value, err == nil && value > 0
-}
-
-func auditNonnegativeInt(details map[string]string, key string) (int, bool) {
-	raw, exists := details[key]
-	if !exists {
-		return 0, false
-	}
-	value, err := strconv.Atoi(strings.TrimSpace(raw))
-	return value, err == nil && value >= 0
-}
-
-func auditPullRequestIndexList(details map[string]string, key string) (string, int, bool) {
-	raw, exists := details[key]
-	if !exists {
-		return "", 0, false
-	}
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return "", 0, true
-	}
-	parts := strings.Split(raw, ",")
-	labels := make([]string, 0, len(parts))
-	seen := make(map[int]struct{}, len(parts))
-	for _, part := range parts {
-		index, err := strconv.Atoi(strings.TrimSpace(part))
-		if err != nil || index <= 0 || index > 1_000_000 {
-			return "", 0, false
+func activityRepositoryTarget(repositories map[int64]domain.Repository, event audit.Event, details activityDetails, branchKey string) string {
+	repositoryID, ok := activityRepositoryID(event, details)
+	label := "Repository unavailable"
+	if ok {
+		if repo, found := repositories[repositoryID]; found {
+			label = repo.FullName()
+		} else {
+			label = "Repository #" + strconv.FormatInt(repositoryID, 10)
 		}
-		if _, exists := seen[index]; exists {
-			return "", 0, false
-		}
-		seen[index] = struct{}{}
-		labels = append(labels, "#"+strconv.Itoa(index))
 	}
-	return strings.Join(labels, ", "), len(labels), true
+	if branchKey == "" {
+		return label
+	}
+	branch, branchOK := activityTextDetail(details, branchKey, 255)
+	if !branchOK {
+		return label + " → branch unavailable"
+	}
+	if branch == "all" {
+		return label + " → all managed branches"
+	}
+	return label + " → " + branch
 }
 
-func auditTextDetail(details map[string]string, key string, maxLength int) (string, bool) {
-	raw, exists := details[key]
-	value := strings.TrimSpace(raw)
-	if !exists || value == "" || len(value) > maxLength {
+func activityRepositoryID(event audit.Event, details activityDetails) (int64, bool) {
+	if repositoryID, ok := activityPositiveInt64Detail(details, "repository_id"); ok {
+		return repositoryID, true
+	}
+	if event.SubjectType == audit.SubjectTypeRepository {
+		repositoryID, err := strconv.ParseInt(strings.TrimSpace(event.SubjectID), 10, 64)
+		return repositoryID, err == nil && repositoryID > 0
+	}
+	return 0, false
+}
+
+func activityPullRequestTarget(repositories map[int64]domain.Repository, event audit.Event, details activityDetails) string {
+	target := activityRepositoryTarget(repositories, event, details, "")
+	if index, ok := activityPositiveInt64Detail(details, "pull_request_index"); ok && index <= 1_000_000 {
+		return target + " → PR #" + strconv.FormatInt(index, 10)
+	}
+	return target + " → PR unavailable"
+}
+
+func activitySharedHeadTarget(repositories map[int64]domain.Repository, event audit.Event, details activityDetails) string {
+	target := activityRepositoryTarget(repositories, event, details, "")
+	if head, ok := activityHeadDetail(details, "head_sha"); ok {
+		return target + " → shared head " + head
+	}
+	return target + " → shared head unavailable"
+}
+
+func activityUserTarget(users map[int64]auth.User, subjectID string) string {
+	userID, err := strconv.ParseInt(strings.TrimSpace(subjectID), 10, 64)
+	if err != nil || userID <= 0 {
+		return "User unavailable"
+	}
+	if user, ok := users[userID]; ok {
+		if displayName, ok := safeActivityText(user.DisplayName, 120); ok {
+			return displayName + " (User #" + strconv.FormatInt(userID, 10) + ")"
+		}
+	}
+	return "User #" + strconv.FormatInt(userID, 10)
+}
+
+func activityFallbackTarget(event audit.Event) string {
+	id, err := strconv.ParseInt(strings.TrimSpace(event.SubjectID), 10, 64)
+	if err != nil || id <= 0 {
+		switch event.SubjectType {
+		case audit.SubjectTypeRepository:
+			return "Repository unavailable"
+		case audit.SubjectTypeBranchFreeze:
+			return "Freeze unavailable"
+		case audit.SubjectTypeThawException:
+			return "Thaw exception unavailable"
+		case audit.SubjectTypeUser:
+			return "User unavailable"
+		default:
+			return "Other target"
+		}
+	}
+	switch event.SubjectType {
+	case audit.SubjectTypeRepository:
+		return "Repository #" + strconv.FormatInt(id, 10)
+	case audit.SubjectTypeBranchFreeze:
+		return "Freeze #" + strconv.FormatInt(id, 10)
+	case audit.SubjectTypeThawException:
+		return "Thaw exception #" + strconv.FormatInt(id, 10)
+	case audit.SubjectTypeUser:
+		return "User #" + strconv.FormatInt(id, 10)
+	default:
+		return "Other target"
+	}
+}
+
+func activityTextDetail(details activityDetails, key string, maxLength int) (string, bool) {
+	raw, ok := details[key]
+	if !ok {
+		return "", false
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", false
+	}
+	return safeActivityText(value, maxLength)
+}
+
+func safeActivityText(value string, maxLength int) (string, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > maxLength {
 		return "", false
 	}
 	for _, r := range value {
@@ -2666,24 +2728,123 @@ func auditTextDetail(details map[string]string, key string, maxLength int) (stri
 	return value, true
 }
 
-func auditTimeDetail(details map[string]string, key string, optional bool) (string, bool) {
-	raw, exists := details[key]
-	value := strings.TrimSpace(raw)
-	if !exists || value == "" {
-		if optional {
-			return "none", true
+func activityPositiveInt64Detail(details activityDetails, key string) (int64, bool) {
+	value, ok := activityInt64Detail(details, key)
+	return value, ok && value > 0
+}
+
+func activityNonnegativeInt64Detail(details activityDetails, key string) (int64, bool) {
+	value, ok := activityInt64Detail(details, key)
+	return value, ok && value >= 0 && value <= 1_000_000_000
+}
+
+func activityInt64Detail(details activityDetails, key string) (int64, bool) {
+	raw, ok := details[key]
+	if !ok {
+		return 0, false
+	}
+	var number int64
+	if err := json.Unmarshal(raw, &number); err == nil {
+		return number, true
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return 0, false
+	}
+	number, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	return number, err == nil
+}
+
+func activityBoolDetail(details activityDetails, key string) (bool, bool) {
+	raw, ok := details[key]
+	if !ok {
+		return false, false
+	}
+	var value bool
+	if err := json.Unmarshal(raw, &value); err == nil {
+		return value, true
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err != nil {
+		return false, false
+	}
+	value, err := strconv.ParseBool(strings.TrimSpace(text))
+	return value, err == nil
+}
+
+func activityTextOrUnavailable(details activityDetails, key string, maxLength int) string {
+	if value, ok := activityTextDetail(details, key, maxLength); ok {
+		return value
+	}
+	return "unavailable"
+}
+
+func activityCountOrUnknown(details activityDetails, key string) string {
+	if value, ok := activityNonnegativeInt64Detail(details, key); ok {
+		return strconv.FormatInt(value, 10)
+	}
+	return "unknown"
+}
+
+func activityCredentialDetail(details activityDetails, key, credential string) string {
+	if replaced, ok := activityBoolDetail(details, key); ok {
+		if replaced {
+			return credential + " rotated; the value remains hidden."
 		}
-		return "", false
+		return credential + " set; the value remains hidden."
+	}
+	return credential + " configuration recorded; the value remains hidden."
+}
+
+func activitySetupCheckDetail(details activityDetails) string {
+	webhook := "webhook evidence unavailable"
+	if fresh, ok := activityBoolDetail(details, "webhook_evidence_fresh"); ok {
+		if fresh {
+			webhook = "webhook evidence fresh"
+		} else {
+			webhook = "webhook evidence not fresh"
+		}
+	}
+	return activityCountOrUnknown(details, "ok_count") + " passed, " + activityCountOrUnknown(details, "warning_count") + " warnings, " + activityCountOrUnknown(details, "failed_count") + " failed across " + activityCountOrUnknown(details, "managed_branch_count") + " managed branches; " + webhook + "."
+}
+
+func activityFailureDetail(details activityDetails) string {
+	reason := "failure category unavailable"
+	if value, ok := activityTextDetail(details, "reason", 120); ok && domain.ValidEnforcementFailureReason(value) {
+		reason = value
+	}
+	state := "state unavailable"
+	if value, ok := activityTextDetail(details, "enforcement_state", 32); ok && domain.EnforcementState(value).Valid() {
+		state = "state " + strings.ReplaceAll(value, "_", " ")
+	}
+	return reason + "; " + state + "."
+}
+
+func activityEnforcementSuccessDetail(details activityDetails) string {
+	return activityCountOrUnknown(details, "open_pull_request_count") + " open PRs evaluated; " + activityCountOrUnknown(details, "statuses_posted") + " statuses posted and " + activityCountOrUnknown(details, "statuses_failed") + " failed."
+}
+
+func activityTimeOrUnavailable(details activityDetails, key string, optional bool) string {
+	value, ok := activityTextDetail(details, key, 64)
+	if !ok {
+		if optional {
+			return "none"
+		}
+		return "time unavailable"
 	}
 	parsed, err := time.Parse(time.RFC3339Nano, value)
 	if err != nil {
-		return "", false
+		return "time unavailable"
 	}
-	return parsed.UTC().Format("2006-01-02 15:04 UTC"), true
+	return parsed.UTC().Format("2006-01-02 15:04 UTC")
 }
 
-func auditHeadSHA(details map[string]string, key string) (string, bool) {
-	value, ok := auditTextDetail(details, key, 64)
+func activityScheduleUpdateDetail(details activityDetails) string {
+	return "Reason " + activityTextOrUnavailable(details, "reason_before", scheduledFreezeReasonMaxLength) + " → " + activityTextOrUnavailable(details, "reason_after", scheduledFreezeReasonMaxLength) + "; starts " + activityTimeOrUnavailable(details, "starts_at_before", false) + " → " + activityTimeOrUnavailable(details, "starts_at_after", false) + "; planned unfreeze " + activityTimeOrUnavailable(details, "planned_ends_at_before", true) + " → " + activityTimeOrUnavailable(details, "planned_ends_at_after", true) + "."
+}
+
+func activityHeadDetail(details activityDetails, key string) (string, bool) {
+	value, ok := activityTextDetail(details, key, 64)
 	if !ok || len(value) < 6 {
 		return "", false
 	}
@@ -2692,44 +2853,79 @@ func auditHeadSHA(details map[string]string, key string) (string, bool) {
 			return "", false
 		}
 	}
-	return value, true
+	if len(value) > 12 {
+		value = value[:12]
+	}
+	return strings.ToLower(value), true
 }
 
-func auditSharedHeadRepositoryLabel(repo domain.Repository, details map[string]string) string {
-	if repo.ID > 0 {
-		return repo.FullName()
-	}
-	if repositoryID, ok := auditDetailInt64(details, "repository_id"); ok {
-		return "Repository #" + strconv.FormatInt(repositoryID, 10)
-	}
-	return "Repository"
-}
-
-func auditRepositoryLabel(repo domain.Repository, details map[string]string) string {
-	if repo.ID > 0 {
-		return repo.FullName()
-	}
-	if fullName := strings.TrimSpace(details["full_name"]); fullName != "" {
-		return fullName
-	}
-	if repositoryID := strings.TrimSpace(details["repository_id"]); repositoryID != "" {
-		return "Repository #" + repositoryID
-	}
-	return "Repository"
-}
-
-func auditDetailOrDash(details map[string]string, key string) string {
-	if value := strings.TrimSpace(details[key]); value != "" {
+func activityHeadOrUnavailable(details activityDetails, key string) string {
+	if value, ok := activityHeadDetail(details, key); ok {
 		return value
 	}
-	return "—"
+	return "unavailable"
 }
 
-func auditRotationDetail(details map[string]string, key string) string {
-	if details[key] == "true" {
-		return "Existing credential was replaced"
+func activityPullRequestIndexList(details activityDetails, key string) (string, int, bool) {
+	encoded, exists := details[key]
+	if !exists {
+		return "", 0, false
 	}
-	return "Credential was set"
+	var raw string
+	if err := json.Unmarshal(encoded, &raw); err != nil {
+		return "", 0, false
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "none", 0, true
+	}
+	if _, ok := safeActivityText(raw, 512); !ok {
+		return "", 0, false
+	}
+	parts := strings.Split(raw, ",")
+	labels := make([]string, 0, len(parts))
+	seen := make(map[int]struct{}, len(parts))
+	for _, part := range parts {
+		index, err := strconv.Atoi(strings.TrimSpace(part))
+		if err != nil || index <= 0 || index > 1_000_000 {
+			return "", 0, false
+		}
+		if _, ok := seen[index]; ok {
+			return "", 0, false
+		}
+		seen[index] = struct{}{}
+		labels = append(labels, "#"+strconv.Itoa(index))
+	}
+	return strings.Join(labels, ", "), len(labels), true
+}
+
+func activitySharedHeadDetail(details activityDetails) string {
+	created, createdCount, createdOK := activityPullRequestIndexList(details, "created_pull_request_indexes")
+	covered, coveredCount, coveredOK := activityPullRequestIndexList(details, "already_covered_pull_request_indexes")
+	declaredCreated, declaredCreatedOK := activityNonnegativeInt64Detail(details, "created_pull_request_count")
+	declaredCovered, declaredCoveredOK := activityNonnegativeInt64Detail(details, "already_covered_pull_request_count")
+	reason, reasonOK := activityTextDetail(details, "reason", 500)
+	if !createdOK || !coveredOK || !declaredCreatedOK || !declaredCoveredOK || !reasonOK || int64(createdCount) != declaredCreated || int64(coveredCount) != declaredCovered || createdCount+coveredCount == 0 {
+		return "Shared-head approval details unavailable."
+	}
+	return "New exceptions: " + created + "; already covered: " + covered + ". Confirmation reason: " + reason + "."
+}
+
+func activityRolesOrUnavailable(details activityDetails, key string) string {
+	value, ok := activityTextDetail(details, key, 128)
+	if !ok {
+		return "unavailable"
+	}
+	parts := strings.Split(value, ",")
+	rawRoles := make([]auth.Role, 0, len(parts))
+	for _, part := range parts {
+		rawRoles = append(rawRoles, auth.Role(strings.TrimSpace(part)))
+	}
+	roles, valid := auth.NormalizeRoleSet(rawRoles)
+	if !valid || len(roles) == 0 {
+		return "unavailable"
+	}
+	return roles.Label()
 }
 
 func webhookDeliveryProcessingState(delivery webhook.Delivery) (string, string) {
@@ -2792,24 +2988,20 @@ func (s *Server) scheduledFreezePageData(ctx context.Context) ([]domain.Reposito
 	return repositories, scheduled, branchOptions, nil
 }
 
-func (s *Server) freezePageData(ctx context.Context) ([]domain.Repository, []domain.BranchFreeze, []freezeAuditView, []managedBranchOption, error) {
+func (s *Server) freezePageData(ctx context.Context) ([]domain.Repository, []domain.BranchFreeze, []managedBranchOption, error) {
 	repositories, err := s.repositories(ctx)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, err
 	}
 	freezes, err := s.activeFreezes(ctx)
 	if err != nil {
-		return nil, nil, nil, nil, err
-	}
-	auditEvents, err := s.freezeAuditViews(ctx, repositories)
-	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, err
 	}
 	branchOptions, err := s.managedBranchOptions(ctx, repositories)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, err
 	}
-	return repositories, freezes, auditEvents, branchOptions, nil
+	return repositories, freezes, branchOptions, nil
 }
 
 func (s *Server) freezeViews(repositories []domain.Repository, freezes []domain.BranchFreeze) []freezeView {
@@ -2945,83 +3137,12 @@ func optionalScheduleRFC3339(value *time.Time) string {
 	return value.UTC().Format(time.RFC3339)
 }
 
-func (s *Server) freezeAuditViews(ctx context.Context, repositories []domain.Repository) ([]freezeAuditView, error) {
-	if s.cfg.AuditStore == nil {
-		return nil, nil
-	}
-	events, err := s.cfg.AuditStore.ListBySubjectType(ctx, audit.SubjectTypeBranchFreeze, 50)
-	if err != nil {
-		return nil, err
-	}
-	repositoriesByID := repositoriesByID(repositories)
-	views := make([]freezeAuditView, 0, len(events))
-	for _, event := range events {
-		if !isFreezeAuditAction(event.Action) {
-			continue
-		}
-		view := freezeAuditView{
-			Action:    event.Action,
-			SubjectID: event.SubjectID,
-			CreatedAt: event.CreatedAt.UTC().Format("2006-01-02 15:04 UTC"),
-		}
-		var details map[string]string
-		if err := json.Unmarshal([]byte(event.DetailsJSON), &details); err == nil {
-			view.RepositoryID = details["repository_id"]
-			view.Branch = details["branch"]
-			view.Status = details["status"]
-			view.Reason = details["reason"]
-			view.Actor = actorLabelForEvent(event, details["actor_kind"], details["actor_role"])
-			if repositoryID, err := strconv.ParseInt(details["repository_id"], 10, 64); err == nil {
-				view.Repository = repositoriesByID[repositoryID]
-			}
-		}
-		views = append(views, view)
-	}
-	return views, nil
-}
-
-func isFreezeAuditAction(action string) bool {
-	switch action {
-	case audit.ActionBranchFreezeCreated, audit.ActionBranchFreezeEnded, audit.ActionBranchFreezeCancelled, audit.ActionBranchFreezePlannedUnfreeze, audit.ActionFreezeScheduleCreated, audit.ActionFreezeScheduleUpdated, audit.ActionFreezeScheduleCancelled, audit.ActionFreezeScheduleActivated, audit.ActionFreezeScheduleStartedNow, audit.ActionFreezeSchedulePlannedUnfreeze:
-		return true
-	default:
-		return false
-	}
-}
-
 func repositoriesByID(repositories []domain.Repository) map[int64]domain.Repository {
 	byID := make(map[int64]domain.Repository, len(repositories))
 	for _, repo := range repositories {
 		byID[repo.ID] = repo
 	}
 	return byID
-}
-
-func actorLabel(kind string, role string) string {
-	kind = strings.TrimSpace(kind)
-	role = strings.TrimSpace(role)
-	if kind == "" && role == "" {
-		return "unknown"
-	}
-	if role == "" {
-		return kind
-	}
-	if kind == "" {
-		return role
-	}
-	return kind + " (" + role + ")"
-}
-
-func actorLabelForEvent(event audit.Event, kind string, role string) string {
-	role = strings.TrimSpace(role)
-	if event.ActorUserID != nil {
-		label := "user #" + strconv.FormatInt(*event.ActorUserID, 10)
-		if role != "" {
-			label += " (" + role + ")"
-		}
-		return label
-	}
-	return actorLabel(kind, role)
 }
 
 func (s *Server) repositoryByID(ctx context.Context, id int64) (domain.Repository, bool, error) {
@@ -3181,13 +3302,13 @@ func enforcementFailureRemediation(reason string) string {
 	case domain.EnforcementFailureOpenPRSync:
 		return "Open pull requests could not be listed from the forge. Check forge availability and token read access, then retry enforcement recovery."
 	case domain.EnforcementFailureEvaluation:
-		return "The current freeze policy could not be evaluated. Review the audit log for the failed run, then retry enforcement recovery."
+		return "The current freeze policy could not be evaluated. Review activity for the failed run, then retry enforcement recovery."
 	case domain.EnforcementFailurePublication:
 		return "One or more " + domain.RequiredStatusContext + " statuses could not be posted. Check forge availability and token permissions, then retry enforcement recovery."
 	case domain.EnforcementFailureRuntime:
 		return "Runtime convergence bookkeeping did not complete. Automatic recovery will rerun the complete current repository policy."
 	default:
-		return "Review the sanitized failure in the audit log, fix the forge setup or credentials, then retry enforcement recovery."
+		return "Review the sanitized failure in activity, fix the forge setup or credentials, then retry enforcement recovery."
 	}
 }
 
@@ -3272,7 +3393,7 @@ func (s *Server) renderRepositories(w http.ResponseWriter, views []repositoryVie
 	})
 }
 
-func (s *Server) renderFreezes(w http.ResponseWriter, repositories []domain.Repository, freezes []freezeView, auditEvents []freezeAuditView, branchOptions []managedBranchOption, formError string, session sessionState) {
+func (s *Server) renderFreezes(w http.ResponseWriter, repositories []domain.Repository, freezes []freezeView, branchOptions []managedBranchOption, formError string, session sessionState) {
 	s.render(w, freezesTemplate, map[string]any{
 		"AppName":                 s.cfg.AppName,
 		"ActivePage":              "freezes",
@@ -3280,7 +3401,6 @@ func (s *Server) renderFreezes(w http.ResponseWriter, repositories []domain.Repo
 		"EnforceableRepositories": enforcementActiveRepositories(repositories),
 		"BranchOptions":           branchOptions,
 		"Freezes":                 freezes,
-		"AuditEvents":             auditEvents,
 		"FormError":               formError,
 		"CSRFToken":               session.CSRFToken,
 	})
@@ -3344,7 +3464,7 @@ func (s *Server) renderUsers(w http.ResponseWriter, users []auth.User, state use
 func (s *Server) renderPublications(w http.ResponseWriter, publications []statusPublicationView, attempts []statusPublicationAttemptView, session sessionState) {
 	s.render(w, publicationsTemplate, map[string]any{
 		"AppName":      s.cfg.AppName,
-		"ActivePage":   "activity",
+		"ActivePage":   "",
 		"CurrentUser":  currentUserFromSession(session),
 		"CSRFToken":    session.CSRFToken,
 		"Publications": publications,
@@ -3352,16 +3472,23 @@ func (s *Server) renderPublications(w http.ResponseWriter, publications []status
 	})
 }
 
+func (s *Server) renderActivity(w http.ResponseWriter, events []activityEventView, session sessionState) {
+	s.render(w, activityTemplate, map[string]any{
+		"AppName":     s.cfg.AppName,
+		"ActivePage":  "activity",
+		"CurrentUser": currentUserFromSession(session),
+		"CSRFToken":   session.CSRFToken,
+		"Events":      events,
+	})
+}
+
 func (s *Server) renderWebhookDeliveries(w http.ResponseWriter, auditLog auditLogView, session sessionState) {
 	s.render(w, webhookDeliveriesTemplate, map[string]any{
 		"AppName":                 s.cfg.AppName,
-		"ActivePage":              "audit",
+		"ActivePage":              "",
 		"CurrentUser":             currentUserFromSession(session),
 		"CSRFToken":               session.CSRFToken,
-		"RequiredContext":         domain.RequiredStatusContext,
 		"Deliveries":              auditLog.Deliveries,
-		"SystemEvents":            auditLog.SystemEvents,
-		"StatusAttempts":          auditLog.StatusAttempts,
 		"Filters":                 auditLog.Filters,
 		"RepositoryFilterOptions": auditLog.RepositoryFilterOptions,
 		"EventFilterOptions":      auditLog.EventFilterOptions,
@@ -3475,7 +3602,7 @@ const pageHead = `<!doctype html>
         <a class="tg-nav-item{{ if eq .ActivePage "freezes" }} is-active{{ end }}" href="/freezes"><svg class="tg-icon"><use href="#tg-i-freeze-branch"></use></svg>Freezes</a>
         <a class="tg-nav-item{{ if eq .ActivePage "scheduled" }} is-active{{ end }}" href="/scheduled-freezes"><svg class="tg-icon"><use href="#tg-i-schedule"></use></svg>Scheduled Freezes</a>
         <a class="tg-nav-item{{ if eq .ActivePage "thaws" }} is-active{{ end }}" href="/decisions"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg>Thaw Requests</a>
-        <a class="tg-nav-item{{ if eq .ActivePage "audit" }} is-active{{ end }}" href="/webhooks"><svg class="tg-icon"><use href="#tg-i-audit"></use></svg>Audit Log</a>
+        <a class="tg-nav-item{{ if eq .ActivePage "activity" }} is-active{{ end }}" href="/activity"><svg class="tg-icon"><use href="#tg-i-activity"></use></svg>Activity</a>
         {{ if .CurrentUser.IsAdmin }}<a class="tg-nav-item{{ if eq .ActivePage "users" }} is-active{{ end }}" href="/users"><svg class="tg-icon"><use href="#tg-i-users"></use></svg>Users & Roles</a>{{ end }}
       </nav>
       {{ if .CurrentUser.Email }}
@@ -3908,7 +4035,7 @@ const dashboardTemplate = pageHead + `
       </article>
 
       <article class="tg-panel">
-        <div class="tg-panel-head"><h2>Recent Events</h2><a class="tg-btn tg-btn-secondary tg-btn-sm" href="/webhooks">View All</a></div>
+        <div class="tg-panel-head"><h2>Recent Events</h2><a class="tg-btn tg-btn-secondary tg-btn-sm" href="/activity">View All</a></div>
         <div class="tg-event-row"><span class="tg-event-icon tg-event-freeze"><svg class="tg-icon"><use href="#tg-i-freeze-branch"></use></svg></span><span>Branch freeze workflow is ready for local records</span><span class="tg-muted">local</span></div>
         <div class="tg-event-row"><span class="tg-event-icon tg-event-ok"><svg class="tg-icon"><use href="#tg-i-check"></use></svg></span><span>Commit statuses post only for enforcement-active repositories</span><span class="tg-muted">enforcement</span></div>
         <div class="tg-event-row"><span class="tg-event-icon tg-event-fail"><svg class="tg-icon"><use href="#tg-i-warning"></use></svg></span><span>Signed webhook receiver stores sanitized delivery metadata only</span><span class="tg-muted">safe</span></div>
@@ -3942,84 +4069,101 @@ const dashboardTemplate = pageHead + `
     </section>
   </main>` + pageFoot
 
-const webhookDeliveriesTemplate = pageHead + `
-  <main class="tg-main tg-setup-page tg-audit-page">
+const activityTemplate = pageHead + `
+  <main class="tg-main tg-setup-page tg-activity-page">
     <header class="tg-header">
       <div>
-        <p class="eyebrow">Signed webhook delivery history</p>
-        <h1 class="tg-title">Audit Log</h1>
-        <p class="tg-subtitle">Inspect sanitized webhook delivery metadata, verification state, and local processing outcomes.</p>
+        <p class="eyebrow">Chronological audit history</p>
+        <h1 class="tg-title">Activity</h1>
+        <p class="tg-subtitle">Recent operator and system changes, newest first. This bounded feed shows sanitized metadata only.</p>
       </div>
-      <span class="tg-badge tg-badge-info"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-audit"></use></svg>Sanitized local metadata only</span>
+      <span class="tg-badge tg-badge-info"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-activity"></use></svg>Latest 100 events at most</span>
     </header>
 
     <section class="tg-warning-callout">
       <span aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-warning"></use></svg></span>
-      <span>This page does not store or render raw webhook payloads, signatures, webhook secrets, or status tokens. Local users are role-gated for audit visibility.</span>
+      <span>Thawguard provides cooperative enforcement for trusted teams. Activity records auditable changes; it is not a hard security boundary against forge writers who can post statuses.</span>
     </section>
 
     <section class="tg-panel tg-data-panel tg-audit-log-panel">
-      <div class="tg-panel-head"><h2>System activity</h2><span class="tg-badge tg-badge-info">{{ len .SystemEvents }} audit events</span></div>
-      <p class="tg-panel-subtitle">Recent setup, freeze, sync, and thaw actions recorded as sanitized audit events.</p>
-      {{ if .SystemEvents }}
+      <div class="tg-panel-head"><h2>Recent activity</h2><span class="tg-badge tg-badge-info">{{ len .Events }} shown</span></div>
+      <p class="tg-panel-subtitle">Actor, action, affected target, outcome, and curated details from Thawguard audit events. Raw JSON and sensitive values are never displayed.</p>
+      {{ if .Events }}
       <div class="tg-table-wrap tg-responsive-table">
         <table class="tg-data-table tg-audit-table">
-          <caption class="tg-sr-only">Recent system activity</caption>
-          <thead><tr><th>Time</th><th>Action</th><th>Repository</th><th>Summary</th><th>Actor</th><th>Details</th></tr></thead>
+          <caption class="tg-sr-only">Recent chronological Thawguard activity</caption>
+          <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Outcome</th><th>Details</th></tr></thead>
           <tbody>
-          {{ range .SystemEvents }}
+          {{ range .Events }}
             <tr>
               <td data-label="Time">{{ .CreatedAt }}</td>
-              <td data-label="Action"><span class="status status-{{ .StateClass }}">{{ .Label }}</span></td>
-              <td data-label="Repository"><span class="tg-table-repo"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-repositories"></use></svg><code>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository{{ end }}</code></span></td>
-              <td data-label="Summary">{{ .Summary }}</td>
               <td data-label="Actor">{{ .Actor }}</td>
+              <td data-label="Action">{{ .ActionLabel }}</td>
+              <td data-label="Target">{{ .Target }}</td>
+              <td data-label="Outcome"><span class="status status-{{ .OutcomeClass }}">{{ .Outcome }}</span></td>
               <td data-label="Details">{{ .Detail }}</td>
             </tr>
           {{ end }}
           </tbody>
         </table>
       </div>
-      {{ else }}
-        <div class="tg-empty-row tg-data-empty"><strong>No system activity yet</strong><span>Repository setup, freeze lifecycle, open PR sync, and thaw approvals will appear here.</span></div>
-      {{ end }}
-    </section>
-
-    <section class="tg-panel tg-data-panel tg-audit-log-panel">
-      <div class="tg-panel-head"><h2>Status publication attempts</h2><span class="tg-badge tg-badge-info">{{ len .StatusAttempts }} attempts</span></div>
-      <p class="tg-panel-subtitle">Recent live posting attempts for the <code>{{ .RequiredContext }}</code> status context. Errors shown here are already sanitized by the publisher.</p>
-      {{ if .StatusAttempts }}
-      <div class="tg-table-wrap tg-responsive-table">
-        <table class="tg-data-table tg-audit-table">
-          <caption class="tg-sr-only">Recent status publication attempts</caption>
-          <thead><tr><th>Attempted</th><th>Repository</th><th>PR</th><th>Head SHA</th><th>Mode</th><th>Result</th><th>Description</th></tr></thead>
-          <tbody>
-          {{ range .StatusAttempts }}
-            <tr>
-              <td data-label="Attempted">{{ .AttemptedAt }}</td>
-              <td data-label="Repository"><span class="tg-table-repo"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-repositories"></use></svg><code>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Attempt.RepositoryID }}{{ end }}</code></span></td>
-              <td data-label="PR">#{{ .Attempt.PullRequestIndex }}</td>
-              <td data-label="Head SHA"><code>{{ .Attempt.HeadSHA }}</code><small class="tg-muted">{{ .Attempt.TargetBranch }}</small></td>
-              <td data-label="Mode"><code>{{ .Attempt.Mode }}</code></td>
-              <td data-label="Result"><span class="status status-{{ if eq .Attempt.Result "posted" }}ok{{ else if eq .Attempt.Result "failed" }}failed{{ else }}pending{{ end }}">{{ .Attempt.Result }}</span></td>
-              <td data-label="Description">{{ .Attempt.Description }}{{ if .Attempt.Error }}<small class="tg-muted">{{ .Attempt.Error }}</small>{{ end }}</td>
-            </tr>
-          {{ end }}
-          </tbody>
-        </table>
+      <div class="tg-mobile-card-list" aria-label="Recent activity mobile cards">
+        {{ range .Events }}
+        <article class="tg-mobile-card">
+          <div class="tg-mobile-card-head">
+            <div><span class="tg-mobile-card-kicker">{{ .CreatedAt }}</span><h3>{{ .ActionLabel }}</h3></div>
+            <span class="status status-{{ .OutcomeClass }}">{{ .Outcome }}</span>
+          </div>
+          <dl class="tg-mobile-card-grid">
+            <div><dt>Actor</dt><dd>{{ .Actor }}</dd></div>
+            <div><dt>Target</dt><dd>{{ .Target }}</dd></div>
+          </dl>
+          <p class="tg-mobile-card-detail">{{ .Detail }}</p>
+        </article>
+        {{ end }}
       </div>
       {{ else }}
-        <div class="tg-empty-row tg-data-empty"><strong>No status publication attempts yet</strong><span>Live status post attempts will appear here after freeze/thaw recomputation for enforcement-active repositories.</span></div>
+        <div class="tg-empty-row tg-data-empty"><strong>No activity yet</strong><span>Operator and system changes will appear here after the first audited action.</span></div>
       {{ end }}
     </section>
 
+    <section class="tg-panel tg-data-panel">
+      <div class="tg-panel-head tg-panel-head-stacked">
+        <div><h2>Operational diagnostics</h2><p class="tg-panel-subtitle">Use these secondary troubleshooting views for transport and status-publication evidence.</p></div>
+        <div class="tg-header-actions">
+          <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/webhooks">Webhook diagnostics</a>
+          <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/publications">Status diagnostics</a>
+        </div>
+      </div>
+    </section>
+  </main>` + pageFoot
+
+const webhookDeliveriesTemplate = pageHead + `
+  <main class="tg-main tg-setup-page tg-audit-page">
+    <header class="tg-header">
+      <div>
+        <p class="eyebrow">Secondary operational diagnostics</p>
+        <h1 class="tg-title">Webhook diagnostics</h1>
+        <p class="tg-subtitle">Inspect recent signed webhook deliveries, verification state, and sanitized local processing outcomes.</p>
+      </div>
+      <div class="tg-header-actions">
+        <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/activity">Back to activity</a>
+        <span class="tg-badge tg-badge-info"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-audit"></use></svg>Sanitized delivery metadata</span>
+      </div>
+    </header>
+
+    <section class="tg-warning-callout">
+      <span aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-warning"></use></svg></span>
+      <span>This troubleshooting page does not store or render raw webhook payloads, request headers, signatures, webhook secrets, status tokens, or session IDs.</span>
+    </section>
+
     <section class="tg-panel tg-data-panel tg-audit-log-panel">
-      <div class="tg-table-toolbar" aria-label="Audit log controls">
+      <div class="tg-table-toolbar" aria-label="Webhook diagnostic controls">
         <div class="tg-toolbar-main">
-          <h2>Recent webhook deliveries</h2>
+          <h2>Signed webhook deliveries</h2>
           <p>Latest signed pull request webhook receipts and local recomputation processing states.</p>
         </div>
-        <div class="tg-toolbar-controls" aria-label="Audit log table controls">
+        <div class="tg-toolbar-controls" aria-label="Webhook delivery table controls">
           <a class="tg-btn tg-btn-secondary tg-btn-sm" href="#audit-filters">Filters{{ if .Filters.HasActiveFilters }} active{{ end }}</a>
         </div>
       </div>
@@ -4028,7 +4172,7 @@ const webhookDeliveriesTemplate = pageHead + `
         <a class="tg-modal-backdrop" href="#" aria-label="Close audit filters"></a>
         <div class="tg-modal-card" role="dialog" aria-modal="true">
           <div class="tg-modal-head">
-            <h2 id="audit-filters-title">Filter audit log</h2>
+            <h2 id="audit-filters-title">Filter webhook deliveries</h2>
             <a href="#" class="tg-modal-close" aria-label="Close"><svg class="tg-icon"><use href="#tg-i-close"></use></svg></a>
           </div>
           <form class="tg-setup-form tg-filter-form" method="get" action="/webhooks">
@@ -4112,7 +4256,7 @@ const webhookDeliveriesTemplate = pageHead + `
         {{ end }}
       </div>
 
-      <footer class="tg-pagination" aria-label="Audit log pagination">
+      <footer class="tg-pagination" aria-label="Webhook diagnostic pagination">
         <span class="tg-pagination-summary">Showing {{ .Filters.ShowingRows }} of {{ .Filters.FilteredRows }} matching rows</span>
         <form class="tg-page-size-form" method="get" action="/webhooks">
           <input type="hidden" name="sort" value="{{ .Filters.Sort }}">
@@ -4133,10 +4277,10 @@ const webhookDeliveriesTemplate = pageHead + `
         <div class="tg-empty-row tg-data-empty">
           {{ if and .Filters.TotalRows .Filters.HasActiveFilters }}
           <strong>No webhook deliveries match these filters</strong>
-          <span>Adjust filters or clear controls to return to the full audit log.</span>
+          <span>Adjust filters or reset controls to return to all loaded deliveries.</span>
           {{ else }}
           <strong>No webhook deliveries recorded yet</strong>
-          <span>Send a signed pull request webhook to see sanitized audit metadata here.</span>
+          <span>Send a signed pull request webhook to see sanitized delivery metadata here.</span>
           {{ end }}
         </div>
       {{ end }}
@@ -4144,66 +4288,109 @@ const webhookDeliveriesTemplate = pageHead + `
   </main>` + pageFoot
 
 const publicationsTemplate = pageHead + `
-  <main class="shell stack">
-    <nav class="topnav"><a href="/">Dashboard</a></nav>
-    <section class="panel">
-      <p class="eyebrow">Status publication diagnostics</p>
-      <h1>Status publications</h1>
-      <p>Each intent below is the latest desired <code>thawguard/freeze</code> status per repository head. Attempts record real posted or failed deliveries to the forge for enforcement-active repositories; errors are sanitized before storage.</p>
+  <main class="tg-main tg-setup-page tg-diagnostics-page">
+    <header class="tg-header">
+      <div>
+        <p class="eyebrow">Secondary operational diagnostics</p>
+        <h1 class="tg-title">Status diagnostics</h1>
+        <p class="tg-subtitle">Inspect the latest desired <code>thawguard/freeze</code> statuses and recent sanitized publication attempts.</p>
+      </div>
+      <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/activity">Back to activity</a>
+    </header>
+
+    <section class="tg-warning-callout">
+      <span aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-warning"></use></svg></span>
+      <span>Publication errors are sanitized before storage. Raw forge response bodies, tokens, passwords, and session IDs are not rendered.</span>
     </section>
 
-    <section class="panel">
-      <h2>Latest desired statuses</h2>
+    <section class="tg-panel tg-data-panel">
+      <div class="tg-panel-head"><h2>Latest desired statuses</h2><span class="tg-badge tg-badge-info">{{ len .Publications }} shown</span></div>
+      <p class="tg-panel-subtitle">The latest desired status per repository head and status context.</p>
       {{ if .Publications }}
-      <table>
-        <thead><tr><th>Last updated</th><th>Repository</th><th>PR</th><th>Target branch</th><th>Head SHA</th><th>Context</th><th>State</th><th>Mode</th><th>Description</th></tr></thead>
-        <tbody>
+      <div class="tg-table-wrap tg-responsive-table">
+        <table class="tg-data-table tg-audit-table">
+          <caption class="tg-sr-only">Latest desired status publications</caption>
+          <thead><tr><th>Last updated</th><th>Repository</th><th>PR / branch</th><th>Head SHA</th><th>Context</th><th>State</th><th>Mode</th><th>Description</th></tr></thead>
+          <tbody>
+          {{ range .Publications }}
+            <tr>
+              <td data-label="Last updated">{{ .UpdatedAt }}</td>
+              <td data-label="Repository">{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Publication.RepositoryID }}{{ end }}</td>
+              <td data-label="PR / branch">#{{ .Publication.PullRequestIndex }}<small class="tg-muted">{{ .Publication.TargetBranch }}</small></td>
+              <td data-label="Head SHA"><code>{{ .Publication.HeadSHA }}</code></td>
+              <td data-label="Context"><code>{{ .Publication.Context }}</code></td>
+              <td data-label="State"><span class="status status-{{ .Publication.State }}">{{ .Publication.State }}</span></td>
+              <td data-label="Mode"><code>{{ .Publication.DeliveryMode }}</code></td>
+              <td data-label="Description">{{ .Publication.Description }}</td>
+            </tr>
+          {{ end }}
+          </tbody>
+        </table>
+      </div>
+      <div class="tg-mobile-card-list" aria-label="Latest desired statuses mobile cards">
         {{ range .Publications }}
-          <tr>
-            <td data-label="Last updated">{{ .UpdatedAt }}</td>
-            <td data-label="Repository">{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Publication.RepositoryID }}{{ end }}</td>
-            <td data-label="PR">#{{ .Publication.PullRequestIndex }}</td>
-            <td data-label="Target branch">{{ .Publication.TargetBranch }}</td>
-            <td data-label="Head SHA"><code>{{ .Publication.HeadSHA }}</code></td>
-            <td data-label="Context"><code>{{ .Publication.Context }}</code></td>
-            <td data-label="State"><span class="status status-{{ .Publication.State }}">{{ .Publication.State }}</span></td>
-            <td data-label="Mode"><code>{{ .Publication.DeliveryMode }}</code></td>
-            <td data-label="Description">{{ .Publication.Description }}</td>
-          </tr>
+        <article class="tg-mobile-card">
+          <div class="tg-mobile-card-head">
+            <div><span class="tg-mobile-card-kicker">Updated {{ .UpdatedAt }}</span><h3>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Publication.RepositoryID }}{{ end }}</h3></div>
+            <span class="status status-{{ .Publication.State }}">{{ .Publication.State }}</span>
+          </div>
+          <p class="tg-mobile-card-meta">PR #{{ .Publication.PullRequestIndex }}<span class="tg-dot">·</span>{{ .Publication.TargetBranch }}<span class="tg-dot">·</span><code>{{ .Publication.HeadSHA }}</code></p>
+          <dl class="tg-mobile-card-grid">
+            <div><dt>Context</dt><dd><code>{{ .Publication.Context }}</code></dd></div>
+            <div><dt>Mode</dt><dd><code>{{ .Publication.DeliveryMode }}</code></dd></div>
+          </dl>
+          <p class="tg-mobile-card-detail">{{ .Publication.Description }}</p>
+        </article>
         {{ end }}
-        </tbody>
-      </table>
+      </div>
       {{ else }}
-      <p>No local publication intents yet.</p>
+        <div class="tg-empty-row tg-data-empty"><strong>No desired statuses yet</strong><span>Desired status records appear after an enforcement-active repository evaluates pull requests.</span></div>
       {{ end }}
     </section>
 
-    <section class="panel">
-      <h2>Recent live posting attempts</h2>
-      <p class="muted">Posted and failed attempts against the forge. Historical records from older databases may still appear here.</p>
+    <section class="tg-panel tg-data-panel">
+      <div class="tg-panel-head"><h2>Recent publication attempts</h2><span class="tg-badge tg-badge-info">{{ len .Attempts }} shown</span></div>
+      <p class="tg-panel-subtitle">Posted and failed attempts against the forge. Historical records from older databases may still appear here.</p>
       {{ if .Attempts }}
-      <table>
-        <thead><tr><th>Attempted</th><th>Repository</th><th>PR</th><th>Target branch</th><th>Head SHA</th><th>Context</th><th>State</th><th>Mode</th><th>Result</th><th>Description</th><th>Error</th></tr></thead>
-        <tbody>
+      <div class="tg-table-wrap tg-responsive-table">
+        <table class="tg-data-table tg-audit-table">
+          <caption class="tg-sr-only">Recent status publication attempts</caption>
+          <thead><tr><th>Attempted</th><th>Repository</th><th>PR / branch</th><th>Head SHA</th><th>State</th><th>Mode</th><th>Result</th><th>Description / error</th></tr></thead>
+          <tbody>
+          {{ range .Attempts }}
+            <tr>
+              <td data-label="Attempted">{{ .AttemptedAt }}</td>
+              <td data-label="Repository">{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Attempt.RepositoryID }}{{ end }}</td>
+              <td data-label="PR / branch">#{{ .Attempt.PullRequestIndex }}<small class="tg-muted">{{ .Attempt.TargetBranch }}</small></td>
+              <td data-label="Head SHA"><code>{{ .Attempt.HeadSHA }}</code><small class="tg-muted">{{ .Attempt.Context }}</small></td>
+              <td data-label="State"><span class="status status-{{ .Attempt.State }}">{{ .Attempt.State }}</span></td>
+              <td data-label="Mode"><code>{{ .Attempt.Mode }}</code></td>
+              <td data-label="Result"><span class="status status-{{ if eq .Attempt.Result "posted" }}ok{{ else }}failed{{ end }}">{{ .Attempt.Result }}</span></td>
+              <td data-label="Description / error">{{ .Attempt.Description }}{{ if .Attempt.Error }}<small class="tg-muted">{{ .Attempt.Error }}</small>{{ end }}</td>
+            </tr>
+          {{ end }}
+          </tbody>
+        </table>
+      </div>
+      <div class="tg-mobile-card-list" aria-label="Recent publication attempts mobile cards">
         {{ range .Attempts }}
-          <tr>
-            <td data-label="Attempted">{{ .AttemptedAt }}</td>
-            <td data-label="Repository">{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Attempt.RepositoryID }}{{ end }}</td>
-            <td data-label="PR">#{{ .Attempt.PullRequestIndex }}</td>
-            <td data-label="Target branch">{{ .Attempt.TargetBranch }}</td>
-            <td data-label="Head SHA"><code>{{ .Attempt.HeadSHA }}</code></td>
-            <td data-label="Context"><code>{{ .Attempt.Context }}</code></td>
-            <td data-label="State"><span class="status status-{{ .Attempt.State }}">{{ .Attempt.State }}</span></td>
-            <td data-label="Mode"><code>{{ .Attempt.Mode }}</code></td>
-            <td data-label="Result"><code>{{ .Attempt.Result }}</code></td>
-            <td data-label="Description">{{ .Attempt.Description }}</td>
-            <td data-label="Error">{{ if .Attempt.Error }}{{ .Attempt.Error }}{{ else }}—{{ end }}</td>
-          </tr>
+        <article class="tg-mobile-card">
+          <div class="tg-mobile-card-head">
+            <div><span class="tg-mobile-card-kicker">{{ .AttemptedAt }}</span><h3>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Attempt.RepositoryID }}{{ end }}</h3></div>
+            <span class="status status-{{ if eq .Attempt.Result "posted" }}ok{{ else }}failed{{ end }}">{{ .Attempt.Result }}</span>
+          </div>
+          <p class="tg-mobile-card-meta">PR #{{ .Attempt.PullRequestIndex }}<span class="tg-dot">·</span>{{ .Attempt.TargetBranch }}<span class="tg-dot">·</span><code>{{ .Attempt.HeadSHA }}</code></p>
+          <dl class="tg-mobile-card-grid">
+            <div><dt>Context</dt><dd><code>{{ .Attempt.Context }}</code></dd></div>
+            <div><dt>State</dt><dd>{{ .Attempt.State }}</dd></div>
+            <div><dt>Mode</dt><dd><code>{{ .Attempt.Mode }}</code></dd></div>
+          </dl>
+          <p class="tg-mobile-card-detail">{{ .Attempt.Description }}{{ if .Attempt.Error }} — {{ .Attempt.Error }}{{ end }}</p>
+        </article>
         {{ end }}
-        </tbody>
-      </table>
+      </div>
       {{ else }}
-      <p>No status publication attempts yet.</p>
+        <div class="tg-empty-row tg-data-empty"><strong>No publication attempts yet</strong><span>Posted or failed forge deliveries will appear here after status publication begins.</span></div>
       {{ end }}
     </section>
   </main>` + pageFoot
@@ -4561,7 +4748,7 @@ const freezesTemplate = pageHead + `
           <label>Planned unfreeze <input type="datetime-local" name="planned_ends_at" aria-describedby="immediate-planned-unfreeze-help"></label>
           <small id="immediate-planned-unfreeze-help" class="tg-muted">Optional. Uses your browser's local timezone and is stored as UTC.</small>
           <div class="tg-freeze-form-footer tg-field-wide">
-            <span class="tg-muted"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-audit"></use></svg>Every freeze is written to the audit log.</span>
+            <span class="tg-muted"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-audit"></use></svg>Every freeze appears in activity.</span>
             <div class="tg-freeze-form-actions">
               <button type="reset" class="tg-btn tg-btn-secondary tg-btn-sm">Reset</button>
               <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-freeze-branch"></use></svg>Freeze Branch</button>

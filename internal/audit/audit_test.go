@@ -103,38 +103,59 @@ func TestStoreDefaultsDetailsAndCreatedAt(t *testing.T) {
 	}
 }
 
-func TestStoreListsAuditEventsBySubjectType(t *testing.T) {
+func TestStoreListsNewestFirstWithStableIDOrdering(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t, ctx)
-	createdAt := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
-	store.now = func() time.Time { return createdAt }
+	older := time.Date(2026, 7, 13, 10, 0, 0, 0, time.UTC)
+	newer := older.Add(time.Second)
 
-	if err := store.Record(ctx, Event{Action: ActionBranchFreezeCreated, SubjectType: SubjectTypeBranchFreeze, SubjectID: "freeze-1"}); err != nil {
-		t.Fatal(err)
-	}
-	for i := range 60 {
-		if err := store.Record(ctx, Event{Action: ActionRepositoryCreated, SubjectType: SubjectTypeRepository, SubjectID: strconv.Itoa(i + 1)}); err != nil {
-			t.Fatal(err)
-		}
-	}
+	insertStoredEvent(t, ctx, store, "older", older)
+	insertStoredEvent(t, ctx, store, "newer-first", newer)
+	insertStoredEvent(t, ctx, store, "newer-second", newer)
 
-	events, err := store.ListBySubjectType(ctx, SubjectTypeBranchFreeze, 10)
+	events, err := store.List(ctx, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 1 {
-		t.Fatalf("expected 1 branch-freeze audit event, got %d", len(events))
+	want := []string{"newer-second", "newer-first", "older"}
+	if len(events) != len(want) {
+		t.Fatalf("expected %d events, got %d", len(want), len(events))
 	}
-	if events[0].SubjectType != SubjectTypeBranchFreeze || events[0].SubjectID != "freeze-1" {
-		t.Fatalf("unexpected audit event: %+v", events[0])
+	for i := range want {
+		if events[i].SubjectID != want[i] {
+			t.Fatalf("event %d: expected subject %q, got %q", i, want[i], events[i].SubjectID)
+		}
 	}
 }
 
-func TestStoreRejectsMissingSubjectTypeFilter(t *testing.T) {
+func TestStoreListHonorsBoundedLimit(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t, ctx)
-	if _, err := store.ListBySubjectType(ctx, "", 10); err == nil {
-		t.Fatal("expected missing subject type error")
+	createdAt := time.Date(2026, 7, 13, 10, 0, 0, 0, time.UTC)
+	for i := range 5 {
+		insertStoredEvent(t, ctx, store, strconv.Itoa(i+1), createdAt.Add(time.Duration(i)*time.Second))
+	}
+
+	events, err := store.List(ctx, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].SubjectID != "5" || events[1].SubjectID != "4" {
+		t.Fatalf("expected newest two events, got %+v", events)
+	}
+}
+
+func TestStoreListReturnsSafeScanFailure(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	if _, err := store.db.ExecContext(ctx, `
+INSERT INTO audit_events(action, subject_type, subject_id, details_json, created_at)
+VALUES (?, ?, ?, ?, ?)`, ActionRepositoryCreated, SubjectTypeRepository, "1", `{}`, "not-a-time"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.List(ctx, 10); err == nil {
+		t.Fatal("expected invalid stored timestamp to fail safely")
 	}
 }
 
@@ -177,6 +198,15 @@ func newTestStore(t *testing.T, ctx context.Context) *Store {
 		t.Fatal(err)
 	}
 	return NewStore(database)
+}
+
+func insertStoredEvent(t *testing.T, ctx context.Context, store *Store, subjectID string, createdAt time.Time) {
+	t.Helper()
+	if _, err := store.db.ExecContext(ctx, `
+INSERT INTO audit_events(action, subject_type, subject_id, details_json, created_at)
+VALUES (?, ?, ?, ?, ?)`, ActionRepositoryCreated, SubjectTypeRepository, subjectID, `{}`, createdAt.Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func projectMigrationsDir(t *testing.T) string {

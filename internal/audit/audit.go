@@ -51,6 +51,48 @@ const (
 	SubjectTypeUser          = "user"
 )
 
+// KnownActions returns every audit action the application currently writes.
+// Presentation layers use this list to make missing curated mappings visible
+// in tests when a new action is introduced.
+func KnownActions() []string {
+	return []string{
+		ActionRepositoryCreated,
+		ActionRepositoryWebhookSecretConfigured,
+		ActionRepositoryStatusTokenConfigured,
+		ActionRepositoryOpenPullRequestsSynced,
+		ActionRepositoryBranchAdded,
+		ActionRepositoryBranchRemoved,
+		ActionRepositorySetupCheckRun,
+		ActionRepositorySetupDriftDetected,
+		ActionRepositoryStatusPostVerified,
+		ActionRepositoryStatusPostVerifyFailed,
+		ActionRepositoryEnforcementActivated,
+		ActionRepositoryEnforcementActivateFail,
+		ActionRepositoryEnforcementReconciled,
+		ActionRepositoryEnforcementReconcileFail,
+		ActionRepositoryEnforcementRecovered,
+		ActionRepositoryEnforcementRecoverFail,
+		ActionRepositoryRuntimeConvergenceFail,
+		ActionBranchFreezeCreated,
+		ActionBranchFreezeEnded,
+		ActionBranchFreezeCancelled,
+		ActionBranchFreezePlannedUnfreeze,
+		ActionFreezeScheduleCreated,
+		ActionFreezeScheduleUpdated,
+		ActionFreezeScheduleCancelled,
+		ActionFreezeScheduleActivated,
+		ActionFreezeScheduleStartedNow,
+		ActionFreezeSchedulePlannedUnfreeze,
+		ActionThawExceptionApproved,
+		ActionThawExceptionSharedHeadApproved,
+		ActionUserRolesUpdated,
+		ActionUserDisabled,
+		ActionUserEnabled,
+		ActionUserPasswordChanged,
+		ActionUserPasswordReset,
+	}
+}
+
 type Event struct {
 	ID          int64
 	ActorUserID *int64
@@ -123,7 +165,7 @@ func (s *Store) List(ctx context.Context, limit int) ([]Event, error) {
 	rows, err := s.db.QueryContext(ctx, `
 SELECT id, actor_user_id, action, subject_type, subject_id, details_json, created_at
 FROM audit_events
-ORDER BY id DESC
+ORDER BY julianday(created_at) DESC, id DESC
 LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list audit events: %w", err)
@@ -140,42 +182,6 @@ LIMIT ?`, limit)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("list audit events rows: %w", err)
-	}
-	return events, nil
-}
-
-func (s *Store) ListBySubjectType(ctx context.Context, subjectType string, limit int) ([]Event, error) {
-	if s == nil || s.db == nil {
-		return nil, errors.New("audit store has no database")
-	}
-	if subjectType == "" {
-		return nil, errors.New("audit event subject type is required")
-	}
-	if limit <= 0 || limit > 500 {
-		limit = 100
-	}
-
-	rows, err := s.db.QueryContext(ctx, `
-SELECT id, actor_user_id, action, subject_type, subject_id, details_json, created_at
-FROM audit_events
-WHERE subject_type = ?
-ORDER BY id DESC
-LIMIT ?`, subjectType, limit)
-	if err != nil {
-		return nil, fmt.Errorf("list audit events by subject type: %w", err)
-	}
-	defer rows.Close()
-
-	events := make([]Event, 0)
-	for rows.Next() {
-		event, err := scanEvent(rows)
-		if err != nil {
-			return nil, err
-		}
-		events = append(events, event)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list audit events by subject type rows: %w", err)
 	}
 	return events, nil
 }

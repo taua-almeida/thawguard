@@ -67,11 +67,14 @@ Current local pages:
 - `/freezes` immediate branch-freeze form and active list, with an optional planned unfreeze time (requires an enforcement-active repository)
 - `/scheduled-freezes` one-time scheduled freeze windows with pending edit, Start Now, cancellation, and optional planned unfreeze controls
 - `/decisions` immediate thaw approval; fetches the current PR head from the forge and scopes the thaw to that PR/head SHA (requires an enforcement-active repository)
-- `/publications` latest desired statuses and live posting attempts (posted/failed)
-- `/webhooks` system activity, status publication attempts, and recent signed webhook delivery metadata; shows sanitized local processing history and does not store raw payloads, signatures, or secrets
+- `/activity` primary chronological audit history for recent operator and system changes, with actor, action, affected target, outcome, timestamp, and curated sanitized details
+- `/webhooks` secondary webhook delivery diagnostics with filters, verification state, and sanitized local processing outcomes
+- `/publications` secondary status-publication diagnostics for latest desired statuses and recent posted or failed attempts
 - `/users` admin-only local user and multi-role management
 
 Local users can hold one or more explicit role flags. Admin configures repositories/users/secrets, freezer performs freeze actions, thaw approver approves PR exceptions, and viewer is read-only. Admin or Freezer may edit a pending schedule or use Start Now; Admin still does not implicitly receive general freeze, cancellation, or thaw capability. If you bind beyond loopback after first-admin setup, keep Thawguard behind the network controls appropriate for your trusted team.
+
+Activity and diagnostic pages render allowlisted, sanitized metadata only. They never display raw webhook payloads, request signatures or headers, secrets, tokens, passwords or hashes, raw forge response bodies, or session IDs. Activity retention, deep-history pagination, export, and deletion remain deferred.
 
 ## License
 

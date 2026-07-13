@@ -48,7 +48,7 @@ make e2e-logs    # follow Thawguard logs
 
 `make e2e-reset` deletes the `thawguard-data` Docker volume. Use it when you want a clean E2E database and are ready to re-enter repository setup, webhook secret, and status token.
 
-Local alpha data is stored in SQLite and includes append-only operator metadata such as audit events, status decisions, status publication attempts, and webhook delivery receipts. The logical database should stay small during E2E testing, but the SQLite WAL file can be larger until checkpointed; this is normal SQLite behavior. Use `make e2e-reset` for clean test runs. Production retention/cleanup policy is not yet wired.
+Local alpha data is stored in SQLite and includes append-only operator metadata such as audit events, status decisions, status publication attempts, and webhook delivery receipts. The logical database should stay small during E2E testing, but the SQLite WAL file can be larger until checkpointed; this is normal SQLite behavior. Use `make e2e-reset` for clean test runs. Production retention, deletion, and export policy are not yet wired.
 
 To stop without deleting local state:
 
@@ -108,11 +108,14 @@ In the throwaway Forgejo/Codeberg repository:
 
 In Thawguard, inspect:
 
-- `/webhooks` — signed delivery receipts should show as verified and processed; system activity shows sanitized audit events.
+- `/activity` — the primary recent chronological audit history should show curated operator and system changes, affected targets, outcomes, and timestamps.
+- `/webhooks` — secondary signed-delivery diagnostics should show receipts as verified and processed with sanitized delivery metadata.
 - `/repositories` — the repository card shows setup-incomplete enforcement plus configured credentials.
 - `/repositories` — run readiness checks to read the open-PR endpoint and each exact managed branch's protection. The card also shows whether a verified `pull_request` delivery was received in the last 24 hours. Then use explicit activation when every prerequisite is ready.
 - `/freezes`, `/scheduled-freezes`, `/decisions` — mutation forms are unavailable and explain that enforcement must be activated first. Server-side validation rejects these actions as well.
-- `/publications` — no publication intents or attempts are created for a setup-incomplete repository.
+- `/publications` — secondary status diagnostics should contain no publication intents or attempts for a setup-incomplete repository.
+
+These pages render sanitized metadata only. Raw webhook payloads, signatures, request headers, webhook secrets, status tokens, passwords and hashes, raw forge response bodies, and session IDs are not displayed. Retention and export remain deferred.
 
 Codeberg will not show a Thawguard commit status for a setup-incomplete repository.
 
@@ -134,7 +137,7 @@ Only pending schedules are editable or startable. A planned unfreeze that is no 
 
 ## Troubleshooting
 
-- No row on `/webhooks`: check the public webhook URL, event type, and whether the tunnel is forwarding `POST /webhooks/forgejo`.
+- No delivery row on `/webhooks`: check the public webhook URL, event type, and whether the tunnel is forwarding `POST /webhooks/forgejo`.
 - Delivery row with an error: check repository owner/name/base URL and whether the webhook secret in Thawguard matches Codeberg.
 - Thawguard cannot decrypt a stored webhook secret or status token: restore the original `THAWGUARD_SECRET_KEY` or recreate the local database volume.
 - Freeze/schedule/thaw forms are unavailable: the repository's enforcement is not active. Complete readiness and use the explicit activation control on `/repositories`.
