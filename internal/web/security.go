@@ -34,14 +34,15 @@ const (
 )
 
 type sessionState struct {
-	ID          string
-	CSRFToken   string
-	UserID      *int64
-	Email       string
-	DisplayName string
-	Role        auth.Role
-	Roles       auth.RoleSet
-	ExpiresAt   time.Time
+	ID                 string
+	CSRFToken          string
+	UserID             *int64
+	Email              string
+	DisplayName        string
+	Role               auth.Role
+	Roles              auth.RoleSet
+	MustChangePassword bool
+	ExpiresAt          time.Time
 }
 
 func (s sessionState) auditActor() domain.Actor {

@@ -15,14 +15,18 @@ import (
 const DefaultSessionTTL = 12 * time.Hour
 
 type User struct {
-	ID          int64
-	Email       string
-	DisplayName string
-	Role        Role
-	Roles       RoleSet
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	ID                 int64
+	Email              string
+	DisplayName        string
+	Role               Role
+	Roles              RoleSet
+	DisabledAt         *time.Time
+	MustChangePassword bool
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
+
+func (u User) Disabled() bool { return u.DisabledAt != nil }
 
 type Session struct {
 	ID        string
@@ -186,6 +190,9 @@ func (s *Service) Login(ctx context.Context, params LoginParams) (Session, error
 	if err != nil || !passwordOK {
 		return Session{}, AuthenticationError{}
 	}
+	if record.Disabled() {
+		return Session{}, AuthenticationError{}
+	}
 	sessionID, csrfToken, err := sessionTokens()
 	if err != nil {
 		return Session{}, err
@@ -203,7 +210,7 @@ func (s *Service) SessionByID(ctx context.Context, id string) (Session, bool, er
 	}
 	row := s.db.QueryRowContext(ctx, `
 SELECT s.id, s.csrf_token, s.expires_at, s.created_at,
-  u.id, u.email, u.display_name, u.role, u.created_at, u.updated_at
+  u.id, u.email, u.display_name, u.role, u.disabled_at, u.must_change_password, u.created_at, u.updated_at
 FROM sessions s
 JOIN users u ON u.id = s.user_id
 WHERE s.id = ?`, id)
@@ -221,6 +228,12 @@ WHERE s.id = ?`, id)
 		return Session{}, false, nil
 	}
 	if !s.now().UTC().Before(session.ExpiresAt) {
+		if err := s.Logout(ctx, id); err != nil {
+			return Session{}, false, err
+		}
+		return Session{}, false, nil
+	}
+	if session.User.Disabled() {
 		if err := s.Logout(ctx, id); err != nil {
 			return Session{}, false, err
 		}
@@ -252,7 +265,7 @@ func (s *Service) ListUsers(ctx context.Context) ([]User, error) {
 		return nil, errors.New("auth service has no database")
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, email, display_name, role, created_at, updated_at
+SELECT id, email, display_name, role, disabled_at, must_change_password, created_at, updated_at
 FROM users
 ORDER BY created_at ASC, id ASC`)
 	if err != nil {
@@ -305,7 +318,7 @@ func (s *Service) userCount(ctx context.Context, q queryer) (int, error) {
 
 func (s *Service) userByEmail(ctx context.Context, email string) (userRecord, error) {
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, email, display_name, password_hash, role, created_at, updated_at
+SELECT id, email, display_name, password_hash, role, disabled_at, must_change_password, created_at, updated_at
 FROM users
 WHERE email = ?`, email)
 	record, err := scanUserRecord(row)
@@ -313,6 +326,23 @@ WHERE email = ?`, email)
 		return userRecord{}, err
 	}
 	user, err := s.hydrateUserRoles(ctx, s.db, record.User)
+	if err != nil {
+		return userRecord{}, err
+	}
+	record.User = user
+	return record, nil
+}
+
+func (s *Service) userByID(ctx context.Context, q queryer, id int64) (userRecord, error) {
+	row := q.QueryRowContext(ctx, `
+SELECT id, email, display_name, password_hash, role, disabled_at, must_change_password, created_at, updated_at
+FROM users
+WHERE id = ?`, id)
+	record, err := scanUserRecord(row)
+	if err != nil {
+		return userRecord{}, err
+	}
+	user, err := s.hydrateUserRoles(ctx, q, record.User)
 	if err != nil {
 		return userRecord{}, err
 	}
@@ -404,9 +434,11 @@ VALUES (?, ?, ?, ?, ?)`, sessionID, user.ID, csrfToken, expiresAt.Format(time.RF
 func scanUser(row scanner) (User, error) {
 	var user User
 	var role string
+	var disabledAt sql.NullString
+	var mustChangePassword int
 	var createdAt string
 	var updatedAt string
-	if err := row.Scan(&user.ID, &user.Email, &user.DisplayName, &role, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&user.ID, &user.Email, &user.DisplayName, &role, &disabledAt, &mustChangePassword, &createdAt, &updatedAt); err != nil {
 		return User{}, err
 	}
 	parsedCreatedAt, err := parseTime(createdAt)
@@ -417,10 +449,16 @@ func scanUser(row scanner) (User, error) {
 	if err != nil {
 		return User{}, fmt.Errorf("parse user updated_at: %w", err)
 	}
+	parsedDisabledAt, err := parseOptionalTime(disabledAt)
+	if err != nil {
+		return User{}, fmt.Errorf("parse user disabled_at: %w", err)
+	}
 	user.Role = Role(role)
 	if user.Role.Valid() {
 		user.Roles = RoleSet{user.Role}
 	}
+	user.DisabledAt = parsedDisabledAt
+	user.MustChangePassword = mustChangePassword != 0
 	user.CreatedAt = parsedCreatedAt
 	user.UpdatedAt = parsedUpdatedAt
 	return user, nil
@@ -429,9 +467,11 @@ func scanUser(row scanner) (User, error) {
 func scanUserRecord(row scanner) (userRecord, error) {
 	var record userRecord
 	var role string
+	var disabledAt sql.NullString
+	var mustChangePassword int
 	var createdAt string
 	var updatedAt string
-	if err := row.Scan(&record.ID, &record.Email, &record.DisplayName, &record.passwordHash, &role, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&record.ID, &record.Email, &record.DisplayName, &record.passwordHash, &role, &disabledAt, &mustChangePassword, &createdAt, &updatedAt); err != nil {
 		return userRecord{}, err
 	}
 	parsedCreatedAt, err := parseTime(createdAt)
@@ -442,10 +482,16 @@ func scanUserRecord(row scanner) (userRecord, error) {
 	if err != nil {
 		return userRecord{}, fmt.Errorf("parse user updated_at: %w", err)
 	}
+	parsedDisabledAt, err := parseOptionalTime(disabledAt)
+	if err != nil {
+		return userRecord{}, fmt.Errorf("parse user disabled_at: %w", err)
+	}
 	record.Role = Role(role)
 	if record.Role.Valid() {
 		record.Roles = RoleSet{record.Role}
 	}
+	record.DisabledAt = parsedDisabledAt
+	record.MustChangePassword = mustChangePassword != 0
 	record.CreatedAt = parsedCreatedAt
 	record.UpdatedAt = parsedUpdatedAt
 	return record, nil
@@ -456,9 +502,11 @@ func scanSession(row scanner) (Session, error) {
 	var role string
 	var expiresAt string
 	var sessionCreatedAt string
+	var disabledAt sql.NullString
+	var mustChangePassword int
 	var userCreatedAt string
 	var userUpdatedAt string
-	if err := row.Scan(&session.ID, &session.CSRFToken, &expiresAt, &sessionCreatedAt, &session.User.ID, &session.User.Email, &session.User.DisplayName, &role, &userCreatedAt, &userUpdatedAt); err != nil {
+	if err := row.Scan(&session.ID, &session.CSRFToken, &expiresAt, &sessionCreatedAt, &session.User.ID, &session.User.Email, &session.User.DisplayName, &role, &disabledAt, &mustChangePassword, &userCreatedAt, &userUpdatedAt); err != nil {
 		return Session{}, err
 	}
 	parsedExpiresAt, err := parseTime(expiresAt)
@@ -477,12 +525,18 @@ func scanSession(row scanner) (Session, error) {
 	if err != nil {
 		return Session{}, fmt.Errorf("parse session user updated_at: %w", err)
 	}
+	parsedDisabledAt, err := parseOptionalTime(disabledAt)
+	if err != nil {
+		return Session{}, fmt.Errorf("parse session user disabled_at: %w", err)
+	}
 	session.ExpiresAt = parsedExpiresAt
 	session.CreatedAt = parsedSessionCreatedAt
 	session.User.Role = Role(role)
 	if session.User.Role.Valid() {
 		session.User.Roles = RoleSet{session.User.Role}
 	}
+	session.User.DisabledAt = parsedDisabledAt
+	session.User.MustChangePassword = mustChangePassword != 0
 	session.User.CreatedAt = parsedUserCreatedAt
 	session.User.UpdatedAt = parsedUserUpdatedAt
 	return session, nil
@@ -494,6 +548,17 @@ func parseTime(raw string) (time.Time, error) {
 		return time.Time{}, err
 	}
 	return parsed.UTC(), nil
+}
+
+func parseOptionalTime(raw sql.NullString) (*time.Time, error) {
+	if !raw.Valid || strings.TrimSpace(raw.String) == "" {
+		return nil, nil
+	}
+	parsed, err := parseTime(raw.String)
+	if err != nil {
+		return nil, err
+	}
+	return &parsed, nil
 }
 
 func normalizeCreateUserParams(params CreateUserParams) CreateUserParams {
@@ -522,11 +587,8 @@ func validateCreateUserParams(params CreateUserParams) error {
 	if len(params.DisplayName) > 120 {
 		return ValidationError{Message: "display name is too long"}
 	}
-	if len(params.Password) < 12 {
-		return ValidationError{Message: "password must be at least 12 characters"}
-	}
-	if len(params.Password) > 1024 {
-		return ValidationError{Message: "password is too long"}
+	if err := validatePassword(params.Password); err != nil {
+		return err
 	}
 	roles, valid := NormalizeRoleSet(params.Roles)
 	if !valid {

@@ -77,6 +77,11 @@ type AuthService interface {
 	Logout(ctx context.Context, id string) error
 	ListUsers(ctx context.Context) ([]auth.User, error)
 	CreateUser(ctx context.Context, params auth.CreateUserParams) (auth.User, error)
+	UpdateUserRoles(ctx context.Context, params auth.UpdateUserRolesParams) (auth.User, error)
+	DisableUser(ctx context.Context, actorUserID int64, userID int64) (auth.User, error)
+	EnableUser(ctx context.Context, actorUserID int64, userID int64) (auth.User, error)
+	ChangePassword(ctx context.Context, params auth.ChangePasswordParams) (auth.Session, error)
+	ResetPassword(ctx context.Context, params auth.ResetPasswordParams) error
 }
 
 type RepositoryStore interface {
@@ -270,6 +275,7 @@ type currentUserView struct {
 	Email                 string
 	DisplayName           string
 	RoleLabel             string
+	CanChangePassword     bool
 	IsAdmin               bool
 	CanManageRepositories bool
 	CanFreeze             bool
@@ -277,9 +283,24 @@ type currentUserView struct {
 }
 
 type userView struct {
-	User      auth.User
-	RoleLabel string
-	CreatedAt string
+	User          auth.User
+	RoleLabel     string
+	CreatedAt     string
+	IsSelf        bool
+	RoleOptions   []roleOption
+	ResetFormOpen bool
+}
+
+// usersPageState carries users-page form state across validation re-renders.
+// RoleFormUserID/RoleFormRoles preserve a submitted per-user role edit and
+// ResetFormUserID keeps a failed reset form expanded on its row; password
+// values are intentionally never part of this state.
+type usersPageState struct {
+	FormError       string
+	CreateRoles     auth.RoleSet
+	RoleFormUserID  int64
+	RoleFormRoles   auth.RoleSet
+	ResetFormUserID int64
 }
 
 type roleOption struct {
@@ -394,6 +415,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /webhooks/forgejo", s.handleForgejoWebhook)
 	s.mux.HandleFunc("GET /users", s.handleUsers)
 	s.mux.HandleFunc("POST /users", s.handleCreateUser)
+	s.mux.HandleFunc("POST /users/roles", s.handleUpdateUserRoles)
+	s.mux.HandleFunc("POST /users/disable", s.handleDisableUser)
+	s.mux.HandleFunc("POST /users/enable", s.handleEnableUser)
+	s.mux.HandleFunc("POST /users/reset-password", s.handleResetUserPassword)
+	s.mux.HandleFunc("GET /account/password", s.handleAccountPassword)
+	s.mux.HandleFunc("POST /account/password", s.handleAccountPasswordPost)
 	s.mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.Dir("web/static"))))
 }
 
@@ -477,11 +504,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/setup", http.StatusSeeOther)
 		return
 	}
-	if _, ok, err := s.currentSession(r); err != nil {
+	if session, ok, err := s.currentSession(r); err != nil {
 		internalServerError(w)
 		return
 	} else if ok {
-		http.Redirect(w, r, "/", http.StatusSeeOther)
+		http.Redirect(w, r, postLoginPath(session.MustChangePassword), http.StatusSeeOther)
 		return
 	}
 	s.renderLoginStatus(w, r, "", http.StatusOK)
@@ -515,7 +542,14 @@ func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	}
 	clearLoginCSRFCookie(w, r)
 	setSessionCookie(w, r, sessionStateFromAuth(session))
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	http.Redirect(w, r, postLoginPath(session.User.MustChangePassword), http.StatusSeeOther)
+}
+
+func postLoginPath(mustChangePassword bool) string {
+	if mustChangePassword {
+		return "/account/password"
+	}
+	return "/"
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -1482,7 +1516,13 @@ func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
 		internalServerError(w)
 		return
 	}
-	s.renderUsers(w, users, "", auth.RoleSet{auth.RoleViewer}, session)
+	s.renderUsers(w, users, defaultUsersPageState(), session)
+}
+
+// defaultUsersPageState seeds the create-user form with the least-privileged
+// role preselected.
+func defaultUsersPageState() usersPageState {
+	return usersPageState{CreateRoles: auth.RoleSet{auth.RoleViewer}}
 }
 
 func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
@@ -1502,21 +1542,192 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		Roles:       roles,
 	})
 	if err != nil {
+		s.renderUsersValidationError(w, r, err, usersPageState{CreateRoles: auth.RoleSet(roles)}, session)
+		return
+	}
+	http.Redirect(w, r, "/users", http.StatusSeeOther)
+}
+
+func (s *Server) handleUpdateUserRoles(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.AuthService == nil {
+		http.Error(w, "auth service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	session, ok := s.requireRepositoryManagerForm(w, r)
+	if !ok || session.UserID == nil {
+		return
+	}
+	userID := formUserID(r)
+	roles := rolesFromForm(r)
+	_, err := s.cfg.AuthService.UpdateUserRoles(r.Context(), auth.UpdateUserRolesParams{
+		ActorUserID: *session.UserID,
+		UserID:      userID,
+		Roles:       roles,
+	})
+	if err != nil {
+		state := defaultUsersPageState()
+		state.RoleFormUserID = userID
+		state.RoleFormRoles, _ = auth.NormalizeRoleSet(roles)
+		s.renderUsersValidationError(w, r, err, state, session)
+		return
+	}
+	http.Redirect(w, r, "/users", http.StatusSeeOther)
+}
+
+func (s *Server) handleDisableUser(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.AuthService == nil {
+		http.Error(w, "auth service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	session, ok := s.requireRepositoryManagerForm(w, r)
+	if !ok || session.UserID == nil {
+		return
+	}
+	userID := formUserID(r)
+	if _, err := s.cfg.AuthService.DisableUser(r.Context(), *session.UserID, userID); err != nil {
+		s.renderUsersValidationError(w, r, err, defaultUsersPageState(), session)
+		return
+	}
+	if *session.UserID == userID {
+		clearSessionCookie(w, r)
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/users", http.StatusSeeOther)
+}
+
+func (s *Server) handleEnableUser(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.AuthService == nil {
+		http.Error(w, "auth service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	session, ok := s.requireRepositoryManagerForm(w, r)
+	if !ok || session.UserID == nil {
+		return
+	}
+	if _, err := s.cfg.AuthService.EnableUser(r.Context(), *session.UserID, formUserID(r)); err != nil {
+		s.renderUsersValidationError(w, r, err, defaultUsersPageState(), session)
+		return
+	}
+	http.Redirect(w, r, "/users", http.StatusSeeOther)
+}
+
+func (s *Server) handleResetUserPassword(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.AuthService == nil {
+		http.Error(w, "auth service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	session, ok := s.requireRepositoryManagerForm(w, r)
+	if !ok || session.UserID == nil {
+		return
+	}
+	userID := formUserID(r)
+	state := defaultUsersPageState()
+	state.ResetFormUserID = userID
+	if r.PostFormValue("temporary_password") != r.PostFormValue("temporary_password_confirmation") {
+		s.renderUsersValidationError(w, r, auth.ValidationError{Message: "temporary passwords do not match"}, state, session)
+		return
+	}
+	err := s.cfg.AuthService.ResetPassword(r.Context(), auth.ResetPasswordParams{
+		ActorUserID:       *session.UserID,
+		UserID:            userID,
+		TemporaryPassword: r.PostFormValue("temporary_password"),
+	})
+	if err != nil {
+		s.renderUsersValidationError(w, r, err, state, session)
+		return
+	}
+	http.Redirect(w, r, "/users", http.StatusSeeOther)
+}
+
+// renderUsersValidationError re-renders the users page for a typed validation
+// error and hides internal error details. Password values are never echoed.
+func (s *Server) renderUsersValidationError(w http.ResponseWriter, r *http.Request, err error, state usersPageState, session sessionState) {
+	if !auth.IsValidationError(err) {
+		internalServerError(w)
+		return
+	}
+	users, listErr := s.cfg.AuthService.ListUsers(r.Context())
+	if listErr != nil {
+		internalServerError(w)
+		return
+	}
+	state.FormError = err.Error()
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusBadRequest)
+	s.renderUsers(w, users, state, session)
+}
+
+func formUserID(r *http.Request) int64 {
+	userID, err := strconv.ParseInt(strings.TrimSpace(r.PostFormValue("user_id")), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return userID
+}
+
+func (s *Server) handleAccountPassword(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.AuthService == nil {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	session, ok := s.requireViewWithGate(w, r, true)
+	if !ok {
+		return
+	}
+	s.renderAccountPassword(w, "", http.StatusOK, session)
+}
+
+func (s *Server) handleAccountPasswordPost(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.AuthService == nil {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	session, ok := s.requireAuthenticatedForm(w, r)
+	if !ok {
+		return
+	}
+	if session.UserID == nil {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if r.PostFormValue("new_password") != r.PostFormValue("new_password_confirmation") {
+		s.renderAccountPassword(w, "new passwords do not match", http.StatusBadRequest, session)
+		return
+	}
+	newSession, err := s.cfg.AuthService.ChangePassword(r.Context(), auth.ChangePasswordParams{
+		UserID:          *session.UserID,
+		CurrentPassword: r.PostFormValue("current_password"),
+		NewPassword:     r.PostFormValue("new_password"),
+	})
+	if err != nil {
 		if !auth.IsValidationError(err) {
 			internalServerError(w)
 			return
 		}
-		users, listErr := s.cfg.AuthService.ListUsers(r.Context())
-		if listErr != nil {
-			internalServerError(w)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusBadRequest)
-		s.renderUsers(w, users, err.Error(), auth.RoleSet(roles), session)
+		s.renderAccountPassword(w, err.Error(), http.StatusBadRequest, session)
 		return
 	}
-	http.Redirect(w, r, "/users", http.StatusSeeOther)
+	setSessionCookie(w, r, sessionStateFromAuth(newSession))
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (s *Server) renderAccountPassword(w http.ResponseWriter, formError string, status int, session sessionState) {
+	tpl, err := template.New("page").Parse(accountPasswordTemplate)
+	if err != nil {
+		internalServerError(w)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if status != http.StatusOK {
+		w.WriteHeader(status)
+	}
+	_ = tpl.Execute(w, map[string]any{
+		"AppName":            s.cfg.AppName,
+		"FormError":          formError,
+		"CSRFToken":          session.CSRFToken,
+		"MustChangePassword": session.MustChangePassword,
+	})
 }
 
 func (s *Server) requireRepositoryManagerForm(w http.ResponseWriter, r *http.Request) (sessionState, bool) {
@@ -1532,16 +1743,31 @@ func (s *Server) requireThawApproverForm(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) requireAuthenticatedForm(w http.ResponseWriter, r *http.Request) (sessionState, bool) {
-	return s.requireRoleForm(w, r, func(roles auth.RoleSet) bool { return roles.CanView() })
+	return s.requireRoleFormWithGate(w, r, func(roles auth.RoleSet) bool { return roles.CanView() }, true)
 }
 
 func (s *Server) requireRoleForm(w http.ResponseWriter, r *http.Request, allowed func(auth.RoleSet) bool) (sessionState, bool) {
+	return s.requireRoleFormWithGate(w, r, allowed, false)
+}
+
+// requireRoleFormWithGate guards authenticated POST mutations. Unless
+// allowForced is set, a session in forced password-change state is redirected
+// to /account/password before role authorization or any domain work.
+func (s *Server) requireRoleFormWithGate(w http.ResponseWriter, r *http.Request, allowed func(auth.RoleSet) bool, allowForced bool) (sessionState, bool) {
 	session, ok, err := s.currentSession(r)
 	if err != nil {
 		internalServerError(w)
 		return sessionState{}, false
 	}
-	if !ok || !allowed(session.Roles) {
+	if !ok {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return sessionState{}, false
+	}
+	if !allowForced && session.MustChangePassword {
+		http.Redirect(w, r, "/account/password", http.StatusSeeOther)
+		return sessionState{}, false
+	}
+	if !allowed(session.Roles) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return sessionState{}, false
 	}
@@ -1557,6 +1783,10 @@ func (s *Server) requireRoleForm(w http.ResponseWriter, r *http.Request, allowed
 }
 
 func (s *Server) requireView(w http.ResponseWriter, r *http.Request) (sessionState, bool) {
+	return s.requireViewWithGate(w, r, false)
+}
+
+func (s *Server) requireViewWithGate(w http.ResponseWriter, r *http.Request, allowForced bool) (sessionState, bool) {
 	if s.cfg.AuthService == nil {
 		session, err := s.sessions.getOrCreate(w, r)
 		if err != nil {
@@ -1569,6 +1799,10 @@ func (s *Server) requireView(w http.ResponseWriter, r *http.Request) (sessionSta
 	session, ok, err := s.currentSession(r)
 	if err != nil {
 		internalServerError(w)
+		return sessionState{}, false
+	}
+	if ok && !allowForced && session.MustChangePassword {
+		http.Redirect(w, r, "/account/password", http.StatusSeeOther)
 		return sessionState{}, false
 	}
 	if ok && session.Roles.CanView() {
@@ -1615,14 +1849,15 @@ func (s *Server) currentSession(r *http.Request) (sessionState, bool, error) {
 func sessionStateFromAuth(session auth.Session) sessionState {
 	userID := session.User.ID
 	return sessionState{
-		ID:          session.ID,
-		CSRFToken:   session.CSRFToken,
-		UserID:      &userID,
-		Email:       session.User.Email,
-		DisplayName: session.User.DisplayName,
-		Role:        session.User.Role,
-		Roles:       session.User.Roles,
-		ExpiresAt:   session.ExpiresAt,
+		ID:                 session.ID,
+		CSRFToken:          session.CSRFToken,
+		UserID:             &userID,
+		Email:              session.User.Email,
+		DisplayName:        session.User.DisplayName,
+		Role:               session.User.Role,
+		Roles:              session.User.Roles,
+		MustChangePassword: session.User.MustChangePassword,
+		ExpiresAt:          session.ExpiresAt,
 	}
 }
 
@@ -1635,6 +1870,7 @@ func currentUserFromSession(session sessionState) currentUserView {
 		Email:                 session.Email,
 		DisplayName:           session.DisplayName,
 		RoleLabel:             roles.Label(),
+		CanChangePassword:     session.UserID != nil,
 		IsAdmin:               session.UserID != nil && roles.CanManageRepositories(),
 		CanManageRepositories: roles.CanManageRepositories(),
 		CanFreeze:             roles.CanFreeze(),
@@ -2212,6 +2448,31 @@ func systemAuditEventViewForEvent(repositoriesByID map[int64]domain.Repository, 
 		}
 		view.Detail = "Head " + headSHA + " — Confirmation reason: " + reason
 		view.StateClass = "ok"
+	case audit.ActionUserRolesUpdated:
+		view.Label = "User roles updated"
+		view.Summary = "User #" + event.SubjectID
+		view.Detail = "Roles " + auditDetailOrDash(details, "roles_before") + " → " + auditDetailOrDash(details, "roles_after")
+		view.StateClass = "info"
+	case audit.ActionUserDisabled:
+		view.Label = "User disabled"
+		view.Summary = "User #" + event.SubjectID
+		view.Detail = "Login blocked and all sessions revoked"
+		view.StateClass = "warning"
+	case audit.ActionUserEnabled:
+		view.Label = "User re-enabled"
+		view.Summary = "User #" + event.SubjectID
+		view.Detail = "Login allowed again; no sessions restored"
+		view.StateClass = "ok"
+	case audit.ActionUserPasswordChanged:
+		view.Label = "Password changed"
+		view.Summary = "User #" + event.SubjectID
+		view.Detail = "Self-service change; previous sessions revoked"
+		view.StateClass = "ok"
+	case audit.ActionUserPasswordReset:
+		view.Label = "Password reset"
+		view.Summary = "User #" + event.SubjectID
+		view.Detail = "Temporary password set by an admin; all sessions revoked and a new password is required at next login"
+		view.StateClass = "warning"
 	default:
 		return systemAuditEventView{}, false
 	}
@@ -2438,17 +2699,25 @@ func scheduledFreezeViews(repositories []domain.Repository, freezes []domain.Bra
 	return views
 }
 
-func userViews(users []auth.User) []userView {
+func userViews(users []auth.User, state usersPageState, session sessionState) []userView {
 	views := make([]userView, 0, len(users))
 	for _, user := range users {
 		roleLabel := user.Roles.Label()
 		if roleLabel == "" {
 			roleLabel = user.Role.Label()
 		}
+		roleFormRoles := user.Roles
+		if state.RoleFormUserID != 0 && state.RoleFormUserID == user.ID {
+			roleFormRoles = state.RoleFormRoles
+		}
+		isSelf := session.UserID != nil && *session.UserID == user.ID
 		views = append(views, userView{
-			User:      user,
-			RoleLabel: roleLabel,
-			CreatedAt: user.CreatedAt.UTC().Format("2006-01-02 15:04 UTC"),
+			User:          user,
+			RoleLabel:     roleLabel,
+			CreatedAt:     user.CreatedAt.UTC().Format("2006-01-02 15:04 UTC"),
+			IsSelf:        isSelf,
+			RoleOptions:   roleOptionsFor(roleFormRoles),
+			ResetFormOpen: !isSelf && state.ResetFormUserID != 0 && state.ResetFormUserID == user.ID,
 		})
 	}
 	return views
@@ -2876,16 +3145,16 @@ func (s *Server) renderDecisions(w http.ResponseWriter, repositories []domain.Re
 	s.render(w, decisionsTemplate, data)
 }
 
-func (s *Server) renderUsers(w http.ResponseWriter, users []auth.User, formError string, selectedRoles auth.RoleSet, session sessionState) {
+func (s *Server) renderUsers(w http.ResponseWriter, users []auth.User, state usersPageState, session sessionState) {
 	s.render(w, usersTemplate, map[string]any{
 		"AppName":     s.cfg.AppName,
 		"ActivePage":  "users",
 		"CurrentUser": currentUserFromSession(session),
 		"CSRFToken":   session.CSRFToken,
-		"Users":       userViews(users),
+		"Users":       userViews(users, state, session),
 		"UserCount":   len(users),
-		"FormError":   formError,
-		"RoleOptions": roleOptionsFor(selectedRoles),
+		"FormError":   state.FormError,
+		"RoleOptions": roleOptionsFor(state.CreateRoles),
 	})
 }
 
@@ -3031,6 +3300,7 @@ const pageHead = `<!doctype html>
         <strong>{{ .CurrentUser.DisplayName }}</strong>
         <span>{{ .CurrentUser.Email }}</span>
         <span class="tg-badge tg-badge-info">{{ .CurrentUser.RoleLabel }}</span>
+        {{ if .CurrentUser.CanChangePassword }}<a class="tg-btn tg-btn-secondary tg-btn-sm" href="/account/password">Change password</a>{{ end }}
         <form method="post" action="/logout">
           <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
           <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm">Log out</button>
@@ -3240,28 +3510,161 @@ const usersTemplate = pageHead + `
 
     <section class="tg-panel tg-data-panel tg-users-panel">
       <div class="tg-panel-head"><h2>Configured users</h2><span class="tg-badge tg-badge-info">local auth</span></div>
+      <p class="tg-panel-subtitle">Thawguard never commits a state without an enabled admin: the final enabled admin cannot be disabled or lose the admin role. Disabling a user revokes all of their sessions; re-enabling does not restore old sessions. Password resets sign the user out everywhere and force a new password on their next login.</p>
       {{ if .Users }}
       <div class="tg-table-wrap tg-responsive-table">
-        <table class="tg-data-table">
+        <table class="tg-data-table tg-users-table">
           <caption class="tg-sr-only">Configured Thawguard users</caption>
-          <thead><tr><th>Name</th><th>Email</th><th>Roles</th><th>Created</th></tr></thead>
+          <thead><tr><th>Name</th><th>Email</th><th>Status</th><th>Roles</th><th>Created</th><th>Actions</th></tr></thead>
           <tbody>
           {{ range .Users }}
             <tr>
-              <td data-label="Name">{{ .User.DisplayName }}</td>
+              <td data-label="Name">{{ .User.DisplayName }}{{ if .IsSelf }} <span class="tg-muted">(you)</span>{{ end }}</td>
               <td data-label="Email"><code>{{ .User.Email }}</code></td>
-              <td data-label="Roles"><span class="status status-ok">{{ .RoleLabel }}</span></td>
+              <td data-label="Status">{{ if .User.Disabled }}<span class="status status-warning">Disabled</span>{{ else }}<span class="status status-ok">Enabled</span>{{ end }}</td>
+              <td data-label="Roles">
+                <form method="post" action="/users/roles" class="tg-user-roles-form">
+                  <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+                  <input type="hidden" name="user_id" value="{{ .User.ID }}">
+                  {{ $userID := .User.ID }}
+                  {{ range .RoleOptions }}
+                  <label class="tg-role-check"><input type="checkbox" id="user-roles-{{ $userID }}-{{ .Value }}" name="roles" value="{{ .Value }}"{{ if .Selected }} checked{{ end }}> {{ .Label }}</label>
+                  {{ end }}
+                  <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm">Save roles</button>
+                </form>
+              </td>
               <td data-label="Created">{{ .CreatedAt }}</td>
+              <td data-label="Actions">
+                <div class="tg-user-actions">
+                  {{ if .User.Disabled }}
+                  <form method="post" action="/users/enable">
+                    <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+                    <input type="hidden" name="user_id" value="{{ .User.ID }}">
+                    <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm">Re-enable</button>
+                  </form>
+                  <p class="tg-muted">Re-enabling does not restore old sessions.</p>
+                  {{ else }}
+                  <form method="post" action="/users/disable" data-confirm-submit data-confirm-title="Disable user?" data-confirm-message="{{ if .IsSelf }}Disabling your own account revokes all of your sessions and signs you out immediately. The final enabled admin cannot be disabled.{{ else }}The user can no longer log in and all of their sessions are revoked. Their password and roles are kept for later re-enabling. The final enabled admin cannot be disabled.{{ end }}" data-confirm-action="Disable user">
+                    <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+                    <input type="hidden" name="user_id" value="{{ .User.ID }}">
+                    <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm">Disable</button>
+                  </form>
+                  {{ end }}
+                  {{ if .IsSelf }}
+                  <p class="tg-muted">Use “Change password” for your own account.</p>
+                  {{ else }}
+                  <div data-credential-block>
+                    <button type="button" class="tg-btn tg-btn-secondary tg-btn-sm"{{ if .ResetFormOpen }} hidden{{ end }} data-credential-reveal data-credential-target="reset-password-{{ .User.ID }}" data-confirm-title="Reset password?" data-confirm-message="This sets an admin-entered temporary password, revokes every session for the user, and forces them to choose a new password on their next login. It does not re-enable a disabled account." data-confirm-action="Open reset form" aria-controls="reset-password-{{ .User.ID }}" aria-expanded="{{ if .ResetFormOpen }}true{{ else }}false{{ end }}"><svg class="tg-icon"><use href="#tg-i-key"></use></svg>Reset password</button>
+                    <form id="reset-password-{{ .User.ID }}"{{ if not .ResetFormOpen }} hidden{{ end }} method="post" action="/users/reset-password" class="tg-user-reset-form" data-credential-form>
+                      {{ if and .ResetFormOpen $.FormError }}<p class="error">{{ $.FormError }}</p>{{ end }}
+                      <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+                      <input type="hidden" name="user_id" value="{{ .User.ID }}">
+                      <label>Temporary password <input type="password" name="temporary_password" data-credential-input{{ if not .ResetFormOpen }} disabled{{ end }} minlength="12" autocomplete="new-password" required></label>
+                      <label>Confirm temporary password <input type="password" name="temporary_password_confirmation" data-credential-input{{ if not .ResetFormOpen }} disabled{{ end }} minlength="12" autocomplete="new-password" required></label>
+                      <div class="tg-credential-form-actions">
+                        <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm">Set temporary password</button>
+                        <button type="button" class="tg-btn tg-btn-secondary tg-btn-sm" data-credential-cancel>Cancel</button>
+                      </div>
+                    </form>
+                  </div>
+                  {{ end }}
+                </div>
+              </td>
             </tr>
           {{ end }}
           </tbody>
         </table>
+      </div>
+      <div class="tg-mobile-card-list" aria-label="Configured users mobile cards">
+        {{ range .Users }}
+        <article class="tg-mobile-card">
+          <div class="tg-mobile-card-head">
+            <div>
+              <span class="tg-mobile-card-kicker">Created {{ .CreatedAt }}</span>
+              <h3>{{ .User.DisplayName }}{{ if .IsSelf }} <span class="tg-muted">(you)</span>{{ end }}</h3>
+            </div>
+            {{ if .User.Disabled }}<span class="status status-warning">Disabled</span>{{ else }}<span class="status status-ok">Enabled</span>{{ end }}
+          </div>
+          <p class="tg-mobile-card-meta"><code>{{ .User.Email }}</code></p>
+          <form method="post" action="/users/roles" class="tg-user-roles-form">
+            <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+            <input type="hidden" name="user_id" value="{{ .User.ID }}">
+            {{ $userID := .User.ID }}
+            {{ range .RoleOptions }}
+            <label class="tg-role-check"><input type="checkbox" id="user-roles-m-{{ $userID }}-{{ .Value }}" name="roles" value="{{ .Value }}"{{ if .Selected }} checked{{ end }}> {{ .Label }}</label>
+            {{ end }}
+            <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm">Save roles</button>
+          </form>
+          <div class="tg-user-actions">
+            {{ if .User.Disabled }}
+            <form method="post" action="/users/enable">
+              <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+              <input type="hidden" name="user_id" value="{{ .User.ID }}">
+              <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm">Re-enable</button>
+            </form>
+            <p class="tg-muted">Re-enabling does not restore old sessions.</p>
+            {{ else }}
+            <form method="post" action="/users/disable" data-confirm-submit data-confirm-title="Disable user?" data-confirm-message="{{ if .IsSelf }}Disabling your own account revokes all of your sessions and signs you out immediately. The final enabled admin cannot be disabled.{{ else }}The user can no longer log in and all of their sessions are revoked. Their password and roles are kept for later re-enabling. The final enabled admin cannot be disabled.{{ end }}" data-confirm-action="Disable user">
+              <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+              <input type="hidden" name="user_id" value="{{ .User.ID }}">
+              <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm">Disable</button>
+            </form>
+            {{ end }}
+            {{ if .IsSelf }}
+            <p class="tg-muted">Use “Change password” for your own account.</p>
+            {{ else }}
+            <div data-credential-block>
+              <button type="button" class="tg-btn tg-btn-secondary tg-btn-sm"{{ if .ResetFormOpen }} hidden{{ end }} data-credential-reveal data-credential-target="reset-password-m-{{ .User.ID }}" data-confirm-title="Reset password?" data-confirm-message="This sets an admin-entered temporary password, revokes every session for the user, and forces them to choose a new password on their next login. It does not re-enable a disabled account." data-confirm-action="Open reset form" aria-controls="reset-password-m-{{ .User.ID }}" aria-expanded="{{ if .ResetFormOpen }}true{{ else }}false{{ end }}"><svg class="tg-icon"><use href="#tg-i-key"></use></svg>Reset password</button>
+              <form id="reset-password-m-{{ .User.ID }}"{{ if not .ResetFormOpen }} hidden{{ end }} method="post" action="/users/reset-password" class="tg-user-reset-form" data-credential-form>
+                {{ if and .ResetFormOpen $.FormError }}<p class="error">{{ $.FormError }}</p>{{ end }}
+                <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+                <input type="hidden" name="user_id" value="{{ .User.ID }}">
+                <label>Temporary password <input type="password" name="temporary_password" data-credential-input{{ if not .ResetFormOpen }} disabled{{ end }} minlength="12" autocomplete="new-password" required></label>
+                <label>Confirm temporary password <input type="password" name="temporary_password_confirmation" data-credential-input{{ if not .ResetFormOpen }} disabled{{ end }} minlength="12" autocomplete="new-password" required></label>
+                <div class="tg-credential-form-actions">
+                  <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm">Set temporary password</button>
+                  <button type="button" class="tg-btn tg-btn-secondary tg-btn-sm" data-credential-cancel>Cancel</button>
+                </div>
+              </form>
+            </div>
+            {{ end }}
+          </div>
+        </article>
+        {{ end }}
       </div>
       {{ else }}
         <div class="tg-empty-row tg-data-empty"><strong>No users yet</strong><span>Create the first admin from setup.</span></div>
       {{ end }}
     </section>
   </main>` + pageFoot
+
+const accountPasswordTemplate = authPageHead + `
+      <div class="tg-panel-head tg-panel-head-stacked">
+        <div>
+          <p class="eyebrow">Account security</p>
+          <h1 class="tg-title">Change your password</h1>
+          {{ if .MustChangePassword }}
+          <p class="tg-subtitle">A temporary password was set for this account. Choose a new password to continue using {{ .AppName }}.</p>
+          {{ else }}
+          <p class="tg-subtitle">Changing your password signs out every session for this account and starts a fresh one here.</p>
+          {{ end }}
+        </div>
+      </div>
+      {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
+      <form method="post" action="/account/password" class="tg-setup-form tg-auth-form">
+        <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
+        <label class="tg-field-wide">Current password <input type="password" name="current_password" autocomplete="current-password" required></label>
+        <label class="tg-field-wide">New password <input type="password" name="new_password" autocomplete="new-password" minlength="12" required></label>
+        <label class="tg-field-wide">Confirm new password <input type="password" name="new_password_confirmation" autocomplete="new-password" minlength="12" required></label>
+        <div class="tg-form-submit tg-field-wide"><button type="submit" class="tg-btn tg-btn-primary">Change password</button></div>
+      </form>
+      <div class="tg-account-links">
+        {{ if not .MustChangePassword }}<a class="tg-btn tg-btn-secondary tg-btn-sm" href="/">Back to dashboard</a>{{ end }}
+        <form method="post" action="/logout">
+          <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
+          <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm">Log out</button>
+        </form>
+      </div>` + authPageFoot
 
 const dashboardTemplate = pageHead + `
   <main class="tg-main tg-dashboard">

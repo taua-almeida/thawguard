@@ -37,10 +37,16 @@ const (
 	ActionFreezeSchedulePlannedUnfreeze      = "freeze_schedule.planned_unfreeze_executed"
 	ActionThawExceptionApproved              = "thaw_exception.approved"
 	ActionThawExceptionSharedHeadApproved    = "thaw_exception.shared_head_approved"
+	ActionUserRolesUpdated                   = "user.roles_updated"
+	ActionUserDisabled                       = "user.disabled"
+	ActionUserEnabled                        = "user.enabled"
+	ActionUserPasswordChanged                = "user.password_changed"
+	ActionUserPasswordReset                  = "user.password_reset"
 
 	SubjectTypeRepository    = "repository"
 	SubjectTypeBranchFreeze  = "branch_freeze"
 	SubjectTypeThawException = "thaw_exception"
+	SubjectTypeUser          = "user"
 )
 
 type Event struct {

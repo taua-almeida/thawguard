@@ -733,6 +733,53 @@ code,
   padding: 10px 20px 20px;
 }
 
+.tg-user-roles-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  align-items: center;
+}
+
+.tg-user-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.tg-user-actions .tg-muted {
+  margin: 0;
+  font-size: 12px;
+}
+
+.tg-user-reset-form {
+  display: grid;
+  gap: 8px;
+}
+
+.tg-user-reset-form[hidden] {
+  display: none;
+}
+
+.tg-user-reset-form label {
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.tg-user-reset-form input {
+  min-height: 34px;
+  padding: 7px 10px;
+  font-size: 13px;
+}
+
+.tg-account-links {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 14px;
+}
+
 .tg-thaw-panel-title {
   display: flex;
   align-items: flex-start;

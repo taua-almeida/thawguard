@@ -83,6 +83,8 @@ func TestOpenAndApplyMigrationsAgainstSQLite(t *testing.T) {
 	assertColumnExists(t, database, "sessions", "csrf_token")
 	assertIndexExists(t, database, "idx_sessions_expires_at")
 	assertTableExists(t, database, "user_roles")
+	assertColumnExists(t, database, "users", "disabled_at")
+	assertColumnExists(t, database, "users", "must_change_password")
 	assertColumnExists(t, database, "repositories", "enforcement_state")
 	assertColumnExists(t, database, "repositories", "enforcement_failure_reason")
 	assertColumnExists(t, database, "repositories", "enforcement_failed_at")
@@ -219,6 +221,8 @@ VALUES
 	assertTableExists(t, database, "user_roles")
 	assertUserRoles(t, database, 101, []string{"admin", "freezer", "thaw_approver", "viewer"})
 	assertUserRoles(t, database, 102, []string{"freezer"})
+	assertUserEnabledWithoutForcedPasswordChange(t, database, 101)
+	assertUserEnabledWithoutForcedPasswordChange(t, database, 102)
 	var sessionCount int
 	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM sessions WHERE id = 'legacy-session'`).Scan(&sessionCount); err != nil {
 		t.Fatal(err)
@@ -615,10 +619,8 @@ func TestImmediatePlannedUnfreezeMigrationPreservesFreezeDataAndAppliesOnce(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(migrations) < 2 || migrations[len(migrations)-2].Name != "0023_immediate_planned_unfreezes.sql" {
-		t.Fatalf("expected immediate planned-unfreeze migration last, got %+v", migrations)
-	}
-	if err := ApplyMigrations(ctx, database, migrations[:len(migrations)-2]); err != nil {
+	plannedUnfreezeIndex := migrationIndex(t, migrations, "0023_immediate_planned_unfreezes.sql")
+	if err := ApplyMigrations(ctx, database, migrations[:plannedUnfreezeIndex]); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.ExecContext(ctx, `
@@ -631,7 +633,7 @@ VALUES
 		t.Fatal(err)
 	}
 
-	if err := ApplyMigrations(ctx, database, migrations[:len(migrations)-1]); err != nil {
+	if err := ApplyMigrations(ctx, database, migrations[:plannedUnfreezeIndex+1]); err != nil {
 		t.Fatal(err)
 	}
 	assertIndexExists(t, database, "idx_branch_freezes_planned_unfreeze_due")
@@ -666,10 +668,8 @@ func TestRepositoryReconciliationMigrationPreservesExistingJobsAndAppliesOnce(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(migrations) == 0 || migrations[len(migrations)-1].Name != "0024_repository_reconciliation_jobs.sql" {
-		t.Fatalf("expected reconciliation migration last, got %+v", migrations)
-	}
-	if err := ApplyMigrations(ctx, database, migrations[:len(migrations)-1]); err != nil {
+	reconciliationIndex := migrationIndex(t, migrations, "0024_repository_reconciliation_jobs.sql")
+	if err := ApplyMigrations(ctx, database, migrations[:reconciliationIndex]); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.ExecContext(ctx, `
@@ -715,6 +715,81 @@ VALUES (790, 79, 'main', 'ended', 'pending convergence', '2026-07-13T08:00:00.00
 	}
 	if applied != 1 {
 		t.Fatalf("expected reconciliation migration applied once, got %d", applied)
+	}
+}
+
+func TestUserAccountManagementMigrationPreservesUsersAndSessionsAndAppliesOnce(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-test.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountIndex := migrationIndex(t, migrations, "0025_user_account_management.sql")
+	if err := ApplyMigrations(ctx, database, migrations[:accountIndex]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO users(id, email, display_name, password_hash, role, created_at, updated_at)
+VALUES (301, 'admin@example.test', 'Admin', 'hash', 'admin', '2026-07-12T10:00:00.000000000Z', '2026-07-12T10:00:00.000000000Z');
+INSERT INTO user_roles(user_id, role, created_at)
+VALUES (301, 'admin', '2026-07-12T10:00:00.000000000Z'), (301, 'viewer', '2026-07-12T10:00:00.000000000Z');
+INSERT INTO sessions(id, user_id, csrf_token, expires_at, created_at)
+VALUES ('existing-session', 301, 'csrf-token', '2027-01-01T00:00:00.000000000Z', '2026-07-12T10:00:00.000000000Z');`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+		t.Fatal(err)
+	}
+	assertColumnExists(t, database, "users", "disabled_at")
+	assertColumnExists(t, database, "users", "must_change_password")
+	assertUserEnabledWithoutForcedPasswordChange(t, database, 301)
+	assertUserRoles(t, database, 301, []string{"admin", "viewer"})
+	var sessionCount int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM sessions WHERE id = 'existing-session' AND user_id = 301 AND csrf_token = 'csrf-token'`).Scan(&sessionCount); err != nil {
+		t.Fatal(err)
+	}
+	if sessionCount != 1 {
+		t.Fatalf("expected existing session to survive account management migration, got %d", sessionCount)
+	}
+
+	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+		t.Fatal(err)
+	}
+	var applied int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = '0025_user_account_management'`).Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected account management migration applied once, got %d", applied)
+	}
+}
+
+func migrationIndex(t *testing.T, migrations []Migration, name string) int {
+	t.Helper()
+	for i, migration := range migrations {
+		if migration.Name == name {
+			return i
+		}
+	}
+	t.Fatalf("expected migration %s to exist, got %+v", name, migrations)
+	return -1
+}
+
+func assertUserEnabledWithoutForcedPasswordChange(t *testing.T, database *sql.DB, userID int64) {
+	t.Helper()
+	var disabledAt sql.NullString
+	var mustChangePassword int
+	if err := database.QueryRow(`SELECT disabled_at, must_change_password FROM users WHERE id = ?`, userID).Scan(&disabledAt, &mustChangePassword); err != nil {
+		t.Fatal(err)
+	}
+	if disabledAt.Valid || mustChangePassword != 0 {
+		t.Fatalf("expected user %d to stay enabled without forced password change, got disabled_at=%+v must_change_password=%d", userID, disabledAt, mustChangePassword)
 	}
 }
 
