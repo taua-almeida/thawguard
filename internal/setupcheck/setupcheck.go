@@ -1,6 +1,10 @@
 package setupcheck
 
-import "github.com/taua-almeida/thawguard/internal/domain"
+import (
+	"context"
+
+	"github.com/taua-almeida/thawguard/internal/domain"
+)
 
 type Status string
 
@@ -8,6 +12,15 @@ const (
 	StatusOK      Status = "ok"
 	StatusWarning Status = "warning"
 	StatusFailed  Status = "failed"
+
+	CheckStatusTokenConfigured                    = "Status token configured"
+	CheckPullRequestReadAccess                    = "Pull request read access"
+	CheckRecentVerifiedPullRequestWebhook         = "Recent verified pull request webhook"
+	CheckStatusPostingUntested                    = "Status posting has not been tested yet"
+	CheckBranchProtectionReadable                 = "Branch protection readable"
+	CheckBranchProtectionEnabled                  = "Branch protection enabled"
+	CheckRequiredStatusChecksEnabled              = "Required status checks enabled"
+	CheckRequiredThawguardFreezeContextConfigured = "Required thawguard/freeze context configured"
 )
 
 type Result struct {
@@ -17,36 +30,17 @@ type Result struct {
 	Remediation string
 }
 
-type Report struct {
-	CanPostStatuses        bool
-	RequiredContextPresent bool
-	WebhookConfigured      bool
+type BranchInspection struct {
+	Results   []Result
+	Protected bool
 }
 
-func Evaluate(report Report) []Result {
-	return []Result{
-		{
-			Name:        "Bot can post statuses",
-			Status:      statusFromBool(report.CanPostStatuses),
-			Description: "Thawguard must be able to publish commit statuses for PR head SHAs.",
-			Remediation: "Use a Forgejo/Codeberg token with permission to write repository statuses.",
-		},
-		{
-			Name:        "Required status context configured",
-			Status:      statusFromBool(report.RequiredContextPresent),
-			Description: "Branch protection must require the exact context " + domain.RequiredStatusContext + ".",
-			Remediation: "Add " + domain.RequiredStatusContext + " to the branch protection required status checks.",
-		},
-		{
-			Name:        "Pull request webhook configured",
-			Status:      statusFromBool(report.WebhookConfigured),
-			Description: "PR webhooks let Thawguard recompute local status decisions when PRs open, update, retarget, or close.",
-			Remediation: "Add a pull_request webhook pointing at /webhooks/forgejo with a shared secret and verify delivery health.",
-		},
-	}
+type Inspector interface {
+	InspectPullRequestRead(ctx context.Context, repo domain.Repository, branch string) (Result, error)
+	InspectBranch(ctx context.Context, repo domain.Repository, branch string) (BranchInspection, error)
 }
 
-func statusFromBool(ok bool) Status {
+func StatusFromBool(ok bool) Status {
 	if ok {
 		return StatusOK
 	}
@@ -55,9 +49,9 @@ func statusFromBool(ok bool) Status {
 
 func ManualSetupSteps() []string {
 	return []string{
-		"Create or choose a Forgejo/Codeberg bot token that can post commit statuses.",
+		"Store an encrypted Forgejo/Codeberg token so Thawguard can run read-only readiness checks.",
 		"Add a pull_request webhook pointing at /webhooks/forgejo with the repository webhook secret.",
 		"Configure branch protection to require the exact status context " + domain.RequiredStatusContext + ".",
-		"Run setup health checks before relying on a freeze.",
+		"Run readiness checks, then use the later controlled activation test to verify status posting.",
 	}
 }

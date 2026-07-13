@@ -257,6 +257,44 @@ func TestDeliveryStoreListsRecentDeliveries(t *testing.T) {
 	}
 }
 
+func TestDeliveryStoreFindsLatestVerifiedPullRequestForExactRepository(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createWebhookDeliveryTestRepository(t, ctx, database)
+	otherRepo, err := repository.NewStore(database).Create(ctx, repository.CreateParams{Owner: "other", Name: "other", DefaultBranch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewDeliveryStore(database)
+	store.now = fixedDeliveryClock(time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC))
+	for _, params := range []DeliveryRecordParams{
+		{RepositoryID: repo.ID, DeliveryID: "unverified", Event: "pull_request"},
+		{RepositoryID: repo.ID, DeliveryID: "push", Event: "push", Verified: true},
+		{RepositoryID: otherRepo.ID, DeliveryID: "other-repository", Event: "pull_request", Verified: true},
+		{RepositoryID: repo.ID, DeliveryID: "matching", Event: "pull_request", Verified: true},
+	} {
+		if _, err := store.Record(ctx, params); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	delivery, found, err := store.LatestVerifiedPullRequestByRepository(ctx, repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || delivery.DeliveryID != "matching" || !delivery.Verified || delivery.Event != "pull_request" {
+		t.Fatalf("unexpected delivery %+v found=%v", delivery, found)
+	}
+
+	missingRepo, err := repository.NewStore(database).Create(ctx, repository.CreateParams{Owner: "missing", Name: "missing", DefaultBranch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := store.LatestVerifiedPullRequestByRepository(ctx, missingRepo.ID); err != nil || found {
+		t.Fatalf("expected no evidence, found=%v err=%v", found, err)
+	}
+}
+
 func createWebhookDeliveryTestRepository(t *testing.T, ctx context.Context, database *sql.DB) domain.Repository {
 	t.Helper()
 	repo, err := repository.NewStore(database).Create(ctx, repository.CreateParams{Owner: "example-owner", Name: "example-repo", DefaultBranch: "main"})

@@ -317,7 +317,9 @@ func TestUsersPageCreatesUsersAndViewerCannotManageRepositories(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewServer(Config{AppName: "Thawguard", AuthService: authService, RepositoryStore: &fakeRepositoryStore{}})
+	runner := &fakeSetupCheckRunner{}
+	repositoryStore := &fakeRepositoryStore{repositories: []domain.Repository{{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"}}}
+	server := NewServer(Config{AppName: "Thawguard", AuthService: authService, RepositoryStore: repositoryStore, SetupCheckRunner: runner})
 	adminCookie := &http.Cookie{Name: sessionCookieName, Value: adminSession.ID}
 
 	recorder := httptest.NewRecorder()
@@ -351,6 +353,9 @@ func TestUsersPageCreatesUsersAndViewerCannotManageRepositories(t *testing.T) {
 	if recorder.Code != http.StatusOK || strings.Contains(recorder.Body.String(), "Users & Roles") {
 		t.Fatalf("expected viewer to read repositories without admin nav, status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
+	if strings.Contains(recorder.Body.String(), "Run readiness checks") {
+		t.Fatalf("expected viewer readiness evidence to be read-only, got %q", recorder.Body.String())
+	}
 	form = repositoryCreateForm()
 	form.Set(csrfFormField, viewerSession.CSRFToken)
 	recorder = httptest.NewRecorder()
@@ -360,6 +365,15 @@ func TestUsersPageCreatesUsersAndViewerCannotManageRepositories(t *testing.T) {
 	server.Routes().ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusForbidden {
 		t.Fatalf("expected viewer repository create to be forbidden, got %d", recorder.Code)
+	}
+	form = url.Values{"repository_id": {"1"}, csrfFormField: {viewerSession.CSRFToken}}
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPost, "/repositories/setup-check", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(viewerCookie)
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden || len(runner.repositories) != 0 {
+		t.Fatalf("expected viewer readiness run to be forbidden, status=%d runs=%d", recorder.Code, len(runner.repositories))
 	}
 }
 
@@ -729,11 +743,14 @@ func TestRepositoriesPageShowsSetupHealthResults(t *testing.T) {
 	checkedAt := time.Date(2026, 6, 29, 14, 0, 0, 0, time.UTC)
 	server := NewServer(Config{
 		AppName:         "Thawguard",
-		RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}},
+		RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}, branches: map[int64][]domain.RepositoryBranch{repo.ID: {{RepositoryID: repo.ID, Name: "main", Protected: true, SetupStatus: "ok", LastCheckedAt: &checkedAt}}}},
 		SetupCheckStore: &fakeSetupCheckStore{checks: map[int64][]setupcheck.Check{
 			repo.ID: {
-				{RepositoryID: repo.ID, Branch: "main", Result: setupcheck.Result{Name: "Bot can post statuses", Status: setupcheck.StatusOK, Description: "Thawguard can post statuses."}, CheckedAt: checkedAt},
-				{RepositoryID: repo.ID, Branch: "main", Result: setupcheck.Result{Name: "Pull request webhook configured", Status: setupcheck.StatusFailed, Description: "Webhook missing.", Remediation: "Configure a pull_request webhook."}, CheckedAt: checkedAt},
+				{RepositoryID: repo.ID, Result: setupcheck.Result{Name: setupcheck.CheckStatusTokenConfigured, Status: setupcheck.StatusOK, Description: "Encrypted token exists."}, CheckedAt: checkedAt},
+				{RepositoryID: repo.ID, Result: setupcheck.Result{Name: setupcheck.CheckRecentVerifiedPullRequestWebhook, Status: setupcheck.StatusWarning, Description: "Webhook is stale.", Remediation: "Deliver a current event."}, CheckedAt: checkedAt},
+				{RepositoryID: repo.ID, Result: setupcheck.Result{Name: setupcheck.CheckStatusPostingUntested, Status: setupcheck.StatusWarning, Description: "Status posting is not tested until activation."}, CheckedAt: checkedAt},
+				{RepositoryID: repo.ID, Branch: "main", Result: setupcheck.Result{Name: setupcheck.CheckBranchProtectionReadable, Status: setupcheck.StatusOK, Description: "Readable <unsafe>."}, CheckedAt: checkedAt},
+				{RepositoryID: repo.ID, Branch: "main", Result: setupcheck.Result{Name: setupcheck.CheckRequiredThawguardFreezeContextConfigured, Status: setupcheck.StatusOK, Description: "Exact context exists."}, CheckedAt: checkedAt},
 			},
 		}},
 	})
@@ -744,10 +761,30 @@ func TestRepositoriesPageShowsSetupHealthResults(t *testing.T) {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
 	}
 	body := recorder.Body.String()
-	for _, want := range []string{"Bot can post statuses", "ok", "Pull request webhook configured", "failed", "Run setup check", "local placeholders for setup visibility"} {
+	for _, want := range []string{setupcheck.CheckStatusTokenConfigured, "passed", setupcheck.CheckRecentVerifiedPullRequestWebhook, "Webhook is stale", setupcheck.CheckStatusPostingUntested, setupcheck.CheckBranchProtectionReadable, "Run readiness checks", "2026-06-29 14:00 UTC", "&lt;unsafe&gt;"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
+	}
+	if strings.Contains(body, "<unsafe>") || strings.Contains(body, "Activate enforcement") {
+		t.Fatalf("expected escaped evidence and no activation control, got %q", body)
+	}
+}
+
+func TestRepositoriesPageKeepsHistoricalPlaceholderChecksReadable(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	checkedAt := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	server := NewServer(Config{
+		AppName:         "Thawguard",
+		RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}},
+		SetupCheckStore: &fakeSetupCheckStore{checks: map[int64][]setupcheck.Check{
+			repo.ID: {{RepositoryID: repo.ID, Branch: "main", Result: setupcheck.Result{Name: "Bot status permission not verified locally", Status: setupcheck.StatusWarning, Description: "Historical placeholder evidence."}, CheckedAt: checkedAt}},
+		}},
+	})
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "Historical placeholder evidence") {
+		t.Fatalf("expected historical checks to remain readable, status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -816,7 +853,7 @@ func TestRunRepositorySetupCheckRejectsInvalidCSRFToken(t *testing.T) {
 
 func TestRunRepositorySetupCheckReportsRunnerError(t *testing.T) {
 	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
-	runner := &fakeSetupCheckRunner{err: errors.New("setup check failed")}
+	runner := &fakeSetupCheckRunner{err: errors.New("setup check failed: secret-token raw forge body")}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, SetupCheckRunner: runner})
 	form := url.Values{"repository_id": {"1"}}
 	cookie, csrfToken := getRepositoryForm(t, server)
@@ -830,6 +867,9 @@ func TestRunRepositorySetupCheckReportsRunnerError(t *testing.T) {
 
 	if recorder.Code != http.StatusBadGateway {
 		t.Fatalf("expected bad gateway status, got %d", recorder.Code)
+	}
+	if strings.Contains(recorder.Body.String(), "secret-token") || strings.Contains(recorder.Body.String(), "raw forge body") {
+		t.Fatalf("expected generic operational error, got %q", recorder.Body.String())
 	}
 }
 
@@ -2859,7 +2899,7 @@ func (r *fakeSetupCheckRunner) Run(ctx context.Context, repo domain.Repository) 
 		return nil, r.err
 	}
 	r.repositories = append(r.repositories, repo)
-	return setupcheck.Evaluate(setupcheck.Report{}), nil
+	return []setupcheck.Result{{Name: setupcheck.CheckStatusPostingUntested, Status: setupcheck.StatusWarning, Description: "Status posting remains untested."}}, nil
 }
 
 func (s *fakeRepositoryStore) List(ctx context.Context) ([]domain.Repository, error) {

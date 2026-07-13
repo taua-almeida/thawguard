@@ -123,15 +123,22 @@ type PullRequestWebhookProcessor interface {
 }
 
 type repositoryView struct {
-	Repository  domain.Repository
-	SetupChecks []setupcheck.Check
-	Branches    []repositoryBranchView
+	Repository       domain.Repository
+	SetupChecks      []setupcheck.Check
+	RepositoryChecks []setupcheck.Check
+	Branches         []repositoryBranchView
+	LastCheckedAt    string
+	EnforcementLabel string
+	EnforcementClass string
 }
 
 type repositoryBranchView struct {
-	Name       string
-	IsDefault  bool
-	SetupLabel string
+	Name          string
+	IsDefault     bool
+	SetupLabel    string
+	SetupClass    string
+	LastCheckedAt string
+	Checks        []setupcheck.Check
 }
 
 // managedBranchOption is one (repository, exact branch) choice for the freeze
@@ -2407,18 +2414,22 @@ func (s *Server) repositoryViews(ctx context.Context, repositories []domain.Repo
 	views := make([]repositoryView, 0, len(repositories))
 	for _, repo := range repositories {
 		view := repositoryView{Repository: repo}
+		view.EnforcementLabel, view.EnforcementClass = enforcementView(repo.EnforcementState)
 		if s.cfg.SetupCheckStore != nil {
 			checks, err := s.cfg.SetupCheckStore.ListByRepository(ctx, repo.ID)
 			if err != nil {
 				return nil, err
 			}
 			view.SetupChecks = latestSetupChecks(checks)
+			if len(view.SetupChecks) > 0 {
+				view.LastCheckedAt = formatReadinessTime(view.SetupChecks[0].CheckedAt)
+			}
 		}
 		branches, err := s.managedBranches(ctx, repo.ID)
 		if err != nil {
 			return nil, err
 		}
-		view.Branches = repositoryBranchViews(repo, branches)
+		view.RepositoryChecks, view.Branches = groupReadinessChecks(repo, branches, view.SetupChecks)
 		views = append(views, view)
 	}
 	return views, nil
@@ -2431,20 +2442,70 @@ func (s *Server) managedBranches(ctx context.Context, repositoryID int64) ([]dom
 	return s.cfg.RepositoryStore.ListBranches(ctx, repositoryID)
 }
 
-func repositoryBranchViews(repo domain.Repository, branches []domain.RepositoryBranch) []repositoryBranchView {
+func groupReadinessChecks(repo domain.Repository, branches []domain.RepositoryBranch, checks []setupcheck.Check) ([]setupcheck.Check, []repositoryBranchView) {
+	repositoryChecks := make([]setupcheck.Check, 0)
+	checksByBranch := make(map[string][]setupcheck.Check)
+	for _, check := range checks {
+		if check.Branch == "" {
+			repositoryChecks = append(repositoryChecks, check)
+			continue
+		}
+		checksByBranch[check.Branch] = append(checksByBranch[check.Branch], check)
+	}
 	views := make([]repositoryBranchView, 0, len(branches))
 	for _, branch := range branches {
-		label := "setup not verified"
-		if branch.SetupStatus != "" && branch.SetupStatus != "unknown" {
-			label = "setup " + branch.SetupStatus
+		branchChecks := checksByBranch[branch.Name]
+		label, class := readinessStatus(branchChecks)
+		lastCheckedAt := ""
+		if branch.LastCheckedAt != nil {
+			lastCheckedAt = formatReadinessTime(*branch.LastCheckedAt)
 		}
 		views = append(views, repositoryBranchView{
-			Name:       branch.Name,
-			IsDefault:  branch.Name == repo.DefaultBranch,
-			SetupLabel: label,
+			Name:          branch.Name,
+			IsDefault:     branch.Name == repo.DefaultBranch,
+			SetupLabel:    label,
+			SetupClass:    class,
+			LastCheckedAt: lastCheckedAt,
+			Checks:        branchChecks,
 		})
 	}
-	return views
+	return repositoryChecks, views
+}
+
+func readinessStatus(checks []setupcheck.Check) (string, string) {
+	if len(checks) == 0 {
+		return "not checked", "status-warning"
+	}
+	status := setupcheck.StatusOK
+	for _, check := range checks {
+		if check.Result.Status == setupcheck.StatusFailed {
+			return "failed", "status-failed"
+		}
+		if check.Result.Status == setupcheck.StatusWarning {
+			status = setupcheck.StatusWarning
+		}
+	}
+	if status == setupcheck.StatusWarning {
+		return "warning", "status-warning"
+	}
+	return "passed", "status-ok"
+}
+
+func enforcementView(state domain.EnforcementState) (string, string) {
+	switch state {
+	case domain.EnforcementActive:
+		return "enforcement active", "status-ok"
+	case domain.EnforcementUnhealthy:
+		return "unhealthy", "status-failed"
+	case domain.EnforcementReady:
+		return "ready", "status-warning"
+	default:
+		return "setup incomplete", "status-warning"
+	}
+}
+
+func formatReadinessTime(value time.Time) string {
+	return value.UTC().Format("2006-01-02 15:04 UTC")
 }
 
 // managedBranchOptions lists the exact managed branches of every
@@ -3042,7 +3103,7 @@ const dashboardTemplate = pageHead + `
 
     <section class="tg-warning-callout">
       <span aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-warning"></use></svg></span>
-      <span>Repositories start setup-incomplete and cannot enforce freezes yet. Enforcement activation ships with the upcoming readiness checks; until then freeze, schedule, and thaw actions stay unavailable.</span>
+      <span>Repositories start setup-incomplete and cannot enforce freezes yet. Read-only readiness checks are available, but activation still requires a later controlled status-post test.</span>
       <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/repositories">View Setup</a>
     </section>
   </main>` + pageFoot
@@ -3381,14 +3442,14 @@ const repositoriesTemplate = pageHead + `
     {{ else }}
     <section class="tg-warning-callout">
       <span aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-warning"></use></svg></span>
-      <span>Your role can view repository setup. Admin role is required to add repositories, rotate credentials, or run setup checks.</span>
+      <span>Your role can view repository readiness evidence. Admin role is required to add repositories, rotate credentials, or run readiness checks.</span>
     </section>
     {{ end }}
 
     <div class="tg-section-heading tg-section-heading-compact">
       <div>
         <h2>Configured repositories</h2>
-        <p>Configure signed webhooks, store future status-posting tokens, record local setup checks, and confirm each repository is ready for freeze workflows.</p>
+        <p>Run read-only Forgejo/Codeberg readiness checks for repository access, signed webhook evidence, and every exact managed branch.</p>
       </div>
     </div>
 
@@ -3402,27 +3463,28 @@ const repositoriesTemplate = pageHead + `
             <h3>{{ .Repository.FullName }}</h3>
           </div>
           <div class="tg-repo-badges">
-            {{ if .Repository.EnforcementActive }}<span class="tg-badge status-ok">enforcement active</span>{{ else }}<span class="tg-badge status-warning">setup incomplete</span>{{ end }}
+            <span class="tg-badge {{ .EnforcementClass }}">{{ .EnforcementLabel }}</span>
             {{ if .Repository.HasWebhookSecret }}<span class="tg-badge status-ok">webhook configured</span>{{ else }}<span class="tg-badge status-warning">webhook missing</span>{{ end }}
             {{ if .Repository.HasStatusToken }}<span class="tg-badge status-ok">status token configured</span>{{ else }}<span class="tg-badge status-warning">status token missing</span>{{ end }}
           </div>
         </div>
         {{ if not .Repository.EnforcementActive }}
-        <p class="tg-muted">Setup incomplete: this repository cannot enforce freezes, schedules, or thaws. Signed webhooks are still received and recorded as setup evidence. Activation ships with the upcoming readiness checks.</p>
+        <p class="tg-muted">This repository cannot enforce freezes, schedules, or thaws. Readiness checks are read-only; status posting is not tested until the later controlled activation flow.</p>
         {{ end }}
         <dl class="tg-repo-meta">
           <div><span class="tg-meta-icon"><svg class="tg-icon"><use href="#tg-i-git-branch"></use></svg></span><dt>Default branch</dt><dd><code>{{ .Repository.DefaultBranch }}</code></dd></div>
           <div><span class="tg-meta-icon"><svg class="tg-icon"><use href="#tg-i-check"></use></svg></span><dt>Required context</dt><dd><code>` + domain.RequiredStatusContext + `</code></dd></div>
           <div><span class="tg-meta-icon"><svg class="tg-icon"><use href="#tg-i-key"></use></svg></span><dt>Status token</dt><dd>{{ if .Repository.HasStatusToken }}<span class="tg-badge status-ok">stored encrypted</span>{{ else }}<span class="tg-badge status-warning">not stored</span>{{ end }}</dd></div>
-          <div><span class="tg-meta-icon"><svg class="tg-icon"><use href="#tg-i-schedule"></use></svg></span><dt>Setup checks</dt><dd>{{ if .SetupChecks }}<span class="tg-badge tg-badge-info">local batch recorded</span>{{ else }}<span class="tg-badge status-warning">not run</span>{{ end }}</dd></div>
+          <div><span class="tg-meta-icon"><svg class="tg-icon"><use href="#tg-i-schedule"></use></svg></span><dt>Last readiness check</dt><dd>{{ if .LastCheckedAt }}{{ .LastCheckedAt }}{{ else }}<span class="tg-badge status-warning">not checked</span>{{ end }}</dd></div>
         </dl>
         <div class="tg-repo-checks">
-          {{ if .SetupChecks }}
-            {{ range .SetupChecks }}
-            <div class="tg-repo-check"><span class="status status-{{ .Result.Status }}">{{ .Result.Status }}</span><div><strong>{{ .Result.Name }}</strong><small>{{ .Result.Description }}{{ if .Result.Remediation }} {{ .Result.Remediation }}{{ end }}</small></div></div>
+          <strong>Repository readiness</strong>
+          {{ if .RepositoryChecks }}
+            {{ range .RepositoryChecks }}
+            <div class="tg-repo-check"><span class="status status-{{ .Result.Status }}">{{ if eq .Result.Status "ok" }}passed{{ else }}{{ .Result.Status }}{{ end }}</span><div><strong>{{ .Result.Name }}</strong><small>{{ .Result.Description }}{{ if .Result.Remediation }} {{ .Result.Remediation }}{{ end }}</small></div></div>
             {{ end }}
           {{ else }}
-            <p class="tg-muted">Run a local setup check to record placeholder readiness results. Live forge verification is not wired yet.</p>
+            <p class="tg-muted">No repository-level readiness evidence has been recorded yet.</p>
           {{ end }}
         </div>
         <div class="tg-repo-branches">
@@ -3430,14 +3492,15 @@ const repositoriesTemplate = pageHead + `
             <strong>Managed branches</strong>
             <span class="tg-badge tg-badge-info">exact names only</span>
           </div>
-          <p class="tg-muted">Freezes and scheduled freezes only apply to these exact branch names. Branch setup stays unverified until readiness checks ship.</p>
+          <p class="tg-muted">Freezes and scheduled freezes only apply to these exact branch names. Each branch is checked independently.</p>
           {{ if .Branches }}
           <ul class="tg-branch-list">
             {{ range .Branches }}
             <li class="tg-branch-row">
               <code class="tg-branch">{{ .Name }}</code>
               {{ if .IsDefault }}<span class="tg-badge tg-badge-info">default</span>{{ end }}
-              <span class="tg-badge status-warning">{{ .SetupLabel }}</span>
+              <span class="tg-badge {{ .SetupClass }}">{{ .SetupLabel }}</span>
+              {{ if .LastCheckedAt }}<small>checked {{ .LastCheckedAt }}</small>{{ end }}
               {{ if and $.CurrentUser.CanManageRepositories (not .IsDefault) (not $view.Repository.EnforcementActive) }}
               <form method="post" action="/repositories/branches/remove" data-confirm-submit data-confirm-title="Remove managed branch?" data-confirm-message="Freezes and schedules can no longer target this branch. Removal is rejected while the branch has an active or scheduled freeze." data-confirm-action="Remove branch">
                 <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
@@ -3445,6 +3508,15 @@ const repositoriesTemplate = pageHead + `
                 <input type="hidden" name="branch" value="{{ .Name }}">
                 <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-close"></use></svg>Remove</button>
               </form>
+              {{ end }}
+              {{ if .Checks }}
+              <div class="tg-repo-checks">
+                {{ range .Checks }}
+                <div class="tg-repo-check"><span class="status status-{{ .Result.Status }}">{{ if eq .Result.Status "ok" }}passed{{ else }}{{ .Result.Status }}{{ end }}</span><div><strong>{{ .Result.Name }}</strong><small>{{ .Result.Description }}{{ if .Result.Remediation }} {{ .Result.Remediation }}{{ end }}</small></div></div>
+                {{ end }}
+              </div>
+              {{ else }}
+              <small>No readiness evidence recorded for this branch.</small>
               {{ end }}
             </li>
             {{ end }}
@@ -3540,11 +3612,11 @@ const repositoriesTemplate = pageHead + `
           <form method="post" action="/repositories/setup-check">
             <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
             <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
-            <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-health-check"></use></svg>Run setup check</button>
+            <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-health-check"></use></svg>Run readiness checks</button>
           </form>
         </div>
         {{ else }}
-        <div class="tg-empty-row"><strong>Read-only repository access</strong><span>Ask an admin to change repository credentials or run setup checks.</span></div>
+        <div class="tg-empty-row"><strong>Read-only readiness evidence</strong><span>Ask an admin to change repository credentials or run readiness checks.</span></div>
         {{ end }}
       </article>
       {{ end }}
@@ -3559,9 +3631,9 @@ const repositoriesTemplate = pageHead + `
     <section class="tg-panel tg-setup-checklist">
       <div class="tg-panel-head"><h2>Manual setup checklist</h2><span class="tg-badge tg-badge-info">local guidance</span></div>
       <div class="tg-checklist-grid">
-        <article><span>1</span><div><strong>Required status context</strong><p>Configure branch protection to require <code>{{ .RequiredContext }}</code> once enforcement is active for the repository.</p></div></article>
+        <article><span>1</span><div><strong>Required status context</strong><p>Configure every managed branch to require the exact context <code>{{ .RequiredContext }}</code>.</p></div></article>
         <article><span>2</span><div><strong>Signed webhook receiver</strong><p>Point pull request webhooks at <code>/webhooks/forgejo</code> with the repository webhook secret.</p></div></article>
-        <article><span>3</span><div><strong>Local setup checks</strong><p>Current checks are local placeholders for setup visibility, not live Forgejo/Codeberg verification.</p></div></article>
+        <article><span>3</span><div><strong>Read-only readiness</strong><p>Run the live read-only checks. Status posting remains unverified until a later controlled activation test.</p></div></article>
       </div>
     </section>
   </main>` + pageFoot

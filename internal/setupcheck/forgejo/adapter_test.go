@@ -3,121 +3,125 @@ package forgejo
 import (
 	"context"
 	"errors"
-	"strings"
+	"strconv"
 	"testing"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/forge"
+	"github.com/taua-almeida/thawguard/internal/setupcheck"
 )
 
-func TestAdapterInspectsHealthyForgejoSetup(t *testing.T) {
-	adapter := Adapter{
-		Client: fakeClient{
-			CapabilityReport: forge.CapabilityReport{CanPostStatuses: true},
-			BranchProtection: forge.BranchProtection{
-				Branch:              "main",
-				Protected:           true,
-				RequiresStatusCheck: true,
-				RequiredContexts:    []string{domain.RequiredStatusContext},
-			},
-		},
-		WebhookConfigured: true,
-	}
-
-	report, err := adapter.Inspect(context.Background(), domain.Repository{Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"})
+func TestAdapterTreatsEmptyPullRequestListAsReadable(t *testing.T) {
+	result, err := (Adapter{Client: &fakeClient{}}).InspectPullRequestRead(context.Background(), testRepository(), "main")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !report.CanPostStatuses || !report.RequiredContextPresent || !report.WebhookConfigured {
-		t.Fatalf("expected healthy report, got %+v", report)
+	if result.Name != setupcheck.CheckPullRequestReadAccess || result.Status != setupcheck.StatusOK {
+		t.Fatalf("unexpected result %+v", result)
 	}
 }
 
-func TestAdapterReportsMissingRequiredContext(t *testing.T) {
-	adapter := Adapter{
-		Client: fakeClient{
-			CapabilityReport: forge.CapabilityReport{CanPostStatuses: true},
-			BranchProtection: forge.BranchProtection{
-				Branch:              "main",
-				Protected:           true,
-				RequiresStatusCheck: true,
-				RequiredContexts:    []string{"ci/test"},
-			},
-		},
-		WebhookConfigured: true,
-	}
-
-	report, err := adapter.Inspect(context.Background(), domain.Repository{Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if report.RequiredContextPresent {
-		t.Fatalf("expected missing required context, got %+v", report)
+func TestAdapterTreatsPullRequestAuthorizationDenialAsFailedEvidence(t *testing.T) {
+	for _, status := range []int{401, 403} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			clientErr := &forge.ResponseError{Operation: "list open pull requests", StatusCode: status, Status: "denied", Snippet: "denied"}
+			result, err := (Adapter{Client: &fakeClient{pullRequestErr: clientErr}}).InspectPullRequestRead(context.Background(), testRepository(), "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Status != setupcheck.StatusFailed {
+				t.Fatalf("expected failed evidence, got %+v", result)
+			}
+		})
 	}
 }
 
-func TestAdapterFailsClosedOnBranchMismatch(t *testing.T) {
-	adapter := Adapter{
-		Client: fakeClient{
-			CapabilityReport: forge.CapabilityReport{CanPostStatuses: true},
-			BranchProtection: forge.BranchProtection{
-				Branch:              "dev",
-				Protected:           true,
-				RequiresStatusCheck: true,
-				RequiredContexts:    []string{domain.RequiredStatusContext},
-			},
-		},
-		WebhookConfigured: true,
-	}
-
-	report, err := adapter.Inspect(context.Background(), domain.Repository{Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if report.RequiredContextPresent {
-		t.Fatalf("expected branch mismatch to fail closed, got %+v", report)
-	}
-}
-
-func TestAdapterReturnsClientError(t *testing.T) {
-	adapter := Adapter{Client: fakeClient{CapabilitiesErr: errors.New("forge unavailable")}}
-	_, err := adapter.Inspect(context.Background(), domain.Repository{Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"})
+func TestAdapterReturnsOperationalPullRequestError(t *testing.T) {
+	_, err := (Adapter{Client: &fakeClient{pullRequestErr: errors.New("network unavailable")}}).InspectPullRequestRead(context.Background(), testRepository(), "main")
 	if err == nil {
-		t.Fatal("expected client error")
-	}
-	if !strings.Contains(err.Error(), "verify forge capabilities") {
-		t.Fatalf("expected capabilities context, got %v", err)
+		t.Fatal("expected operational error")
 	}
 }
 
-func TestAdapterReturnsBranchProtectionError(t *testing.T) {
-	adapter := Adapter{Client: fakeClient{BranchProtectionErr: errors.New("branch protection unavailable")}}
-	_, err := adapter.Inspect(context.Background(), domain.Repository{Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"})
-	if err == nil {
-		t.Fatal("expected client error")
+func TestAdapterInspectsProtectedBranchWithExactContext(t *testing.T) {
+	client := &fakeClient{protection: map[string]forge.BranchProtection{
+		"main": {Branch: "main", Protected: true, RequiresStatusCheck: true, RequiredContexts: []string{domain.RequiredStatusContext}},
+	}}
+	inspection, err := (Adapter{Client: client}).InspectBranch(context.Background(), testRepository(), "main")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), "read branch protection") {
-		t.Fatalf("expected branch-protection context, got %v", err)
+	if !inspection.Protected || len(inspection.Results) != 4 {
+		t.Fatalf("unexpected inspection %+v", inspection)
+	}
+	for _, result := range inspection.Results {
+		if result.Status != setupcheck.StatusOK {
+			t.Fatalf("expected all checks OK, got %+v", inspection.Results)
+		}
+	}
+}
+
+func TestAdapterDoesNotAcceptSimilarContext(t *testing.T) {
+	client := &fakeClient{protection: map[string]forge.BranchProtection{
+		"main": {Branch: "main", Protected: true, RequiresStatusCheck: true, RequiredContexts: []string{domain.RequiredStatusContext + "-preview"}},
+	}}
+	inspection, err := (Adapter{Client: client}).InspectBranch(context.Background(), testRepository(), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Results[3].Status != setupcheck.StatusFailed {
+		t.Fatalf("expected exact-context failure, got %+v", inspection.Results[3])
+	}
+}
+
+func TestAdapterReportsDisabledStatusChecksSeparately(t *testing.T) {
+	client := &fakeClient{protection: map[string]forge.BranchProtection{
+		"main": {Branch: "main", Protected: true},
+	}}
+	inspection, err := (Adapter{Client: client}).InspectBranch(context.Background(), testRepository(), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Results[0].Status != setupcheck.StatusOK || inspection.Results[1].Status != setupcheck.StatusOK || inspection.Results[2].Status != setupcheck.StatusFailed || inspection.Results[3].Status != setupcheck.StatusFailed {
+		t.Fatalf("unexpected separate results %+v", inspection.Results)
+	}
+}
+
+func TestAdapterTranslatesNotFoundToUnprotectedEvidence(t *testing.T) {
+	client := &fakeClient{protectionErr: map[string]error{"release": forge.ErrBranchProtectionNotFound}}
+	inspection, err := (Adapter{Client: client}).InspectBranch(context.Background(), testRepository(), "release")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.Protected || inspection.Results[0].Status != setupcheck.StatusOK || inspection.Results[1].Status != setupcheck.StatusFailed {
+		t.Fatalf("unexpected unprotected evidence %+v", inspection)
+	}
+}
+
+func TestAdapterReturnsBranchOperationalError(t *testing.T) {
+	client := &fakeClient{protectionErr: map[string]error{"main": errors.New("network unavailable")}}
+	if _, err := (Adapter{Client: client}).InspectBranch(context.Background(), testRepository(), "main"); err == nil {
+		t.Fatal("expected operational error")
 	}
 }
 
 type fakeClient struct {
-	CapabilityReport    forge.CapabilityReport
-	BranchProtection    forge.BranchProtection
-	CapabilitiesErr     error
-	BranchProtectionErr error
+	pullRequestErr error
+	protection     map[string]forge.BranchProtection
+	protectionErr  map[string]error
 }
 
-func (c fakeClient) VerifyCapabilities(ctx context.Context, owner, repo string) (forge.CapabilityReport, error) {
-	if c.CapabilitiesErr != nil {
-		return forge.CapabilityReport{}, c.CapabilitiesErr
-	}
-	return c.CapabilityReport, nil
+func (c *fakeClient) ListOpenPullRequests(context.Context, string, string, string) ([]domain.PullRequest, error) {
+	return nil, c.pullRequestErr
 }
 
-func (c fakeClient) ReadBranchProtection(ctx context.Context, owner, repo, branch string) (forge.BranchProtection, error) {
-	if c.BranchProtectionErr != nil {
-		return forge.BranchProtection{}, c.BranchProtectionErr
+func (c *fakeClient) ReadBranchProtection(_ context.Context, _, _, branch string) (forge.BranchProtection, error) {
+	if err := c.protectionErr[branch]; err != nil {
+		return forge.BranchProtection{Branch: branch}, err
 	}
-	return c.BranchProtection, nil
+	return c.protection[branch], nil
+}
+
+func testRepository() domain.Repository {
+	return domain.Repository{Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"}
 }

@@ -7,19 +7,22 @@ import (
 	"github.com/taua-almeida/thawguard/internal/domain"
 )
 
-func TestEvaluateReportsSetupFailures(t *testing.T) {
-	results := Evaluate(Report{CanPostStatuses: true})
-	if len(results) != 3 {
-		t.Fatalf("expected 3 setup checks, got %d", len(results))
+func TestStableReadinessCheckNames(t *testing.T) {
+	names := []string{
+		CheckStatusTokenConfigured,
+		CheckPullRequestReadAccess,
+		CheckRecentVerifiedPullRequestWebhook,
+		CheckStatusPostingUntested,
+		CheckBranchProtectionReadable,
+		CheckBranchProtectionEnabled,
+		CheckRequiredStatusChecksEnabled,
+		CheckRequiredThawguardFreezeContextConfigured,
 	}
-	if results[0].Status != StatusOK {
-		t.Fatalf("expected status-posting check to pass, got %s", results[0].Status)
+	if len(names) != 8 {
+		t.Fatalf("expected eight stable check names, got %d", len(names))
 	}
-	if results[1].Status != StatusFailed {
-		t.Fatalf("expected required-context check to fail, got %s", results[1].Status)
-	}
-	if !strings.Contains(results[1].Remediation, domain.RequiredStatusContext) {
-		t.Fatalf("expected remediation to mention required context, got %q", results[1].Remediation)
+	if !strings.Contains(CheckRequiredThawguardFreezeContextConfigured, domain.RequiredStatusContext) {
+		t.Fatalf("expected branch context check name to include %s", domain.RequiredStatusContext)
 	}
 }
 

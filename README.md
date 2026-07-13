@@ -16,10 +16,10 @@ Thawguard is cooperative enforcement for trusted teams. It is intended to preven
 
 Thawguard has one operational mode. Each repository carries a persisted enforcement state:
 
-- New and existing repositories start **setup incomplete**. Setup (encrypted webhook secret, encrypted status token, signed webhook deliveries) stays fully available, and verified webhooks are recorded as setup evidence, but no commit status is ever posted and freeze, scheduled-freeze, and thaw actions are rejected.
+- New and existing repositories start **setup incomplete**. Setup (encrypted webhook secret, encrypted status token, signed webhook deliveries) and read-only readiness checks stay fully available, but no commit status is ever posted and freeze, scheduled-freeze, and thaw actions are rejected.
 - An **enforcement-active** repository has one behavior: freeze lifecycle actions synchronize current open pull requests from the forge, evaluate each affected head SHA across the whole repository (including PRs on other target branches sharing the same commit), and post the real `thawguard/freeze` commit status. A missing token or forge failure fails closed: no stale status is posted, and failures during posting are recorded as sanitized failed attempts.
 
-Activation is not implemented yet: it ships with the upcoming readiness checks, which will require the encrypted status token, the required branch context, a verified signed webhook, and passing readiness checks. Current builds therefore leave every repository setup-incomplete. There is no shadow or dry-run runtime mode.
+Read-only readiness checks verify pull-request access, branch protection for every exact managed branch, required status checks, the exact `thawguard/freeze` context, and recent signed `pull_request` webhook evidence. They never post a synthetic status. Status-post permission therefore remains explicitly unverified, and setup-incomplete repositories do not become ready. A later controlled status-post test will implement activation. There is no shadow or dry-run runtime mode.
 
 ## Managed branches
 
@@ -29,7 +29,7 @@ Each repository has an explicit list of managed branches: the exact branch names
 - Admins add or remove exact branch names on `/repositories`. Removal is rejected while the branch has an active or pending scheduled freeze; ended or cancelled history never blocks removal.
 - Branch scope is locked while a repository is enforcement-active.
 - Freeze and scheduled-freeze creation are rejected server-side for any branch that is not managed for the selected repository.
-- Newly added branches are unverified until the upcoming readiness checks confirm their setup.
+- Newly added branches are unverified until an administrator runs readiness checks and the forge confirms their setup.
 
 ## Local development
 
@@ -55,7 +55,7 @@ Current local pages:
 - `/` dashboard
 - `/setup` first local admin setup when no users exist; the first account starts with all MVP roles for local bootstrap
 - `/login` and `/logout` local user session flow
-- `/repositories` repository setup form, enforcement state, managed branch scope, and manual setup checklist
+- `/repositories` repository setup form, enforcement state, managed branch scope, and read-only readiness evidence
 - `/freezes` active branch-freeze form and list (requires an enforcement-active repository)
 - `/scheduled-freezes` one-time scheduled freeze windows with optional planned unfreeze (requires an enforcement-active repository)
 - `/decisions` immediate thaw approval; fetches the current PR head from the forge and scopes the thaw to that PR/head SHA (requires an enforcement-active repository)

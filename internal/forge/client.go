@@ -2,6 +2,8 @@ package forge
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
 )
@@ -21,12 +23,17 @@ type BranchProtection struct {
 	RequiresStatusCheck bool
 }
 
-type CapabilityReport struct {
-	CanReadPullRequests      bool
-	CanPostStatuses          bool
-	CanReadBranchProtection  bool
-	CanWriteBranchProtection bool
-	Warnings                 []string
+var ErrBranchProtectionNotFound = errors.New("branch protection not found")
+
+type ResponseError struct {
+	Operation  string
+	StatusCode int
+	Status     string
+	Snippet    string
+}
+
+func (e *ResponseError) Error() string {
+	return fmt.Sprintf("%s: forge returned %s: %s", e.Operation, e.Status, e.Snippet)
 }
 
 type Client interface {
@@ -34,6 +41,4 @@ type Client interface {
 	ListOpenPullRequests(ctx context.Context, owner, repo, targetBranch string) ([]domain.PullRequest, error)
 	PostCommitStatus(ctx context.Context, owner, repo string, status CommitStatus) error
 	ReadBranchProtection(ctx context.Context, owner, repo, branch string) (BranchProtection, error)
-	UpsertRequiredStatusContext(ctx context.Context, owner, repo, branch, contextName string) error
-	VerifyCapabilities(ctx context.Context, owner, repo string) (CapabilityReport, error)
 }

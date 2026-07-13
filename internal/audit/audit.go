@@ -16,6 +16,8 @@ const (
 	ActionRepositoryOpenPullRequestsSynced  = "repository.open_pull_requests_synced"
 	ActionRepositoryBranchAdded             = "repository.branch_added"
 	ActionRepositoryBranchRemoved           = "repository.branch_removed"
+	ActionRepositorySetupCheckRun           = "repository.setup_check_run"
+	ActionRepositorySetupDriftDetected      = "repository.setup_drift_detected"
 	ActionBranchFreezeCreated               = "branch_freeze.created"
 	ActionBranchFreezeEnded                 = "branch_freeze.ended"
 	ActionBranchFreezeCancelled             = "branch_freeze.cancelled"

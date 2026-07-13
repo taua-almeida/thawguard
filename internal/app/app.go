@@ -20,6 +20,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/repositorysetup"
 	"github.com/taua-almeida/thawguard/internal/secrets"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
+	setupforgejo "github.com/taua-almeida/thawguard/internal/setupcheck/forgejo"
 	"github.com/taua-almeida/thawguard/internal/statuspublication"
 	"github.com/taua-almeida/thawguard/internal/statuspublisher"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
@@ -65,7 +66,8 @@ func (a *App) Run(ctx context.Context) error {
 	repositorySetup := repositorysetup.NewServiceWithSecrets(database, secretStore)
 	repositoryStore := repository.NewStore(database)
 	setupCheckStore := setupcheck.NewStore(database)
-	setupCheckRunner := localSetupHealthRunner{recorder: setupCheckStore}
+	webhookDeliveryStore := webhook.NewDeliveryStore(database)
+	setupCheckRunner := setupcheck.NewReadinessService(database, repositorySetup, webhookDeliveryStore, forgejoReadinessInspectorForRepository)
 	freezeStore := freeze.NewService(database)
 	pullRequestStore := pullrequest.NewStore(database)
 	auditStore := audit.NewStore(database)
@@ -80,7 +82,6 @@ func (a *App) Run(ctx context.Context) error {
 	openPullRequestSyncer := newForgeOpenPullRequestSyncer(repositoryStore, repositorySetup, pullRequestStore, forgejoPullRequestClientForRepository, auditStore)
 	freezeStoreForWeb := newFreezeRecomputingStore(freezeStore, repositoryStore, openPullRequestSyncer, pullRequestStore, statusDecisionStore, statusPublisher)
 	thawApprovalStore := newThawApprovalService(repositoryStore, repositorySetup, pullRequestStore, thawExceptionStore, freezeStore, statusDecisionStore, statusPublisher, openPullRequestSyncer, forgejoThawApprovalClientForRepository)
-	webhookDeliveryStore := webhook.NewDeliveryStore(database)
 	pullRequestWebhookProcessor := webhook.NewPullRequestProcessor(repositoryStore, pullRequestStore, statusDecisionStore, statusPublisher)
 	server := &http.Server{
 		Addr: a.cfg.HTTPAddr,
@@ -157,6 +158,17 @@ func forgejoThawApprovalClientForRepository(repo domain.Repository, token string
 		return client, nil
 	default:
 		return nil, fmt.Errorf("repository forge %q is not supported for thaw approvals", repo.Forge)
+	}
+}
+
+func forgejoReadinessInspectorForRepository(repo domain.Repository, token string) (setupcheck.Inspector, error) {
+	switch strings.ToLower(strings.TrimSpace(repo.Forge)) {
+	case "forgejo", "codeberg", "":
+		client := forgejo.New(repo.BaseURL, token)
+		client.HTTPClient = &http.Client{Timeout: 10 * time.Second}
+		return setupforgejo.Adapter{Client: client}, nil
+	default:
+		return nil, fmt.Errorf("repository forge %q is not supported for readiness checks", repo.Forge)
 	}
 }
 

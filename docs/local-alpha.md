@@ -5,7 +5,7 @@ This runbook starts Thawguard locally with Docker and exercises repository setup
 Alpha scope:
 
 - Thawguard has one operational mode: an enforcement-active repository synchronizes current open PRs from the forge and posts real `thawguard/freeze` commit statuses.
-- Repository enforcement activation is **not implemented yet**. It ships with the upcoming readiness checks, which will require the encrypted status token, the required branch context, a verified signed webhook, and passing readiness checks. In current builds every repository stays setup-incomplete.
+- Repository enforcement activation is **not implemented yet**. Read-only readiness checks now verify the encrypted status token, pull-request access, every managed branch's protection and exact required context, and recent signed webhook evidence. Status-post permission remains unverified until a later controlled write test, so setup-incomplete repositories stay setup-incomplete.
 - A setup-incomplete repository can be fully configured: credentials can be stored, and signed webhooks are verified and recorded as setup evidence. It cannot create freezes, schedules, or thaws, and no commit status is posted for it.
 - Thawguard is cooperative enforcement for trusted teams and is not a hard security boundary.
 
@@ -76,9 +76,9 @@ Use a throwaway Forgejo/Codeberg repository, not a production repository.
 3. Set a webhook secret. Use a high-entropy value and save it somewhere local temporarily.
 4. Set a status token with enough forge permission to post commit statuses and read pull requests for the throwaway repository. It is stored encrypted and is required before enforcement can ever be activated.
 
-The repository card shows its enforcement state. New repositories are setup-incomplete and stay that way in current builds; the activation step lands with the readiness-check feature.
+The repository card shows its enforcement state. New repositories are setup-incomplete and stay that way after read-only readiness checks; activation requires a later controlled status-post test.
 
-The card also lists the repository's managed branches — the exact branch names freezes and scheduled freezes may target. The default branch is always managed and cannot be removed. Admins can add or remove exact branch names (no globs or patterns) while enforcement is inactive; a branch with an active or pending scheduled freeze cannot be removed. Newly added branches show as unverified until readiness checks ship.
+The card also lists the repository's managed branches — the exact branch names freezes and scheduled freezes may target. The default branch is always managed and cannot be removed. Admins can add or remove exact branch names (no globs or patterns) while enforcement is inactive; a branch with an active or pending scheduled freeze cannot be removed. An administrator can run read-only readiness checks for all managed branches from the card.
 
 ## 4. Connect Forgejo/Codeberg webhooks safely
 
@@ -98,7 +98,7 @@ Configure the webhook on the throwaway repository:
 
 If your tunnel cannot restrict paths, use a throwaway repository and an ephemeral tunnel URL, keep the test short, and stop the tunnel immediately after the test.
 
-## 5. Setup-incomplete E2E flow (current builds)
+## 5. Setup-incomplete E2E flow
 
 In the throwaway Forgejo/Codeberg repository:
 
@@ -110,6 +110,7 @@ In Thawguard, inspect:
 
 - `/webhooks` — signed delivery receipts should show as verified and processed; system activity shows sanitized audit events.
 - `/repositories` — the repository card shows setup-incomplete enforcement plus configured credentials.
+- `/repositories` — run readiness checks to read the open-PR endpoint and each exact managed branch's protection. The card also shows whether a verified `pull_request` delivery was received in the last 24 hours. Status posting remains warning/unverified because this action performs no write.
 - `/freezes`, `/scheduled-freezes`, `/decisions` — mutation forms are unavailable and explain that enforcement must be activated first. Server-side validation rejects these actions as well.
 - `/publications` — no publication intents or attempts are created for a setup-incomplete repository.
 
@@ -132,13 +133,13 @@ Scheduled freeze windows activate from the local Thawguard process. Keep the pro
 - No row on `/webhooks`: check the public webhook URL, event type, and whether the tunnel is forwarding `POST /webhooks/forgejo`.
 - Delivery row with an error: check repository owner/name/base URL and whether the webhook secret in Thawguard matches Codeberg.
 - Thawguard cannot decrypt a stored webhook secret or status token: restore the original `THAWGUARD_SECRET_KEY` or recreate the local database volume.
-- Freeze/schedule/thaw forms are unavailable: the repository's enforcement is not active. In current builds this is expected for every repository until the activation feature lands.
+- Freeze/schedule/thaw forms are unavailable: the repository's enforcement is not active. Read-only readiness checks do not activate it; a later controlled status-post test will own activation.
 - Inspecting the live SQLite database requires copying the WAL files too: copy `/data/thawguard.db`, `/data/thawguard.db-wal`, and `/data/thawguard.db-shm` to the same local directory before opening the database.
 - Docker cannot reach the app on non-Linux hosts: run `go run ./cmd/thawguard` locally for now. The compose file intentionally uses Linux host networking so first-admin setup stays loopback-only until a local user exists.
 
 ## What this local alpha does not do
 
 - It does not post commit statuses for setup-incomplete repositories, and it has no shadow/dry-run runtime mode.
-- It does not activate repository enforcement yet; activation ships with the readiness-check feature.
+- It does not activate repository enforcement yet; activation requires a later controlled status-post test.
 - It does not configure Codeberg branch protection.
 - It does not provide production-ready local user authentication.

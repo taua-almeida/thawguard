@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/taua-almeida/thawguard/internal/db"
+	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/repository"
 )
 
@@ -20,7 +21,11 @@ func TestStoreRecordsAndListsSetupChecks(t *testing.T) {
 	checkedAt := time.Date(2026, 6, 29, 13, 0, 0, 0, time.UTC)
 	store.now = func() time.Time { return checkedAt }
 
-	results := Evaluate(Report{CanPostStatuses: true, RequiredContextPresent: false, WebhookConfigured: true})
+	results := []Result{
+		{Name: CheckBranchProtectionReadable, Status: StatusOK, Description: "Branch protection was read."},
+		{Name: CheckRequiredThawguardFreezeContextConfigured, Status: StatusFailed, Description: "Required context is missing.", Remediation: "Add " + domain.RequiredStatusContext + "."},
+		{Name: CheckRecentVerifiedPullRequestWebhook, Status: StatusOK, Description: "Recent webhook exists."},
+	}
 	if err := store.Record(ctx, repo.ID, repo.DefaultBranch, results); err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +52,7 @@ func TestStoreRecordsAndListsSetupChecks(t *testing.T) {
 		}
 	}
 
-	contextCheck := byName["Required status context configured"]
+	contextCheck := byName[CheckRequiredThawguardFreezeContextConfigured]
 	if contextCheck.ID == 0 {
 		t.Fatal("expected required-context check")
 	}

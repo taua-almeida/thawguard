@@ -3,9 +3,11 @@ package forgejo
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
@@ -195,6 +197,114 @@ func TestClientRejectsInvalidPullRequestList(t *testing.T) {
 	client := New("https://codeberg.org", "token")
 	if _, err := client.ListOpenPullRequests(context.Background(), "", "repo", "main"); err == nil {
 		t.Fatal("expected missing owner error")
+	}
+}
+
+func TestClientReadsBranchProtection(t *testing.T) {
+	var gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("expected GET, got %s", r.Method)
+		}
+		if got := r.URL.EscapedPath(); got != "/api/v1/repos/team%20name/repo%20name/branch_protections/release%2F1.0" {
+			t.Fatalf("unexpected escaped path %q", got)
+		}
+		gotAuth = r.Header.Get("Authorization")
+		_ = json.NewEncoder(w).Encode(branchProtectionResponse{
+			BranchName:          "release/1.0",
+			EnableStatusCheck:   true,
+			StatusCheckContexts: []string{domain.RequiredStatusContext, "ci/test"},
+		})
+	}))
+	defer server.Close()
+	client := New(server.URL, "read-token")
+
+	protection, err := client.ReadBranchProtection(context.Background(), "team name", "repo name", "release/1.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotAuth != "token read-token" {
+		t.Fatalf("unexpected auth header %q", gotAuth)
+	}
+	if !protection.Protected || !protection.RequiresStatusCheck || protection.Branch != "release/1.0" {
+		t.Fatalf("unexpected protection %+v", protection)
+	}
+	if len(protection.RequiredContexts) != 2 || protection.RequiredContexts[0] != domain.RequiredStatusContext {
+		t.Fatalf("unexpected contexts %+v", protection.RequiredContexts)
+	}
+}
+
+func TestClientReadsBranchProtectionWithStatusChecksDisabled(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(branchProtectionResponse{BranchName: "main"})
+	}))
+	defer server.Close()
+
+	protection, err := New(server.URL, "token").ReadBranchProtection(context.Background(), "owner", "repo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !protection.Protected || protection.RequiresStatusCheck || len(protection.RequiredContexts) != 0 {
+		t.Fatalf("unexpected protection %+v", protection)
+	}
+}
+
+func TestClientTreatsMissingBranchProtectionAsUnprotected(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+
+	protection, err := New(server.URL, "token").ReadBranchProtection(context.Background(), "owner", "repo", "main")
+	if !errors.Is(err, forge.ErrBranchProtectionNotFound) {
+		t.Fatalf("expected not-found evidence, got protection=%+v err=%v", protection, err)
+	}
+	if protection.Protected || protection.Branch != "main" {
+		t.Fatalf("unexpected missing protection evidence %+v", protection)
+	}
+}
+
+func TestClientRejectsMalformedBranchProtection(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"branch_name":`))
+	}))
+	defer server.Close()
+
+	if _, err := New(server.URL, "token").ReadBranchProtection(context.Background(), "owner", "repo", "main"); err == nil || !strings.Contains(err.Error(), "decode branch protection response") {
+		t.Fatalf("expected malformed JSON error, got %v", err)
+	}
+}
+
+func TestClientBoundsAndRedactsBranchProtectionErrors(t *testing.T) {
+	const token = "secret-read-token"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(token + strings.Repeat("x", 1024)))
+	}))
+	defer server.Close()
+
+	_, err := New(server.URL, token).ReadBranchProtection(context.Background(), "owner", "repo", "main")
+	if err == nil {
+		t.Fatal("expected forge error")
+	}
+	if strings.Contains(err.Error(), token) {
+		t.Fatalf("expected token redaction, got %v", err)
+	}
+	if len(err.Error()) > 700 {
+		t.Fatalf("expected bounded error, got %d bytes", len(err.Error()))
+	}
+}
+
+func TestClientEmptyPullRequestListProvesReadableResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]pullRequestResponse{})
+	}))
+	defer server.Close()
+
+	prs, err := New(server.URL, "token").ListOpenPullRequests(context.Background(), "owner", "repo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prs) != 0 {
+		t.Fatalf("expected empty readable list, got %+v", prs)
 	}
 }
 

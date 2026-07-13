@@ -42,7 +42,7 @@ func TestRepositoriesPageShowsManagedBranches(t *testing.T) {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
 	}
 	body := recorder.Body.String()
-	for _, want := range []string{"Managed branches", "exact names only", "release/1.4", ">default<", "setup not verified", `action="/repositories/branches"`, `action="/repositories/branches/remove"`} {
+	for _, want := range []string{"Managed branches", "exact names only", "release/1.4", ">default<", "not checked", `action="/repositories/branches"`, `action="/repositories/branches/remove"`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected repositories page to contain %q, got %q", want, body)
 		}

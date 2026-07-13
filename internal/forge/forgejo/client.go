@@ -16,8 +16,6 @@ import (
 	"github.com/taua-almeida/thawguard/internal/forge"
 )
 
-var ErrNotImplemented = errors.New("forgejo client not implemented in scaffold")
-
 type Client struct {
 	BaseURL    string
 	Token      string
@@ -48,7 +46,7 @@ func (c *Client) GetPullRequest(ctx context.Context, owner, repo string, index i
 	if err != nil {
 		return domain.PullRequest{}, fmt.Errorf("get pull request: %w", err)
 	}
-	return decodePullRequest(resp)
+	return decodePullRequest(resp, c.Token)
 }
 
 func (c *Client) ListOpenPullRequests(ctx context.Context, owner, repo, targetBranch string) ([]domain.PullRequest, error) {
@@ -74,7 +72,7 @@ func (c *Client) ListOpenPullRequests(ctx context.Context, owner, repo, targetBr
 		if err != nil {
 			return nil, fmt.Errorf("list open pull requests: %w", err)
 		}
-		pagePRs, payloadCount, err := decodePullRequestsPage(resp, strings.TrimSpace(targetBranch))
+		pagePRs, payloadCount, err := decodePullRequestsPage(resp, strings.TrimSpace(targetBranch), c.Token)
 		if err != nil {
 			return nil, err
 		}
@@ -118,21 +116,52 @@ func (c *Client) PostCommitStatus(ctx context.Context, owner, repo string, statu
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("post commit status: forge returned %s: %s", resp.Status, responseSnippet(resp.Body))
+		return responseError("post commit status", resp, c.Token)
 	}
 	return nil
 }
 
 func (c *Client) ReadBranchProtection(ctx context.Context, owner, repo, branch string) (forge.BranchProtection, error) {
-	return forge.BranchProtection{}, ErrNotImplemented
-}
-
-func (c *Client) UpsertRequiredStatusContext(ctx context.Context, owner, repo, branch, contextName string) error {
-	return ErrNotImplemented
-}
-
-func (c *Client) VerifyCapabilities(ctx context.Context, owner, repo string) (forge.CapabilityReport, error) {
-	return forge.CapabilityReport{}, ErrNotImplemented
+	if err := validateBranchProtection(owner, repo, branch); err != nil {
+		return forge.BranchProtection{}, err
+	}
+	endpoint, err := c.branchProtectionEndpoint(owner, repo, branch)
+	if err != nil {
+		return forge.BranchProtection{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return forge.BranchProtection{}, fmt.Errorf("create branch protection request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	if strings.TrimSpace(c.Token) != "" {
+		req.Header.Set("Authorization", "token "+strings.TrimSpace(c.Token))
+	}
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return forge.BranchProtection{}, fmt.Errorf("read branch protection: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return forge.BranchProtection{Branch: strings.TrimSpace(branch)}, forge.ErrBranchProtectionNotFound
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return forge.BranchProtection{}, responseError("read branch protection", resp, c.Token)
+	}
+	var payload branchProtectionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return forge.BranchProtection{}, fmt.Errorf("decode branch protection response: %w", err)
+	}
+	payload.BranchName = strings.TrimSpace(payload.BranchName)
+	if payload.BranchName == "" || payload.BranchName != strings.TrimSpace(branch) {
+		return forge.BranchProtection{}, errors.New("branch protection response has an unexpected branch name")
+	}
+	return forge.BranchProtection{
+		Branch:              payload.BranchName,
+		Protected:           true,
+		RequiresStatusCheck: payload.EnableStatusCheck,
+		RequiredContexts:    append([]string(nil), payload.StatusCheckContexts...),
+	}, nil
 }
 
 var _ forge.Client = (*Client)(nil)
@@ -155,6 +184,12 @@ type pullRequestResponse struct {
 	Head struct {
 		SHA string `json:"sha"`
 	} `json:"head"`
+}
+
+type branchProtectionResponse struct {
+	BranchName          string   `json:"branch_name"`
+	EnableStatusCheck   bool     `json:"enable_status_check"`
+	StatusCheckContexts []string `json:"status_check_contexts"`
 }
 
 func validatePostCommitStatus(owner string, repo string, status forge.CommitStatus) error {
@@ -214,6 +249,23 @@ func validateListOpenPullRequests(owner string, repo string, targetBranch string
 	return nil
 }
 
+func validateBranchProtection(owner, repo, branch string) error {
+	var missing []string
+	if strings.TrimSpace(owner) == "" {
+		missing = append(missing, "owner")
+	}
+	if strings.TrimSpace(repo) == "" {
+		missing = append(missing, "repository")
+	}
+	if strings.TrimSpace(branch) == "" {
+		missing = append(missing, "branch")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("missing required branch protection fields: %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
 func validCommitStatusState(state domain.CommitStatusState) bool {
 	switch state {
 	case domain.CommitStatusSuccess, domain.CommitStatusFailure, domain.CommitStatusPending, domain.CommitStatusError:
@@ -265,10 +317,33 @@ func (c *Client) pullRequestEndpoint(owner string, repo string, index int) (stri
 	return base.JoinPath("api", "v1", "repos", owner, repo, "pulls", strconv.Itoa(index)).String(), nil
 }
 
-func decodePullRequest(resp *http.Response) (domain.PullRequest, error) {
+func (c *Client) branchProtectionEndpoint(owner, repo, branch string) (string, error) {
+	if c == nil {
+		return "", errors.New("forgejo client is nil")
+	}
+	base, err := url.Parse(strings.TrimSpace(c.BaseURL))
+	if err != nil || base.Scheme == "" || base.Host == "" {
+		return "", errors.New("forgejo base URL is invalid")
+	}
+	segments := []string{"api", "v1", "repos", owner, repo, "branch_protections", branch}
+	path := strings.TrimRight(base.Path, "/")
+	rawPath := strings.TrimRight(base.EscapedPath(), "/")
+	for _, segment := range segments {
+		segment = strings.TrimSpace(segment)
+		path += "/" + segment
+		rawPath += "/" + url.PathEscape(segment)
+	}
+	base.Path = path
+	base.RawPath = rawPath
+	base.RawQuery = ""
+	base.Fragment = ""
+	return base.String(), nil
+}
+
+func decodePullRequest(resp *http.Response, token string) (domain.PullRequest, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return domain.PullRequest{}, fmt.Errorf("get pull request: forge returned %s: %s", resp.Status, responseSnippet(resp.Body))
+		return domain.PullRequest{}, responseError("get pull request", resp, token)
 	}
 	var payload pullRequestResponse
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
@@ -281,10 +356,10 @@ func decodePullRequest(resp *http.Response) (domain.PullRequest, error) {
 	return pr, nil
 }
 
-func decodePullRequestsPage(resp *http.Response, targetBranch string) ([]domain.PullRequest, int, error) {
+func decodePullRequestsPage(resp *http.Response, targetBranch, token string) ([]domain.PullRequest, int, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, 0, fmt.Errorf("list open pull requests: forge returned %s: %s", resp.Status, responseSnippet(resp.Body))
+		return nil, 0, responseError("list open pull requests", resp, token)
 	}
 	var payload []pullRequestResponse
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
@@ -319,7 +394,11 @@ func (c *Client) httpClient() *http.Client {
 	return http.DefaultClient
 }
 
-func responseSnippet(reader io.Reader) string {
+func responseError(operation string, resp *http.Response, token string) error {
+	return &forge.ResponseError{Operation: operation, StatusCode: resp.StatusCode, Status: resp.Status, Snippet: responseSnippet(resp.Body, token)}
+}
+
+func responseSnippet(reader io.Reader, token string) string {
 	const maxResponseBytes = 512
 	data, err := io.ReadAll(io.LimitReader(reader, maxResponseBytes))
 	if err != nil {
@@ -328,6 +407,9 @@ func responseSnippet(reader io.Reader) string {
 	message := strings.TrimSpace(string(data))
 	if message == "" {
 		return "empty response body"
+	}
+	if token = strings.TrimSpace(token); token != "" {
+		message = strings.ReplaceAll(message, token, "[redacted]")
 	}
 	return message
 }

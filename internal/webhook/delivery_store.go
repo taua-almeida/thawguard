@@ -230,6 +230,29 @@ WHERE repository_id = ? AND delivery_id = ?`, repositoryID, deliveryID)
 	return delivery, true, nil
 }
 
+func (s *DeliveryStore) LatestVerifiedPullRequestByRepository(ctx context.Context, repositoryID int64) (Delivery, bool, error) {
+	if s == nil || s.db == nil {
+		return Delivery{}, false, errors.New("webhook delivery store has no database")
+	}
+	if repositoryID <= 0 {
+		return Delivery{}, false, ValidationError{Message: "webhook delivery repository is required"}
+	}
+	row := s.db.QueryRowContext(ctx, `
+SELECT id, repository_id, delivery_id, event, action, received_at, verified, processing_started_at, processed_at, error
+FROM webhook_deliveries
+WHERE repository_id = ? AND verified = 1 AND event = 'pull_request'
+ORDER BY received_at DESC, id DESC
+LIMIT 1`, repositoryID)
+	delivery, err := scanDelivery(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Delivery{}, false, nil
+	}
+	if err != nil {
+		return Delivery{}, false, err
+	}
+	return delivery, true, nil
+}
+
 func (s *DeliveryStore) ListRecent(ctx context.Context, limit int) ([]Delivery, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("webhook delivery store has no database")

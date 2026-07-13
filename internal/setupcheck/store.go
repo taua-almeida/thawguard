@@ -50,7 +50,7 @@ func (s *Store) Record(ctx context.Context, repositoryID int64, branch string, r
 		}
 	}()
 
-	if err := s.recordNoTx(ctx, tx, repositoryID, branch, results); err != nil {
+	if err := s.recordNoTx(ctx, tx, repositoryID, branch, results, s.now().UTC()); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -60,8 +60,11 @@ func (s *Store) Record(ctx context.Context, repositoryID int64, branch string, r
 	return nil
 }
 
-func (s *Store) recordNoTx(ctx context.Context, tx *sql.Tx, repositoryID int64, branch string, results []Result) error {
-	checkedAt := s.now().UTC().Format(setupCheckTimeFormat)
+func (s *Store) recordNoTx(ctx context.Context, tx *sql.Tx, repositoryID int64, branch string, results []Result, checkedAt time.Time) error {
+	if err := validateRecordParams(repositoryID, results); err != nil {
+		return err
+	}
+	checkedAtText := checkedAt.UTC().Format(setupCheckTimeFormat)
 	var branchValue any
 	branch = strings.TrimSpace(branch)
 	if branch != "" {
@@ -75,7 +78,7 @@ func (s *Store) recordNoTx(ctx context.Context, tx *sql.Tx, repositoryID int64, 
 		}
 		_, err := tx.ExecContext(ctx, `
 INSERT INTO setup_checks(repository_id, branch, name, status, description, remediation, checked_at)
-VALUES (?, ?, ?, ?, ?, ?, ?)`, repositoryID, branchValue, result.Name, result.Status, result.Description, remediation, checkedAt)
+VALUES (?, ?, ?, ?, ?, ?, ?)`, repositoryID, branchValue, result.Name, result.Status, result.Description, remediation, checkedAtText)
 		if err != nil {
 			return fmt.Errorf("record setup check %q: %w", result.Name, err)
 		}

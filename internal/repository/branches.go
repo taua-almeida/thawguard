@@ -119,6 +119,37 @@ WHERE repository_id = ? AND name = ?`, repositoryID, name)
 	return nil
 }
 
+func (s *Store) UpdateBranchReadiness(ctx context.Context, repositoryID int64, name string, protected bool, setupStatus string, checkedAt time.Time) error {
+	if s == nil || s.db == nil {
+		return errors.New("repository store has no database")
+	}
+	if repositoryID <= 0 || strings.TrimSpace(name) == "" || checkedAt.IsZero() {
+		return ValidationError{Message: "valid repository branch readiness fields are required"}
+	}
+	if setupStatus != "ok" && setupStatus != "unknown" {
+		return ValidationError{Message: "repository branch setup status is invalid"}
+	}
+	protectedValue := 0
+	if protected {
+		protectedValue = 1
+	}
+	result, err := s.db.ExecContext(ctx, `
+UPDATE repository_branches
+SET protected = ?, setup_status = ?, last_checked_at = ?
+WHERE repository_id = ? AND name = ?`, protectedValue, setupStatus, checkedAt.UTC().Format(time.RFC3339Nano), repositoryID, strings.TrimSpace(name))
+	if err != nil {
+		return fmt.Errorf("update repository branch readiness: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("update repository branch readiness rows: %w", err)
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 // BranchHasBlockingFreeze reports whether the branch has an active freeze or a
 // pending scheduled freeze. Ended and cancelled history never blocks removal.
 func (s *Store) BranchHasBlockingFreeze(ctx context.Context, repositoryID int64, name string) (bool, error) {
