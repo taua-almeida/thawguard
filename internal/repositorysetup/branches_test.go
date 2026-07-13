@@ -106,6 +106,34 @@ func TestServiceAddBranchRecordsAuditEventTransactionally(t *testing.T) {
 	}
 }
 
+func TestServiceBranchScopeChangesAdvanceRepositorySnapshot(t *testing.T) {
+	ctx := context.Background()
+	service, repo := newBranchTestService(t, ctx)
+	before := repo.UpdatedAt
+
+	if _, err := service.AddBranch(ctx, repo.ID, "release/1.4", branchTestAdmin); err != nil {
+		t.Fatal(err)
+	}
+	afterAdd, err := repository.NewStore(service.db).Get(ctx, repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !afterAdd.UpdatedAt.After(before) {
+		t.Fatalf("expected branch add to advance repository snapshot, before=%s after=%s", before, afterAdd.UpdatedAt)
+	}
+
+	if err := service.RemoveBranch(ctx, repo.ID, "release/1.4", branchTestAdmin); err != nil {
+		t.Fatal(err)
+	}
+	afterRemove, err := repository.NewStore(service.db).Get(ctx, repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !afterRemove.UpdatedAt.After(afterAdd.UpdatedAt) {
+		t.Fatalf("expected branch removal to advance repository snapshot, add=%s remove=%s", afterAdd.UpdatedAt, afterRemove.UpdatedAt)
+	}
+}
+
 func TestServiceBranchScopeIsLockedWhileEnforcementIsActive(t *testing.T) {
 	ctx := context.Background()
 	service, repo := newBranchTestService(t, ctx)
@@ -148,8 +176,14 @@ func TestServiceRemoveBranchGuardsAndAudits(t *testing.T) {
 		t.Fatal(err)
 	}
 	freezes := freeze.NewService(service.db)
+	if _, err := repository.NewStore(service.db).SetEnforcementState(ctx, repo.ID, domain.EnforcementActive); err != nil {
+		t.Fatal(err)
+	}
 	active, err := freezes.CreateActive(ctx, freeze.CreateParams{RepositoryID: repo.ID, Branch: "release/1.4", Reason: "release freeze"}, branchTestAdmin)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.NewStore(service.db).SetEnforcementState(ctx, repo.ID, domain.EnforcementSetupIncomplete); err != nil {
 		t.Fatal(err)
 	}
 	if err := service.RemoveBranch(ctx, repo.ID, "release/1.4", branchTestAdmin); !IsValidationError(err) && !repository.IsValidationError(err) {
@@ -159,8 +193,14 @@ func TestServiceRemoveBranchGuardsAndAudits(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if _, err := repository.NewStore(service.db).SetEnforcementState(ctx, repo.ID, domain.EnforcementActive); err != nil {
+		t.Fatal(err)
+	}
 	scheduled, err := freezes.CreateScheduled(ctx, freeze.ScheduleParams{RepositoryID: repo.ID, Branch: "release/1.4", Reason: "window", StartsAt: time.Now().UTC().Add(time.Hour)}, branchTestAdmin)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.NewStore(service.db).SetEnforcementState(ctx, repo.ID, domain.EnforcementSetupIncomplete); err != nil {
 		t.Fatal(err)
 	}
 	if err := service.RemoveBranch(ctx, repo.ID, "release/1.4", branchTestAdmin); !IsValidationError(err) && !repository.IsValidationError(err) {

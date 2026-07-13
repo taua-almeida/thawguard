@@ -22,6 +22,11 @@ import (
 
 const statusPostVerificationDescription = "Thawguard status-post verification"
 
+const (
+	activeFreezeDeactivationMessage    = "Lift all active freezes before deactivating repository enforcement."
+	pendingScheduleDeactivationMessage = "Cancel all pending scheduled freezes before deactivating repository enforcement."
+)
+
 type enforcementReadinessRunner interface {
 	Run(ctx context.Context, repo domain.Repository) ([]setupcheck.Result, error)
 }
@@ -131,7 +136,7 @@ func (s *enforcementService) ActivateEnforcement(ctx context.Context, repository
 		return domain.Repository{}, repository.ValidationError{Message: "Activation stopped: the controlled thawguard/setup status could not be posted. The repository returned to setup-incomplete; fix the token or forge setup and verify again."}
 	}
 	verifiedAt := s.now().UTC()
-	counts, reason, claim, policyErr := s.reconcileCurrentPolicy(ctx, repo, &verifiedAt, true)
+	counts, reason, claim, policyErr := s.reconcileCurrentPolicy(ctx, repo, &verifiedAt, true, jobs.Job{})
 	if policyErr != nil {
 		if reason == domain.EnforcementFailureOpenPRSync {
 			// The forge cache never refreshed and enforcement never flipped:
@@ -172,6 +177,122 @@ func (s *enforcementService) ActivateEnforcement(ctx context.Context, repository
 	return updated, nil
 }
 
+// DeactivateEnforcement converges the current no-freeze policy while holding
+// the repository's durable reconciliation claim, then atomically fences that
+// exact generation and transitions active to ready. Existing credentials and
+// status-post verification evidence are retained for maintenance.
+func (s *enforcementService) DeactivateEnforcement(ctx context.Context, repositoryID int64, actor domain.Actor) (domain.Repository, error) {
+	if err := s.configured(); err != nil {
+		return domain.Repository{}, err
+	}
+	repo, err := s.loadRepository(ctx, repositoryID)
+	if err != nil {
+		return domain.Repository{}, err
+	}
+	if repo.EnforcementState != domain.EnforcementActive {
+		return domain.Repository{}, repository.ValidationError{Message: "Repository enforcement can only be deactivated while it is active."}
+	}
+	if err := s.requireNoDeactivationBlockers(ctx, freeze.NewStore(s.db), repo.ID); err != nil {
+		return domain.Repository{}, err
+	}
+	if _, err := s.jobs.EnqueueReconciliation(ctx, repo.ID); err != nil {
+		return domain.Repository{}, err
+	}
+	claim, claimed, err := s.jobs.ClaimRepository(ctx, repo.ID)
+	if err != nil {
+		return domain.Repository{}, err
+	}
+	if !claimed {
+		return domain.Repository{}, repository.ValidationError{Message: "Repository enforcement reconciliation is already in progress. Retry deactivation after it finishes."}
+	}
+
+	counts, reason, _, convergeErr := s.reconcileCurrentPolicy(ctx, repo, nil, false, claim)
+	if convergeErr != nil {
+		if !domain.ValidEnforcementFailureReason(reason) {
+			reason = domain.EnforcementFailureRuntime
+		}
+		_, rescheduleErr := s.jobs.RescheduleClaim(ctx, claim, reason)
+		return domain.Repository{}, errors.Join(repository.ValidationError{Message: "Deactivation stopped because the current freeze policy could not be reconciled. Repository enforcement remains active and retry work is preserved."}, convergeErr, rescheduleErr)
+	}
+
+	updated, err := s.recordEnforcementDeactivation(ctx, repo, actor, counts, claim)
+	if err != nil {
+		category := domain.EnforcementFailureRuntime
+		if changedCategory, ok := convergenceStateChangeCategory(err); ok {
+			category = changedCategory
+		}
+		_, rescheduleErr := s.jobs.RescheduleClaim(ctx, claim, category)
+		return domain.Repository{}, errors.Join(err, rescheduleErr)
+	}
+	return updated, nil
+}
+
+func (s *enforcementService) requireNoDeactivationBlockers(ctx context.Context, store *freeze.Store, repositoryID int64) error {
+	active, err := store.HasActiveForRepository(ctx, repositoryID)
+	if err != nil {
+		return err
+	}
+	if active {
+		return repository.ValidationError{Message: activeFreezeDeactivationMessage}
+	}
+	scheduled, err := store.HasScheduledForRepository(ctx, repositoryID)
+	if err != nil {
+		return err
+	}
+	if scheduled {
+		return repository.ValidationError{Message: pendingScheduleDeactivationMessage}
+	}
+	return nil
+}
+
+func (s *enforcementService) recordEnforcementDeactivation(ctx context.Context, repo domain.Repository, actor domain.Actor, counts activationCounts, claim jobs.Job) (domain.Repository, error) {
+	var updated domain.Repository
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
+		repositoryStore := repository.NewStoreTx(tx)
+		current, err := repositoryStore.Get(ctx, repo.ID)
+		if err != nil {
+			return err
+		}
+		if !current.Active || current.EnforcementState != domain.EnforcementActive {
+			return repository.ValidationError{Message: "Repository enforcement changed while deactivation was running. It was not deactivated."}
+		}
+		if err := s.requireNoDeactivationBlockers(ctx, freeze.NewStoreTx(tx), repo.ID); err != nil {
+			return err
+		}
+		completed, err := jobs.NewStoreTx(tx).CompleteClaim(ctx, claim)
+		if err != nil {
+			return err
+		}
+		if !completed {
+			return convergenceStateChangeError{category: domain.EnforcementFailureRuntime}
+		}
+		if err := freeze.NewStoreTx(tx).MarkRepositoryRecomputed(ctx, repo.ID); err != nil {
+			return err
+		}
+		var transitioned bool
+		updated, transitioned, err = repositoryStore.TransitionEnforcementState(ctx, repo.ID, domain.EnforcementActive, domain.EnforcementReady)
+		if err != nil {
+			return err
+		}
+		if !transitioned {
+			return repository.ValidationError{Message: "Repository enforcement changed while deactivation was running. It was not deactivated."}
+		}
+		updated, err = repositoryStore.ClearEnforcementFailure(ctx, repo.ID)
+		if err != nil {
+			return err
+		}
+		event := enforcementEvent(audit.ActionRepositoryEnforcementDeactivated, updated, actor, map[string]string{
+			"default_branch": repo.DefaultBranch,
+			"maintenance":    "status token or managed branch",
+		}, &counts)
+		if err := audit.NewStoreTx(tx).Record(ctx, event); err != nil {
+			return fmt.Errorf("record repository.enforcement_deactivated audit event: %w", err)
+		}
+		return nil
+	})
+	return updated, err
+}
+
 // reconcileCurrentPolicy is the one shared implementation of enforcement
 // convergence used by activation, unhealthy recovery, and manual
 // reconciliation: it synchronizes current open pull requests from the forge,
@@ -182,7 +303,7 @@ func (s *enforcementService) ActivateEnforcement(ctx context.Context, repository
 // refresh and the first publication; callers own reverting the state on
 // failure. It stops at the first failed group and returns its stable failure
 // reason with truthful counts; already-posted statuses are never rolled back.
-func (s *enforcementService) reconcileCurrentPolicy(ctx context.Context, repo domain.Repository, activateVerifiedAt *time.Time, enqueueActivationIntent bool) (activationCounts, string, jobs.Job, error) {
+func (s *enforcementService) reconcileCurrentPolicy(ctx context.Context, repo domain.Repository, activateVerifiedAt *time.Time, enqueueActivationIntent bool, expectedClaim jobs.Job) (activationCounts, string, jobs.Job, error) {
 	counts := activationCounts{}
 	if err := s.syncer.syncRepository(ctx, repo, ""); err != nil {
 		return counts, domain.EnforcementFailureOpenPRSync, jobs.Job{}, err
@@ -193,19 +314,29 @@ func (s *enforcementService) reconcileCurrentPolicy(ctx context.Context, repo do
 	}
 	counts.managedBranches = managedBranches
 	counts.openPullRequests = len(openPRs)
-	claim := jobs.Job{}
+	claim := expectedClaim
 	if activateVerifiedAt != nil {
-		claim, _, err = s.markActive(ctx, repo.ID, *activateVerifiedAt, enqueueActivationIntent)
+		activatedClaim, _, markErr := s.markActive(ctx, repo.ID, *activateVerifiedAt, enqueueActivationIntent)
+		err = markErr
 		if err != nil {
 			return counts, "", jobs.Job{}, err
 		}
+		if activatedClaim.ID != 0 {
+			claim = activatedClaim
+		}
 	}
 	for _, group := range pullRequestsByHead(openPRs) {
+		if err := s.requireCurrentReconciliationClaim(ctx, claim); err != nil {
+			return counts, "", claim, err
+		}
 		counts.statusesAttempted++
 		result, err := s.statuses.RunForSharedHead(ctx, group, group[0].Index)
 		if err != nil {
 			counts.statusesFailed++
 			return counts, domain.EnforcementFailureEvaluation, claim, err
+		}
+		if err := s.requireCurrentReconciliationClaim(ctx, claim); err != nil {
+			return counts, "", claim, err
 		}
 		if _, err := s.publisher.Publish(ctx, result); err != nil {
 			counts.statusesFailed++
@@ -214,6 +345,17 @@ func (s *enforcementService) reconcileCurrentPolicy(ctx context.Context, repo do
 		counts.statusesPosted++
 	}
 	return counts, "", claim, nil
+}
+
+func (s *enforcementService) requireCurrentReconciliationClaim(ctx context.Context, claim jobs.Job) error {
+	current, err := s.jobs.ClaimCurrent(ctx, claim)
+	if err != nil {
+		return err
+	}
+	if !current {
+		return convergenceStateChangeError{category: domain.EnforcementFailureRuntime}
+	}
+	return nil
 }
 
 func (s *enforcementService) configured() error {
@@ -335,6 +477,9 @@ func (s *enforcementService) recordVerificationSuccess(ctx context.Context, repo
 	var updated domain.Repository
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
 		store := repository.NewStoreTx(tx)
+		if err := requireCurrentVerificationSnapshot(ctx, store, repo); err != nil {
+			return err
+		}
 		if _, err := store.SetStatusPostVerifiedAt(ctx, repo.ID, &verifiedAt); err != nil {
 			return err
 		}
@@ -364,6 +509,9 @@ func (s *enforcementService) recordVerificationSuccess(ctx context.Context, repo
 func (s *enforcementService) recordVerificationFailure(ctx context.Context, repo domain.Repository, actor domain.Actor) error {
 	return s.inTx(ctx, func(tx *sql.Tx) error {
 		store := repository.NewStoreTx(tx)
+		if err := requireCurrentVerificationSnapshot(ctx, store, repo); err != nil {
+			return err
+		}
 		updated, err := store.SetStatusPostVerifiedAt(ctx, repo.ID, nil)
 		if err != nil {
 			return err
@@ -383,6 +531,17 @@ func (s *enforcementService) recordVerificationFailure(ctx context.Context, repo
 		}
 		return nil
 	})
+}
+
+func requireCurrentVerificationSnapshot(ctx context.Context, store *repository.Store, expected domain.Repository) error {
+	current, err := store.Get(ctx, expected.ID)
+	if err != nil {
+		return err
+	}
+	if current.Active != expected.Active || current.EnforcementState != expected.EnforcementState || !current.UpdatedAt.Equal(expected.UpdatedAt) {
+		return repository.ValidationError{Message: "Repository setup changed while status-post verification was running. Rerun readiness checks and retry verification."}
+	}
+	return nil
 }
 
 type activationCounts struct {
@@ -411,18 +570,37 @@ func (s *enforcementService) recordEnforcementFailure(ctx context.Context, repo 
 	failedAt := s.now().UTC()
 	return s.inTx(ctx, func(tx *sql.Tx) error {
 		store := repository.NewStoreTx(tx)
+		current, err := store.Get(ctx, repo.ID)
+		if err != nil {
+			return err
+		}
+		// A stale reconciliation failure must not overwrite a repository that
+		// has since been safely deactivated to ready.
+		if failure.resultState == domain.EnforcementUnhealthy && current.EnforcementState != domain.EnforcementActive && current.EnforcementState != domain.EnforcementUnhealthy {
+			return nil
+		}
 		if failure.clearVerification {
 			if _, err := store.SetStatusPostVerifiedAt(ctx, repo.ID, nil); err != nil {
 				return err
 			}
 		}
-		// The loaded repo can be stale here: a readiness run may already have
-		// flipped active to unhealthy, and reconcileCurrentPolicy flips to
-		// active before publishing. The result state is therefore always
-		// written instead of being diffed against the stale snapshot.
-		updated, err := store.SetEnforcementState(ctx, repo.ID, failure.resultState)
-		if err != nil {
-			return err
+		updated := current
+		if current.EnforcementState != failure.resultState {
+			if failure.resultState == domain.EnforcementUnhealthy {
+				var transitioned bool
+				updated, transitioned, err = store.TransitionEnforcementState(ctx, repo.ID, domain.EnforcementActive, domain.EnforcementUnhealthy)
+				if err != nil {
+					return err
+				}
+				if !transitioned {
+					return nil
+				}
+			} else {
+				updated, err = store.SetEnforcementState(ctx, repo.ID, failure.resultState)
+				if err != nil {
+					return err
+				}
+			}
 		}
 		if failure.persistFailure {
 			updated, err = store.SetEnforcementFailure(ctx, repo.ID, failure.reason, failedAt)

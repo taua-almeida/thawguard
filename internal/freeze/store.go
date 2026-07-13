@@ -93,7 +93,7 @@ func (s *Store) CreateActive(ctx context.Context, params CreateParams) (domain.B
 	if err := validateCreateParams(params, now); err != nil {
 		return domain.BranchFreeze{}, err
 	}
-	if err := s.requireRepository(ctx, params.RepositoryID); err != nil {
+	if err := s.requireEnforcementActiveRepository(ctx, params.RepositoryID); err != nil {
 		return domain.BranchFreeze{}, err
 	}
 	if err := s.rejectDuplicateActive(ctx, params.RepositoryID, params.Branch); err != nil {
@@ -147,7 +147,7 @@ func (s *Store) CreateScheduled(ctx context.Context, params ScheduleParams) (dom
 	if err := validateScheduleParams(params, s.now().UTC()); err != nil {
 		return domain.BranchFreeze{}, err
 	}
-	if err := s.requireRepository(ctx, params.RepositoryID); err != nil {
+	if err := s.requireEnforcementActiveRepository(ctx, params.RepositoryID); err != nil {
 		return domain.BranchFreeze{}, err
 	}
 	now := s.now().UTC()
@@ -476,11 +476,20 @@ func (s *Store) ActivateScheduled(ctx context.Context, id int64) (domain.BranchF
 	result, err := s.db.ExecContext(ctx, `
 UPDATE branch_freezes
 SET status = ?, needs_recompute = 1, updated_at = ?
-WHERE id = ? AND scheduled = 1 AND status = ? AND starts_at <= ?`, domain.BranchFreezeStatusActive, now, id, domain.BranchFreezeStatusScheduled, now)
+WHERE id = ? AND scheduled = 1 AND status = ? AND starts_at <= ?
+  AND EXISTS (
+    SELECT 1 FROM repositories
+    WHERE repositories.id = branch_freezes.repository_id
+      AND repositories.active = 1
+      AND repositories.enforcement_state = ?
+  )`, domain.BranchFreezeStatusActive, now, id, domain.BranchFreezeStatusScheduled, now, domain.EnforcementActive)
 	if err != nil {
 		return domain.BranchFreeze{}, createActiveFreezeError(err)
 	}
 	if err := requireAffectedFreeze(result, "scheduled freeze is not due"); err != nil {
+		if activeErr := s.requireFreezeRepositoryEnforcement(ctx, id); activeErr != nil {
+			return domain.BranchFreeze{}, activeErr
+		}
 		return domain.BranchFreeze{}, err
 	}
 	return s.Get(ctx, id)
@@ -499,7 +508,13 @@ func (s *Store) StartScheduledNow(ctx context.Context, id int64) (domain.BranchF
 UPDATE branch_freezes
 SET status = ?, starts_at = ?, needs_recompute = 1, updated_at = ?
 WHERE id = ? AND scheduled = 1 AND status = ? AND starts_at > ?
-  AND (planned_ends_at IS NULL OR planned_ends_at > ?)`,
+  AND (planned_ends_at IS NULL OR planned_ends_at > ?)
+  AND EXISTS (
+    SELECT 1 FROM repositories
+    WHERE repositories.id = branch_freezes.repository_id
+      AND repositories.active = 1
+      AND repositories.enforcement_state = ?
+  )`,
 		domain.BranchFreezeStatusActive,
 		nowText,
 		nowText,
@@ -507,6 +522,7 @@ WHERE id = ? AND scheduled = 1 AND status = ? AND starts_at > ?
 		domain.BranchFreezeStatusScheduled,
 		nowText,
 		nowText,
+		domain.EnforcementActive,
 	)
 	if err != nil {
 		return domain.BranchFreeze{}, createActiveFreezeError(err)
@@ -516,6 +532,9 @@ WHERE id = ? AND scheduled = 1 AND status = ? AND starts_at > ?
 		return domain.BranchFreeze{}, fmt.Errorf("start scheduled freeze now rows affected: %w", err)
 	}
 	if affected == 0 {
+		if activeErr := s.requireFreezeRepositoryEnforcement(ctx, id); activeErr != nil {
+			return domain.BranchFreeze{}, activeErr
+		}
 		target, err := s.Get(ctx, id)
 		if errors.Is(err, sql.ErrNoRows) {
 			return domain.BranchFreeze{}, ValidationError{Message: "scheduled freeze is no longer pending"}
@@ -605,16 +624,48 @@ WHERE id = ? AND status = ?`, params.Status, now, now, params.ID, domain.BranchF
 	return s.Get(ctx, params.ID)
 }
 
-func (s *Store) requireRepository(ctx context.Context, repositoryID int64) error {
+func (s *Store) requireEnforcementActiveRepository(ctx context.Context, repositoryID int64) error {
 	var existing int64
-	err := s.db.QueryRowContext(ctx, `SELECT id FROM repositories WHERE id = ? AND active = 1`, repositoryID).Scan(&existing)
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM repositories WHERE id = ? AND active = 1 AND enforcement_state = ?`, repositoryID, domain.EnforcementActive).Scan(&existing)
 	if errors.Is(err, sql.ErrNoRows) {
-		return ValidationError{Message: "repository not found"}
+		return ValidationError{Message: domain.EnforcementNotActiveMessage}
 	}
 	if err != nil {
-		return fmt.Errorf("check freeze repository: %w", err)
+		return fmt.Errorf("check freeze repository enforcement: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) requireFreezeRepositoryEnforcement(ctx context.Context, freezeID int64) error {
+	var repositoryID int64
+	err := s.db.QueryRowContext(ctx, `SELECT repository_id FROM branch_freezes WHERE id = ?`, freezeID).Scan(&repositoryID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("load freeze repository for enforcement check: %w", err)
+	}
+	return s.requireEnforcementActiveRepository(ctx, repositoryID)
+}
+
+func (s *Store) HasActiveForRepository(ctx context.Context, repositoryID int64) (bool, error) {
+	return s.hasStatusForRepository(ctx, repositoryID, domain.BranchFreezeStatusActive)
+}
+
+func (s *Store) HasScheduledForRepository(ctx context.Context, repositoryID int64) (bool, error) {
+	return s.hasStatusForRepository(ctx, repositoryID, domain.BranchFreezeStatusScheduled)
+}
+
+func (s *Store) hasStatusForRepository(ctx context.Context, repositoryID int64, status domain.BranchFreezeStatus) (bool, error) {
+	if s == nil || s.db == nil {
+		return false, errors.New("freeze store has no database")
+	}
+	var exists int
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM branch_freezes WHERE repository_id = ? AND status = ?)`, repositoryID, status).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check repository freeze blockers: %w", err)
+	}
+	return exists == 1, nil
 }
 
 func (s *Store) rejectDuplicateActive(ctx context.Context, repositoryID int64, branch string) error {

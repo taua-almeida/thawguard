@@ -44,6 +44,8 @@ type enforcementForgeState struct {
 	// (lowercase) head SHA so partial publication can be exercised.
 	failFreezePostSHA string
 	failPulls         bool
+	onSetupPost       func()
+	onFreezePost      func()
 	requests          int
 }
 
@@ -105,6 +107,12 @@ func newEnforcementHarness(t *testing.T, ctx context.Context) *enforcementHarnes
 				t.Error(err)
 			}
 			postSHA := strings.TrimPrefix(r.URL.Path, "/api/v1/repos/taua-almeida/thawguard/statuses/")
+			if body["context"] == domain.SetupStatusContext && state.onSetupPost != nil {
+				state.onSetupPost()
+			}
+			if body["context"] == domain.RequiredStatusContext && state.onFreezePost != nil {
+				state.onFreezePost()
+			}
 			if (state.failSetupPost && body["context"] == domain.SetupStatusContext) ||
 				(state.failFreezePost && body["context"] == domain.RequiredStatusContext) ||
 				(state.failFreezePostSHA != "" && body["context"] == domain.RequiredStatusContext && postSHA == state.failFreezePostSHA) {
@@ -159,6 +167,15 @@ func (h *enforcementHarness) currentRepo(t *testing.T, ctx context.Context) doma
 		t.Fatal(err)
 	}
 	return repo
+}
+
+func (h *enforcementHarness) activateForDeactivation(t *testing.T, ctx context.Context) {
+	t.Helper()
+	verifiedAt := time.Now().UTC()
+	if _, err := repository.NewStore(h.database).SetStatusPostVerifiedAt(ctx, h.repo.ID, &verifiedAt); err != nil {
+		t.Fatal(err)
+	}
+	h.setState(t, ctx, domain.EnforcementActive)
 }
 
 func (h *enforcementHarness) auditEvents(t *testing.T, ctx context.Context, action string) []audit.Event {
@@ -255,6 +272,47 @@ func TestVerifyStatusPostingSuccessPostsSetupContextAndBecomesReady(t *testing.T
 	assertAppTableCount(t, h.database, "status_results", 0)
 	assertAppTableCount(t, h.database, "status_publication_intents", 0)
 	assertAppTableCount(t, h.database, "status_publication_attempts", 0)
+}
+
+func TestVerifyStatusPostingRejectsStaleSuccessAfterSetupChanges(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*enforcementHarness, context.Context) error
+	}{
+		{name: "status token", mutate: func(h *enforcementHarness, ctx context.Context) error {
+			_, err := repository.NewStore(h.database).SetStatusTokenCiphertext(ctx, h.repo.ID, []byte("replacement-ciphertext"))
+			return err
+		}},
+		{name: "managed branches", mutate: func(h *enforcementHarness, ctx context.Context) error {
+			_, err := repositorysetup.NewService(h.database).AddBranch(ctx, h.repo.ID, "release/2.0", h.admin)
+			return err
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			h := newEnforcementHarness(t, ctx)
+			var setupErr error
+			h.forge.onSetupPost = func() {
+				h.forge.onSetupPost = nil
+				setupErr = test.mutate(h, ctx)
+			}
+
+			_, err := h.service.VerifyStatusPosting(ctx, h.repo.ID, h.admin)
+			if setupErr != nil {
+				t.Fatal(setupErr)
+			}
+			if !repository.IsValidationError(err) || !strings.Contains(err.Error(), "setup changed") {
+				t.Fatalf("expected stale verification rejection, got %v", err)
+			}
+			stored := h.currentRepo(t, ctx)
+			if stored.EnforcementState != domain.EnforcementSetupIncomplete || stored.StatusPostVerifiedAt != nil {
+				t.Fatalf("stale verification must not restore ready evidence, got %+v", stored)
+			}
+			if events := h.auditEvents(t, ctx, audit.ActionRepositoryStatusPostVerified); len(events) != 0 {
+				t.Fatalf("stale verification must not record success, got %+v", events)
+			}
+		})
+	}
 }
 
 func TestVerifyStatusPostingFailureStaysSetupIncompleteWithSanitizedEvidence(t *testing.T) {
@@ -492,9 +550,11 @@ func TestActivateEnforcementPublishesCurrentPolicyStatuses(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Historical stored policy: main is actively frozen from before activation.
+	h.setState(t, ctx, domain.EnforcementActive)
 	if _, err := freeze.NewService(h.database).CreateActive(ctx, freeze.CreateParams{RepositoryID: h.repo.ID, Branch: "main", Reason: "release freeze"}, admin); err != nil {
 		t.Fatal(err)
 	}
+	h.setState(t, ctx, domain.EnforcementSetupIncomplete)
 	h.forge.openPRs = []forgejoPullRequestResponse{
 		newAppPullRequestResponse(42, "open", "main", "AAA111BBB222"),
 		newAppPullRequestResponse(43, "open", "develop", "CCC333DDD444"),
@@ -538,9 +598,11 @@ func TestActivateEnforcementKeepsRepositoryWideSharedHeadPolicy(t *testing.T) {
 	if _, err := repository.NewStore(h.database).AddBranch(ctx, h.repo.ID, "develop"); err != nil {
 		t.Fatal(err)
 	}
+	h.setState(t, ctx, domain.EnforcementActive)
 	if _, err := freeze.NewService(h.database).CreateActive(ctx, freeze.CreateParams{RepositoryID: h.repo.ID, Branch: "main", Reason: "release freeze"}, h.admin); err != nil {
 		t.Fatal(err)
 	}
+	h.setState(t, ctx, domain.EnforcementSetupIncomplete)
 	// PRs on a frozen and an unfrozen managed branch share one head SHA: the
 	// SHA-scoped decision must stay failure repository-wide.
 	h.forge.openPRs = []forgejoPullRequestResponse{
@@ -568,12 +630,14 @@ func TestActivateEnforcementKeepsRepositoryWideSharedHeadPolicy(t *testing.T) {
 func TestActivateEnforcementRespectsCurrentHeadThawException(t *testing.T) {
 	ctx := context.Background()
 	h := newEnforcementHarness(t, ctx)
+	h.setState(t, ctx, domain.EnforcementActive)
 	if _, err := freeze.NewService(h.database).CreateActive(ctx, freeze.CreateParams{RepositoryID: h.repo.ID, Branch: "main", Reason: "release freeze"}, h.admin); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := thawexception.NewService(h.database).Approve(ctx, thawexception.ApproveParams{RepositoryID: h.repo.ID, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "aaa111bbb222", Reason: "hotfix"}, h.admin); err != nil {
 		t.Fatal(err)
 	}
+	h.setState(t, ctx, domain.EnforcementSetupIncomplete)
 	h.forge.openPRs = []forgejoPullRequestResponse{newAppPullRequestResponse(42, "open", "main", "AAA111BBB222")}
 	if _, err := h.service.VerifyStatusPosting(ctx, h.repo.ID, h.admin); err != nil {
 		t.Fatal(err)
@@ -626,4 +690,274 @@ func TestActivateEnforcementPublicationFailureBecomesUnhealthy(t *testing.T) {
 	}
 	// Attempt history is preserved through the normal publication tables.
 	assertAppTableCount(t, h.database, "status_publication_attempts", 1)
+}
+
+func TestDeactivateEnforcementConvergesToSuccessAndBecomesReady(t *testing.T) {
+	ctx := context.Background()
+	h := newEnforcementHarness(t, ctx)
+	h.activateForDeactivation(t, ctx)
+	h.forge.openPRs = []forgejoPullRequestResponse{newAppPullRequestResponse(42, "open", "main", "AAA111BBB222")}
+
+	updated, err := h.service.DeactivateEnforcement(ctx, h.repo.ID, h.admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.EnforcementState != domain.EnforcementReady || updated.StatusPostVerifiedAt == nil {
+		t.Fatalf("expected ready repository retaining verification evidence, got %+v", updated)
+	}
+	freezePosts := make([]postedEnforcementStatus, 0)
+	for _, post := range h.forge.posted {
+		if post.Context == domain.RequiredStatusContext {
+			freezePosts = append(freezePosts, post)
+		}
+	}
+	if len(freezePosts) != 1 || freezePosts[0].State != string(domain.CommitStatusSuccess) {
+		t.Fatalf("expected one successful converged freeze status, got %+v", freezePosts)
+	}
+	if events := h.auditEvents(t, ctx, audit.ActionRepositoryEnforcementDeactivated); len(events) != 1 || !strings.Contains(events[0].DetailsJSON, `"enforcement_state":"ready"`) {
+		t.Fatalf("expected one ready deactivation audit event, got %+v", events)
+	}
+	if _, err := jobs.NewStore(h.database).GetReconciliation(ctx, h.repo.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected completed reconciliation claim, got %v", err)
+	}
+}
+
+func TestDeactivateEnforcementRejectsInactiveLifecycleStates(t *testing.T) {
+	for _, state := range []domain.EnforcementState{domain.EnforcementReady, domain.EnforcementSetupIncomplete, domain.EnforcementUnhealthy} {
+		t.Run(string(state), func(t *testing.T) {
+			ctx := context.Background()
+			h := newEnforcementHarness(t, ctx)
+			h.setState(t, ctx, state)
+			_, err := h.service.DeactivateEnforcement(ctx, h.repo.ID, h.admin)
+			if !repository.IsValidationError(err) || !strings.Contains(err.Error(), "only be deactivated while it is active") {
+				t.Fatalf("expected lifecycle rejection, got %v", err)
+			}
+			if h.forge.requests != 0 || len(h.auditEvents(t, ctx, audit.ActionRepositoryEnforcementDeactivated)) != 0 {
+				t.Fatalf("expected no side effects for %s", state)
+			}
+		})
+	}
+}
+
+func TestDeactivateEnforcementBlockersDoNotMutateStateOrRetryIntent(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		message string
+		create  func(*enforcementHarness, context.Context)
+	}{
+		{
+			name:    "active freeze",
+			message: activeFreezeDeactivationMessage,
+			create: func(h *enforcementHarness, ctx context.Context) {
+				if _, err := freeze.NewService(h.database).CreateActive(ctx, freeze.CreateParams{RepositoryID: h.repo.ID, Branch: "main", Reason: "release"}, h.admin); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:    "pending schedule",
+			message: pendingScheduleDeactivationMessage,
+			create: func(h *enforcementHarness, ctx context.Context) {
+				if _, err := freeze.NewService(h.database).CreateScheduled(ctx, freeze.ScheduleParams{RepositoryID: h.repo.ID, Branch: "main", Reason: "release", StartsAt: time.Now().UTC().Add(time.Hour)}, h.admin); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			h := newEnforcementHarness(t, ctx)
+			h.activateForDeactivation(t, ctx)
+			test.create(h, ctx)
+			beforeJob, beforeJobErr := jobs.NewStore(h.database).GetReconciliation(ctx, h.repo.ID)
+
+			_, err := h.service.DeactivateEnforcement(ctx, h.repo.ID, h.admin)
+			if !repository.IsValidationError(err) || err.Error() != test.message {
+				t.Fatalf("expected blocker %q, got %v", test.message, err)
+			}
+			if repo := h.currentRepo(t, ctx); repo.EnforcementState != domain.EnforcementActive {
+				t.Fatalf("expected repository to remain active, got %s", repo.EnforcementState)
+			}
+			afterJob, afterJobErr := jobs.NewStore(h.database).GetReconciliation(ctx, h.repo.ID)
+			if !errors.Is(beforeJobErr, afterJobErr) || (beforeJobErr == nil && beforeJob.Generation != afterJob.Generation) {
+				t.Fatalf("expected retry intent unchanged, before=%+v/%v after=%+v/%v", beforeJob, beforeJobErr, afterJob, afterJobErr)
+			}
+			if h.forge.requests != 0 || len(h.auditEvents(t, ctx, audit.ActionRepositoryEnforcementDeactivated)) != 0 {
+				t.Fatal("expected blocker to prevent convergence and audit")
+			}
+		})
+	}
+}
+
+func TestDeactivateEnforcementPublicationFailureLeavesActiveAndUnaudited(t *testing.T) {
+	ctx := context.Background()
+	h := newEnforcementHarness(t, ctx)
+	h.activateForDeactivation(t, ctx)
+	h.forge.openPRs = []forgejoPullRequestResponse{newAppPullRequestResponse(42, "open", "main", "AAA111BBB222")}
+	h.forge.failFreezePost = true
+
+	_, err := h.service.DeactivateEnforcement(ctx, h.repo.ID, h.admin)
+	if !repository.IsValidationError(err) || !strings.Contains(err.Error(), "remains active") {
+		t.Fatalf("expected safe deactivation failure, got %v", err)
+	}
+	if repo := h.currentRepo(t, ctx); repo.EnforcementState != domain.EnforcementActive {
+		t.Fatalf("expected active repository, got %s", repo.EnforcementState)
+	}
+	if len(h.auditEvents(t, ctx, audit.ActionRepositoryEnforcementDeactivated)) != 0 {
+		t.Fatal("expected no successful deactivation audit")
+	}
+	if job, err := jobs.NewStore(h.database).GetReconciliation(ctx, h.repo.ID); err != nil || job.LockedAt != nil {
+		t.Fatalf("expected preserved unlocked retry ownership, job=%+v err=%v", job, err)
+	}
+}
+
+func TestDeactivateEnforcementNewerGenerationPreventsTransition(t *testing.T) {
+	ctx := context.Background()
+	h := newEnforcementHarness(t, ctx)
+	h.activateForDeactivation(t, ctx)
+	h.forge.openPRs = []forgejoPullRequestResponse{newAppPullRequestResponse(42, "open", "main", "AAA111BBB222")}
+	var generationErr error
+	h.forge.onFreezePost = func() {
+		h.forge.onFreezePost = nil
+		_, generationErr = jobs.NewStore(h.database).EnqueueReconciliation(ctx, h.repo.ID)
+	}
+
+	_, err := h.service.DeactivateEnforcement(ctx, h.repo.ID, h.admin)
+	if generationErr != nil {
+		t.Fatal(generationErr)
+	}
+	if err == nil {
+		t.Fatal("expected newer generation to abort deactivation")
+	}
+	if repo := h.currentRepo(t, ctx); repo.EnforcementState != domain.EnforcementActive {
+		t.Fatalf("expected active repository, got %s", repo.EnforcementState)
+	}
+	if len(h.auditEvents(t, ctx, audit.ActionRepositoryEnforcementDeactivated)) != 0 {
+		t.Fatal("expected no successful audit for stale generation")
+	}
+}
+
+func TestReconciliationSupersededClaimCannotPublish(t *testing.T) {
+	ctx := context.Background()
+	h := newEnforcementHarness(t, ctx)
+	h.activateForDeactivation(t, ctx)
+	h.forge.openPRs = []forgejoPullRequestResponse{newAppPullRequestResponse(42, "open", "main", "AAA111BBB222")}
+	jobStore := jobs.NewStore(h.database)
+	if _, err := jobStore.EnqueueReconciliation(ctx, h.repo.ID); err != nil {
+		t.Fatal(err)
+	}
+	claim, claimed, err := jobStore.ClaimRepository(ctx, h.repo.ID)
+	if err != nil || !claimed {
+		t.Fatalf("expected initial claim, claim=%+v claimed=%v err=%v", claim, claimed, err)
+	}
+	if _, err := jobStore.EnqueueReconciliation(ctx, h.repo.ID); err != nil {
+		t.Fatal(err)
+	}
+	repo := h.currentRepo(t, ctx)
+	_, _, _, err = h.service.reconcileCurrentPolicy(ctx, repo, nil, false, claim)
+	if _, ok := convergenceStateChangeCategory(err); !ok {
+		t.Fatalf("expected superseded claim fence, got %v", err)
+	}
+	for _, post := range h.forge.posted {
+		if post.Context == domain.RequiredStatusContext {
+			t.Fatalf("superseded claim must not publish freeze status, got %+v", h.forge.posted)
+		}
+	}
+}
+
+func TestDeactivateEnforcementAuditAndStateTransitionAreAtomic(t *testing.T) {
+	ctx := context.Background()
+	h := newEnforcementHarness(t, ctx)
+	h.activateForDeactivation(t, ctx)
+	if _, err := h.database.ExecContext(ctx, `
+CREATE TRIGGER fail_deactivation_audit
+BEFORE INSERT ON audit_events
+WHEN NEW.action = 'repository.enforcement_deactivated'
+BEGIN
+  SELECT RAISE(ABORT, 'forced audit failure');
+END`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := h.service.DeactivateEnforcement(ctx, h.repo.ID, h.admin); err == nil {
+		t.Fatal("expected forced audit failure")
+	}
+	if repo := h.currentRepo(t, ctx); repo.EnforcementState != domain.EnforcementActive {
+		t.Fatalf("expected state rollback to active, got %s", repo.EnforcementState)
+	}
+	if len(h.auditEvents(t, ctx, audit.ActionRepositoryEnforcementDeactivated)) != 0 {
+		t.Fatal("expected audit rollback")
+	}
+}
+
+func TestPolicyMutationsAndStaleReconciliationAreSafeAfterDeactivation(t *testing.T) {
+	ctx := context.Background()
+	h := newEnforcementHarness(t, ctx)
+	h.activateForDeactivation(t, ctx)
+	if _, err := h.service.DeactivateEnforcement(ctx, h.repo.ID, h.admin); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := freeze.NewService(h.database).CreateActive(ctx, freeze.CreateParams{RepositoryID: h.repo.ID, Branch: "main", Reason: "stale"}, h.admin); !freeze.IsValidationError(err) {
+		t.Fatalf("expected stale freeze mutation rejection, got %v", err)
+	}
+	if _, err := freeze.NewService(h.database).CreateScheduled(ctx, freeze.ScheduleParams{RepositoryID: h.repo.ID, Branch: "main", Reason: "stale", StartsAt: time.Now().UTC().Add(time.Hour)}, h.admin); !freeze.IsValidationError(err) {
+		t.Fatalf("expected stale schedule mutation rejection, got %v", err)
+	}
+	if _, err := thawexception.NewService(h.database).Approve(ctx, thawexception.ApproveParams{RepositoryID: h.repo.ID, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "aaa111bbb222", Reason: "stale"}, h.admin); !thawexception.IsValidationError(err) {
+		t.Fatalf("expected stale thaw mutation rejection, got %v", err)
+	}
+	assertAppTableCount(t, h.database, "branch_freezes", 0)
+	assertAppTableCount(t, h.database, "thaw_exceptions", 0)
+
+	jobStore := jobs.NewStore(h.database)
+	if _, err := jobStore.EnqueueReconciliation(ctx, h.repo.ID); err != nil {
+		t.Fatal(err)
+	}
+	claim, claimed, err := jobStore.ClaimRepository(ctx, h.repo.ID)
+	if err != nil || !claimed {
+		t.Fatalf("expected stale claim, claim=%+v claimed=%v err=%v", claim, claimed, err)
+	}
+	requestsBefore := h.forge.requests
+	if _, err := h.service.processReconciliationClaim(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+	if repo := h.currentRepo(t, ctx); repo.EnforcementState != domain.EnforcementReady {
+		t.Fatalf("expected stale work to preserve ready, got %s", repo.EnforcementState)
+	}
+	if h.forge.requests != requestsBefore {
+		t.Fatalf("expected stale work to publish nothing, requests before=%d after=%d", requestsBefore, h.forge.requests)
+	}
+}
+
+func TestMaintenanceMutationsAfterDeactivationRetainReadinessInvalidation(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*enforcementHarness, context.Context, *repositorysetup.Service) error
+	}{
+		{name: "status token", mutate: func(h *enforcementHarness, ctx context.Context, setup *repositorysetup.Service) error {
+			_, err := setup.SetStatusToken(ctx, h.repo.ID, "replacement-status-token-456", h.admin)
+			return err
+		}},
+		{name: "managed branch", mutate: func(h *enforcementHarness, ctx context.Context, setup *repositorysetup.Service) error {
+			_, err := setup.AddBranch(ctx, h.repo.ID, "release/2.0", h.admin)
+			return err
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			h := newEnforcementHarness(t, ctx)
+			h.activateForDeactivation(t, ctx)
+			if _, err := h.service.DeactivateEnforcement(ctx, h.repo.ID, h.admin); err != nil {
+				t.Fatal(err)
+			}
+			setup := repositorysetup.NewServiceWithSecrets(h.database, newAppTestSecretStore(t))
+			if err := test.mutate(h, ctx, setup); err != nil {
+				t.Fatal(err)
+			}
+			if repo := h.currentRepo(t, ctx); repo.EnforcementState != domain.EnforcementSetupIncomplete {
+				t.Fatalf("expected maintenance mutation to invalidate ready, got %s", repo.EnforcementState)
+			}
+		})
+	}
 }

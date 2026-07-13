@@ -1108,6 +1108,10 @@ func createTestRepository(t *testing.T, ctx context.Context, database *sql.DB) d
 	if err != nil {
 		t.Fatal(err)
 	}
+	repo, err = repository.NewStore(database).SetEnforcementState(ctx, repo.ID, domain.EnforcementActive)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return repo
 }
 

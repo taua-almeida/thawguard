@@ -232,6 +232,26 @@ WHERE id = ? AND type = ? AND generation = ? AND run_at <= ?
 	return candidate, true, nil
 }
 
+// ClaimCurrent reports whether claim still owns the exact live generation and
+// lease. Callers check this before external side effects so an expired or
+// superseded worker cannot publish stale repository policy.
+func (s *Store) ClaimCurrent(ctx context.Context, claim Job) (bool, error) {
+	if err := validateClaim(claim); err != nil {
+		return false, err
+	}
+	var current bool
+	err := s.db.QueryRowContext(ctx, `
+SELECT EXISTS(
+  SELECT 1
+  FROM jobs
+  WHERE id = ? AND type = ? AND generation = ? AND locked_at = ? AND locked_at > ?
+)`, claim.ID, ReconcileRepositoryEnforcement, claim.Generation, formatTime(*claim.LockedAt), formatTime(s.now().UTC().Add(-ReconciliationLease))).Scan(&current)
+	if err != nil {
+		return false, fmt.Errorf("check repository reconciliation claim: %w", err)
+	}
+	return current, nil
+}
+
 // CompleteClaim deletes only the exact generation and lease token observed by
 // the worker. If enqueue advanced generation during the claim, the newer work
 // is retained and the old lease is released without changing its due time.

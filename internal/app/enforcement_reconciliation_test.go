@@ -84,6 +84,7 @@ func TestReconcileEnforcementSuccessRepublishesPolicyAndClearsFailure(t *testing
 	if _, err := repository.NewStore(h.database).AddBranch(ctx, h.repo.ID, "develop"); err != nil {
 		t.Fatal(err)
 	}
+	h.setState(t, ctx, domain.EnforcementActive)
 	if _, err := freeze.NewService(h.database).CreateActive(ctx, freeze.CreateParams{RepositoryID: h.repo.ID, Branch: "main", Reason: "release freeze"}, h.admin); err != nil {
 		t.Fatal(err)
 	}
@@ -141,6 +142,7 @@ func TestReconcileEnforcementKeepsRepositoryWideSharedHeadPolicy(t *testing.T) {
 	if _, err := repository.NewStore(h.database).AddBranch(ctx, h.repo.ID, "develop"); err != nil {
 		t.Fatal(err)
 	}
+	h.setState(t, ctx, domain.EnforcementActive)
 	if _, err := freeze.NewService(h.database).CreateActive(ctx, freeze.CreateParams{RepositoryID: h.repo.ID, Branch: "main", Reason: "release freeze"}, h.admin); err != nil {
 		t.Fatal(err)
 	}
@@ -162,6 +164,7 @@ func TestReconcileEnforcementKeepsRepositoryWideSharedHeadPolicy(t *testing.T) {
 func TestReconcileEnforcementRespectsCurrentThawException(t *testing.T) {
 	ctx := context.Background()
 	h := newEnforcementHarness(t, ctx)
+	h.setState(t, ctx, domain.EnforcementActive)
 	if _, err := freeze.NewService(h.database).CreateActive(ctx, freeze.CreateParams{RepositoryID: h.repo.ID, Branch: "main", Reason: "release freeze"}, h.admin); err != nil {
 		t.Fatal(err)
 	}
@@ -337,6 +340,7 @@ func TestRecoverEnforcementOnlyAllowedFromUnhealthy(t *testing.T) {
 func TestRecoverEnforcementSuccessBecomesActiveAndClearsFailure(t *testing.T) {
 	ctx := context.Background()
 	h := newEnforcementHarness(t, ctx)
+	h.setState(t, ctx, domain.EnforcementActive)
 	if _, err := freeze.NewService(h.database).CreateActive(ctx, freeze.CreateParams{RepositoryID: h.repo.ID, Branch: "main", Reason: "release freeze"}, h.admin); err != nil {
 		t.Fatal(err)
 	}
@@ -479,6 +483,7 @@ func TestRecoverEnforcementSyncFailureStaysUnhealthyWithoutStalePublication(t *t
 func TestRecoverEnforcementPublicationFailureStaysUnhealthy(t *testing.T) {
 	ctx := context.Background()
 	h := newEnforcementHarness(t, ctx)
+	h.setState(t, ctx, domain.EnforcementActive)
 	if _, err := freeze.NewService(h.database).CreateActive(ctx, freeze.CreateParams{RepositoryID: h.repo.ID, Branch: "main", Reason: "release freeze"}, h.admin); err != nil {
 		t.Fatal(err)
 	}

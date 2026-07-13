@@ -84,6 +84,9 @@ func (s *Service) ApproveSharedHead(ctx context.Context, params ApproveSharedHea
 	}()
 
 	store := NewStoreTx(tx)
+	if err := store.requireEnforcementActiveRepository(ctx, params.RepositoryID); err != nil {
+		return nil, err
+	}
 	approved := make([]domain.ThawException, 0, len(params.Exceptions))
 	created := make([]domain.ThawException, 0, len(params.Exceptions))
 	alreadyCovered := make([]domain.ThawException, 0, len(params.Exceptions))

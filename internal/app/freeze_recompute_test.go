@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/freeze"
+	"github.com/taua-almeida/thawguard/internal/jobs"
 	"github.com/taua-almeida/thawguard/internal/statuspublication"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
 )
@@ -219,6 +221,78 @@ func TestFreezeRecomputingStoreReturnsPublishErrorAfterFreezeChange(t *testing.T
 	if created.ID != freezes.created.ID {
 		t.Fatalf("expected freeze returned with recompute error, got %+v", created)
 	}
+}
+
+func TestFreezeRecomputingStoreStopsWhenClaimIsSuperseded(t *testing.T) {
+	for _, test := range []struct {
+		name              string
+		current           []bool
+		wantStatusRuns    int
+		wantCurrentChecks int
+	}{
+		{name: "before evaluation", current: []bool{false}, wantStatusRuns: 0, wantCurrentChecks: 1},
+		{name: "before publication", current: []bool{true, false}, wantStatusRuns: 1, wantCurrentChecks: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			freezes := &fakeFreezeOperations{created: domain.BranchFreeze{ID: 1, RepositoryID: 7, Branch: "main", Status: domain.BranchFreezeStatusActive, Active: true}}
+			pulls := &fakeOpenPullRequestBranchLister{prs: []domain.PullRequest{{RepositoryID: 7, Index: 1, State: "open", TargetBranch: "main", HeadSHA: "aaa111"}}}
+			statuses := &fakeSharedHeadStatusRunner{}
+			publisher := &fakeStatusPublisher{}
+			convergence := newTestEnforcementConvergence(test.current...)
+			store := newFreezeRecomputingStore(freezes, &fakeOpenPRRepositoryGetter{repo: newRecomputeTestRepository(7, domain.EnforcementActive)}, &fakeRecomputeSyncer{}, pulls, statuses, publisher)
+			store.convergence = convergence
+
+			if _, err := store.CreateActive(ctx, freeze.CreateParams{RepositoryID: 7, Branch: "main", Reason: "release freeze"}, domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); err != nil {
+				t.Fatal(err)
+			}
+			if len(statuses.calls) != test.wantStatusRuns || len(publisher.results) != 0 {
+				t.Fatalf("superseded claim must stop before publication, status calls=%d publishes=%d", len(statuses.calls), len(publisher.results))
+			}
+			if convergence.currentCalls != test.wantCurrentChecks || convergence.completeCalls != 0 || convergence.failCalls != 0 {
+				t.Fatalf("expected newer work to retain ownership, convergence=%+v", convergence)
+			}
+		})
+	}
+}
+
+type testEnforcementConvergence struct {
+	claim         jobs.Job
+	current       []bool
+	currentCalls  int
+	completeCalls int
+	failCalls     int
+}
+
+func newTestEnforcementConvergence(current ...bool) *testEnforcementConvergence {
+	lockedAt := time.Now().UTC()
+	return &testEnforcementConvergence{
+		claim:   jobs.Job{ID: 1, RepositoryID: 7, Generation: 1, LockedAt: &lockedAt},
+		current: append([]bool(nil), current...),
+	}
+}
+
+func (c *testEnforcementConvergence) Claim(context.Context, int64) (jobs.Job, bool, error) {
+	return c.claim, true, nil
+}
+
+func (c *testEnforcementConvergence) Current(context.Context, jobs.Job) (bool, error) {
+	index := c.currentCalls
+	c.currentCalls++
+	if index >= len(c.current) {
+		return true, nil
+	}
+	return c.current[index], nil
+}
+
+func (c *testEnforcementConvergence) Complete(context.Context, jobs.Job) error {
+	c.completeCalls++
+	return nil
+}
+
+func (c *testEnforcementConvergence) Fail(context.Context, jobs.Job, string) error {
+	c.failCalls++
+	return nil
 }
 
 type fakeFreezeOperations struct {

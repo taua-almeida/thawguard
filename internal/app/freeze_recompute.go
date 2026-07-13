@@ -281,7 +281,7 @@ func (s *freezeRecomputingStore) convergeFreeze(ctx context.Context, changed dom
 			return nil
 		}
 	}
-	converged, err := s.recomputeBranch(ctx, changed.RepositoryID, changed.Branch)
+	converged, err := s.recomputeBranch(ctx, changed.RepositoryID, changed.Branch, claim)
 	if err != nil {
 		return failRuntimeConvergence(ctx, s.convergence, claim, err)
 	}
@@ -370,7 +370,7 @@ func (s *freezeRecomputingStore) loadRepository(ctx context.Context, repositoryI
 	return repo, nil
 }
 
-func (s *freezeRecomputingStore) recomputeBranch(ctx context.Context, repositoryID int64, branch string) (bool, error) {
+func (s *freezeRecomputingStore) recomputeBranch(ctx context.Context, repositoryID int64, branch string, claim jobs.Job) (bool, error) {
 	if s == nil || s.syncer == nil || s.pullRequests == nil || s.statuses == nil || s.publisher == nil {
 		return false, errors.New("freeze recomputing store is not configured")
 	}
@@ -397,12 +397,23 @@ func (s *freezeRecomputingStore) recomputeBranch(ctx context.Context, repository
 	// to every cached open PR in the repository sharing the head, including
 	// cross-target-branch collisions.
 	for _, group := range pullRequestsByHead(branchPRs) {
-		if len(group) == 0 {
-			continue
+		current, err := currentRuntimeConvergenceClaim(ctx, s.convergence, claim)
+		if err != nil {
+			return false, convergenceError(domain.EnforcementFailureRuntime, err)
+		}
+		if !current {
+			return false, nil
 		}
 		result, err := s.statuses.RunForSharedHead(ctx, group, group[0].Index)
 		if err != nil {
 			return false, convergenceError(domain.EnforcementFailureEvaluation, fmt.Errorf("recompute freeze status for cached pull requests: %w", err))
+		}
+		current, err = currentRuntimeConvergenceClaim(ctx, s.convergence, claim)
+		if err != nil {
+			return false, convergenceError(domain.EnforcementFailureRuntime, err)
+		}
+		if !current {
+			return false, nil
 		}
 		if _, err := s.publisher.Publish(ctx, result); err != nil {
 			return false, convergenceError(domain.EnforcementFailurePublication, fmt.Errorf("publish freeze status for cached pull requests: %w", err))

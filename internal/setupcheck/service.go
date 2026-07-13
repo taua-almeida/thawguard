@@ -183,6 +183,21 @@ func (s *Service) persistRun(ctx context.Context, repo domain.Repository, reposi
 			_ = tx.Rollback()
 		}
 	}()
+	repositoryStore := repository.NewStoreTx(tx)
+	current, err := repositoryStore.Get(ctx, repo.ID)
+	if err != nil {
+		return err
+	}
+	// Forge inspection runs outside this transaction. If lifecycle or setup
+	// changed while it was in flight, its evidence belongs to the old snapshot
+	// and must not overwrite the repository's current readiness state.
+	if current.Active != repo.Active || current.EnforcementState != repo.EnforcementState || !current.UpdatedAt.Equal(repo.UpdatedAt) {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit stale readiness no-op: %w", err)
+		}
+		committed = true
+		return nil
+	}
 	checkedAt, err = nextRunTimestamp(ctx, tx, repo.ID, checkedAt)
 	if err != nil {
 		return err
@@ -192,7 +207,6 @@ func (s *Service) persistRun(ctx context.Context, repo domain.Repository, reposi
 	if err := store.recordNoTx(ctx, tx, repo.ID, "", repositoryResults, checkedAt); err != nil {
 		return err
 	}
-	repositoryStore := repository.NewStoreTx(tx)
 	drifted := make([]string, 0)
 	allResults := append([]Result(nil), repositoryResults...)
 	for _, run := range branches {
@@ -216,16 +230,19 @@ func (s *Service) persistRun(ctx context.Context, repo domain.Repository, reposi
 	}
 	okCount, warningCount, failedCount := resultCounts(allResults)
 	if repo.EnforcementState == domain.EnforcementActive && failedCount > 0 {
-		if _, err := repositoryStore.SetEnforcementState(ctx, repo.ID, domain.EnforcementUnhealthy); err != nil {
+		_, transitioned, err := repositoryStore.TransitionEnforcementState(ctx, repo.ID, domain.EnforcementActive, domain.EnforcementUnhealthy)
+		if err != nil {
 			return err
 		}
-		// The stored failure keeps the repository page truthful while the
-		// durable runner or an explicit retry performs the full recovery proof.
-		if _, err := repositoryStore.SetEnforcementFailure(ctx, repo.ID, domain.EnforcementFailureReadinessChecks, checkedAt); err != nil {
-			return err
-		}
-		if _, err := jobs.NewStoreTx(tx).EnsureReconciliationFailure(ctx, repo.ID, domain.EnforcementFailureReadinessChecks); err != nil {
-			return err
+		if transitioned {
+			// The stored failure keeps the repository page truthful while the
+			// durable runner or an explicit retry performs the full recovery proof.
+			if _, err := repositoryStore.SetEnforcementFailure(ctx, repo.ID, domain.EnforcementFailureReadinessChecks, checkedAt); err != nil {
+				return err
+			}
+			if _, err := jobs.NewStoreTx(tx).EnsureReconciliationFailure(ctx, repo.ID, domain.EnforcementFailureReadinessChecks); err != nil {
+				return err
+			}
 		}
 	}
 

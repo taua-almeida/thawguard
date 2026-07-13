@@ -11,6 +11,7 @@ import (
 
 type enforcementConvergence interface {
 	Claim(ctx context.Context, repositoryID int64) (jobs.Job, bool, error)
+	Current(ctx context.Context, claim jobs.Job) (bool, error)
 	Complete(ctx context.Context, claim jobs.Job) error
 	Fail(ctx context.Context, claim jobs.Job, category string) error
 }
@@ -37,6 +38,13 @@ func (s *runtimeConvergenceService) Enqueue(ctx context.Context, repositoryID in
 	}
 	_, err := s.jobs.EnqueueReconciliation(ctx, repositoryID)
 	return err
+}
+
+func (s *runtimeConvergenceService) Current(ctx context.Context, claim jobs.Job) (bool, error) {
+	if s == nil || s.jobs == nil {
+		return false, errors.New("runtime convergence has no job store")
+	}
+	return s.jobs.ClaimCurrent(ctx, claim)
 }
 
 func (s *runtimeConvergenceService) Complete(ctx context.Context, claim jobs.Job) error {
@@ -85,4 +93,11 @@ func failRuntimeConvergence(ctx context.Context, convergence enforcementConverge
 		return errors.Join(err, fmt.Errorf("record runtime convergence failure: %w", failureErr))
 	}
 	return err
+}
+
+func currentRuntimeConvergenceClaim(ctx context.Context, convergence enforcementConvergence, claim jobs.Job) (bool, error) {
+	if convergence == nil {
+		return true, nil
+	}
+	return convergence.Current(ctx, claim)
 }

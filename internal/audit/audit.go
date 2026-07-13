@@ -21,6 +21,7 @@ const (
 	ActionRepositoryStatusPostVerified       = "repository.status_post_verified"
 	ActionRepositoryStatusPostVerifyFailed   = "repository.status_post_verification_failed"
 	ActionRepositoryEnforcementActivated     = "repository.enforcement_activated"
+	ActionRepositoryEnforcementDeactivated   = "repository.enforcement_deactivated"
 	ActionRepositoryEnforcementActivateFail  = "repository.enforcement_activation_failed"
 	ActionRepositoryEnforcementReconciled    = "repository.enforcement_reconcile_succeeded"
 	ActionRepositoryEnforcementReconcileFail = "repository.enforcement_reconcile_failed"
@@ -67,6 +68,7 @@ func KnownActions() []string {
 		ActionRepositoryStatusPostVerified,
 		ActionRepositoryStatusPostVerifyFailed,
 		ActionRepositoryEnforcementActivated,
+		ActionRepositoryEnforcementDeactivated,
 		ActionRepositoryEnforcementActivateFail,
 		ActionRepositoryEnforcementReconciled,
 		ActionRepositoryEnforcementReconcileFail,

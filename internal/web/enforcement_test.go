@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/auth"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/jobs"
@@ -17,15 +19,26 @@ import (
 )
 
 type fakeEnforcementService struct {
-	verified     []int64
-	activated    []int64
-	reconciled   []int64
-	recovered    []int64
-	actors       []domain.Actor
-	verifyErr    error
-	activateErr  error
-	reconcileErr error
-	recoverErr   error
+	verified      []int64
+	activated     []int64
+	reconciled    []int64
+	recovered     []int64
+	deactivated   []int64
+	actors        []domain.Actor
+	verifyErr     error
+	activateErr   error
+	reconcileErr  error
+	recoverErr    error
+	deactivateErr error
+}
+
+func (s *fakeEnforcementService) DeactivateEnforcement(ctx context.Context, repositoryID int64, actor domain.Actor) (domain.Repository, error) {
+	if s.deactivateErr != nil {
+		return domain.Repository{}, s.deactivateErr
+	}
+	s.deactivated = append(s.deactivated, repositoryID)
+	s.actors = append(s.actors, actor)
+	return domain.Repository{ID: repositoryID, EnforcementState: domain.EnforcementReady}, nil
 }
 
 func (s *fakeEnforcementService) VerifyStatusPosting(ctx context.Context, repositoryID int64, actor domain.Actor) (domain.Repository, error) {
@@ -165,6 +178,12 @@ func TestRepositoriesPageOffersReconcileActionForActiveRepository(t *testing.T) 
 	if !strings.Contains(body, `action="/repositories/reconcile"`) || !strings.Contains(body, "Reconcile now") {
 		t.Fatalf("expected reconcile action for active repository, got %q", body)
 	}
+	if !strings.Contains(body, `action="/repositories/deactivate"`) || !strings.Contains(body, "Deactivate for maintenance") || !strings.Contains(body, `data-confirm-title="Deactivate repository enforcement?"`) {
+		t.Fatalf("expected confirmed maintenance deactivation action, got %q", body)
+	}
+	if strings.Contains(body, `data-credential-target="status-token-7"`) || !strings.Contains(body, "Deactivate enforcement before replacing the status token") {
+		t.Fatalf("expected active status-token maintenance lock in UI, got %q", body)
+	}
 	if !strings.Contains(body, `data-confirm-title="Reconcile enforcement now?"`) ||
 		!strings.Contains(body, "refreshes current open pull requests") ||
 		!strings.Contains(body, "republishes the current thawguard/freeze policy") ||
@@ -263,7 +282,7 @@ func TestRepositoriesPageHidesReconcileAndRecoveryBeforeActivation(t *testing.T)
 		server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
 
 		body := recorder.Body.String()
-		if strings.Contains(body, `action="/repositories/reconcile"`) || strings.Contains(body, `action="/repositories/recover"`) {
+		if strings.Contains(body, `action="/repositories/reconcile"`) || strings.Contains(body, `action="/repositories/recover"`) || strings.Contains(body, `action="/repositories/deactivate"`) {
 			t.Fatalf("expected no reconcile/recovery actions for %s repository, got %q", state, body)
 		}
 	}
@@ -322,6 +341,65 @@ func TestActivateEnforcementHandlerRedirectsAfterSuccess(t *testing.T) {
 	}
 	if len(service.activated) != 1 || service.activated[0] != 7 {
 		t.Fatalf("expected activation call for repository 7, got %+v", service.activated)
+	}
+}
+
+func TestDeactivateEnforcementHandlerRedirectsWithMaintenanceNotice(t *testing.T) {
+	service := &fakeEnforcementService{}
+	server := newEnforcementTestServer(enforcementTestRepository(domain.EnforcementActive), passingReadinessChecks(time.Now().UTC()), service)
+	cookie, csrfToken := getRepositoryForm(t, server)
+
+	form := url.Values{"repository_id": {"7"}, csrfFormField: {csrfToken}}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/repositories/deactivate", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != "/repositories?notice=enforcement-deactivated" {
+		t.Fatalf("expected deactivation PRG redirect, status=%d location=%q", recorder.Code, recorder.Header().Get("Location"))
+	}
+	if len(service.deactivated) != 1 || service.deactivated[0] != 7 {
+		t.Fatalf("expected deactivation call for repository 7, got %+v", service.deactivated)
+	}
+
+	noticeRecorder := httptest.NewRecorder()
+	noticeRequest := httptest.NewRequest(http.MethodGet, recorder.Header().Get("Location"), nil)
+	noticeRequest.AddCookie(cookie)
+	server.Routes().ServeHTTP(noticeRecorder, noticeRequest)
+	if !strings.Contains(noticeRecorder.Body.String(), "Repository enforcement is inactive") || !strings.Contains(noticeRecorder.Body.String(), "ready for status-token or managed-branch maintenance") {
+		t.Fatalf("expected clear maintenance notice, got %q", noticeRecorder.Body.String())
+	}
+}
+
+func TestRepositoriesPageShowsDeactivationBlockerLinks(t *testing.T) {
+	repo := enforcementTestRepository(domain.EnforcementActive)
+	for _, test := range []struct {
+		name      string
+		freezes   []domain.BranchFreeze
+		scheduled []domain.BranchFreeze
+		want      string
+		link      string
+	}{
+		{name: "active freeze", freezes: []domain.BranchFreeze{{ID: 1, RepositoryID: repo.ID, Status: domain.BranchFreezeStatusActive}}, want: "Lift all active freezes", link: `/freezes`},
+		{name: "pending schedule", scheduled: []domain.BranchFreeze{{ID: 2, RepositoryID: repo.ID, Status: domain.BranchFreezeStatusScheduled, Scheduled: true}}, want: "Cancel all pending scheduled freezes", link: `/scheduled-freezes`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			freezeStore := &fakeFreezeStore{freezes: test.freezes, scheduled: test.scheduled}
+			server := NewServer(Config{
+				AppName:              "Thawguard",
+				RepositoryStore:      &fakeRepositoryStore{repositories: []domain.Repository{repo}},
+				FreezeStore:          freezeStore,
+				ScheduledFreezeStore: freezeStore,
+				EnforcementService:   &fakeEnforcementService{},
+			})
+			recorder := httptest.NewRecorder()
+			server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+			body := recorder.Body.String()
+			if !strings.Contains(body, test.want) || !strings.Contains(body, `href="`+test.link+`"`) || strings.Contains(body, `action="/repositories/deactivate"`) {
+				t.Fatalf("expected blocker guidance without action, got %q", body)
+			}
+		})
 	}
 }
 
@@ -426,12 +504,35 @@ func TestEnforcementHandlersRenderTypedValidationErrorsSafely(t *testing.T) {
 	}
 }
 
+func TestEnforcementHandlerRendersOnlyCuratedJoinedValidationMessage(t *testing.T) {
+	service := &fakeEnforcementService{deactivateErr: errors.Join(
+		repository.ValidationError{Message: "Deactivation stopped safely."},
+		errors.New("secret-token raw forge body"),
+	)}
+	server := newEnforcementTestServer(enforcementTestRepository(domain.EnforcementActive), nil, service)
+	cookie, csrfToken := getRepositoryForm(t, server)
+	form := url.Values{"repository_id": {"7"}, csrfFormField: {csrfToken}}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/repositories/deactivate", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(body, "Deactivation stopped safely.") {
+		t.Fatalf("expected curated validation message, status=%d body=%q", recorder.Code, body)
+	}
+	if strings.Contains(body, "secret-token") || strings.Contains(body, "raw forge body") {
+		t.Fatalf("internal joined cause leaked to response: %q", body)
+	}
+}
+
 func TestEnforcementHandlersRejectInvalidCSRF(t *testing.T) {
 	service := &fakeEnforcementService{}
 	server := newEnforcementTestServer(enforcementTestRepository(domain.EnforcementReady), nil, service)
 	cookie, _ := getRepositoryForm(t, server)
 
-	for _, path := range []string{"/repositories/status-verification", "/repositories/activate", "/repositories/reconcile", "/repositories/recover"} {
+	for _, path := range []string{"/repositories/status-verification", "/repositories/activate", "/repositories/deactivate", "/repositories/reconcile", "/repositories/recover"} {
 		form := url.Values{"repository_id": {"7"}, csrfFormField: {"not-the-session-token"}}
 		recorder := httptest.NewRecorder()
 		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(form.Encode()))
@@ -442,7 +543,7 @@ func TestEnforcementHandlersRejectInvalidCSRF(t *testing.T) {
 			t.Fatalf("expected CSRF rejection for %s, got %d", path, recorder.Code)
 		}
 	}
-	if len(service.verified) != 0 || len(service.activated) != 0 || len(service.reconciled) != 0 || len(service.recovered) != 0 {
+	if len(service.verified) != 0 || len(service.activated) != 0 || len(service.deactivated) != 0 || len(service.reconciled) != 0 || len(service.recovered) != 0 {
 		t.Fatalf("expected no service calls after CSRF rejection, got %+v", service)
 	}
 }
@@ -489,11 +590,11 @@ func TestEnforcementActionsForbiddenForNonAdmin(t *testing.T) {
 		t.Fatalf("expected viewer to see the stored failure reason, got %q", body)
 	}
 	if strings.Contains(body, `action="/repositories/status-verification"`) || strings.Contains(body, `action="/repositories/activate"`) ||
-		strings.Contains(body, `action="/repositories/reconcile"`) || strings.Contains(body, `action="/repositories/recover"`) {
+		strings.Contains(body, `action="/repositories/deactivate"`) || strings.Contains(body, `action="/repositories/reconcile"`) || strings.Contains(body, `action="/repositories/recover"`) {
 		t.Fatalf("expected no actionable enforcement forms for viewer, got %q", body)
 	}
 
-	for _, path := range []string{"/repositories/status-verification", "/repositories/activate", "/repositories/reconcile", "/repositories/recover"} {
+	for _, path := range []string{"/repositories/status-verification", "/repositories/activate", "/repositories/deactivate", "/repositories/reconcile", "/repositories/recover"} {
 		form := url.Values{"repository_id": {"7"}, csrfFormField: {viewerSession.CSRFToken}}
 		recorder := httptest.NewRecorder()
 		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(form.Encode()))
@@ -504,8 +605,23 @@ func TestEnforcementActionsForbiddenForNonAdmin(t *testing.T) {
 			t.Fatalf("expected viewer %s to be forbidden, got %d", path, recorder.Code)
 		}
 	}
-	if len(service.verified) != 0 || len(service.activated) != 0 || len(service.reconciled) != 0 || len(service.recovered) != 0 {
+	if len(service.verified) != 0 || len(service.activated) != 0 || len(service.deactivated) != 0 || len(service.reconciled) != 0 || len(service.recovered) != 0 {
 		t.Fatalf("expected no service calls for viewer, got %+v", service)
+	}
+}
+
+func TestActivityMappingRendersEnforcementDeactivation(t *testing.T) {
+	repo := enforcementTestRepository(domain.EnforcementReady)
+	event := audit.Event{
+		Action:      audit.ActionRepositoryEnforcementDeactivated,
+		SubjectType: audit.SubjectTypeRepository,
+		SubjectID:   "7",
+		DetailsJSON: `{"repository_id":"7","full_name":"taua-almeida/thawguard","enforcement_state":"ready"}`,
+		CreatedAt:   time.Now().UTC(),
+	}
+	view := activityEventViewForEvent(map[int64]domain.Repository{7: repo}, nil, event)
+	if view.ActionLabel != "Enforcement deactivation" || view.Outcome != "Succeeded" || !strings.Contains(view.Detail, "ready for maintenance") {
+		t.Fatalf("unexpected deactivation activity view: %+v", view)
 	}
 }
 

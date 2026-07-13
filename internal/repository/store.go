@@ -212,6 +212,38 @@ WHERE id = ?`, string(state), updatedAt, repositoryID)
 	return s.Get(ctx, repositoryID)
 }
 
+// TransitionEnforcementState changes the lifecycle only when the persisted
+// state still matches from. Callers use the boolean result as a transaction
+// fence against stale application-level checks.
+func (s *Store) TransitionEnforcementState(ctx context.Context, repositoryID int64, from, to domain.EnforcementState) (domain.Repository, bool, error) {
+	if s == nil || s.db == nil {
+		return domain.Repository{}, false, errors.New("repository store has no database")
+	}
+	if repositoryID <= 0 {
+		return domain.Repository{}, false, ValidationError{Message: "repository id is required"}
+	}
+	if !from.Valid() || !to.Valid() {
+		return domain.Repository{}, false, ValidationError{Message: "repository enforcement state is invalid"}
+	}
+	updatedAt := s.now().UTC().Format(time.RFC3339Nano)
+	result, err := s.db.ExecContext(ctx, `
+UPDATE repositories
+SET enforcement_state = ?, updated_at = ?
+WHERE id = ? AND active = 1 AND enforcement_state = ?`, string(to), updatedAt, repositoryID, string(from))
+	if err != nil {
+		return domain.Repository{}, false, fmt.Errorf("transition repository enforcement state: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return domain.Repository{}, false, fmt.Errorf("transition repository enforcement state rows: %w", err)
+	}
+	if affected == 0 {
+		return domain.Repository{}, false, nil
+	}
+	updated, err := s.Get(ctx, repositoryID)
+	return updated, true, err
+}
+
 // SetStatusPostVerifiedAt stores the latest successful controlled status-post
 // verification time; a nil verifiedAt clears the evidence.
 func (s *Store) SetStatusPostVerifiedAt(ctx context.Context, repositoryID int64, verifiedAt *time.Time) (domain.Repository, error) {

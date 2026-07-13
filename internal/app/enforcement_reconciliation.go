@@ -55,7 +55,7 @@ func (s *enforcementService) reconcileEnforcementCore(ctx context.Context, repo 
 		}
 		return domain.Repository{}, domain.EnforcementFailureReadinessChecks, repository.ValidationError{Message: "Reconciliation stopped: readiness checks did not pass, so nothing was synchronized or published. The repository is marked unhealthy. " + err.Error()}
 	}
-	counts, reason, _, policyErr := s.reconcileCurrentPolicy(ctx, repo, nil, false)
+	counts, reason, _, policyErr := s.reconcileCurrentPolicy(ctx, repo, nil, false, claim)
 	if policyErr != nil {
 		if reason == "" {
 			return domain.Repository{}, domain.EnforcementFailureRuntime, policyErr
@@ -134,7 +134,7 @@ func (s *enforcementService) recoverEnforcementCore(ctx context.Context, repo do
 		return domain.Repository{}, domain.EnforcementFailureSetupStatusPost, repository.ValidationError{Message: "Recovery stopped: the controlled thawguard/setup status could not be posted with the stored token. The repository remains unhealthy; fix the token permissions or forge setup and retry."}
 	}
 	verifiedAt := s.now().UTC()
-	counts, reason, _, policyErr := s.reconcileCurrentPolicy(ctx, repo, &verifiedAt, false)
+	counts, reason, _, policyErr := s.reconcileCurrentPolicy(ctx, repo, &verifiedAt, false, claim)
 	if policyErr != nil {
 		if reason == "" {
 			if failureErr := s.recordRuntimeFailure(ctx, repo.ID, domain.EnforcementFailureRuntime, actor, preserveJobGeneration); failureErr != nil {

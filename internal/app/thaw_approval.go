@@ -173,10 +173,24 @@ func (s *thawApprovalService) ApproveThaw(ctx context.Context, params statusresu
 			return statusresult.ThawApprovalOutcome{}, nil
 		}
 	}
+	current, err := currentRuntimeConvergenceClaim(ctx, s.convergence, claim)
+	if err != nil {
+		return statusresult.ThawApprovalOutcome{}, failRuntimeConvergence(ctx, s.convergence, claim, convergenceError(domain.EnforcementFailureRuntime, err))
+	}
+	if !current {
+		return statusresult.ThawApprovalOutcome{}, nil
+	}
 	result, err := s.statuses.RunForSharedHead(ctx, openPRs, cached.Index)
 	if err != nil {
 		convergenceErr := convergenceError(domain.EnforcementFailureEvaluation, safeThawApprovalError(err, token))
 		return statusresult.ThawApprovalOutcome{}, failRuntimeConvergence(ctx, s.convergence, claim, convergenceErr)
+	}
+	current, err = currentRuntimeConvergenceClaim(ctx, s.convergence, claim)
+	if err != nil {
+		return statusresult.ThawApprovalOutcome{}, failRuntimeConvergence(ctx, s.convergence, claim, convergenceError(domain.EnforcementFailureRuntime, err))
+	}
+	if !current {
+		return statusresult.ThawApprovalOutcome{}, nil
 	}
 	if _, err := s.publisher.Publish(ctx, result); err != nil {
 		convergenceErr := convergenceError(domain.EnforcementFailurePublication, safeThawApprovalError(err, token))

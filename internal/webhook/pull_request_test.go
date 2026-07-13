@@ -12,6 +12,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/db"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/freeze"
+	"github.com/taua-almeida/thawguard/internal/jobs"
 	"github.com/taua-almeida/thawguard/internal/pullrequest"
 	"github.com/taua-almeida/thawguard/internal/repository"
 	"github.com/taua-almeida/thawguard/internal/statuspublication"
@@ -267,6 +268,39 @@ func TestPullRequestProcessorCachesWithoutPublishingBeforeEnforcementActivation(
 	}
 }
 
+func TestPullRequestProcessorStopsBeforePublicationWhenClaimIsSuperseded(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createEnforcedTestRepository(t, ctx, database)
+	prStore := pullrequest.NewStore(database)
+	statusStore := statusresult.NewStore(database)
+	publicationStore := statuspublication.NewStore(database)
+	convergence := &webhookTestConvergence{current: []bool{true, false}}
+	processor := NewPullRequestProcessor(repository.NewStore(database), prStore, statusresult.NewService(statusStore, freeze.NewService(database)), recordingTestPublisher{store: publicationStore})
+	processor.SetConvergence(convergence)
+
+	processed, err := processor.Process(ctx, readFixture(t, "codeberg_pull_request_opened.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if processed.Recomputed || len(processed.StatusResults) != 0 || len(processed.Publications) != 0 {
+		t.Fatalf("superseded webhook claim must report delegated convergence, got %+v", processed)
+	}
+	if _, err := prStore.Get(ctx, repo.ID, 42); err != nil {
+		t.Fatalf("webhook cache should still record current forge state: %v", err)
+	}
+	publications, err := publicationStore.ListRecent(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(publications) != 0 {
+		t.Fatalf("superseded webhook claim must not create publication intent, got %+v", publications)
+	}
+	if convergence.currentCalls != 2 || convergence.completeCalls != 0 || convergence.failCalls != 0 {
+		t.Fatalf("expected newer work to retain ownership, convergence=%+v", convergence)
+	}
+}
+
 func TestPullRequestProcessorRejectsUnknownRepository(t *testing.T) {
 	ctx := context.Background()
 	database := newTestDB(t, ctx)
@@ -313,6 +347,38 @@ type failingPublisher struct{}
 
 func (failingPublisher) Publish(ctx context.Context, result statusresult.Result) (statuspublication.Publication, error) {
 	return statuspublication.Publication{}, errors.New("publication failed")
+}
+
+type webhookTestConvergence struct {
+	current       []bool
+	currentCalls  int
+	completeCalls int
+	failCalls     int
+}
+
+func (c *webhookTestConvergence) Enqueue(context.Context, int64) error { return nil }
+
+func (c *webhookTestConvergence) Claim(context.Context, int64) (jobs.Job, bool, error) {
+	return jobs.Job{ID: 1, RepositoryID: 1, Generation: 1}, true, nil
+}
+
+func (c *webhookTestConvergence) Current(context.Context, jobs.Job) (bool, error) {
+	index := c.currentCalls
+	c.currentCalls++
+	if index >= len(c.current) {
+		return true, nil
+	}
+	return c.current[index], nil
+}
+
+func (c *webhookTestConvergence) Complete(context.Context, jobs.Job) error {
+	c.completeCalls++
+	return nil
+}
+
+func (c *webhookTestConvergence) Fail(context.Context, jobs.Job, string) error {
+	c.failCalls++
+	return nil
 }
 
 func readFixture(t *testing.T, name string) []byte {

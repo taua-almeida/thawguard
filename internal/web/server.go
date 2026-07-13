@@ -62,6 +62,7 @@ type Config struct {
 type EnforcementService interface {
 	VerifyStatusPosting(ctx context.Context, repositoryID int64, actor domain.Actor) (domain.Repository, error)
 	ActivateEnforcement(ctx context.Context, repositoryID int64, actor domain.Actor) (domain.Repository, error)
+	DeactivateEnforcement(ctx context.Context, repositoryID int64, actor domain.Actor) (domain.Repository, error)
 	ReconcileEnforcement(ctx context.Context, repositoryID int64, actor domain.Actor) (domain.Repository, error)
 	RecoverEnforcement(ctx context.Context, repositoryID int64, actor domain.Actor) (domain.Repository, error)
 }
@@ -172,8 +173,10 @@ type repositoryView struct {
 	// VerifyAvailable is true when the latest recorded readiness run has
 	// every mandatory read-only check OK; the POST re-runs readiness, so this
 	// only controls whether the action is offered.
-	VerifyAvailable     bool
-	VerifyBlockedReason string
+	VerifyAvailable      bool
+	VerifyBlockedReason  string
+	ActiveFreezeCount    int
+	PendingScheduleCount int
 }
 
 type repositoryBranchView struct {
@@ -404,6 +407,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /repositories/setup-check", s.handleRunRepositorySetupCheck)
 	s.mux.HandleFunc("POST /repositories/status-verification", s.handleVerifyStatusPosting)
 	s.mux.HandleFunc("POST /repositories/activate", s.handleActivateEnforcement)
+	s.mux.HandleFunc("POST /repositories/deactivate", s.handleDeactivateEnforcement)
 	s.mux.HandleFunc("POST /repositories/reconcile", s.handleReconcileEnforcement)
 	s.mux.HandleFunc("POST /repositories/recover", s.handleRecoverEnforcement)
 	s.mux.HandleFunc("GET /freezes", s.handleFreezes)
@@ -995,7 +999,11 @@ func (s *Server) handleRepositories(w http.ResponseWriter, r *http.Request) {
 		internalServerError(w)
 		return
 	}
-	s.renderRepositories(w, views, "", session)
+	notice := ""
+	if r.URL.Query().Get("notice") == "enforcement-deactivated" {
+		notice = "Repository enforcement is inactive. The repository is ready for status-token or managed-branch maintenance."
+	}
+	s.renderRepositoriesPage(w, views, "", notice, session)
 }
 
 func (s *Server) handleCreateRepository(w http.ResponseWriter, r *http.Request) {
@@ -1074,7 +1082,8 @@ func (s *Server) handleRepositoryBranchMutation(w http.ResponseWriter, r *http.R
 // renderRepositoriesValidationError re-renders the repositories page for a
 // typed validation error and hides internal error details.
 func (s *Server) renderRepositoriesValidationError(w http.ResponseWriter, r *http.Request, err error, session sessionState) {
-	if !repository.IsValidationError(err) && !repositorysetup.IsValidationError(err) {
+	message, ok := repositoryValidationMessage(err)
+	if !ok {
 		internalServerError(w)
 		return
 	}
@@ -1090,7 +1099,19 @@ func (s *Server) renderRepositoriesValidationError(w http.ResponseWriter, r *htt
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusBadRequest)
-	s.renderRepositories(w, views, err.Error(), session)
+	s.renderRepositories(w, views, message, session)
+}
+
+func repositoryValidationMessage(err error) (string, bool) {
+	var repositoryErr repository.ValidationError
+	if errors.As(err, &repositoryErr) {
+		return repositoryErr.Message, true
+	}
+	var setupErr repositorysetup.ValidationError
+	if errors.As(err, &setupErr) {
+		return setupErr.Message, true
+	}
+	return "", false
 }
 
 func (s *Server) handleSetRepositoryWebhookSecret(w http.ResponseWriter, r *http.Request) {
@@ -1197,6 +1218,13 @@ func (s *Server) handleActivateEnforcement(w http.ResponseWriter, r *http.Reques
 	})
 }
 
+func (s *Server) handleDeactivateEnforcement(w http.ResponseWriter, r *http.Request) {
+	s.handleEnforcementTransitionTo(w, r, "/repositories?notice=enforcement-deactivated", func(ctx context.Context, repositoryID int64, actor domain.Actor) error {
+		_, err := s.cfg.EnforcementService.DeactivateEnforcement(ctx, repositoryID, actor)
+		return err
+	})
+}
+
 func (s *Server) handleReconcileEnforcement(w http.ResponseWriter, r *http.Request) {
 	s.handleEnforcementTransition(w, r, func(ctx context.Context, repositoryID int64, actor domain.Actor) error {
 		_, err := s.cfg.EnforcementService.ReconcileEnforcement(ctx, repositoryID, actor)
@@ -1215,6 +1243,10 @@ func (s *Server) handleRecoverEnforcement(w http.ResponseWriter, r *http.Request
 // actions and re-renders the repositories page with the typed validation
 // message when the service rejects or reports a sanitized failure.
 func (s *Server) handleEnforcementTransition(w http.ResponseWriter, r *http.Request, transition func(ctx context.Context, repositoryID int64, actor domain.Actor) error) {
+	s.handleEnforcementTransitionTo(w, r, "/repositories", transition)
+}
+
+func (s *Server) handleEnforcementTransitionTo(w http.ResponseWriter, r *http.Request, successLocation string, transition func(ctx context.Context, repositoryID int64, actor domain.Actor) error) {
 	if s.cfg.EnforcementService == nil {
 		http.Error(w, "enforcement service is not configured", http.StatusServiceUnavailable)
 		return
@@ -1231,7 +1263,7 @@ func (s *Server) handleEnforcementTransition(w http.ResponseWriter, r *http.Requ
 		s.renderRepositoriesValidationError(w, r, err, session)
 		return
 	}
-	http.Redirect(w, r, "/repositories", http.StatusSeeOther)
+	http.Redirect(w, r, successLocation, http.StatusSeeOther)
 }
 
 func (s *Server) handleFreezes(w http.ResponseWriter, r *http.Request) {
@@ -2407,6 +2439,7 @@ var activityActionDefinitions = map[string]activityActionDefinition{
 	audit.ActionRepositoryStatusPostVerified:       {Label: "Status-post verification", Outcome: "Succeeded", OutcomeClass: "ok"},
 	audit.ActionRepositoryStatusPostVerifyFailed:   {Label: "Status-post verification", Outcome: "Failed", OutcomeClass: "failed"},
 	audit.ActionRepositoryEnforcementActivated:     {Label: "Enforcement activation", Outcome: "Succeeded", OutcomeClass: "ok"},
+	audit.ActionRepositoryEnforcementDeactivated:   {Label: "Enforcement deactivation", Outcome: "Succeeded", OutcomeClass: "warning"},
 	audit.ActionRepositoryEnforcementActivateFail:  {Label: "Enforcement activation", Outcome: "Failed", OutcomeClass: "failed"},
 	audit.ActionRepositoryEnforcementReconciled:    {Label: "Enforcement reconciliation", Outcome: "Succeeded", OutcomeClass: "ok"},
 	audit.ActionRepositoryEnforcementReconcileFail: {Label: "Enforcement reconciliation", Outcome: "Failed", OutcomeClass: "failed"},
@@ -2494,6 +2527,9 @@ func activityEventViewForEvent(repositories map[int64]domain.Repository, users m
 	case audit.ActionRepositoryEnforcementActivated, audit.ActionRepositoryEnforcementReconciled, audit.ActionRepositoryEnforcementRecovered:
 		view.Target = activityRepositoryTarget(repositories, event, details, "")
 		view.Detail = activityEnforcementSuccessDetail(details)
+	case audit.ActionRepositoryEnforcementDeactivated:
+		view.Target = activityRepositoryTarget(repositories, event, details, "")
+		view.Detail = "Current freeze policy converged to success; enforcement is inactive and the repository is ready for maintenance."
 	case audit.ActionRepositoryEnforcementActivateFail, audit.ActionRepositoryEnforcementReconcileFail, audit.ActionRepositoryEnforcementRecoverFail:
 		view.Target = activityRepositoryTarget(repositories, event, details, "")
 		view.Detail = activityFailureDetail(details)
@@ -3160,6 +3196,8 @@ func (s *Server) repositoryByID(ctx context.Context, id int64) (domain.Repositor
 
 func (s *Server) repositoryViews(ctx context.Context, repositories []domain.Repository) ([]repositoryView, error) {
 	jobsByRepository := make(map[int64]jobs.Job)
+	activeFreezesByRepository := make(map[int64]int)
+	pendingSchedulesByRepository := make(map[int64]int)
 	if s.cfg.ReconciliationJobStore != nil {
 		pending, err := s.cfg.ReconciliationJobStore.ListReconciliations(ctx)
 		if err != nil {
@@ -3169,9 +3207,27 @@ func (s *Server) repositoryViews(ctx context.Context, repositories []domain.Repo
 			jobsByRepository[job.RepositoryID] = job
 		}
 	}
+	activeFreezes, err := s.activeFreezes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, activeFreeze := range activeFreezes {
+		activeFreezesByRepository[activeFreeze.RepositoryID]++
+	}
+	scheduled, err := s.scheduledFreezes(ctx, 500)
+	if err != nil {
+		return nil, err
+	}
+	for _, scheduledFreeze := range scheduled {
+		if scheduledFreeze.Status == domain.BranchFreezeStatusScheduled {
+			pendingSchedulesByRepository[scheduledFreeze.RepositoryID]++
+		}
+	}
 	views := make([]repositoryView, 0, len(repositories))
 	for _, repo := range repositories {
 		view := repositoryView{Repository: repo}
+		view.ActiveFreezeCount = activeFreezesByRepository[repo.ID]
+		view.PendingScheduleCount = pendingSchedulesByRepository[repo.ID]
 		view.EnforcementLabel, view.EnforcementClass = enforcementView(repo.EnforcementState)
 		view.IsSetupIncomplete = repo.EnforcementState == domain.EnforcementSetupIncomplete
 		view.IsReady = repo.EnforcementState == domain.EnforcementReady
@@ -3364,6 +3420,10 @@ func latestSetupChecks(checks []setupcheck.Check) []setupcheck.Check {
 }
 
 func (s *Server) renderRepositories(w http.ResponseWriter, views []repositoryView, formError string, session sessionState) {
+	s.renderRepositoriesPage(w, views, formError, "", session)
+}
+
+func (s *Server) renderRepositoriesPage(w http.ResponseWriter, views []repositoryView, formError, notice string, session sessionState) {
 	overview := repositoryOverview{RepositoryCount: len(views), WebhookSecretStorageEnabled: s.cfg.RepositorySecretEncryptionConfigured}
 	for _, view := range views {
 		if view.Repository.HasWebhookSecret {
@@ -3385,6 +3445,7 @@ func (s *Server) renderRepositories(w http.ResponseWriter, views []repositoryVie
 		"Overview":                          overview,
 		"RepositoryViews":                   views,
 		"FormError":                         formError,
+		"Notice":                            notice,
 		"CSRFToken":                         session.CSRFToken,
 		"CurrentUser":                       currentUserFromSession(session),
 		"RequiredContext":                   domain.RequiredStatusContext,
@@ -3795,7 +3856,6 @@ const usersTemplate = pageHead + `
     </header>
 
     {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
-
     <section class="tg-panel tg-users-panel">
       <div class="tg-panel-head tg-panel-head-stacked">
         <div>
@@ -4410,6 +4470,7 @@ const repositoriesTemplate = pageHead + `
     </header>
 
     {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
+    {{ if .Notice }}<p class="tg-warning-callout">{{ .Notice }}</p>{{ end }}
 
     <section class="tg-stats tg-setup-stats" aria-label="Repository setup summary">
       <article class="tg-stat">
@@ -4615,7 +4676,9 @@ const repositoriesTemplate = pageHead + `
                 </div>
                 {{ if .Repository.HasStatusToken }}<span class="tg-badge status-ok">stored encrypted</span>{{ else }}<span class="tg-badge status-warning">missing</span>{{ end }}
               </div>
-              {{ if .Repository.HasStatusToken }}
+              {{ if .Repository.EnforcementActive }}
+              <span class="tg-muted">Deactivate enforcement before replacing the status token for maintenance.</span>
+              {{ else if .Repository.HasStatusToken }}
               <button type="button" class="tg-btn tg-btn-secondary tg-btn-sm tg-repo-action-btn" data-credential-reveal data-credential-target="status-token-{{ .Repository.ID }}" data-confirm-title="Rotate status token?" data-confirm-message="The current encrypted status token stays active until you submit a replacement. Reveal this input only when you are ready to update live posting credentials for this repository." data-confirm-action="Reveal token input" aria-controls="status-token-{{ .Repository.ID }}" aria-expanded="false"><svg class="tg-icon"><use href="#tg-i-key"></use></svg>Rotate token</button>
               <form method="post" action="/repositories/status-token" id="status-token-{{ .Repository.ID }}" class="tg-secret-form tg-credential-form" hidden data-credential-form>
                 <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
@@ -4673,6 +4736,18 @@ const repositoriesTemplate = pageHead + `
             <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
             <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-health-check"></use></svg>Reconcile now</button>
           </form>
+            {{ if .ActiveFreezeCount }}
+          <p class="error">Lift all active freezes before deactivating repository enforcement. <a href="/freezes">Manage active freezes</a>.</p>
+            {{ else if .PendingScheduleCount }}
+          <p class="error">Cancel all pending scheduled freezes before deactivating repository enforcement. <a href="/scheduled-freezes">Manage scheduled freezes</a>.</p>
+            {{ else }}
+          <form method="post" action="/repositories/deactivate" data-confirm-submit data-confirm-title="Deactivate repository enforcement?" data-confirm-message="Thawguard will first synchronize current open pull requests and converge thawguard/freeze to success. Enforcement will then become inactive so an admin can replace the status token or edit managed branches. Existing history and thaw exceptions are preserved." data-confirm-action="Deactivate enforcement">
+            <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
+            <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
+            <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-warning"></use></svg>Deactivate for maintenance</button>
+          </form>
+          <p class="tg-muted">Use deactivation only for status-token or managed-branch maintenance. Active freezes must be lifted and pending schedules cancelled through their audited workflows first.</p>
+            {{ end }}
           {{ end }}
           {{ if .IsUnhealthy }}
           <form method="post" action="/repositories/recover" data-confirm-submit data-confirm-title="Retry enforcement recovery?" data-confirm-message="Recovery reruns every read-only readiness check, tests a controlled thawguard/setup status post, synchronizes current open pull requests, and republishes the current thawguard/freeze policy. The repository returns to active only after complete success; any failure keeps it unhealthy." data-confirm-action="Retry recovery">

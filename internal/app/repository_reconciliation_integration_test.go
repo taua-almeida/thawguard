@@ -23,6 +23,7 @@ func TestRepositoryReconciliationRunnerRecoversUnhealthyRepositoryWithFullProof(
 	ctx := context.Background()
 	h := newEnforcementHarness(t, ctx)
 	h.forge.openPRs = []forgejoPullRequestResponse{newAppPullRequestResponse(42, "open", "main", "AAA111BBB222")}
+	h.setState(t, ctx, domain.EnforcementActive)
 	created, err := freeze.NewService(h.database).CreateActive(ctx, freeze.CreateParams{RepositoryID: h.repo.ID, Branch: "main", Reason: "release"}, h.admin)
 	if err != nil {
 		t.Fatal(err)

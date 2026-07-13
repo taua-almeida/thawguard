@@ -116,16 +116,17 @@ func (s *Service) RemoveBranch(ctx context.Context, repositoryID int64, branch s
 	return nil
 }
 
-// invalidateReadyOnBranchScopeChange drops a ready repository back to
-// setup-incomplete: a changed managed-branch scope means the recorded
-// readiness evidence no longer covers every managed branch. Historical
-// setup-check rows are untouched.
+// invalidateReadyOnBranchScopeChange advances the repository setup snapshot
+// for every managed-branch change. A ready repository also drops back to
+// setup-incomplete because its recorded evidence no longer covers the current
+// branch scope. Historical setup-check rows are untouched.
 func invalidateReadyOnBranchScopeChange(ctx context.Context, store *repository.Store, repo domain.Repository) error {
-	if repo.EnforcementState != domain.EnforcementReady {
-		return nil
+	nextState := repo.EnforcementState
+	if nextState == domain.EnforcementReady {
+		nextState = domain.EnforcementSetupIncomplete
 	}
-	if _, err := store.SetEnforcementState(ctx, repo.ID, domain.EnforcementSetupIncomplete); err != nil {
-		return fmt.Errorf("reset ready repository after managed branch change: %w", err)
+	if _, err := store.SetEnforcementState(ctx, repo.ID, nextState); err != nil {
+		return fmt.Errorf("advance repository setup snapshot after managed branch change: %w", err)
 	}
 	return nil
 }

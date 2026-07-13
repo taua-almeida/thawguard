@@ -12,6 +12,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/jobs"
 	"github.com/taua-almeida/thawguard/internal/repository"
+	"github.com/taua-almeida/thawguard/internal/repositorysetup"
 	"github.com/taua-almeida/thawguard/internal/webhook"
 )
 
@@ -260,6 +261,73 @@ func TestReadinessServiceDefinitiveFailureMakesActiveRepositoryUnhealthy(t *test
 	if err != nil || job.LockedAt != nil || job.RunAt.Before(before.Add(14*time.Second)) {
 		t.Fatalf("expected released 15-second readiness retry, job=%+v err=%v", job, err)
 	}
+}
+
+func TestReadinessServiceDiscardsRunAfterLifecycleChanges(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createReadinessRepository(t, ctx, database)
+	active, err := repository.NewStore(database).SetEnforcementState(ctx, repo.ID, domain.EnforcementActive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active.HasStatusToken = true
+	inspector := healthyInspector()
+	inspector.onBranch = func(string) {
+		if _, transitioned, err := repository.NewStore(database).TransitionEnforcementState(ctx, repo.ID, domain.EnforcementActive, domain.EnforcementReady); err != nil || !transitioned {
+			t.Fatalf("expected concurrent deactivation transition, transitioned=%v err=%v", transitioned, err)
+		}
+	}
+	service := readinessService(database, inspector, fakeTokenProvider{token: "token", found: true}, recentWebhook(repo.ID))
+	if _, err := service.Run(ctx, active); err != nil {
+		t.Fatal(err)
+	}
+	checks, err := NewStore(database).ListByRepository(ctx, repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(checks) != 0 {
+		t.Fatalf("stale readiness run must not persist checks, got %+v", checks)
+	}
+	branches, err := repository.NewStore(database).ListBranches(ctx, repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if branches[0].LastCheckedAt != nil || branches[0].SetupStatus != "unknown" {
+		t.Fatalf("stale readiness run must not update branch evidence, got %+v", branches[0])
+	}
+	assertAuditCount(t, ctx, database, audit.ActionRepositorySetupCheckRun, 0)
+}
+
+func TestReadinessServiceDiscardsRunAfterManagedBranchChanges(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createReadinessRepository(t, ctx, database)
+	inspector := healthyInspector()
+	inspector.onBranch = func(string) {
+		if _, err := repositorysetup.NewService(database).AddBranch(ctx, repo.ID, "release/2.0", domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := readinessService(database, inspector, fakeTokenProvider{token: "token", found: true}, recentWebhook(repo.ID))
+	if _, err := service.Run(ctx, repo); err != nil {
+		t.Fatal(err)
+	}
+	checks, err := NewStore(database).ListByRepository(ctx, repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(checks) != 0 {
+		t.Fatalf("stale branch-scope readiness run must not persist checks, got %+v", checks)
+	}
+	branches, err := repository.NewStore(database).ListBranches(ctx, repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(branches) != 2 || branches[0].LastCheckedAt != nil || branches[1].LastCheckedAt != nil {
+		t.Fatalf("stale readiness run must not update either branch, got %+v", branches)
+	}
+	assertAuditCount(t, ctx, database, audit.ActionRepositorySetupCheckRun, 0)
 }
 
 func TestReadinessServiceRollsBackChecksAndAuditWhenBranchSummaryFails(t *testing.T) {

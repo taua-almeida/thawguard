@@ -276,6 +276,38 @@ func TestThawApprovalPersistsBeforeRecomputeAndPublication(t *testing.T) {
 	}
 }
 
+func TestThawApprovalStopsBeforePublicationWhenClaimIsSuperseded(t *testing.T) {
+	selected := thawApprovalTestPullRequest(42, "abc123")
+	cache := &thawApprovalTestPullRequestCache{}
+	exceptions := &thawApprovalTestExceptionApprover{}
+	statuses := &thawApprovalTestStatusRunner{}
+	publisher := &thawApprovalTestPublisher{}
+	service := newThawApprovalTestService(
+		cache,
+		exceptions,
+		statuses,
+		publisher,
+		&thawApprovalTestSyncer{cache: cache, snapshots: [][]domain.PullRequest{{selected}}},
+		&thawApprovalTestForgeClient{pullRequests: []domain.PullRequest{selected}},
+	)
+	convergence := newTestEnforcementConvergence(true, false)
+	service.convergence = convergence
+
+	outcome, err := service.ApproveThaw(context.Background(), thawApprovalTestParams(nil), thawApprovalTestActor())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exceptions.uniqueCalls != 1 || statuses.calls != 1 {
+		t.Fatalf("expected durable thaw policy to persist and evaluate once, exceptions=%d statuses=%d", exceptions.uniqueCalls, statuses.calls)
+	}
+	if publisher.calls != 0 || outcome.Result != nil {
+		t.Fatalf("superseded thaw claim must not publish, calls=%d outcome=%+v", publisher.calls, outcome)
+	}
+	if convergence.currentCalls != 2 || convergence.completeCalls != 0 || convergence.failCalls != 0 {
+		t.Fatalf("expected newer work to retain ownership, convergence=%+v", convergence)
+	}
+}
+
 func TestThawApprovalForgeFailuresAreFailClosedAndRedactTokens(t *testing.T) {
 	selected := thawApprovalTestPullRequest(42, "abc123")
 	for _, test := range []struct {

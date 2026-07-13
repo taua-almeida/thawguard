@@ -96,12 +96,18 @@ func TestReconciliationEnqueueDuringLeaseFencesOldCompletion(t *testing.T) {
 	if err != nil || !claimed {
 		t.Fatalf("expected claim, got %+v claimed=%v err=%v", claim, claimed, err)
 	}
+	if current, err := store.ClaimCurrent(ctx, claim); err != nil || !current {
+		t.Fatalf("expected live claim to be current, current=%v err=%v", current, err)
+	}
 	newer, err := store.EnqueueReconciliation(ctx, repo.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if newer.Generation != claim.Generation+1 || newer.LockedAt == nil {
 		t.Fatalf("expected generation advance without lease loss, old=%+v newer=%+v", claim, newer)
+	}
+	if current, err := store.ClaimCurrent(ctx, claim); err != nil || current {
+		t.Fatalf("expected superseded claim not to be current, current=%v err=%v", current, err)
 	}
 	completed, err := store.CompleteClaim(ctx, claim)
 	if err != nil || completed {

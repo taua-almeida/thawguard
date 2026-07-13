@@ -55,6 +55,7 @@ type StatusPublisher interface {
 type EnforcementConvergence interface {
 	Enqueue(ctx context.Context, repositoryID int64) error
 	Claim(ctx context.Context, repositoryID int64) (jobs.Job, bool, error)
+	Current(ctx context.Context, claim jobs.Job) (bool, error)
 	Complete(ctx context.Context, claim jobs.Job) error
 	Fail(ctx context.Context, claim jobs.Job, category string) error
 }
@@ -145,7 +146,7 @@ func (p *PullRequestProcessor) Process(ctx context.Context, body []byte) (PullRe
 	if err != nil {
 		return PullRequestProcessResult{}, p.failConvergence(ctx, claim, domain.EnforcementFailureRuntime, err)
 	}
-	results, publications, category, err := p.recomputeAndPublish(ctx, plans)
+	results, publications, claimCurrent, category, err := p.recomputeAndPublish(ctx, plans, claim)
 	if err != nil {
 		return PullRequestProcessResult{}, p.failConvergence(ctx, claim, category, err)
 	}
@@ -153,12 +154,12 @@ func (p *PullRequestProcessor) Process(ctx context.Context, body []byte) (PullRe
 	if err != nil {
 		return PullRequestProcessResult{}, p.failConvergence(ctx, claim, domain.EnforcementFailureRuntime, err)
 	}
-	if p.convergence != nil {
+	if p.convergence != nil && claimCurrent {
 		if err := p.convergence.Complete(ctx, claim); err != nil {
 			return PullRequestProcessResult{}, p.failConvergence(ctx, claim, domain.EnforcementFailureRuntime, err)
 		}
 	}
-	if len(results) == 0 {
+	if !claimCurrent || len(results) == 0 {
 		return PullRequestProcessResult{Event: event, Repository: repo, PullRequest: cached}, nil
 	}
 
@@ -216,22 +217,43 @@ func (p *PullRequestProcessor) openPullRequestsForHead(ctx context.Context, repo
 	return filtered, nil
 }
 
-func (p *PullRequestProcessor) recomputeAndPublish(ctx context.Context, plans []recomputePlan) ([]statusresult.Result, []statuspublication.Publication, string, error) {
+func (p *PullRequestProcessor) recomputeAndPublish(ctx context.Context, plans []recomputePlan, claim jobs.Job) ([]statusresult.Result, []statuspublication.Publication, bool, string, error) {
 	results := make([]statusresult.Result, 0, len(plans))
 	publications := make([]statuspublication.Publication, 0, len(plans))
 	for _, plan := range plans {
+		current, err := p.claimCurrent(ctx, claim)
+		if err != nil {
+			return nil, nil, false, domain.EnforcementFailureRuntime, err
+		}
+		if !current {
+			return nil, nil, false, "", nil
+		}
 		status, err := p.statuses.RunForSharedHead(ctx, plan.PullRequests, plan.PreferredIndex)
 		if err != nil {
-			return nil, nil, domain.EnforcementFailureEvaluation, err
+			return nil, nil, true, domain.EnforcementFailureEvaluation, err
+		}
+		current, err = p.claimCurrent(ctx, claim)
+		if err != nil {
+			return nil, nil, false, domain.EnforcementFailureRuntime, err
+		}
+		if !current {
+			return nil, nil, false, "", nil
 		}
 		publication, err := p.publisher.Publish(ctx, status)
 		if err != nil {
-			return nil, nil, domain.EnforcementFailurePublication, err
+			return nil, nil, true, domain.EnforcementFailurePublication, err
 		}
 		results = append(results, status)
 		publications = append(publications, publication)
 	}
-	return results, publications, "", nil
+	return results, publications, true, "", nil
+}
+
+func (p *PullRequestProcessor) claimCurrent(ctx context.Context, claim jobs.Job) (bool, error) {
+	if p.convergence == nil {
+		return true, nil
+	}
+	return p.convergence.Current(ctx, claim)
 }
 
 func (p *PullRequestProcessor) failConvergence(ctx context.Context, claim jobs.Job, category string, cause error) error {

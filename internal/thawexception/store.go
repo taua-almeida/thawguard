@@ -68,7 +68,7 @@ func (s *Store) Approve(ctx context.Context, params ApproveParams, actor domain.
 	if err := validateApproveParams(params); err != nil {
 		return domain.ThawException{}, err
 	}
-	if err := s.requireRepository(ctx, params.RepositoryID); err != nil {
+	if err := s.requireEnforcementActiveRepository(ctx, params.RepositoryID); err != nil {
 		return domain.ThawException{}, err
 	}
 
@@ -143,14 +143,14 @@ LIMIT 1`, pr.RepositoryID, pr.Index, pr.HeadSHA, pr.TargetBranch, now)
 	return &exception, nil
 }
 
-func (s *Store) requireRepository(ctx context.Context, repositoryID int64) error {
+func (s *Store) requireEnforcementActiveRepository(ctx context.Context, repositoryID int64) error {
 	var existing int64
-	err := s.db.QueryRowContext(ctx, `SELECT id FROM repositories WHERE id = ? AND active = 1`, repositoryID).Scan(&existing)
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM repositories WHERE id = ? AND active = 1 AND enforcement_state = ?`, repositoryID, domain.EnforcementActive).Scan(&existing)
 	if errors.Is(err, sql.ErrNoRows) {
-		return ValidationError{Message: "repository not found"}
+		return ValidationError{Message: domain.EnforcementNotActiveMessage}
 	}
 	if err != nil {
-		return fmt.Errorf("check thaw exception repository: %w", err)
+		return fmt.Errorf("check thaw exception repository enforcement: %w", err)
 	}
 	return nil
 }
