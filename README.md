@@ -54,6 +54,16 @@ Runtime configuration is environment-variable based. The binary does not current
 
 For a Docker-based local alpha runbook, see [`docs/local-alpha.md`](docs/local-alpha.md).
 
+The runbook includes a persistent loopback-only Thawguard + Forgejo stack and a disposable real-Forgejo smoke test:
+
+```sh
+make local-up    # retain Forgejo and Thawguard state across stop/start
+make local-down
+make e2e         # fresh isolated stack; always removes containers and volumes
+```
+
+`make e2e` opens a real local Forgejo pull request so Forgejo emits the signed webhook, then verifies `thawguard/freeze` failure/success posting and required-status merge blocking. It is explicitly gated; ordinary `go test ./...` never starts Docker.
+
 Repository webhook secrets and status-posting tokens are encrypted before they are stored. To enable secret/token setup in local development, set `THAWGUARD_SECRET_KEY` to a stable, high-entropy, base64-encoded 32-byte installation key. Without this key, the rest of the local UI remains usable, but webhook secret and status token setup are disabled. Losing or changing this key makes stored secrets and tokens undecryptable.
 
 The local signed webhook receiver is `POST /webhooks/forgejo`. It verifies configured repository webhook secrets and records sanitized delivery results. For a setup-incomplete repository it also refreshes the local PR cache as setup evidence; for an enforcement-active repository it additionally recomputes and posts the `thawguard/freeze` status.

@@ -1,152 +1,201 @@
-# Local alpha E2E runbook
+# Local Forgejo integration and E2E
 
-This runbook starts Thawguard locally with Docker and exercises repository setup and signed Forgejo/Codeberg pull-request webhooks against throwaway repositories.
+This runbook provides two Linux-hosted development modes:
 
-Alpha scope:
+- a persistent manual stack for interactive Thawguard and Forgejo work; and
+- a disposable automated smoke test that provisions a real local Forgejo repository and exercises actual signed webhook delivery, status posting, and branch protection.
 
-- Thawguard has one operational mode: an enforcement-active repository synchronizes current open PRs from the forge and posts real `thawguard/freeze` commit statuses.
-- Repository enforcement activation is explicit. Read-only readiness checks verify the encrypted status token, pull-request access, every managed branch's protection and exact required context, and recent signed webhook evidence. Activation reruns readiness, performs a controlled `thawguard/setup` status post, synchronizes current open pull requests, and publishes current policy before changing the repository to active.
-- A setup-incomplete repository can be fully configured: credentials can be stored, and signed webhooks are verified and recorded as setup evidence. It cannot create freezes, schedules, or thaws, and no commit status is posted for it.
-- Thawguard is cooperative enforcement for trusted teams and is not a hard security boundary.
+Thawguard is cooperative enforcement for trusted teams. These checks demonstrate accidental-merge prevention and auditable workflow behavior. They do not make Thawguard an unbypassable security boundary against forge users who can post statuses with sufficient permissions.
 
-## 1. Generate a local secret key
+## Requirements and network boundary
 
-Create a local `.env` file. It is ignored by git.
+Install Docker with Docker Compose, Go, and OpenSSL. The Compose files are Linux-oriented because both services use host networking while binding only to the host loopback interface:
+
+- Thawguard: <http://127.0.0.1:8080>
+- Forgejo: <http://127.0.0.1:3000>
+
+Neither service binds to `0.0.0.0`, and no SSH port is enabled. Forgejo can deliver directly to Thawguard at `127.0.0.1` without a tunnel because both containers share the Linux host network namespace.
+
+Manual and automated modes intentionally share ports. Stop the other stack or process first if either port is occupied.
+
+The local overlay pins:
+
+```text
+codeberg.org/forgejo/forgejo:15.0.4@sha256:9e14382433760127c87cb78c4dbc44b45abbb0c09c8479812c8e99b3dc893429
+```
+
+## Persistent manual mode
+
+### 1. Create the local Thawguard installation key
+
+Create an ignored `.env` file from the repository root. Keep this key stable while retaining the local Thawguard volume; changing it makes stored webhook secrets and status tokens undecryptable.
 
 ```sh
+umask 077
 THAWGUARD_SECRET_KEY=$(openssl rand -base64 32)
 cat > .env <<EOF
 THAWGUARD_SECRET_KEY=$THAWGUARD_SECRET_KEY
 THAWGUARD_PUBLIC_URL=http://127.0.0.1:8080
 EOF
+unset THAWGUARD_SECRET_KEY
 ```
 
-Keep this key stable for a local alpha database. If it changes, stored webhook secrets and status-posting tokens become undecryptable.
+Do not commit `.env`, tokens, webhook secrets, or local database files.
 
-## 2. Start the local Docker alpha
+### 2. Start both services
 
 ```sh
-docker compose up --build
+make local-up
 ```
 
-Open <http://127.0.0.1:8080> and create the first local admin user if this is a fresh database. The first account starts with all MVP roles so the local bootstrap user can configure repositories.
+The command builds Thawguard, starts the persistent `thawguard-local` Compose project, and waits for both HTTP health checks.
 
-Thawguard runtime configuration is environment-variable based. The Docker Compose file sets `THAWGUARD_DB_PATH=/data/thawguard.db`; the binary does not parse `--db` or `--addr` CLI flags.
+### 3. Create the first local Forgejo administrator
 
-The compose file is Linux-oriented. It uses host networking so first-admin setup can stay on `127.0.0.1:8080`. Host networking has lower network isolation than the default Docker bridge, so treat this as a local-alpha convenience only. Do not change the container to bind `0.0.0.0` before the first local admin user exists.
-
-The first build may pull Docker base images and Go modules. This runbook does not publish images or contact Codeberg during the Docker build.
-
-For the repeatable E2E loop, export a stable local key in your shell or keep it in `.env`. The Makefile loads `.env` for these targets, matching Docker Compose's behavior. Then use:
+Use a fictional local identity. Ask Forgejo to generate the initial password so it never appears in the command arguments:
 
 ```sh
-make e2e-up      # build/start without deleting state
-make e2e-reset   # delete the Docker volume, rebuild, and start fresh
-make e2e-down    # stop without deleting state
-make e2e-logs    # follow Thawguard logs
+docker compose --project-name thawguard-local \
+  --file compose.yaml --file compose.local.yaml \
+  exec --no-TTY --user git forgejo \
+  forgejo --work-path /data/gitea --config /data/gitea/conf/app.ini \
+  admin user create \
+  --username local-admin \
+  --random-password \
+  --random-password-length 24 \
+  --email local-admin@thawguard.test \
+  --admin
 ```
 
-`make e2e-reset` deletes the `thawguard-data` Docker volume. Use it when you want a clean E2E database and are ready to re-enter repository setup, webhook secret, and status token.
+Forgejo prints the generated password once. Copy it from the terminal, log in at <http://127.0.0.1:3000>, and change it when Forgejo prompts you. Create only fictional local users and repositories.
 
-Local alpha data is stored in SQLite and includes append-only operator metadata such as audit events, status decisions, status publication attempts, and webhook delivery receipts. The logical database should stay small during E2E testing, but the SQLite WAL file can be larger until checkpointed; this is normal SQLite behavior. Use `make e2e-reset` for clean test runs. Production retention, deletion, and export policy are not yet wired.
+### 4. Prepare a Forgejo repository
 
-To stop without deleting local state:
+In Forgejo:
+
+1. Create a fictional repository and initialize its `main` branch.
+2. Create a feature branch with at least one commit.
+3. Create an access token for the fictional repository owner with repository read/write access. Keep it local and paste it directly into Thawguard when needed.
+4. Protect `main`, enable required status checks, and require the exact context `thawguard/freeze`. Apply the rule to repository administrators if the repository owner will perform the merge-blocking check.
+
+### 5. Configure Thawguard and the webhook
+
+1. Open <http://127.0.0.1:8080/setup> and create the first local Thawguard admin.
+2. On `/repositories`, connect the Forgejo repository using base URL `http://127.0.0.1:3000`.
+3. Store a locally generated webhook secret and the fictional owner's Forgejo access token in the write-only encrypted forms.
+4. Add any additional exact managed branches before activation. The default branch is managed automatically.
+5. In Forgejo, add an active repository webhook:
+   - target: `http://127.0.0.1:8080/webhooks/forgejo`
+   - content type: JSON
+   - secret: the same locally generated value stored in Thawguard
+   - event: pull requests
+6. Open a real pull request into `main`. Forgejo should deliver the signed event to Thawguard.
+7. Confirm the verified, processed delivery on `/webhooks`.
+8. Run read-only readiness checks on `/repositories`.
+9. Use **Verify status posting**, then **Activate enforcement**.
+
+### 6. Exercise the freeze lifecycle
+
+1. Create a freeze for `main` on `/freezes`.
+2. Confirm Forgejo records `thawguard/freeze=failure` on the pull request head.
+3. Confirm the protected branch refuses a normal merge because the required status is failing.
+4. Lift the freeze through Thawguard.
+5. Confirm the same status context becomes `success`.
+
+Thawguard posts only its own status context. It does not replace other required checks or prevent a sufficiently privileged collaborator from bypassing cooperative policy.
+
+### 7. Stop, restart, reset, and inspect
 
 ```sh
-docker compose down
+make local-logs   # follow both services
+make local-down   # stop containers; retain both named volumes
+make local-up     # restart with retained Forgejo and Thawguard state
+make local-reset  # delete both named volumes and start a fresh stack
 ```
 
-To delete the local alpha database volume:
+Use `local-reset` only when the stored Forgejo repositories, users, and Thawguard database can be discarded. A normal `local-down` followed by `local-up` preserves both services' data.
+
+## Disposable automated E2E
+
+Run the narrow local smoke with:
 
 ```sh
-docker compose down -v
+make e2e
 ```
 
-## 3. Configure a throwaway repository in Thawguard
+The target:
 
-Use a throwaway Forgejo/Codeberg repository, not a production repository.
+1. uses the separate `thawguard-e2e` Compose project;
+2. removes any old disposable containers and volumes;
+3. generates all passwords, tokens, secrets, and the Thawguard installation key in memory;
+4. starts fresh Forgejo and Thawguard containers and waits for both health checks;
+5. creates a local Forgejo admin and fictional repository owner through the Forgejo admin CLI;
+6. provisions a private repository, branches, commits, branch protection, and webhook through Forgejo's HTTP API;
+7. creates the first Thawguard admin and configures repository credentials and managed branches through real CSRF-protected HTTP forms;
+8. opens a real Forgejo pull request, causing Forgejo itself to emit the signed webhook;
+9. verifies the delivery, activates enforcement through the real workflow, creates a freeze, observes a failing status and blocked merge, lifts the freeze, and observes success; and
+10. removes both containers and both named volumes on success or failure.
 
-1. Go to `/repositories`.
-2. Add the throwaway repository:
-   - Forge: `forgejo`
-   - Base URL: `https://codeberg.org`
-   - Owner: your mock owner or organization
-   - Repository: your mock repository name
-   - Default branch: usually `main`
-3. Set a webhook secret. Use a high-entropy value and save it somewhere local temporarily.
-4. Set a status token with enough forge permission to post commit statuses and read pull requests for the throwaway repository. It is stored encrypted and is required before enforcement can ever be activated.
+The Go test has an `e2e` build tag and also requires `THAWGUARD_E2E=1`. Ordinary commands remain Docker-free:
 
-The repository card shows its enforcement state. New repositories are setup-incomplete after read-only readiness checks until an administrator explicitly activates enforcement and the controlled status-post plus initial policy convergence succeed.
-
-The card also lists the repository's managed branches — the exact branch names freezes and scheduled freezes may target. The default branch is always managed and cannot be removed. Admins can add or remove exact branch names (no globs or patterns) while enforcement is inactive; a branch with an active or pending scheduled freeze cannot be removed. An administrator can run read-only readiness checks for all managed branches from the card.
-
-## 4. Connect Forgejo/Codeberg webhooks safely
-
-Codeberg must reach `POST /webhooks/forgejo` to send real webhooks. For local testing, use a tunnel or reverse proxy you trust, with HTTPS/TLS enabled.
-
-Important safety rule: local Thawguard users are for trusted operators. Admin, freezer, thaw approver, and viewer are explicit local role flags, not a hard security boundary against forge write collaborators. Do not expose the full Thawguard UI to the public internet during alpha testing. Prefer a tunnel/proxy that only forwards:
-
-```text
-POST /webhooks/forgejo
+```sh
+go test ./...
 ```
 
-Configure the webhook on the throwaway repository:
+For debugging a failed run only:
 
-- Payload URL: `<your-public-webhook-url>/webhooks/forgejo`
-- Secret: the same webhook secret saved in Thawguard
-- Event: pull requests
+```sh
+make e2e-keep
+```
 
-If your tunnel cannot restrict paths, use a throwaway repository and an ephemeral tunnel URL, keep the test short, and stop the tunnel immediately after the test.
+That target leaves a failed `thawguard-e2e` project running and prints the exact cleanup command. Successful runs are always removed.
 
-## 5. Setup-incomplete E2E flow
+Maintainers can verify the failure trap without provisioning fixtures:
 
-In the throwaway Forgejo/Codeberg repository:
+```sh
+E2E_FAIL_AFTER_START=1 make e2e
+```
 
-1. Create a branch.
-2. Open a pull request into `main`.
-3. Push another commit to the PR branch.
+The command intentionally exits with status 97 after both services become healthy; the normal `e2e` target must still remove its containers and volumes.
 
-In Thawguard, inspect:
+## Prioritized E2E expansion matrix
 
-- `/activity` — the primary recent chronological audit history should show curated operator and system changes, affected targets, outcomes, and timestamps.
-- `/webhooks` — secondary signed-delivery diagnostics should show receipts as verified and processed with sanitized delivery metadata.
-- `/repositories` — the repository card shows setup-incomplete enforcement plus configured credentials.
-- `/repositories` — run readiness checks to read the open-PR endpoint and each exact managed branch's protection. The card also shows whether a verified `pull_request` delivery was received in the last 24 hours. Then use explicit activation when every prerequisite is ready.
-- `/freezes`, `/scheduled-freezes`, `/decisions` — mutation forms are unavailable and explain that enforcement must be activated first. Server-side validation rejects these actions as well.
-- `/publications` — secondary status diagnostics should contain no publication intents or attempts for a setup-incomplete repository.
+The initial smoke intentionally covers one freeze/lift path. Add later cases in this order:
 
-These pages render sanitized metadata only. Raw webhook payloads, signatures, request headers, webhook secrets, status tokens, passwords and hashes, raw forge response bodies, and session IDs are not displayed. Retention and export remain deferred.
+| Priority | Scenario | Main proof |
+| --- | --- | --- |
+| P0 | Invalid webhook signature and duplicate delivery | Invalid input has no side effects; a real duplicate is idempotent. |
+| P0 | Token failure and redaction | Posting fails closed, recovery evidence is sanitized, and no token reaches output. |
+| P0 | Setup readiness failure and recovery | Missing protection/context blocks activation; correcting Forgejo setup allows recovery. |
+| P0 | Restart persistence and reconciliation | Durable state survives restart and current policy converges after recovery. |
+| P1 | Cancel freeze | Cancellation republishes current policy and remains auditable. |
+| P1 | Immediate per-PR thaw | A real PR/head receives an audited exception and success status. |
+| P1 | Stale-head thaw invalidation | A new head invalidates the old exception and is reevaluated. |
+| P1 | Shared-head confirmation | SHA-scoped impact is shown and explicit confirmation covers the affected set. |
+| P2 | Scheduled create/edit/Start Now/cancel | One-time schedule transitions use the normal convergence path. |
+| P2 | Planned unfreeze | Due unfreeze republishes success and survives restart. |
+| P2 | Viewer/freezer/thaw-approver/admin permissions | Real sessions enforce each route and action boundary. |
+| P3 | Audit and activity evidence | Operator-visible records contain required evidence without raw secrets or payloads. |
 
-Codeberg will not show a Thawguard commit status for a setup-incomplete repository.
+Do not expand the first smoke into a generic provider framework. Each case should reuse the existing Forgejo and Thawguard HTTP surfaces.
 
-## 6. Enforcement-active behavior
+## Future optional real-Codeberg smoke
 
-Once a repository is enforcement-active, every freeze lifecycle action follows one invariant:
+A real-Codeberg profile is design-only and requires separate approval before implementation or execution. It should:
 
-1. Freeze create, lift/end, cancel, scheduled activation, and planned unfreeze first synchronize current open PRs from the forge using the repository's encrypted status token.
-2. Thawguard evaluates each affected head SHA across the whole repository. A commit status applies to the commit, so open PRs on other target branches sharing the same head are part of the same decision; a shared SHA cannot show success unless every affected frozen PR is covered.
-3. Thawguard posts only the `thawguard/freeze` status context and records each posted or failed attempt.
+- use a stable public HTTPS tunnel restricted to `POST /webhooks/forgejo` where practical;
+- use a throwaway Codeberg repository and short-lived, least-privilege credentials;
+- require explicit credential-gating and never run from `go test ./...`, normal `make e2e`, or CI;
+- verify one real webhook delivery and one real status-posting lifecycle;
+- avoid committing or printing credentials, raw payloads, signatures, or tunnel configuration; and
+- tear down the tunnel and throwaway test state after the smoke.
 
-Thaw approval fetches the selected PR's current head SHA from the forge, stores the exception for that exact head, recomputes the shared-head status, and publishes the result. If several open PRs share the head SHA, Thawguard pauses for explicit confirmation before approving all of them. A missing status token or a forge failure fails closed: no status is posted, and failures during posting are recorded as sanitized failed attempts.
-
-If a policy change commits but live convergence fails, Thawguard marks the repository unhealthy and retains one durable automatic recovery job. Recovery retries the complete current repository state after restart as well as during the running process; the existing admin retry action uses the same proof and job.
-
-Scheduled freeze windows activate from the local Thawguard process. Admins and Freezers can edit a pending schedule's reason, future start time, and optional planned unfreeze without changing its repository or branch. Clearing the optional value removes the planned unfreeze. **Start Now** activates a still-pending future schedule immediately, preserves a future planned unfreeze exactly, and runs the same current-forge synchronization, repository-wide shared-head evaluation, publication, durable intent, and retry path as automatic activation. If live convergence fails after activation commits, the schedule remains active while repository enforcement becomes unhealthy and one reconciliation job retries with bounded backoff.
-
-Only pending schedules are editable or startable. A planned unfreeze that is no longer in the future must be edited before Start Now. Recurring schedules and archive controls remain deferred. Keep the process running for scheduled starts, retries, and planned unfreezes to execute.
+No tunnel provider is selected, installed, or represented in the current Compose files.
 
 ## Troubleshooting
 
-- No delivery row on `/webhooks`: check the public webhook URL, event type, and whether the tunnel is forwarding `POST /webhooks/forgejo`.
-- Delivery row with an error: check repository owner/name/base URL and whether the webhook secret in Thawguard matches Codeberg.
-- Thawguard cannot decrypt a stored webhook secret or status token: restore the original `THAWGUARD_SECRET_KEY` or recreate the local database volume.
-- Freeze/schedule/thaw forms are unavailable: the repository's enforcement is not active. Complete readiness and use the explicit activation control on `/repositories`.
-- Inspecting the live SQLite database requires copying the WAL files too: copy `/data/thawguard.db`, `/data/thawguard.db-wal`, and `/data/thawguard.db-shm` to the same local directory before opening the database.
-- Docker cannot reach the app on non-Linux hosts: run `go run ./cmd/thawguard` locally for now. The compose file intentionally uses Linux host networking so first-admin setup stays loopback-only until a local user exists.
-
-## What this local alpha does not do
-
-- It does not post commit statuses for setup-incomplete repositories, and it has no shadow/dry-run runtime mode.
-- It does not provide recurring schedules or schedule archive controls.
-- It does not configure Codeberg branch protection.
-- It does not provide production-ready local user authentication.
+- **Port already in use:** stop the persistent stack with `make local-down` before `make e2e`, or stop the unrelated loopback process.
+- **Forgejo webhook is not delivered:** confirm the target is `http://127.0.0.1:8080/webhooks/forgejo`, the event is pull requests, and both services are in the same host-networked Compose stack.
+- **Readiness fails:** confirm the encrypted status token can read pull requests and branch protection, every managed branch is protected, and each requires the exact `thawguard/freeze` context.
+- **Secret or token cannot be decrypted:** restore the original `THAWGUARD_SECRET_KEY` for that Thawguard volume or intentionally reset the local stack.
+- **Inspecting SQLite manually:** copy `thawguard.db`, `thawguard.db-wal`, and `thawguard.db-shm` together before opening the database. Never publish the copied database.

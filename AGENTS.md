@@ -61,6 +61,7 @@ Important product boundary: Thawguard is cooperative enforcement for trusted tea
 - SQLite stores/migrations: temp-database tests.
 - HTTP handlers: `httptest` tests.
 - Webhook signatures and payload parsing: sanitized fixtures only.
+- Docker-backed Forgejo E2E runs only through the explicit `make e2e` target. Ordinary `go test ./...` must stay fast and must not start containers.
 - Performance changes need benchmarks or profiling evidence. Do not optimize speculatively.
 
 ## Security and privacy

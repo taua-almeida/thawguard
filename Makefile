@@ -3,7 +3,9 @@
 export THAWGUARD_SECRET_KEY
 export THAWGUARD_PUBLIC_URL
 
-.PHONY: fmt test build e2e-up e2e-down e2e-reset e2e-logs
+LOCAL_COMPOSE = docker compose --project-name thawguard-local --file compose.yaml --file compose.local.yaml
+
+.PHONY: fmt test build local-up local-down local-reset local-logs e2e e2e-keep
 
 fmt:
 	gofmt -w cmd internal
@@ -14,17 +16,23 @@ test:
 build:
 	go build -o bin/thawguard ./cmd/thawguard
 
-e2e-up:
+local-up:
 	@test -n "$$THAWGUARD_SECRET_KEY" || { echo "set THAWGUARD_SECRET_KEY first; see docs/local-alpha.md"; exit 1; }
-	docker compose up --build -d
+	$(LOCAL_COMPOSE) up --build --detach --wait --wait-timeout 180
 
-e2e-down:
-	docker compose down
+local-down:
+	@THAWGUARD_SECRET_KEY="$${THAWGUARD_SECRET_KEY:-unused-for-compose-down}" $(LOCAL_COMPOSE) down --remove-orphans
 
-e2e-reset:
+local-reset:
 	@test -n "$$THAWGUARD_SECRET_KEY" || { echo "set THAWGUARD_SECRET_KEY first; see docs/local-alpha.md"; exit 1; }
-	docker compose down -v
-	docker compose up --build -d
+	$(LOCAL_COMPOSE) down --volumes --remove-orphans
+	$(LOCAL_COMPOSE) up --build --detach --wait --wait-timeout 180
 
-e2e-logs:
-	docker compose logs -f thawguard
+local-logs:
+	@THAWGUARD_SECRET_KEY="$${THAWGUARD_SECRET_KEY:-unused-for-compose-logs}" $(LOCAL_COMPOSE) logs --follow thawguard forgejo
+
+e2e:
+	bash scripts/e2e.sh
+
+e2e-keep:
+	E2E_KEEP_ON_FAILURE=1 bash scripts/e2e.sh

@@ -1,0 +1,36 @@
+services:
+  thawguard:
+    depends_on:
+      forgejo:
+        condition: service_healthy
+
+  forgejo:
+    image: codeberg.org/forgejo/forgejo:15.0.4@sha256:9e14382433760127c87cb78c4dbc44b45abbb0c09c8479812c8e99b3dc893429
+    # Host networking lets Forgejo and Thawguard exchange webhooks while both
+    # HTTP listeners remain bound to the Linux host loopback interface.
+    network_mode: host
+    environment:
+      USER_UID: "1000"
+      USER_GID: "1000"
+      FORGEJO__database__DB_TYPE: sqlite3
+      FORGEJO__security__INSTALL_LOCK: "true"
+      FORGEJO__service__DISABLE_REGISTRATION: "true"
+      FORGEJO__server__DOMAIN: 127.0.0.1
+      FORGEJO__server__HTTP_ADDR: 127.0.0.1
+      FORGEJO__server__HTTP_PORT: "3000"
+      FORGEJO__server__ROOT_URL: http://127.0.0.1:3000/
+      FORGEJO__server__DISABLE_SSH: "true"
+      FORGEJO__webhook__ALLOWED_HOST_LIST: 127.0.0.1
+      FORGEJO__log__MODE: console
+    volumes:
+      - forgejo-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  forgejo-data:
