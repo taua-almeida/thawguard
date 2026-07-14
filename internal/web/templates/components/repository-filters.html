@@ -1,0 +1,14 @@
+{{ define "components/repository-filters" }}
+    <div class="tg-repo-filterbar">
+      <form method="get" action="/repositories" class="tg-repo-search" role="search" aria-label="Search repositories">
+        <svg class="tg-icon" aria-hidden="true"><use href="#tg-i-search"></use></svg>
+        <input type="search" name="q" value="{{ .Filter.Query }}" placeholder="Search owner/name" aria-label="Search repositories by owner or name">
+        {{ if .Filter.State }}<input type="hidden" name="state" value="{{ .Filter.State }}">{{ end }}
+        <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm">Search</button>
+      </form>
+      <nav class="tg-state-chips" aria-label="Filter repositories by lifecycle state">
+        {{ range .StateChips }}
+        <a class="tg-state-chip{{ if .Selected }} is-selected{{ end }}" href="{{ .URL }}"{{ if .Selected }} aria-current="true"{{ end }}>{{ .Label }} <span class="tg-state-chip-count">{{ .Count }}</span></a>
+        {{ end }}
+      </nav>
+    </div>{{ end }}

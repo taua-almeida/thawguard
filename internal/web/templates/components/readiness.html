@@ -1,0 +1,13 @@
+{{ define "components/readiness" }}
+        <div class="tg-repo-checks">
+          <strong>Repository readiness</strong>
+          {{ if .RepositoryChecks }}
+            {{ range .RepositoryChecks }}
+            {{ template "components/readiness-check" . }}
+            {{ end }}
+          {{ else }}
+            <p class="tg-muted">No repository-level readiness evidence has been recorded yet.</p>
+          {{ end }}
+        </div>{{ end }}
+
+{{ define "components/readiness-check" }}<div class="tg-repo-check"><span class="status status-{{ .Result.Status }}">{{ if eq .Result.Status "ok" }}passed{{ else }}{{ .Result.Status }}{{ end }}</span><div><strong>{{ .Result.Name }}</strong><small>{{ .Result.Description }}{{ if .Result.Remediation }} {{ .Result.Remediation }}{{ end }}</small></div></div>{{ end }}

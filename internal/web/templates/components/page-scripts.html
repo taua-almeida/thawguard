@@ -1,0 +1,90 @@
+{{ define "components/page-scripts" }}
+  <script>
+    (() => {
+      const dialog = document.querySelector('[data-alert-dialog]');
+      if (!dialog) return;
+      const title = dialog.querySelector('[data-alert-title]');
+      const message = dialog.querySelector('[data-alert-message]');
+      const confirm = dialog.querySelector('[data-alert-confirm]');
+      let pendingConfirm = null;
+
+      const closeDialog = () => {
+        dialog.hidden = true;
+        pendingConfirm = null;
+      };
+
+      const openDialog = (trigger, onConfirm) => {
+        pendingConfirm = onConfirm;
+        title.textContent = trigger.getAttribute('data-confirm-title') || 'Confirm action';
+        message.textContent = trigger.getAttribute('data-confirm-message') || 'Continue?';
+        confirm.textContent = trigger.getAttribute('data-confirm-action') || 'Continue';
+        dialog.hidden = false;
+        confirm.focus();
+      };
+
+      document.querySelectorAll('[data-alert-cancel]').forEach((button) => {
+        button.addEventListener('click', closeDialog);
+      });
+
+      document.querySelectorAll('[data-confirm-submit]').forEach((form) => {
+        form.addEventListener('submit', (event) => {
+          if (form.dataset.confirmed === 'true') {
+            delete form.dataset.confirmed;
+            return;
+          }
+          event.preventDefault();
+          openDialog(form, () => {
+            form.dataset.confirmed = 'true';
+            if (typeof form.requestSubmit === 'function') {
+              form.requestSubmit();
+              return;
+            }
+            form.submit();
+          });
+        });
+      });
+
+      document.querySelectorAll('[data-credential-reveal]').forEach((button) => {
+        button.addEventListener('click', () => {
+          openDialog(button, () => {
+            const target = document.getElementById(button.getAttribute('data-credential-target'));
+            if (target) {
+              target.hidden = false;
+              target.querySelectorAll('[data-credential-input]').forEach((input) => { input.disabled = false; });
+              target.querySelector('[data-credential-input]')?.focus();
+            }
+            button.hidden = true;
+            button.setAttribute('aria-expanded', 'true');
+          });
+        });
+      });
+
+      document.querySelectorAll('[data-credential-cancel]').forEach((button) => {
+        button.addEventListener('click', () => {
+          const form = button.closest('[data-credential-form]');
+          const block = button.closest('[data-credential-block]');
+          const trigger = block?.querySelector('[data-credential-reveal]');
+          if (form) {
+            form.reset();
+            form.hidden = true;
+            form.querySelectorAll('[data-credential-input]').forEach((input) => { input.disabled = true; });
+          }
+          if (trigger) {
+            trigger.hidden = false;
+            trigger.setAttribute('aria-expanded', 'false');
+            trigger.focus();
+          }
+        });
+      });
+
+      confirm.addEventListener('click', () => {
+        const callback = pendingConfirm;
+        closeDialog();
+        if (callback) callback();
+      });
+
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && !dialog.hidden) closeDialog();
+      });
+    })();
+  </script>{{ end }}

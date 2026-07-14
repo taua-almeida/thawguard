@@ -1,0 +1,102 @@
+{{ define "pages/repositories" }}
+  <main class="tg-main tg-setup-page">
+{{ template "components/page-header" . }}
+
+    {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
+    {{ if .Notice }}<p class="tg-warning-callout">{{ .Notice }}</p>{{ end }}
+
+    <section class="tg-stats tg-setup-stats" aria-label="Repository setup summary">
+      <article class="tg-stat">
+        <span class="tg-stat-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-repositories"></use></svg></span>
+        <span><span class="tg-stat-label">Repos</span><strong class="tg-stat-value">{{ .Overview.RepositoryCount }}</strong></span>
+      </article>
+      <article class="tg-stat">
+        <span class="tg-stat-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-check"></use></svg></span>
+        <span><span class="tg-stat-label">Webhooks</span><strong class="tg-stat-value">{{ .Overview.WebhookConfiguredCount }}</strong></span>
+      </article>
+      <article class="tg-stat">
+        <span class="tg-stat-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-key"></use></svg></span>
+        <span><span class="tg-stat-label">Status tokens</span><strong class="tg-stat-value">{{ .Overview.StatusTokenConfiguredCount }}</strong></span>
+      </article>
+      <article class="tg-stat tg-stat-info">
+        <span class="tg-stat-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-schedule"></use></svg></span>
+        <span><span class="tg-stat-label">Checks</span><strong class="tg-stat-value">Local</strong></span>
+      </article>
+      <a class="tg-stat tg-stat-scheduled tg-stat-link" href="/repositories?state=active" aria-label="Show repositories with active enforcement">
+        <span class="tg-stat-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-icy-shield"></use></svg></span>
+        <span><span class="tg-stat-label">Enforcing</span><strong class="tg-stat-value">{{ .Overview.EnforcementActiveCount }}</strong></span>
+      </a>
+    </section>
+
+    {{ if .CurrentUser.CanManageRepositories }}
+    <section id="connect-repository" class="tg-modal tg-connect-modal" aria-labelledby="connect-repository-title">
+      <a class="tg-modal-backdrop" href="#" aria-label="Close connect repository"></a>
+      <div class="tg-modal-card" role="dialog" aria-modal="true">
+        <div class="tg-modal-head">
+          <h2 id="connect-repository-title">Connect a repository</h2>
+          <a href="#" class="tg-modal-close" aria-label="Close"><svg class="tg-icon"><use href="#tg-i-close"></use></svg></a>
+        </div>
+        <p class="tg-setup-copy">Add the Forgejo or Codeberg repository Thawguard should watch. The required status context stays fixed as <code>{{ .RequiredContext }}</code>.</p>
+        <form method="post" action="/repositories" class="tg-setup-form tg-connect-form">
+          <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+          <label>Forge
+            <select name="forge">
+              <option value="forgejo">Forgejo</option>
+              <option value="codeberg">Codeberg</option>
+            </select>
+          </label>
+          <label>Base URL <input name="base_url" value="https://codeberg.org"></label>
+          <label>Owner <input name="owner" placeholder="acme" required></label>
+          <label>Repository <input name="name" placeholder="shop-api" required></label>
+          <label>Default branch <input name="default_branch" value="main"></label>
+          <div class="tg-form-submit"><button type="submit" class="tg-btn tg-btn-primary">Connect</button></div>
+        </form>
+        <p class="tg-local-note"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-warning"></use></svg><span>Repository credentials are write-only and restricted to admins.</span></p>
+      </div>
+    </section>
+    {{ else }}
+    <section class="tg-warning-callout">
+      <span aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-warning"></use></svg></span>
+      <span>Your role can view repository readiness evidence. Admin role is required to add repositories, rotate credentials, or run readiness checks.</span>
+    </section>
+    {{ end }}
+
+    <div class="tg-section-heading tg-section-heading-compact">
+      <div>
+        <h2>Configured repositories{{ if .Filter.Active }} <span class="tg-muted">— showing {{ .VisibleCount }} of {{ .TotalCount }}</span>{{ end }}</h2>
+        <p>Run read-only Forgejo/Codeberg readiness checks for repository access, signed webhook evidence, and every exact managed branch.</p>
+      </div>
+    </div>
+
+    {{ if .TotalCount }}
+{{ template "components/repository-filters" . }}
+    {{ end }}
+
+    {{ if .RepositoryViews }}
+    <section class="tg-repo-grid" aria-label="Configured repositories">
+      {{ range .RepositoryViews }}
+{{ template "components/repository-card" . }}
+      {{ end }}
+    </section>
+    {{ else if .Filter.Active }}
+    <section class="tg-panel tg-empty-row">
+      <strong>No repositories match this filter</strong>
+      <span>Adjust the search or lifecycle-state filter, or clear it to see every configured repository.</span>
+      <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/repositories">Clear filter</a>
+    </section>
+    {{ else }}
+    <section class="tg-panel tg-empty-row">
+      <strong>No repositories configured yet</strong>
+      <span>Add your first Forgejo or Codeberg repository to start setup.</span>
+    </section>
+    {{ end }}
+
+    <section class="tg-panel tg-setup-checklist">
+      <div class="tg-panel-head"><h2>Manual setup checklist</h2><span class="tg-badge tg-badge-info">local guidance</span></div>
+      <div class="tg-checklist-grid">
+        <article><span>1</span><div><strong>Required status context</strong><p>Configure every managed branch to require the exact context <code>{{ .RequiredContext }}</code>.</p></div></article>
+        <article><span>2</span><div><strong>Signed webhook receiver</strong><p>Point pull request webhooks at <code>/webhooks/forgejo</code> with the repository webhook secret.</p></div></article>
+        <article><span>3</span><div><strong>Read-only readiness</strong><p>Run the live read-only checks. Status posting remains unverified until a later controlled activation test.</p></div></article>
+      </div>
+    </section>
+  </main>{{ end }}

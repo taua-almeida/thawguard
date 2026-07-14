@@ -1,0 +1,12 @@
+{{ define "components/confirmation-dialog" }}
+    <div class="tg-alert-dialog" data-alert-dialog hidden role="dialog" aria-modal="true" aria-labelledby="tg-confirm-title" aria-describedby="tg-confirm-message">
+      <button type="button" class="tg-alert-backdrop" data-alert-cancel aria-label="Close confirmation"></button>
+      <div class="tg-alert-card">
+        <h2 id="tg-confirm-title" data-alert-title>Confirm action</h2>
+        <p id="tg-confirm-message" data-alert-message>Continue?</p>
+        <div class="tg-alert-actions">
+          <button type="button" class="tg-btn tg-btn-secondary" data-alert-cancel>Cancel</button>
+          <button type="button" class="tg-btn tg-btn-primary" data-alert-confirm>Continue</button>
+        </div>
+      </div>
+    </div>{{ end }}

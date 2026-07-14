@@ -1,0 +1,48 @@
+{{ define "layouts/repositories" }}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ .AppName }}</title>
+  <link rel="stylesheet" href="/static/thawguard.css">
+</head>
+<body>
+  {{ template "components/icons" }}
+  <div class="tg-app">
+    <aside class="tg-sidebar" aria-label="Primary navigation">
+      <a class="tg-logo" href="/" aria-label="{{ .AppName }} dashboard">
+        <span class="tg-logo-mark" aria-hidden="true"><svg class="tg-brand-icon"><use href="#tg-i-icy-shield"></use></svg></span>
+        <span>{{ .AppName }}</span>
+      </a>
+      <nav class="tg-nav">
+        <a class="tg-nav-item{{ if eq .ActivePage "dashboard" }} is-active{{ end }}" href="/"><svg class="tg-icon"><use href="#tg-i-dashboard"></use></svg>Dashboard</a>
+        <a class="tg-nav-item{{ if eq .ActivePage "repositories" }} is-active{{ end }}" href="/repositories"><svg class="tg-icon"><use href="#tg-i-repositories"></use></svg>Repositories</a>
+        <a class="tg-nav-item{{ if eq .ActivePage "freezes" }} is-active{{ end }}" href="/freezes"><svg class="tg-icon"><use href="#tg-i-freeze-branch"></use></svg>Freezes</a>
+        <a class="tg-nav-item{{ if eq .ActivePage "scheduled" }} is-active{{ end }}" href="/scheduled-freezes"><svg class="tg-icon"><use href="#tg-i-schedule"></use></svg>Scheduled Freezes</a>
+        <a class="tg-nav-item{{ if eq .ActivePage "thaws" }} is-active{{ end }}" href="/decisions"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg>Thaw Requests</a>
+        <a class="tg-nav-item{{ if eq .ActivePage "activity" }} is-active{{ end }}" href="/activity"><svg class="tg-icon"><use href="#tg-i-activity"></use></svg>Activity</a>
+        {{ if .CurrentUser.IsAdmin }}<a class="tg-nav-item{{ if eq .ActivePage "users" }} is-active{{ end }}" href="/users"><svg class="tg-icon"><use href="#tg-i-users"></use></svg>Users & Roles</a>{{ end }}
+      </nav>
+      {{ if .CurrentUser.Email }}
+      <div class="tg-sidebar-user">
+        <strong>{{ .CurrentUser.DisplayName }}</strong>
+        <span>{{ .CurrentUser.Email }}</span>
+        <span class="tg-badge tg-badge-info">{{ .CurrentUser.RoleLabel }}</span>
+        {{ if .CurrentUser.CanChangePassword }}<a class="tg-btn tg-btn-secondary tg-btn-sm" href="/account/password">Change password</a>{{ end }}
+        <form method="post" action="/logout">
+          <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+          <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm">Log out</button>
+        </form>
+      </div>
+      {{ end }}
+      <div class="tg-sidebar-note">
+        <span class="tg-status-dot"></span>
+        <span>Cooperative enforcement</span>
+      </div>
+    </aside>
+    <div class="tg-content">
+{{ template "pages/repositories" . }}
+{{ template "components/confirmation-dialog" }}
+  </div></div>
+{{ template "components/page-scripts" }}
+</body></html>{{ end }}

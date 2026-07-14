@@ -1,0 +1,12 @@
+{{ define "components/page-header" }}
+    <header class="tg-header">
+      <div>
+        <h1 class="tg-title">Repositories</h1>
+        <p class="tg-subtitle">Connect Forgejo/Codeberg repositories and verify freeze setup.</p>
+      </div>
+      {{ if .CurrentUser.CanManageRepositories }}
+      <div class="tg-header-actions">
+        <a class="tg-btn tg-btn-primary" href="#connect-repository"><svg class="tg-icon"><use href="#tg-i-plus"></use></svg>Add Repository</a>
+      </div>
+      {{ end }}
+    </header>{{ end }}
