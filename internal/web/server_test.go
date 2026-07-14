@@ -942,6 +942,144 @@ func TestRepositoriesPageShowsEnforcementState(t *testing.T) {
 	}
 }
 
+func newRepositoriesFindabilityServer() *Server {
+	return NewServer(Config{
+		AppName: "Thawguard",
+		RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{
+			{ID: 1, Owner: "acme", Name: "alpha-active", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive},
+			{ID: 2, Owner: "acme", Name: "beta-setup", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementSetupIncomplete},
+			{ID: 3, Owner: "acme", Name: "gamma-unhealthy", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementUnhealthy},
+			{ID: 4, Owner: "acme", Name: "delta-ready", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementReady},
+		}},
+	})
+}
+
+func TestRepositoriesPageOrdersByAttentionAndShowsFilters(t *testing.T) {
+	server := newRepositoriesFindabilityServer()
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	previous := -1
+	for _, fullName := range []string{"acme/gamma-unhealthy", "acme/beta-setup", "acme/delta-ready", "acme/alpha-active"} {
+		index := strings.Index(body, fullName)
+		if index == -1 {
+			t.Fatalf("expected body to contain %q", fullName)
+		}
+		if index < previous {
+			t.Fatalf("expected attention-first ordering, %q appeared too early", fullName)
+		}
+		previous = index
+	}
+	for _, want := range []string{
+		`class="tg-stat tg-stat-scheduled tg-stat-link" href="/repositories?state=active"`,
+		`href="/repositories?state=unhealthy"`,
+		`href="/repositories?state=setup-incomplete"`,
+		`href="/repositories?state=ready"`,
+		">All <span class=\"tg-state-chip-count\">4</span>",
+		"tg-lifecycle-rail",
+		"is-broken",
+		`name="q"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected body to contain %q", want)
+		}
+	}
+	if strings.Contains(body, "showing") {
+		t.Fatalf("expected no filtered count without an active filter, got %q", body)
+	}
+}
+
+func TestRepositoriesPageFiltersByState(t *testing.T) {
+	server := newRepositoriesFindabilityServer()
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories?state=unhealthy", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{"acme/gamma-unhealthy", "showing 1 of 4", `aria-current="true"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected body to contain %q", want)
+		}
+	}
+	for _, hidden := range []string{"acme/alpha-active", "acme/beta-setup", "acme/delta-ready"} {
+		if strings.Contains(body, hidden) {
+			t.Fatalf("expected state filter to hide %q", hidden)
+		}
+	}
+}
+
+func TestRepositoriesPageIgnoresUnknownStateFilter(t *testing.T) {
+	server := newRepositoriesFindabilityServer()
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories?state=bogus", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{"acme/gamma-unhealthy", "acme/beta-setup", "acme/delta-ready", "acme/alpha-active"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected unknown state filter to be ignored, missing %q", want)
+		}
+	}
+	if strings.Contains(body, "showing") {
+		t.Fatalf("expected unknown state filter to be treated as no filter, got %q", body)
+	}
+}
+
+func TestRepositoriesPageFiltersBySearchQuery(t *testing.T) {
+	server := newRepositoriesFindabilityServer()
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories?q=DELTA", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{
+		"acme/delta-ready",
+		"showing 1 of 4",
+		`value="DELTA"`,
+		`>All <span class="tg-state-chip-count">1</span>`,
+		`>Ready <span class="tg-state-chip-count">1</span>`,
+		"Rotating the status token or changing managed branches returns this repository to setup until it is re-verified.",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected body to contain %q", want)
+		}
+	}
+	for _, hidden := range []string{"acme/alpha-active", "acme/beta-setup", "acme/gamma-unhealthy"} {
+		if strings.Contains(body, hidden) {
+			t.Fatalf("expected search filter to hide %q", hidden)
+		}
+	}
+}
+
+func TestRepositoriesPageShowsFilteredEmptyState(t *testing.T) {
+	server := newRepositoriesFindabilityServer()
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories?q=no-such-repository", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{"No repositories match this filter", `href="/repositories">Clear filter</a>`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected body to contain %q", want)
+		}
+	}
+	if strings.Contains(body, "No repositories configured yet") {
+		t.Fatalf("expected filtered empty state instead of the unconfigured empty state, got %q", body)
+	}
+}
+
 func TestMutationPagesShowSetupRequiredWithoutEnforceableRepositories(t *testing.T) {
 	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementSetupIncomplete}
 	server := NewServer(Config{

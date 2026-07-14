@@ -177,6 +177,32 @@ type repositoryView struct {
 	VerifyBlockedReason  string
 	ActiveFreezeCount    int
 	PendingScheduleCount int
+	// Lifecycle renders the Setup → Ready → Active rail; the Active node is
+	// marked broken while enforcement is unhealthy.
+	Lifecycle []lifecycleNode
+}
+
+// lifecycleNode is one step of the enforcement lifecycle rail.
+type lifecycleNode struct {
+	Label string
+	Class string
+}
+
+// repositoryListFilter narrows the repositories page by full-name substring
+// and lifecycle state. POST error re-renders always show the unfiltered list.
+type repositoryListFilter struct {
+	Query string
+	State string
+}
+
+func (f repositoryListFilter) Active() bool { return f.Query != "" || f.State != "" }
+
+// repositoryStateChip is one lifecycle-state filter link with its total count.
+type repositoryStateChip struct {
+	Label    string
+	URL      string
+	Count    int
+	Selected bool
 }
 
 type repositoryBranchView struct {
@@ -1003,7 +1029,7 @@ func (s *Server) handleRepositories(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("notice") == "enforcement-deactivated" {
 		notice = "Repository enforcement is inactive. The repository is ready for status-token or managed-branch maintenance."
 	}
-	s.renderRepositoriesPage(w, views, "", notice, session)
+	s.renderRepositoriesPage(w, views, "", notice, session, parseRepositoryListFilter(r.URL.Query()))
 }
 
 func (s *Server) handleCreateRepository(w http.ResponseWriter, r *http.Request) {
@@ -3229,6 +3255,7 @@ func (s *Server) repositoryViews(ctx context.Context, repositories []domain.Repo
 		view.ActiveFreezeCount = activeFreezesByRepository[repo.ID]
 		view.PendingScheduleCount = pendingSchedulesByRepository[repo.ID]
 		view.EnforcementLabel, view.EnforcementClass = enforcementView(repo.EnforcementState)
+		view.Lifecycle = lifecycleRail(repo.EnforcementState)
 		view.IsSetupIncomplete = repo.EnforcementState == domain.EnforcementSetupIncomplete
 		view.IsReady = repo.EnforcementState == domain.EnforcementReady
 		view.IsUnhealthy = repo.EnforcementState == domain.EnforcementUnhealthy
@@ -3381,6 +3408,130 @@ func enforcementView(state domain.EnforcementState) (string, string) {
 	}
 }
 
+func lifecycleRail(state domain.EnforcementState) []lifecycleNode {
+	switch state {
+	case domain.EnforcementReady:
+		return []lifecycleNode{{"Setup", "is-done"}, {"Ready", "is-current"}, {"Active", "is-pending"}}
+	case domain.EnforcementActive:
+		return []lifecycleNode{{"Setup", "is-done"}, {"Ready", "is-done"}, {"Active", "is-current"}}
+	case domain.EnforcementUnhealthy:
+		return []lifecycleNode{{"Setup", "is-done"}, {"Ready", "is-done"}, {"Active", "is-broken"}}
+	default:
+		return []lifecycleNode{{"Setup", "is-current"}, {"Ready", "is-pending"}, {"Active", "is-pending"}}
+	}
+}
+
+// repositoryStateFilters maps URL-safe filter values to lifecycle states, in
+// attention-first display order.
+var repositoryStateFilters = []struct {
+	Value string
+	Label string
+	State domain.EnforcementState
+}{
+	{"unhealthy", "Unhealthy", domain.EnforcementUnhealthy},
+	{"setup-incomplete", "Setup incomplete", domain.EnforcementSetupIncomplete},
+	{"ready", "Ready", domain.EnforcementReady},
+	{"active", "Active", domain.EnforcementActive},
+}
+
+func parseRepositoryListFilter(query url.Values) repositoryListFilter {
+	filter := repositoryListFilter{Query: strings.TrimSpace(query.Get("q"))}
+	state := strings.TrimSpace(query.Get("state"))
+	for _, option := range repositoryStateFilters {
+		if option.Value == state {
+			filter.State = state
+			break
+		}
+	}
+	return filter
+}
+
+func (f repositoryListFilter) matches(view repositoryView) bool {
+	if f.Query != "" && !strings.Contains(strings.ToLower(view.Repository.FullName()), strings.ToLower(f.Query)) {
+		return false
+	}
+	if f.State != "" {
+		for _, option := range repositoryStateFilters {
+			if option.Value == f.State {
+				return view.Repository.EnforcementState == option.State
+			}
+		}
+		return false
+	}
+	return true
+}
+
+func filterRepositoryViews(views []repositoryView, filter repositoryListFilter) []repositoryView {
+	if !filter.Active() {
+		return views
+	}
+	visible := make([]repositoryView, 0, len(views))
+	for _, view := range views {
+		if filter.matches(view) {
+			visible = append(visible, view)
+		}
+	}
+	return visible
+}
+
+// sortRepositoryViewsByAttention orders the list so states needing operator
+// action come first: unhealthy, setup incomplete, ready, then active.
+func sortRepositoryViewsByAttention(views []repositoryView) {
+	rank := func(state domain.EnforcementState) int {
+		switch state {
+		case domain.EnforcementUnhealthy:
+			return 0
+		case domain.EnforcementSetupIncomplete:
+			return 1
+		case domain.EnforcementReady:
+			return 2
+		default:
+			return 3
+		}
+	}
+	sort.SliceStable(views, func(i, j int) bool {
+		ri, rj := rank(views[i].Repository.EnforcementState), rank(views[j].Repository.EnforcementState)
+		if ri != rj {
+			return ri < rj
+		}
+		return views[i].Repository.FullName() < views[j].Repository.FullName()
+	})
+}
+
+func repositoryListURL(query, state string) string {
+	values := url.Values{}
+	if query != "" {
+		values.Set("q", query)
+	}
+	if state != "" {
+		values.Set("state", state)
+	}
+	if len(values) == 0 {
+		return "/repositories"
+	}
+	return "/repositories?" + values.Encode()
+}
+
+func repositoryStateChips(views []repositoryView, filter repositoryListFilter) []repositoryStateChip {
+	queryOnly := filter
+	queryOnly.State = ""
+	matchingQuery := filterRepositoryViews(views, queryOnly)
+	counts := make(map[domain.EnforcementState]int)
+	for _, view := range matchingQuery {
+		counts[view.Repository.EnforcementState]++
+	}
+	chips := []repositoryStateChip{{Label: "All", URL: repositoryListURL(filter.Query, ""), Count: len(matchingQuery), Selected: filter.State == ""}}
+	for _, option := range repositoryStateFilters {
+		chips = append(chips, repositoryStateChip{
+			Label:    option.Label,
+			URL:      repositoryListURL(filter.Query, option.Value),
+			Count:    counts[option.State],
+			Selected: filter.State == option.Value,
+		})
+	}
+	return chips
+}
+
 func formatReadinessTime(value time.Time) string {
 	return value.UTC().Format("2006-01-02 15:04 UTC")
 }
@@ -3420,10 +3571,10 @@ func latestSetupChecks(checks []setupcheck.Check) []setupcheck.Check {
 }
 
 func (s *Server) renderRepositories(w http.ResponseWriter, views []repositoryView, formError string, session sessionState) {
-	s.renderRepositoriesPage(w, views, formError, "", session)
+	s.renderRepositoriesPage(w, views, formError, "", session, repositoryListFilter{})
 }
 
-func (s *Server) renderRepositoriesPage(w http.ResponseWriter, views []repositoryView, formError, notice string, session sessionState) {
+func (s *Server) renderRepositoriesPage(w http.ResponseWriter, views []repositoryView, formError, notice string, session sessionState, filter repositoryListFilter) {
 	overview := repositoryOverview{RepositoryCount: len(views), WebhookSecretStorageEnabled: s.cfg.RepositorySecretEncryptionConfigured}
 	for _, view := range views {
 		if view.Repository.HasWebhookSecret {
@@ -3439,11 +3590,17 @@ func (s *Server) renderRepositoriesPage(w http.ResponseWriter, views []repositor
 			overview.EnforcementActiveCount++
 		}
 	}
+	sortRepositoryViewsByAttention(views)
+	visible := filterRepositoryViews(views, filter)
 	s.render(w, repositoriesTemplate, map[string]any{
 		"AppName":                           s.cfg.AppName,
 		"ActivePage":                        "repositories",
 		"Overview":                          overview,
-		"RepositoryViews":                   views,
+		"RepositoryViews":                   visible,
+		"Filter":                            filter,
+		"StateChips":                        repositoryStateChips(views, filter),
+		"TotalCount":                        len(views),
+		"VisibleCount":                      len(visible),
 		"FormError":                         formError,
 		"Notice":                            notice,
 		"CSRFToken":                         session.CSRFToken,
@@ -3649,6 +3806,8 @@ const pageHead = `<!doctype html>
     <symbol id="tg-i-key" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M7.5 14.5a4.5 4.5 0 1 1 3.18-7.68A4.5 4.5 0 0 1 12 10l8-8 M15.5 6.5l2 2 M17.5 4.5l2 2"/></symbol>
     <symbol id="tg-i-git-branch" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M6 4v10 M18 6a6 6 0 0 1-6 6H6 M8 18a2 2 0 1 1-4 0 2 2 0 0 1 4 0z M20 6a2 2 0 1 1-4 0 2 2 0 0 1 4 0z"/></symbol>
     <symbol id="tg-i-health-check" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M12 21a9 9 0 1 1 0-18 9 9 0 0 1 0 18z M5.8 12h3l1.4-3.8 2.7 7.6 1.5-3.8h3.8 M15.8 8.2l1.2 1.2 2.2-2.4"/></symbol>
+    <symbol id="tg-i-lock" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M6 11h12a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1v-8a1 1 0 0 1 1-1z M8 11V7a4 4 0 0 1 8 0v4 M12 15v2.5"/></symbol>
+    <symbol id="tg-i-search" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16z M21 21l-4.35-4.35"/></symbol>
     <symbol id="tg-i-branch-impact" viewBox="0 0 12 16"><path fill="currentColor" fill-rule="evenodd" d="M11 11.28V5c-.03-.78-.34-1.47-.94-2.06C9.46 2.35 8.78 2.03 8 2H7V0L4 3l3 3V4h1c.27.02.48.11.69.31.21.2.3.42.31.69v6.28A1.993 1.993 0 0 0 10 15a1.993 1.993 0 0 0 1-3.72zm-1 2.92c-.66 0-1.2-.55-1.2-1.2 0-.65.55-1.2 1.2-1.2.65 0 1.2.55 1.2 1.2 0 .65-.55 1.2-1.2 1.2zM4 3c0-1.11-.89-2-2-2a1.993 1.993 0 0 0-1 3.72v6.56A1.993 1.993 0 0 0 2 15a1.993 1.993 0 0 0 1-3.72V4.72c.59-.34 1-.98 1-1.72zm-.8 10c0 .66-.55 1.2-1.2 1.2-.65 0-1.2-.55-1.2-1.2 0-.65.55-1.2 1.2-1.2.65 0 1.2.55 1.2 1.2zM2 4.2C1.34 4.2.8 3.65.8 3c0-.65.55-1.2 1.2-1.2.65 0 1.2.55 1.2 1.2 0 .65-.55 1.2-1.2 1.2z"/></symbol>
   </svg>
   <div class="tg-app">
@@ -4489,10 +4648,10 @@ const repositoriesTemplate = pageHead + `
         <span class="tg-stat-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-schedule"></use></svg></span>
         <span><span class="tg-stat-label">Checks</span><strong class="tg-stat-value">Local</strong></span>
       </article>
-      <article class="tg-stat tg-stat-scheduled">
+      <a class="tg-stat tg-stat-scheduled tg-stat-link" href="/repositories?state=active" aria-label="Show repositories with active enforcement">
         <span class="tg-stat-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-icy-shield"></use></svg></span>
         <span><span class="tg-stat-label">Enforcing</span><strong class="tg-stat-value">{{ .Overview.EnforcementActiveCount }}</strong></span>
-      </article>
+      </a>
     </section>
 
     {{ if .CurrentUser.CanManageRepositories }}
@@ -4530,10 +4689,26 @@ const repositoriesTemplate = pageHead + `
 
     <div class="tg-section-heading tg-section-heading-compact">
       <div>
-        <h2>Configured repositories</h2>
+        <h2>Configured repositories{{ if .Filter.Active }} <span class="tg-muted">— showing {{ .VisibleCount }} of {{ .TotalCount }}</span>{{ end }}</h2>
         <p>Run read-only Forgejo/Codeberg readiness checks for repository access, signed webhook evidence, and every exact managed branch.</p>
       </div>
     </div>
+
+    {{ if .TotalCount }}
+    <div class="tg-repo-filterbar">
+      <form method="get" action="/repositories" class="tg-repo-search" role="search" aria-label="Search repositories">
+        <svg class="tg-icon" aria-hidden="true"><use href="#tg-i-search"></use></svg>
+        <input type="search" name="q" value="{{ .Filter.Query }}" placeholder="Search owner/name" aria-label="Search repositories by owner or name">
+        {{ if .Filter.State }}<input type="hidden" name="state" value="{{ .Filter.State }}">{{ end }}
+        <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm">Search</button>
+      </form>
+      <nav class="tg-state-chips" aria-label="Filter repositories by lifecycle state">
+        {{ range .StateChips }}
+        <a class="tg-state-chip{{ if .Selected }} is-selected{{ end }}" href="{{ .URL }}"{{ if .Selected }} aria-current="true"{{ end }}>{{ .Label }} <span class="tg-state-chip-count">{{ .Count }}</span></a>
+        {{ end }}
+      </nav>
+    </div>
+    {{ end }}
 
     {{ if .RepositoryViews }}
     <section class="tg-repo-grid" aria-label="Configured repositories">
@@ -4543,6 +4718,9 @@ const repositoriesTemplate = pageHead + `
           <div>
             <p class="tg-repo-kicker">{{ .Repository.Forge }}</p>
             <h3>{{ .Repository.FullName }}</h3>
+            <ol class="tg-lifecycle-rail" aria-label="Enforcement lifecycle">
+              {{ range .Lifecycle }}<li class="tg-lifecycle-node {{ .Class }}"><span class="tg-lifecycle-dot" aria-hidden="true"></span>{{ .Label }}</li>{{ end }}
+            </ol>
           </div>
           <div class="tg-repo-badges">
             <span class="tg-badge {{ .EnforcementClass }}">{{ .EnforcementLabel }}</span>
@@ -4551,19 +4729,33 @@ const repositoriesTemplate = pageHead + `
           </div>
         </div>
         {{ if .Repository.EnforcementActive }}
-        <p class="tg-muted">Enforcement is active{{ if .StatusPostVerifiedAt }}; status posting last verified at {{ .StatusPostVerifiedAt }}{{ end }}. Freezes, schedules, and thaw approvals publish <code>` + domain.RequiredStatusContext + `</code> statuses for this repository.</p>
+        <div class="tg-state-banner is-active">
+          <svg class="tg-icon" aria-hidden="true"><use href="#tg-i-icy-shield"></use></svg>
+          <p>Enforcement is active{{ if .StatusPostVerifiedAt }}; status posting last verified at {{ .StatusPostVerifiedAt }}{{ end }}. Freezes, schedules, and thaw approvals publish <code>` + domain.RequiredStatusContext + `</code> statuses for this repository.</p>
+        </div>
         {{ else if .IsReady }}
-        <p class="tg-muted">Status posting verified{{ if .StatusPostVerifiedAt }} at {{ .StatusPostVerifiedAt }}{{ end }} with a controlled <code>` + domain.SetupStatusContext + `</code> status. Ready to activate — enforcement stays off until an admin explicitly activates it.</p>
+        <div class="tg-state-banner is-ready">
+          <svg class="tg-icon" aria-hidden="true"><use href="#tg-i-check"></use></svg>
+          <p>Status posting verified{{ if .StatusPostVerifiedAt }} at {{ .StatusPostVerifiedAt }}{{ end }} with a controlled <code>` + domain.SetupStatusContext + `</code> status. Ready to activate — enforcement stays off until an admin explicitly activates it.</p>
+        </div>
         {{ else if .IsUnhealthy }}
-        <p class="error">Enforcement is unhealthy{{ if .Repository.EnforcementFailureReason }}: {{ .Repository.EnforcementFailureReason }}{{ if .EnforcementFailedAt }} ({{ .EnforcementFailedAt }}){{ end }}{{ else }}: the last enforcement run failed{{ end }}. Freeze, schedule, and thaw actions stay disabled while recovery reruns the complete enforcement proof.</p>
-        {{ if .RecoveryInProgress }}
-        <p class="tg-muted">Recovery in progress. Attempt count: {{ .RecoveryAttempts }}.</p>
+        <div class="tg-state-banner is-unhealthy">
+          <svg class="tg-icon" aria-hidden="true"><use href="#tg-i-warning"></use></svg>
+          <div>
+            <p class="error">Enforcement is unhealthy{{ if .Repository.EnforcementFailureReason }}: {{ .Repository.EnforcementFailureReason }}{{ if .EnforcementFailedAt }} ({{ .EnforcementFailedAt }}){{ end }}{{ else }}: the last enforcement run failed{{ end }}. Freeze, schedule, and thaw actions stay disabled while recovery reruns the complete enforcement proof.</p>
+            {{ if .RecoveryInProgress }}
+            <p class="tg-muted">Recovery in progress. Attempt count: {{ .RecoveryAttempts }}.</p>
+            {{ else }}
+            <p class="tg-muted">Automatic recovery is pending. Attempt count: {{ .RecoveryAttempts }}{{ if .NextRecoveryAt }}. Next retry: {{ .NextRecoveryAt }}{{ end }}.</p>
+            {{ end }}
+            <p class="tg-muted">{{ .FailureRemediation }}</p>
+          </div>
+        </div>
         {{ else }}
-        <p class="tg-muted">Automatic recovery is pending. Attempt count: {{ .RecoveryAttempts }}{{ if .NextRecoveryAt }}. Next retry: {{ .NextRecoveryAt }}{{ end }}.</p>
-        {{ end }}
-        <p class="tg-muted">{{ .FailureRemediation }}</p>
-        {{ else if not .Repository.EnforcementActive }}
-        <p class="tg-muted">This repository cannot enforce freezes, schedules, or thaws. Readiness checks are read-only; status posting is not tested until the controlled verification below.</p>
+        <div class="tg-state-banner is-setup">
+          <svg class="tg-icon" aria-hidden="true"><use href="#tg-i-warning"></use></svg>
+          <p>This repository cannot enforce freezes, schedules, or thaws. Readiness checks are read-only; status posting is not tested until the controlled verification below.</p>
+        </div>
         {{ end }}
         <dl class="tg-repo-meta">
           <div><span class="tg-meta-icon"><svg class="tg-icon"><use href="#tg-i-git-branch"></use></svg></span><dt>Default branch</dt><dd><code>{{ .Repository.DefaultBranch }}</code></dd></div>
@@ -4585,6 +4777,7 @@ const repositoriesTemplate = pageHead + `
           <div class="tg-repo-branches-head">
             <strong>Managed branches</strong>
             <span class="tg-badge tg-badge-info">exact names only</span>
+            {{ if .Repository.EnforcementActive }}<span class="tg-badge tg-badge-lock"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-lock"></use></svg>locked while active</span>{{ end }}
           </div>
           <p class="tg-muted">Freezes and scheduled freezes only apply to these exact branch names. Each branch is checked independently.</p>
           {{ if .Branches }}
@@ -4675,6 +4868,7 @@ const repositoriesTemplate = pageHead + `
                   <span>{{ if .Repository.HasStatusToken }}Stored encrypted. Hidden until rotation.{{ else }}Required for enforcement: posts the <code>` + domain.RequiredStatusContext + `</code> commit status and syncs open PRs.{{ end }}</span>
                 </div>
                 {{ if .Repository.HasStatusToken }}<span class="tg-badge status-ok">stored encrypted</span>{{ else }}<span class="tg-badge status-warning">missing</span>{{ end }}
+                {{ if .Repository.EnforcementActive }}<span class="tg-badge tg-badge-lock"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-lock"></use></svg>locked while active</span>{{ end }}
               </div>
               {{ if .Repository.EnforcementActive }}
               <span class="tg-muted">Deactivate enforcement before replacing the status token for maintenance.</span>
@@ -4704,6 +4898,9 @@ const repositoriesTemplate = pageHead + `
           <p class="tg-muted">Credential values are write-only and stored encrypted.</p>
           {{ else }}
           <p class="tg-muted">Set <code>THAWGUARD_SECRET_KEY</code> to save webhook secrets and status tokens.</p>
+          {{ end }}
+          {{ if .IsReady }}
+          <p class="tg-muted">Rotating the status token or changing managed branches returns this repository to setup until it is re-verified.</p>
           {{ end }}
           <form method="post" action="/repositories/setup-check">
             <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
@@ -4762,6 +4959,12 @@ const repositoriesTemplate = pageHead + `
         {{ end }}
       </article>
       {{ end }}
+    </section>
+    {{ else if .Filter.Active }}
+    <section class="tg-panel tg-empty-row">
+      <strong>No repositories match this filter</strong>
+      <span>Adjust the search or lifecycle-state filter, or clear it to see every configured repository.</span>
+      <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/repositories">Clear filter</a>
     </section>
     {{ else }}
     <section class="tg-panel tg-empty-row">
