@@ -1,0 +1,15 @@
+{{ define "components/active-freeze-actions" }}
+                {{ if .CanFreeze }}
+                <form method="post" action="/freezes/end" data-confirm-submit data-confirm-title="Lift freeze?" data-confirm-message="Future status recomputation can pass if no other freeze applies. This action is auditable and may publish updated statuses for known open PRs." data-confirm-action="Lift freeze">
+                  <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+                  <input type="hidden" name="freeze_id" value="{{ .Freeze.ID }}">
+                  <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg>Lift</button>
+                </form>
+                <form method="post" action="/freezes/cancel" data-confirm-submit data-confirm-title="Cancel freeze?" data-confirm-message="This removes the local active freeze without completing it or recording it as ended. Thawguard will recompute statuses for known open PRs after the freeze changes." data-confirm-action="Cancel freeze">
+                  <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+                  <input type="hidden" name="freeze_id" value="{{ .Freeze.ID }}">
+                  <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-close"></use></svg>Cancel</button>
+                </form>
+                {{ else }}
+                <span class="tg-muted">Read only</span>
+                {{ end }}{{ end }}

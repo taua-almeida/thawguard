@@ -7,13 +7,18 @@
       const message = dialog.querySelector('[data-alert-message]');
       const confirm = dialog.querySelector('[data-alert-confirm]');
       let pendingConfirm = null;
+      let previouslyFocused = null;
 
       const closeDialog = () => {
+        const focusTarget = previouslyFocused;
         dialog.hidden = true;
         pendingConfirm = null;
+        previouslyFocused = null;
+        if (focusTarget && typeof focusTarget.focus === 'function') focusTarget.focus();
       };
 
       const openDialog = (trigger, onConfirm) => {
+        previouslyFocused = document.activeElement;
         pendingConfirm = onConfirm;
         title.textContent = trigger.getAttribute('data-confirm-title') || 'Confirm action';
         message.textContent = trigger.getAttribute('data-confirm-message') || 'Continue?';
@@ -84,7 +89,24 @@
       });
 
       document.addEventListener('keydown', (event) => {
-        if (event.key === 'Escape' && !dialog.hidden) closeDialog();
+        if (dialog.hidden) return;
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          closeDialog();
+          return;
+        }
+        if (event.key !== 'Tab') return;
+        const focusable = [...dialog.querySelectorAll('button:not([disabled]):not([tabindex="-1"])')];
+        if (focusable.length === 0) return;
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && (document.activeElement === last || !dialog.contains(document.activeElement))) {
+          event.preventDefault();
+          first.focus();
+        }
       });
     })();
   </script>{{ end }}

@@ -1,0 +1,7 @@
+{{ define "pages/freezes" }}
+  <main class="tg-main tg-setup-page tg-freezes-page">
+{{ template "components/freezes-page-header" . }}
+    {{ if .FormError }}<p class="error" role="alert">{{ .FormError }}</p>{{ end }}
+{{ template "components/freeze-workbench" . }}
+{{ template "components/active-freezes" . }}
+  </main>{{ end }}

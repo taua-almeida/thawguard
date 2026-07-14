@@ -1,0 +1,68 @@
+{{ define "components/freeze-workbench" }}
+    <section class="tg-freeze-workbench" aria-label="Create branch freeze and review its effect">
+      <section class="tg-panel tg-freeze-form-panel">
+        <div class="tg-panel-head tg-panel-head-stacked">
+          <div>
+            <h2>Create a freeze</h2>
+            <p class="tg-panel-subtitle">Open PRs on the branch receive a failing <code>{{ .RequiredContext }}</code> status check.</p>
+          </div>
+        </div>
+        {{ if not .CurrentUser.CanFreeze }}
+        <div class="tg-empty-row">
+          <strong>Read-only freeze access</strong>
+          <span>Your role can view freezes. Explicit freezer role is required to create, lift, or cancel freezes.</span>
+        </div>
+        {{ else if .EnforceableRepositories }}
+        <form method="post" action="/freezes" class="tg-setup-form tg-freeze-form" data-freeze-form>
+          <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+          <input type="hidden" name="timezone_offset_minutes" value="0" data-timezone-offset-minutes>
+          <label>Repository
+            <select name="repository_id" required data-freeze-repository>
+            {{ range .EnforceableRepositories }}<option value="{{ .ID }}"{{ if and $.FreezeForm.Submitted (eq .ID $.FreezeForm.RepositoryID) }} selected{{ end }}>{{ .FullName }}</option>{{ end }}
+            </select>
+          </label>
+          <label>Branch
+            <select name="branch" required data-freeze-branch>
+            {{ range .BranchOptions }}<option value="{{ .Name }}" data-repository="{{ .RepositoryID }}"{{ if and $.FreezeForm.Submitted (eq .RepositoryID $.FreezeForm.RepositoryID) (eq .Name $.FreezeForm.Branch) }} selected{{ end }}>{{ .Name }}</option>{{ end }}
+            </select>
+          </label>
+          <label class="tg-field-wide">Reason <input name="reason" value="{{ .FreezeForm.Reason }}" placeholder="Release cut 2026-07 — QA verification in progress" required></label>
+          <label>Planned unfreeze <input type="datetime-local" name="planned_ends_at" value="{{ .FreezeForm.PlannedEndsAt }}" aria-describedby="immediate-planned-unfreeze-help" data-local-datetime disabled></label>
+          <small id="immediate-planned-unfreeze-help" class="tg-muted">Optional. Enabled when browser-local timezone conversion is available; stored as UTC.</small>
+          <noscript class="tg-field-wide"><small class="tg-noscript-warning">Planned unfreeze is unavailable without JavaScript. Create the freeze without it and lift the freeze manually.</small></noscript>
+          <div class="tg-freeze-form-footer tg-field-wide">
+            <span class="tg-muted"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-audit"></use></svg>Every freeze appears in activity.</span>
+            <div class="tg-freeze-form-actions">
+              <button type="reset" class="tg-btn tg-btn-secondary tg-btn-sm">Reset</button>
+              <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-freeze-branch"></use></svg>Freeze Branch</button>
+            </div>
+          </div>
+        </form>
+        {{ else }}
+        <div class="tg-empty-row">
+          <strong>No repository has active enforcement</strong>
+          <span>Repository enforcement is not active. Complete setup and activate enforcement before creating a freeze.</span>
+          <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/repositories">Repository setup</a>
+        </div>
+        {{ end }}
+      </section>
+
+      <aside class="tg-panel tg-impact-card">
+        <div class="tg-panel-head tg-impact-head">
+          <div class="tg-impact-title-row">
+            <h2><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-branch-impact"></use></svg>Freeze effect</h2>
+            <span class="tg-badge status-warning">{{ if and .CurrentUser.CanFreeze .EnforceableRepositories }}Evaluated on submit{{ else }}Policy summary{{ end }}</span>
+          </div>
+          <p class="tg-panel-subtitle">This is a policy summary, not a live forge lookup. Thawguard evaluates known open PRs after the freeze is created.</p>
+        </div>
+        {{ if and .CurrentUser.CanFreeze .EnforceableRepositories }}
+        <div class="tg-impact-context"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-git-branch"></use></svg><code data-preview-repository>Selected repository</code><span class="tg-arrow">→</span><code class="tg-branch" data-preview-branch>main</code></div>
+        {{ end }}
+        <div class="tg-pr-preview-list tg-freeze-effect-list">
+          <div class="tg-pr-preview-row"><span class="tg-badge tg-badge-info">1</span><div><strong>Exact branch policy</strong><small>Only pull requests targeting the selected repository branch are evaluated.</small></div></div>
+          <div class="tg-pr-preview-row"><span class="tg-badge tg-badge-info">2</span><div><strong>Required status changes</strong><small><code>{{ .RequiredContext }}</code> is recomputed; an applicable freeze fails it unless an approved thaw covers the PR and head.</small></div></div>
+          <div class="tg-pr-preview-row"><span class="tg-badge tg-badge-info">3</span><div><strong>Branch protection enforces it</strong><small>Merge blocking depends on the forge requiring this exact status context.</small></div></div>
+        </div>
+        <p class="tg-impact-warning"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-warning"></use></svg>Thawguard prevents accidental merges for trusted teams; collaborators with sufficient forge permissions can still bypass cooperative enforcement.</p>
+      </aside>
+    </section>{{ end }}

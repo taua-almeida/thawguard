@@ -1,4 +1,4 @@
-{{ define "layouts/repositories" }}<!doctype html>
+{{ define "layouts/freezes" }}<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -11,8 +11,10 @@
   <div class="tg-app">
 {{ template "components/app-sidebar" . }}
     <div class="tg-content">
-{{ template "pages/repositories" . }}
+{{ template "pages/freezes" . }}
 {{ template "components/confirmation-dialog" }}
-  </div></div>
+    </div>
+  </div>
+{{ template "components/freezes-scripts" }}
 {{ template "components/page-scripts" }}
 </body></html>{{ end }}

@@ -878,18 +878,10 @@ func TestFreezesPageShowsRepositoriesAndActiveFreezes(t *testing.T) {
 	plannedEndsAt := time.Date(2026, 7, 13, 9, 0, 0, 0, time.UTC)
 	activeFreeze := domain.BranchFreeze{ID: 1, RepositoryID: repo.ID, Branch: "dev", Status: domain.BranchFreezeStatusActive, Active: true, Reason: "QA freeze", PlannedEndsAt: &plannedEndsAt}
 	manualFreeze := domain.BranchFreeze{ID: 2, RepositoryID: repo.ID, Branch: "main", Status: domain.BranchFreezeStatusActive, Active: true, Reason: `<script>alert("unsafe")</script>`}
-	auditEvent := audit.Event{
-		Action:      audit.ActionBranchFreezeCreated,
-		SubjectType: audit.SubjectTypeBranchFreeze,
-		SubjectID:   "1",
-		DetailsJSON: `{"actor_kind":"bootstrap_admin","actor_role":"admin","repository_id":"1","branch":"dev","status":"active","reason":"QA freeze"}`,
-		CreatedAt:   time.Date(2026, 6, 29, 15, 30, 0, 0, time.UTC),
-	}
 	server := NewServer(Config{
 		AppName:         "Thawguard",
 		RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}},
 		FreezeStore:     &fakeFreezeStore{freezes: []domain.BranchFreeze{activeFreeze, manualFreeze}},
-		AuditStore:      &fakeAuditStore{events: []audit.Event{auditEvent}},
 	})
 
 	recorder := httptest.NewRecorder()
@@ -904,7 +896,7 @@ func TestFreezesPageShowsRepositoriesAndActiveFreezes(t *testing.T) {
 	if token := csrfTokenFromBody(t, body); token == "" {
 		t.Fatal("expected CSRF token in freeze form")
 	}
-	for _, want := range []string{"Create a freeze", "Preview impact", "3 open PRs", "Active Freezes", "taua-almeida/thawguard", "dev", "QA freeze", "Freeze Branch", "Planned unfreeze", `name="planned_ends_at"`, `name="timezone_offset_minutes"`, "Optional. Uses your browser's local timezone and is stored as UTC.", "Planned unfreeze: 2026-07-13 09:00 UTC", "No planned unfreeze", "&lt;script&gt;alert", "Lift", "Cancel", `<form method="post" action="/freezes/end" data-confirm-submit data-confirm-title="Lift freeze?"`, `data-confirm-action="Lift freeze"`, `<button type="submit" class="tg-btn tg-btn-primary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg>Lift</button>`, `<form method="post" action="/freezes/cancel" data-confirm-submit data-confirm-title="Cancel freeze?"`, `data-confirm-action="Cancel freeze"`, `data-alert-dialog hidden`} {
+	for _, want := range []string{"Create a freeze", "Freeze effect", "Evaluated on submit", "policy summary, not a live forge lookup", "Active Freezes", "taua-almeida/thawguard", "dev", "QA freeze", "Freeze Branch", "Planned unfreeze", `name="planned_ends_at"`, `name="timezone_offset_minutes"`, "Enabled when browser-local timezone conversion is available; stored as UTC.", "Planned unfreeze is unavailable without JavaScript", "data-local-datetime disabled", "2026-07-13 09:00 UTC", "No planned unfreeze", "&lt;script&gt;alert", "Lift", "Cancel", "tg-responsive-table", "Active freeze mobile cards", `<form method="post" action="/freezes/end" data-confirm-submit data-confirm-title="Lift freeze?"`, `data-confirm-action="Lift freeze"`, `<button type="submit" class="tg-btn tg-btn-primary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg>Lift</button>`, `<form method="post" action="/freezes/cancel" data-confirm-submit data-confirm-title="Cancel freeze?"`, `data-confirm-action="Cancel freeze"`, `data-alert-dialog hidden`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
@@ -914,6 +906,11 @@ func TestFreezesPageShowsRepositoriesAndActiveFreezes(t *testing.T) {
 	}
 	if strings.Contains(body, "window."+"confirm") {
 		t.Fatalf("expected custom confirmation dialog instead of browser confirm, got %q", body)
+	}
+	for _, fictional := range []string{"3 open PRs", "#248", "Fix checkout tax rounding", "Live preview of PRs"} {
+		if strings.Contains(body, fictional) {
+			t.Fatalf("expected freezes page not to present fictional live data %q, got %q", fictional, body)
+		}
 	}
 }
 
@@ -1277,8 +1274,19 @@ func TestCreateFreezeRendersPastPlannedUnfreezeValidation(t *testing.T) {
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.AddCookie(cookie)
 	server.Routes().ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "planned unfreeze time must be in the future") {
-		t.Fatalf("expected safe past-time validation, status=%d body=%q", recorder.Code, recorder.Body.String())
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(body, "planned unfreeze time must be in the future") {
+		t.Fatalf("expected safe past-time validation, status=%d body=%q", recorder.Code, body)
+	}
+	for _, preserved := range []string{
+		`<option value="1" selected>taua-almeida/thawguard</option>`,
+		`<option value="main" data-repository="1" selected>main</option>`,
+		`<input name="reason" value="release window"`,
+		`name="planned_ends_at" value="2020-01-01T00:00"`,
+	} {
+		if !strings.Contains(body, preserved) {
+			t.Fatalf("expected validation render to preserve %q, got %q", preserved, body)
+		}
 	}
 }
 

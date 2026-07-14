@@ -1,0 +1,47 @@
+{{ define "components/active-freezes" }}
+    <section class="tg-panel tg-active-freezes-panel">
+      <div class="tg-panel-head"><h2>Active Freezes</h2><span class="tg-badge">{{ len .ActiveFreezes }} active</span></div>
+      {{ if .ActiveFreezes }}
+      <div class="tg-table-wrap tg-responsive-table">
+        <table class="tg-data-table tg-freezes-table">
+          <thead><tr><th>Repository / branch</th><th>Reason</th><th>Planned unfreeze</th><th>Status</th><th>Actions</th></tr></thead>
+          <tbody>
+          {{ range .ActiveFreezes }}
+            <tr>
+              <td><span class="tg-table-repo"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-freeze-branch"></use></svg><code>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Freeze.RepositoryID }}{{ end }}</code><span class="tg-arrow">→</span><code class="tg-branch">{{ .Freeze.Branch }}</code></span></td>
+              <td class="tg-freeze-reason">{{ .Freeze.Reason }}</td>
+              <td>{{ if .HasPlannedEndAt }}{{ .PlannedEndsAt }}{{ else }}<span class="tg-muted">No planned unfreeze</span>{{ end }}</td>
+              <td><span class="status status-frozen">{{ .Freeze.Status }}</span></td>
+              <td class="tg-table-actions">
+{{ template "components/active-freeze-actions" . }}
+              </td>
+            </tr>
+          {{ end }}
+          </tbody>
+        </table>
+      </div>
+      <div class="tg-mobile-card-list" aria-label="Active freeze mobile cards">
+        {{ range .ActiveFreezes }}
+        <article class="tg-mobile-card">
+          <div class="tg-mobile-card-head">
+            <div><span class="tg-mobile-card-kicker">{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Freeze.RepositoryID }}{{ end }}</span><h3>{{ .Freeze.Branch }}</h3></div>
+            <span class="status status-frozen">{{ .Freeze.Status }}</span>
+          </div>
+          <dl class="tg-mobile-card-grid">
+            <div><dt>Planned unfreeze</dt><dd>{{ if .HasPlannedEndAt }}{{ .PlannedEndsAt }}{{ else }}None{{ end }}</dd></div>
+            <div><dt>Policy</dt><dd>Exact branch</dd></div>
+          </dl>
+          <p class="tg-mobile-card-detail">{{ .Freeze.Reason }}</p>
+          <div class="tg-table-actions tg-active-freeze-actions">
+{{ template "components/active-freeze-actions" . }}
+          </div>
+        </article>
+        {{ end }}
+      </div>
+      {{ else }}
+        <div class="tg-empty-row">
+          <strong>No active freezes yet</strong>
+          <span>Freeze a repository branch to see it listed here.</span>
+        </div>
+      {{ end }}
+    </section>{{ end }}

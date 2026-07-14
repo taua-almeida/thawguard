@@ -158,13 +158,6 @@ type managedBranchOption struct {
 	Name         string
 }
 
-type freezeView struct {
-	Freeze          domain.BranchFreeze
-	Repository      domain.Repository
-	PlannedEndsAt   string
-	HasPlannedEndAt bool
-}
-
 type scheduledFreezeView struct {
 	Freeze                domain.BranchFreeze
 	Repository            domain.Repository
@@ -1230,7 +1223,7 @@ func (s *Server) handleFreezes(w http.ResponseWriter, r *http.Request) {
 		internalServerError(w)
 		return
 	}
-	s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), branchOptions, "", session)
+	s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), branchOptions, freezesPageState{}, session)
 }
 
 func (s *Server) handleCreateFreeze(w http.ResponseWriter, r *http.Request) {
@@ -1259,7 +1252,10 @@ func (s *Server) handleCreateFreeze(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
-		s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), branchOptions, err.Error(), session)
+		s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), branchOptions, freezesPageState{
+			FormError:  err.Error(),
+			FreezeForm: freezeFormStateFromRequest(r),
+		}, session)
 		return
 	}
 	http.Redirect(w, r, "/freezes", http.StatusSeeOther)
@@ -1299,7 +1295,7 @@ func (s *Server) handleCloseFreeze(w http.ResponseWriter, r *http.Request, close
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
-		s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), branchOptions, err.Error(), session)
+		s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), branchOptions, freezesPageState{FormError: err.Error()}, session)
 		return
 	}
 	http.Redirect(w, r, "/freezes", http.StatusSeeOther)
@@ -2978,39 +2974,6 @@ func (s *Server) scheduledFreezePageData(ctx context.Context) ([]domain.Reposito
 	return repositories, scheduled, branchOptions, nil
 }
 
-func (s *Server) freezePageData(ctx context.Context) ([]domain.Repository, []domain.BranchFreeze, []managedBranchOption, error) {
-	repositories, err := s.repositories(ctx)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	freezes, err := s.activeFreezes(ctx)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	branchOptions, err := s.managedBranchOptions(ctx, repositories)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	return repositories, freezes, branchOptions, nil
-}
-
-func (s *Server) freezeViews(repositories []domain.Repository, freezes []domain.BranchFreeze) []freezeView {
-	repositoriesByID := make(map[int64]domain.Repository, len(repositories))
-	for _, repo := range repositories {
-		repositoriesByID[repo.ID] = repo
-	}
-	views := make([]freezeView, 0, len(freezes))
-	for _, freeze := range freezes {
-		views = append(views, freezeView{
-			Freeze:          freeze,
-			Repository:      repositoriesByID[freeze.RepositoryID],
-			PlannedEndsAt:   optionalScheduleTime(freeze.PlannedEndsAt),
-			HasPlannedEndAt: freeze.PlannedEndsAt != nil && !freeze.PlannedEndsAt.IsZero(),
-		})
-	}
-	return views
-}
-
 func scheduledFreezeViews(repositories []domain.Repository, freezes []domain.BranchFreeze, state scheduledFreezePageState) []scheduledFreezeView {
 	repositoriesByID := repositoriesByID(repositories)
 	views := make([]scheduledFreezeView, 0, len(freezes))
@@ -3172,19 +3135,6 @@ func (s *Server) managedBranchOptions(ctx context.Context, repositories []domain
 		}
 	}
 	return options, nil
-}
-
-func (s *Server) renderFreezes(w http.ResponseWriter, repositories []domain.Repository, freezes []freezeView, branchOptions []managedBranchOption, formError string, session sessionState) {
-	s.render(w, freezesTemplate, map[string]any{
-		"AppName":                 s.cfg.AppName,
-		"ActivePage":              "freezes",
-		"CurrentUser":             currentUserFromSession(session),
-		"EnforceableRepositories": enforcementActiveRepositories(repositories),
-		"BranchOptions":           branchOptions,
-		"Freezes":                 freezes,
-		"FormError":               formError,
-		"CSRFToken":               session.CSRFToken,
-	})
 }
 
 // enforcementActiveRepositories keeps mutation forms scoped to repositories
@@ -4176,148 +4126,6 @@ const publicationsTemplate = pageHead + `
       {{ end }}
     </section>
   </main>` + pageFoot
-
-const freezesTemplate = pageHead + `
-  <main class="tg-main tg-setup-page tg-freezes-page">
-    <header class="tg-header">
-      <div>
-        <h1 class="tg-title">Branch Freezes</h1>
-        <p class="tg-subtitle">Freeze a branch to block merges, then review and lift active freezes.</p>
-      </div>
-      <span class="tg-badge tg-badge-info"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-warning"></use></svg>Cooperative enforcement — auditable, not a hard security gate</span>
-    </header>
-
-    {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
-
-    <section class="tg-freeze-workbench" aria-label="Create branch freeze and preview impact">
-      <section class="tg-panel tg-freeze-form-panel">
-        <div class="tg-panel-head tg-panel-head-stacked">
-          <div>
-            <h2>Create a freeze</h2>
-            <p class="tg-panel-subtitle">Open PRs on the branch receive a failing <code>` + domain.RequiredStatusContext + `</code> status check.</p>
-          </div>
-        </div>
-        {{ if not .CurrentUser.CanFreeze }}
-        <div class="tg-empty-row">
-          <strong>Read-only freeze access</strong>
-          <span>Your role can view freezes. Explicit freezer role is required to create, lift, or cancel freezes.</span>
-        </div>
-        {{ else if .EnforceableRepositories }}
-        <form method="post" action="/freezes" class="tg-setup-form tg-freeze-form" data-freeze-form>
-          <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
-          <input type="hidden" name="timezone_offset_minutes" value="0" data-timezone-offset-minutes>
-          <label>Repository
-            <select name="repository_id" required data-freeze-repository>
-            {{ range .EnforceableRepositories }}<option value="{{ .ID }}">{{ .FullName }}</option>{{ end }}
-            </select>
-          </label>
-          <label>Branch
-            <select name="branch" required data-freeze-branch>
-            {{ range .BranchOptions }}<option value="{{ .Name }}" data-repository="{{ .RepositoryID }}">{{ .Name }}</option>{{ end }}
-            </select>
-          </label>
-          <label class="tg-field-wide">Reason <input name="reason" placeholder="Release cut 2026-07 — QA verification in progress" required></label>
-          <label>Planned unfreeze <input type="datetime-local" name="planned_ends_at" aria-describedby="immediate-planned-unfreeze-help"></label>
-          <small id="immediate-planned-unfreeze-help" class="tg-muted">Optional. Uses your browser's local timezone and is stored as UTC.</small>
-          <div class="tg-freeze-form-footer tg-field-wide">
-            <span class="tg-muted"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-audit"></use></svg>Every freeze appears in activity.</span>
-            <div class="tg-freeze-form-actions">
-              <button type="reset" class="tg-btn tg-btn-secondary tg-btn-sm">Reset</button>
-              <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-freeze-branch"></use></svg>Freeze Branch</button>
-            </div>
-          </div>
-        </form>
-        {{ else }}
-        <div class="tg-empty-row">
-          <strong>No repository has active enforcement</strong>
-          <span>Repository enforcement is not active. Complete setup and activate enforcement before creating a freeze.</span>
-          <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/repositories">Repository setup</a>
-        </div>
-        {{ end }}
-      </section>
-
-      <aside class="tg-panel tg-impact-card">
-        <div class="tg-panel-head tg-impact-head">
-          <div class="tg-impact-title-row">
-            <h2><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-branch-impact"></use></svg>Preview impact</h2>
-          <span class="tg-badge status-warning">3 open PRs</span>
-          </div>
-          <p class="tg-panel-subtitle">Live preview of PRs blocked by this freeze. Updates on repo/branch change; real lookup is wired later.</p>
-        </div>
-        <div class="tg-impact-context"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-git-branch"></use></svg><code data-preview-repository>Selected repository</code><span class="tg-arrow">→</span><code class="tg-branch" data-preview-branch>main</code></div>
-        <div class="tg-pr-preview-list">
-          <div class="tg-pr-preview-row"><a href="#">#248</a><div><strong>Fix checkout tax rounding</strong><small>Ivo · a3f7c2d</small></div></div>
-          <div class="tg-pr-preview-row"><a href="#">#245</a><div><strong>Add coupon validation endpoint</strong><small>Priya · 7be9f1d</small></div></div>
-          <div class="tg-pr-preview-row"><a href="#">#241</a><div><strong>Update shipping rate calculator</strong><small>Lena · c02de84</small></div></div>
-        </div>
-        <p class="tg-impact-warning"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-warning"></use></svg>These PRs will get a failing <code>` + domain.RequiredStatusContext + `</code> check until the freeze is lifted.</p>
-      </aside>
-    </section>
-
-    <section class="tg-panel tg-active-freezes-panel">
-      <div class="tg-panel-head"><h2>Active Freezes</h2><span class="tg-badge">{{ len .Freezes }} active</span></div>
-      {{ if .Freezes }}
-      <div class="tg-table-wrap">
-        <table class="tg-data-table tg-freezes-table">
-          <thead><tr><th>Repository / branch</th><th>Reason</th><th>Expiry</th><th>PRs</th><th>Status</th><th></th></tr></thead>
-          <tbody>
-          {{ range .Freezes }}
-            <tr>
-              <td><span class="tg-table-repo"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-freeze-branch"></use></svg><code>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Freeze.RepositoryID }}{{ end }}</code><span class="tg-arrow">→</span><code class="tg-branch">{{ .Freeze.Branch }}</code></span></td>
-              <td>{{ .Freeze.Reason }}</td>
-              <td>{{ if .HasPlannedEndAt }}Planned unfreeze: {{ .PlannedEndsAt }}{{ else }}<span class="tg-muted">No planned unfreeze</span>{{ end }}</td>
-              <td><span class="tg-muted">preview</span></td>
-              <td><span class="status status-frozen">{{ .Freeze.Status }}</span></td>
-              <td class="tg-table-actions">
-                {{ if $.CurrentUser.CanFreeze }}
-                <form method="post" action="/freezes/end" data-confirm-submit data-confirm-title="Lift freeze?" data-confirm-message="Future status recomputation can pass if no other freeze applies. This action is auditable and may publish updated statuses for known open PRs." data-confirm-action="Lift freeze">
-                  <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
-                  <input type="hidden" name="freeze_id" value="{{ .Freeze.ID }}">
-                  <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg>Lift</button>
-                </form>
-                <form method="post" action="/freezes/cancel" data-confirm-submit data-confirm-title="Cancel freeze?" data-confirm-message="This removes the local active freeze without completing it or recording it as ended. Thawguard will recompute statuses for known open PRs after the freeze changes." data-confirm-action="Cancel freeze">
-                  <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
-                  <input type="hidden" name="freeze_id" value="{{ .Freeze.ID }}">
-                  <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-close"></use></svg>Cancel</button>
-                </form>
-                {{ else }}
-                <span class="tg-muted">Read only</span>
-                {{ end }}
-              </td>
-            </tr>
-          {{ end }}
-          </tbody>
-        </table>
-      </div>
-      {{ else }}
-        <div class="tg-empty-row">
-          <strong>No active freezes yet</strong>
-          <span>Freeze a repository branch to see it listed here.</span>
-        </div>
-      {{ end }}
-    </section>
-  </main>
-  <script>
-    (() => {` + branchFilterScript + `
-      const form = document.querySelector('[data-freeze-form]');
-      if (!form) return;
-      const repo = form.querySelector('[data-freeze-repository]');
-      const branch = form.querySelector('[data-freeze-branch]');
-      const timezoneOffset = form.querySelector('[data-timezone-offset-minutes]');
-      if (timezoneOffset) timezoneOffset.value = String(new Date().getTimezoneOffset());
-      const repoOut = document.querySelector('[data-preview-repository]');
-      const branchOut = document.querySelector('[data-preview-branch]');
-      const update = () => {
-        if (repoOut && repo) repoOut.textContent = repo.options[repo.selectedIndex]?.textContent?.trim() || 'Selected repository';
-        if (branchOut && branch) branchOut.textContent = branch.value.trim() || 'branch';
-      };
-      repo.addEventListener('change', () => { filterBranchOptions(repo, branch); update(); });
-      branch.addEventListener('change', update);
-      filterBranchOptions(repo, branch);
-      update();
-    })();
-  </script>
-` + pageFoot
 
 // branchFilterScript keeps the managed-branch select scoped to the selected
 // repository. Server-side (repository_id, branch) validation stays

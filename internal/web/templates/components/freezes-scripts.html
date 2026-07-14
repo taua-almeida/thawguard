@@ -1,0 +1,45 @@
+{{ define "components/freezes-scripts" }}
+  <script>
+    (() => {
+      const filterBranchOptions = (repo, branch) => {
+        if (!repo || !branch) return;
+        let first = null;
+        for (const option of branch.options) {
+          const match = option.dataset.repository === repo.value;
+          option.hidden = !match;
+          option.disabled = !match;
+          if (match && first === null) first = option;
+        }
+        const selected = branch.options[branch.selectedIndex];
+        if ((!selected || selected.disabled) && first !== null) branch.value = first.value;
+      };
+
+      const form = document.querySelector('[data-freeze-form]');
+      if (!form) return;
+      const repo = form.querySelector('[data-freeze-repository]');
+      const branch = form.querySelector('[data-freeze-branch]');
+      const timezoneOffset = form.querySelector('[data-timezone-offset-minutes]');
+      const plannedEndsAt = form.querySelector('[data-local-datetime]');
+      const updateTimezoneOffset = () => {
+        if (!timezoneOffset) return;
+        const selectedTime = plannedEndsAt?.value ? new Date(plannedEndsAt.value) : new Date();
+        if (!Number.isNaN(selectedTime.getTime())) timezoneOffset.value = String(selectedTime.getTimezoneOffset());
+      };
+      if (plannedEndsAt) {
+        plannedEndsAt.disabled = false;
+        plannedEndsAt.addEventListener('change', updateTimezoneOffset);
+      }
+      form.addEventListener('submit', updateTimezoneOffset);
+      updateTimezoneOffset();
+      const repoOut = document.querySelector('[data-preview-repository]');
+      const branchOut = document.querySelector('[data-preview-branch]');
+      const update = () => {
+        if (repoOut && repo) repoOut.textContent = repo.options[repo.selectedIndex]?.textContent?.trim() || 'Selected repository';
+        if (branchOut && branch) branchOut.textContent = branch.value.trim() || 'branch';
+      };
+      repo?.addEventListener('change', () => { filterBranchOptions(repo, branch); update(); });
+      branch?.addEventListener('change', update);
+      filterBranchOptions(repo, branch);
+      update();
+    })();
+  </script>{{ end }}
