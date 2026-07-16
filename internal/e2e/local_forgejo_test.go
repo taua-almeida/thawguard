@@ -4,8 +4,12 @@ package e2e
 
 import (
 	"bytes"
+	"cmp"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -28,6 +32,8 @@ const (
 	fixtureReleaseBranch = "release"
 	fixtureFeatureBranch = "feature/freeze-check"
 	requiredContext      = "thawguard/freeze"
+	invalidDeliveryID    = "e2e-invalid-signature-fixture"
+	duplicateDeliveryID  = "e2e-duplicate-delivery-fixture"
 )
 
 type e2eConfig struct {
@@ -67,6 +73,16 @@ type commitStatus struct {
 	Status  string `json:"status"`
 }
 
+type webhookSideEffectEvidence struct {
+	webhookPage         string
+	webhookRows         int
+	statusResults       int
+	publicationIntents  int
+	publicationAttempts int
+	activityEvents      int
+	freezeStatuses      []commitStatus
+}
+
 func TestLocalForgejoFreezeLifecycle(t *testing.T) {
 	if os.Getenv("THAWGUARD_E2E") != "1" {
 		t.Skip("set THAWGUARD_E2E=1 and use make e2e")
@@ -102,9 +118,21 @@ func TestLocalForgejoFreezeLifecycle(t *testing.T) {
 	createFreeze(t, ctx, browser, repositoryID)
 	waitForStatus(t, ctx, forgejo, pr.Head.SHA, "failure")
 	assertMergeBlockedByRequiredStatus(t, ctx, forgejo, pr.Number)
+	openPullRequestSyncsBeforeProbes := countOpenPullRequestSyncEvents(requirePage(t, ctx, browser, "/activity"))
+
+	t.Run("invalid signature has no side effects", func(t *testing.T) {
+		payload := syntheticPullRequestWebhookPayload(t, cfg, pr.Number+1000, pr.Head.SHA)
+		assertInvalidSignatureHasNoSideEffects(t, ctx, forgejo, browser, cfg, repositoryID, pr.Head.SHA, payload)
+	})
+	t.Run("duplicate delivery is idempotent", func(t *testing.T) {
+		payload := syntheticPullRequestWebhookPayload(t, cfg, pr.Number, pr.Head.SHA)
+		assertDuplicateDeliveryIsIdempotent(t, ctx, forgejo, browser, cfg, repositoryID, pr.Head.SHA, payload)
+	})
 
 	liftFreeze(t, ctx, browser)
 	waitForStatus(t, ctx, forgejo, pr.Head.SHA, "success")
+	activityPage := waitForOneNewOpenPullRequestSync(t, ctx, browser, openPullRequestSyncsBeforeProbes)
+	requireLatestOpenPullRequestSync(t, activityPage)
 }
 
 func loadConfig(t *testing.T) e2eConfig {
@@ -254,6 +282,266 @@ func createForgejoPullRequest(t *testing.T, ctx context.Context, forgejo *forgej
 	return pr
 }
 
+// syntheticPullRequestWebhookPayload is an in-memory E2E fixture sent by this
+// test, not an event emitted by Forgejo. It contains only fields required for
+// pull request parsing and processing and uses the disposable fictional repo.
+func syntheticPullRequestWebhookPayload(t *testing.T, cfg e2eConfig, index int, headSHA string) []byte {
+	t.Helper()
+	payload := map[string]any{
+		"action": "synchronized",
+		"repository": map[string]any{
+			"owner":     map[string]string{"login": fixtureOwner},
+			"name":      fixtureRepository,
+			"clone_url": cfg.forgejoURL + "/" + fixtureOwner + "/" + fixtureRepository + ".git",
+		},
+		"pull_request": map[string]any{
+			"number":   index,
+			"title":    "Fictional release check",
+			"state":    "open",
+			"html_url": cfg.forgejoURL + "/" + fixtureOwner + "/" + fixtureRepository + "/pulls/" + strconv.Itoa(index),
+			"base":     map[string]string{"ref": "main"},
+			"head":     map[string]string{"sha": headSHA},
+		},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("encode synthetic E2E webhook fixture: %v", err)
+	}
+	return body
+}
+
+func assertInvalidSignatureHasNoSideEffects(t *testing.T, ctx context.Context, forgejo *forgejoAPI, browser *thawguardBrowser, cfg e2eConfig, repositoryID int64, headSHA string, payload []byte) {
+	t.Helper()
+	before := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, headSHA)
+	if strings.Contains(before.webhookPage, invalidDeliveryID) {
+		t.Fatalf("invalid-signature fixture delivery ID %q already exists", invalidDeliveryID)
+	}
+
+	response, err := postSyntheticWebhook(ctx, cfg.thawguardURL, payload, invalidDeliveryID, "invalid-e2e-signing-secret")
+	requireAcceptedWebhookResponse(t, response, err, "invalid-signature fixture")
+
+	after := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, headSHA)
+	if strings.Contains(after.webhookPage, invalidDeliveryID) {
+		t.Fatalf("invalid-signature fixture delivery ID %q was recorded", invalidDeliveryID)
+	}
+	requireIdenticalWebhookEvidence(t, before, after, "invalid-signature fixture")
+}
+
+func assertDuplicateDeliveryIsIdempotent(t *testing.T, ctx context.Context, forgejo *forgejoAPI, browser *thawguardBrowser, cfg e2eConfig, repositoryID int64, headSHA string, payload []byte) {
+	t.Helper()
+	before := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, headSHA)
+	if strings.Contains(before.webhookPage, duplicateDeliveryID) {
+		t.Fatalf("duplicate fixture delivery ID %q already exists", duplicateDeliveryID)
+	}
+
+	response, err := postSyntheticWebhook(ctx, cfg.thawguardURL, payload, duplicateDeliveryID, cfg.webhookSecret)
+	requireAcceptedWebhookResponse(t, response, err, "first duplicate fixture request")
+	afterFirst := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, headSHA)
+	requireProcessedVerifiedDelivery(t, afterFirst.webhookPage, duplicateDeliveryID)
+	if afterFirst.webhookRows != before.webhookRows+1 {
+		t.Fatalf("first duplicate fixture request changed webhook rows by %d, want 1", afterFirst.webhookRows-before.webhookRows)
+	}
+	if afterFirst.statusResults != before.statusResults+1 {
+		t.Fatalf("first duplicate fixture request changed status results by %d, want 1", afterFirst.statusResults-before.statusResults)
+	}
+	if afterFirst.publicationIntents != before.publicationIntents {
+		t.Fatalf("first duplicate fixture request changed idempotent publication intent count from %d to %d", before.publicationIntents, afterFirst.publicationIntents)
+	}
+	if afterFirst.publicationAttempts != before.publicationAttempts+1 {
+		t.Fatalf("first duplicate fixture request changed publication attempts by %d, want 1", afterFirst.publicationAttempts-before.publicationAttempts)
+	}
+	if afterFirst.activityEvents != before.activityEvents {
+		t.Fatalf("first duplicate fixture request unexpectedly changed activity events from %d to %d", before.activityEvents, afterFirst.activityEvents)
+	}
+	if len(afterFirst.freezeStatuses) != len(before.freezeStatuses)+1 {
+		t.Fatalf("first duplicate fixture request changed Forgejo freeze statuses by %d, want 1", len(afterFirst.freezeStatuses)-len(before.freezeStatuses))
+	}
+	if latest := afterFirst.freezeStatuses[len(afterFirst.freezeStatuses)-1]; latest.Status != "failure" {
+		t.Fatalf("first duplicate fixture request posted latest %s=%q, want failure", requiredContext, latest.Status)
+	}
+
+	response, err = postSyntheticWebhook(ctx, cfg.thawguardURL, payload, duplicateDeliveryID, cfg.webhookSecret)
+	requireAcceptedWebhookResponse(t, response, err, "second duplicate fixture request")
+	afterSecond := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, headSHA)
+	requireProcessedVerifiedDelivery(t, afterSecond.webhookPage, duplicateDeliveryID)
+	requireIdenticalWebhookEvidence(t, afterFirst, afterSecond, "second duplicate fixture request")
+}
+
+func postSyntheticWebhook(ctx context.Context, baseURL string, payload []byte, deliveryID, signingSecret string) (apiResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/webhooks/forgejo", bytes.NewReader(payload))
+	if err != nil {
+		return apiResponse{}, fmt.Errorf("create synthetic E2E webhook request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Forgejo-Event", "pull_request")
+	req.Header.Set("X-Forgejo-Delivery", deliveryID)
+	req.Header.Set("X-Forgejo-Signature", syntheticWebhookSignature(payload, signingSecret))
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		return apiResponse{}, fmt.Errorf("send synthetic E2E webhook request: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	if err != nil {
+		return apiResponse{}, fmt.Errorf("read synthetic E2E webhook response: %w", err)
+	}
+	return apiResponse{statusCode: resp.StatusCode, body: body}, nil
+}
+
+func syntheticWebhookSignature(payload []byte, secret string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write(payload)
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+}
+
+func requireAcceptedWebhookResponse(t *testing.T, response apiResponse, err error, operation string) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("%s: %v", operation, err)
+	}
+	if response.statusCode != http.StatusAccepted || string(response.body) != "accepted\n" {
+		t.Fatalf("%s did not return the generic accepted response (status=%d)", operation, response.statusCode)
+	}
+}
+
+func collectWebhookSideEffectEvidence(t *testing.T, ctx context.Context, forgejo *forgejoAPI, browser *thawguardBrowser, repositoryID int64, headSHA string) webhookSideEffectEvidence {
+	t.Helper()
+	webhookPath := "/webhooks?" + url.Values{
+		"repository_id": {strconv.FormatInt(repositoryID, 10)},
+		"event":         {"pull_request"},
+		"limit":         {"100"},
+	}.Encode()
+	webhookPage := requirePage(t, ctx, browser, webhookPath)
+	decisionsPage := requirePage(t, ctx, browser, "/decisions")
+	publicationsPage := requirePage(t, ctx, browser, "/publications")
+	activityPage := requirePage(t, ctx, browser, "/activity")
+	statuses, err := listForgejoFreezeStatuses(ctx, forgejo, headSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return webhookSideEffectEvidence{
+		webhookPage:         webhookPage,
+		webhookRows:         requirePageCount(t, webhookPage, webhookRowsPattern, "webhook rows"),
+		statusResults:       requirePageCount(t, decisionsPage, statusResultsPattern, "status results"),
+		publicationIntents:  requirePageCount(t, publicationsPage, publicationIntentsPattern, "publication intents"),
+		publicationAttempts: requirePageCount(t, publicationsPage, publicationAttemptsPattern, "publication attempts"),
+		activityEvents:      requirePageCount(t, activityPage, activityEventsPattern, "activity events"),
+		freezeStatuses:      statuses,
+	}
+}
+
+func requirePageCount(t *testing.T, page string, pattern *regexp.Regexp, label string) int {
+	t.Helper()
+	match := pattern.FindStringSubmatch(page)
+	if len(match) != 2 {
+		t.Fatalf("could not read %s count from rendered page", label)
+	}
+	count, err := strconv.Atoi(match[1])
+	if err != nil {
+		t.Fatalf("parse %s count: %v", label, err)
+	}
+	return count
+}
+
+func listForgejoFreezeStatuses(ctx context.Context, forgejo *forgejoAPI, headSHA string) ([]commitStatus, error) {
+	response, err := forgejo.do(ctx, http.MethodGet, forgejo.repositoryPath("commits", headSHA, "statuses"), nil)
+	if err != nil {
+		return nil, err
+	}
+	if response.statusCode != http.StatusOK {
+		return nil, apiStatusError(response, "list Forgejo commit statuses")
+	}
+	var statuses []commitStatus
+	if err := json.Unmarshal(response.body, &statuses); err != nil {
+		return nil, fmt.Errorf("decode Forgejo commit statuses: %w", err)
+	}
+	filtered := statuses[:0]
+	for _, status := range statuses {
+		if status.Context == requiredContext {
+			filtered = append(filtered, status)
+		}
+	}
+	slices.SortFunc(filtered, func(a, b commitStatus) int { return cmp.Compare(a.ID, b.ID) })
+	return filtered, nil
+}
+
+func requireProcessedVerifiedDelivery(t *testing.T, page, deliveryID string) {
+	t.Helper()
+	marker := ">" + html.EscapeString(deliveryID) + "</code>"
+	if count := strings.Count(page, marker); count != 2 {
+		t.Fatalf("delivery ID %q rendered %d times, want one desktop row and one mobile card", deliveryID, count)
+	}
+	markerIndex := strings.Index(page, marker)
+	rowStart := strings.LastIndex(page[:markerIndex], `<tr id="delivery-`)
+	rowEndOffset := strings.Index(page[markerIndex:], "</tr>")
+	if rowStart < 0 || rowEndOffset < 0 {
+		t.Fatalf("delivery ID %q is missing its desktop row", deliveryID)
+	}
+	row := page[rowStart : markerIndex+rowEndOffset]
+	if !strings.Contains(row, ">verified</span>") || !strings.Contains(row, ">processed</span>") {
+		t.Fatalf("delivery ID %q is not rendered as verified and processed", deliveryID)
+	}
+}
+
+func countOpenPullRequestSyncEvents(page string) int {
+	return strings.Count(page, `<td data-label="Action">Open pull request sync</td>`)
+}
+
+func waitForOneNewOpenPullRequestSync(t *testing.T, ctx context.Context, browser *thawguardBrowser, before int) string {
+	t.Helper()
+	expected := before + 1
+	var activityPage string
+	waitFor(t, 30*time.Second, "one new open pull request sync activity event", func() (bool, error) {
+		page, err := browser.get(ctx, "/activity")
+		if err != nil {
+			return false, err
+		}
+		activityPage = page
+		return countOpenPullRequestSyncEvents(page) >= expected, nil
+	})
+	if actual := countOpenPullRequestSyncEvents(activityPage); actual != expected {
+		t.Fatalf("open pull request sync activity events changed from %d to %d, want exactly %d", before, actual, expected)
+	}
+	return activityPage
+}
+
+func requireLatestOpenPullRequestSync(t *testing.T, page string) {
+	t.Helper()
+	marker := `<td data-label="Action">Open pull request sync</td>`
+	markerIndex := strings.Index(page, marker)
+	if markerIndex < 0 {
+		t.Fatal("activity is missing an open pull request sync event")
+	}
+	rowStart := strings.LastIndex(page[:markerIndex], "<tr>")
+	rowEndOffset := strings.Index(page[markerIndex:], "</tr>")
+	if rowStart < 0 || rowEndOffset < 0 {
+		t.Fatal("latest open pull request sync event is missing its activity row")
+	}
+	row := page[rowStart : markerIndex+rowEndOffset]
+	if !strings.Contains(row, "1 open PRs synchronized; 0 cached PRs marked closed.") {
+		t.Fatal("latest forge sync did not confirm one real PR and zero invalid-signature cache entries")
+	}
+}
+
+func requireIdenticalWebhookEvidence(t *testing.T, before, after webhookSideEffectEvidence, operation string) {
+	t.Helper()
+	if before.webhookRows != after.webhookRows ||
+		before.statusResults != after.statusResults ||
+		before.publicationIntents != after.publicationIntents ||
+		before.publicationAttempts != after.publicationAttempts ||
+		before.activityEvents != after.activityEvents ||
+		!slices.Equal(before.freezeStatuses, after.freezeStatuses) {
+		t.Fatalf("%s changed side-effect evidence: webhook rows %d→%d, status results %d→%d, publication intents %d→%d, publication attempts %d→%d, activity events %d→%d, Forgejo freeze statuses %d→%d",
+			operation,
+			before.webhookRows, after.webhookRows,
+			before.statusResults, after.statusResults,
+			before.publicationIntents, after.publicationIntents,
+			before.publicationAttempts, after.publicationAttempts,
+			before.activityEvents, after.activityEvents,
+			len(before.freezeStatuses), len(after.freezeStatuses))
+	}
+}
+
 func activateEnforcement(t *testing.T, ctx context.Context, browser *thawguardBrowser, repositoryID int64) {
 	t.Helper()
 	page := requirePage(t, ctx, browser, "/repositories")
@@ -316,27 +604,14 @@ func liftFreeze(t *testing.T, ctx context.Context, browser *thawguardBrowser) {
 func waitForStatus(t *testing.T, ctx context.Context, forgejo *forgejoAPI, sha, expected string) {
 	t.Helper()
 	waitFor(t, 30*time.Second, requiredContext+"="+expected, func() (bool, error) {
-		response, err := forgejo.do(ctx, http.MethodGet, forgejo.repositoryPath("commits", sha, "statuses"), nil)
+		statuses, err := listForgejoFreezeStatuses(ctx, forgejo, sha)
 		if err != nil {
 			return false, err
 		}
-		if response.statusCode != http.StatusOK {
-			return false, apiStatusError(response, "list Forgejo commit statuses")
+		if len(statuses) == 0 {
+			return false, nil
 		}
-		var statuses []commitStatus
-		if err := json.Unmarshal(response.body, &statuses); err != nil {
-			return false, fmt.Errorf("decode Forgejo commit statuses: %w", err)
-		}
-		var latest commitStatus
-		for _, status := range statuses {
-			if status.Context == requiredContext && status.ID > latest.ID {
-				latest = status
-			}
-		}
-		if latest.ID != 0 {
-			return latest.Status == expected, nil
-		}
-		return false, nil
+		return statuses[len(statuses)-1].Status == expected, nil
 	})
 }
 
@@ -477,7 +752,14 @@ func requireHiddenInput(t *testing.T, page, name string) string {
 	return html.UnescapeString(match[1])
 }
 
-var nonzeroMatchingRows = regexp.MustCompile(`Showing [1-9][0-9]* of [1-9][0-9]* matching rows`)
+var (
+	nonzeroMatchingRows        = regexp.MustCompile(`Showing [1-9][0-9]* of [1-9][0-9]* matching rows`)
+	webhookRowsPattern         = regexp.MustCompile(`Showing ([0-9]+) of [0-9]+ matching rows`)
+	statusResultsPattern       = regexp.MustCompile(`Thaw approval results</h2><span[^>]*>([0-9]+) status results</span>`)
+	publicationIntentsPattern  = regexp.MustCompile(`Latest desired statuses</h2><span[^>]*>([0-9]+) shown</span>`)
+	publicationAttemptsPattern = regexp.MustCompile(`Recent publication attempts</h2><span[^>]*>([0-9]+) shown</span>`)
+	activityEventsPattern      = regexp.MustCompile(`Recent activity</h2><span[^>]*>([0-9]+) shown</span>`)
+)
 
 func requireAPIStatus(t *testing.T, response apiResponse, err error, expected int, operation string) {
 	t.Helper()

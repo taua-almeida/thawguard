@@ -133,8 +133,14 @@ The target:
 6. provisions a private repository, branches, commits, branch protection, and webhook through Forgejo's HTTP API;
 7. creates the first Thawguard admin and configures repository credentials and managed branches through real CSRF-protected HTTP forms;
 8. opens a real Forgejo pull request, causing Forgejo itself to emit the signed webhook;
-9. verifies the delivery, activates enforcement through the real workflow, creates a freeze, observes a failing status and blocked merge, lifts the freeze, and observes success; and
-10. removes both containers and both named volumes on success or failure.
+9. verifies the real delivery and activates enforcement through the real workflow;
+10. creates a freeze and observes a failing status;
+11. confirms the required status blocks the merge;
+12. sends sanitized in-memory E2E fixtures to the real webhook endpoint, proving an invalid signature has no trusted side effects and one valid repository-scoped delivery ID cannot process or publish twice;
+13. lifts the freeze and observes a succeeding status; and
+14. removes both containers and both named volumes on success or failure.
+
+Only the pull request delivery in step 8 is Forgejo-emitted. The rejection and duplicate probes are clearly identified synthetic E2E fixtures; they reuse the fictional repository and never store or print their payloads, signatures, or in-memory secret.
 
 The Go test has an `e2e` build tag and also requires `THAWGUARD_E2E=1`. Ordinary commands remain Docker-free:
 
@@ -160,11 +166,11 @@ The command intentionally exits with status 97 after both services become health
 
 ## Prioritized E2E expansion matrix
 
-The initial smoke intentionally covers one freeze/lift path. Add later cases in this order:
+The disposable smoke covers the freeze/lift path and the first P0 webhook row below. Add the remaining cases in this order:
 
 | Priority | Scenario | Main proof |
 | --- | --- | --- |
-| P0 | Invalid webhook signature and duplicate delivery | Invalid input has no side effects; a real duplicate is idempotent. |
+| P0 (covered) | Invalid webhook signature and duplicate delivery | Invalid input has no side effects; a repository-scoped duplicate is idempotent. |
 | P0 | Token failure and redaction | Posting fails closed, recovery evidence is sanitized, and no token reaches output. |
 | P0 | Setup readiness failure and recovery | Missing protection/context blocks activation; correcting Forgejo setup allows recovery. |
 | P0 | Restart persistence and reconciliation | Durable state survives restart and current policy converges after recovery. |
