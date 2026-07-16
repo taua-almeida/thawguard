@@ -27,21 +27,25 @@ import (
 )
 
 const (
-	fixtureOwner         = "e2e-owner"
-	fixtureRepository    = "icebox-demo"
-	fixtureReleaseBranch = "release"
-	fixtureFeatureBranch = "feature/freeze-check"
-	requiredContext      = "thawguard/freeze"
-	invalidDeliveryID    = "e2e-invalid-signature-fixture"
-	duplicateDeliveryID  = "e2e-duplicate-delivery-fixture"
+	fixtureOwner           = "e2e-owner"
+	fixtureRepository      = "icebox-demo"
+	fixtureReleaseBranch   = "release"
+	fixtureFeatureBranch   = "feature/freeze-check"
+	primaryStatusTokenName = "thawguard-e2e-status-primary"
+	requiredContext        = "thawguard/freeze"
+	invalidDeliveryID      = "e2e-invalid-signature-fixture"
+	duplicateDeliveryID    = "e2e-duplicate-delivery-fixture"
 )
 
 type e2eConfig struct {
-	forgejoURL        string
-	forgejoToken      string
-	thawguardURL      string
-	webhookSecret     string
-	thawguardPassword string
+	forgejoURL             string
+	forgejoControlToken    string
+	forgejoOwnerPassword   string
+	primaryStatusToken     string
+	replacementStatusToken string
+	thawguardURL           string
+	webhookSecret          string
+	thawguardPassword      string
 }
 
 type forgejoAPI struct {
@@ -68,9 +72,10 @@ type pullRequest struct {
 }
 
 type commitStatus struct {
-	ID      int64  `json:"id"`
-	Context string `json:"context"`
-	Status  string `json:"status"`
+	ID          int64  `json:"id"`
+	Context     string `json:"context"`
+	Status      string `json:"status"`
+	Description string `json:"description"`
 }
 
 type webhookSideEffectEvidence struct {
@@ -88,15 +93,16 @@ func TestLocalForgejoFreezeLifecycle(t *testing.T) {
 		t.Skip("set THAWGUARD_E2E=1 and use make e2e")
 	}
 	cfg := loadConfig(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
+	sensitiveValues := cfg.sensitiveValues()
 	forgejo := &forgejoAPI{
 		baseURL: cfg.forgejoURL,
-		token:   cfg.forgejoToken,
-		client:  &http.Client{Timeout: 10 * time.Second},
+		token:   cfg.forgejoControlToken,
+		client:  newScanningHTTPClient(10*time.Second, "Forgejo API", sensitiveValues),
 	}
-	browser := newThawguardBrowser(t, cfg.thawguardURL)
+	browser := newThawguardBrowser(t, cfg.thawguardURL, sensitiveValues)
 
 	provisionForgejoRepository(t, ctx, forgejo)
 	repositoryID := configureThawguard(t, ctx, browser, cfg)
@@ -116,45 +122,87 @@ func TestLocalForgejoFreezeLifecycle(t *testing.T) {
 
 	activateEnforcement(t, ctx, browser, repositoryID)
 	createFreeze(t, ctx, browser, repositoryID)
-	waitForStatus(t, ctx, forgejo, pr.Head.SHA, "failure")
+	waitForStatusWithDescription(t, ctx, forgejo, pr.Head.SHA, "failure", "Branch is frozen; merge is blocked by Thawguard")
 	assertMergeBlockedByRequiredStatus(t, ctx, forgejo, pr.Number)
+
+	beforeTokenFailure := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, pr.Head.SHA)
+	revokePrimaryStatusToken(t, ctx, forgejo, cfg.forgejoOwnerPassword)
+	newHeadSHA := advanceFeatureBranch(t, ctx, forgejo, pr)
+	waitForTokenFailureEvidence(t, ctx, forgejo, browser, repositoryID, newHeadSHA)
+	afterTokenFailure := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, newHeadSHA)
+	requireTokenFailureSideEffects(t, beforeTokenFailure, afterTokenFailure)
+	assertNoFreezeStatus(t, ctx, forgejo, newHeadSHA)
+	assertMergeBlockedByRequiredStatus(t, ctx, forgejo, pr.Number)
+	scanRenderedTokenSurfaces(t, ctx, browser)
+
+	rotateStatusTokenAndRecover(t, ctx, browser, cfg, repositoryID)
+	waitForRecoveredEnforcement(t, ctx, forgejo, browser, newHeadSHA)
+	assertMergeBlockedByRequiredStatus(t, ctx, forgejo, pr.Number)
+	scanRenderedTokenSurfaces(t, ctx, browser)
+
 	openPullRequestSyncsBeforeProbes := countOpenPullRequestSyncEvents(requirePage(t, ctx, browser, "/activity"))
 
 	t.Run("invalid signature has no side effects", func(t *testing.T) {
-		payload := syntheticPullRequestWebhookPayload(t, cfg, pr.Number+1000, pr.Head.SHA)
-		assertInvalidSignatureHasNoSideEffects(t, ctx, forgejo, browser, cfg, repositoryID, pr.Head.SHA, payload)
+		payload := syntheticPullRequestWebhookPayload(t, cfg, pr.Number+1000, newHeadSHA)
+		assertInvalidSignatureHasNoSideEffects(t, ctx, forgejo, browser, cfg, repositoryID, newHeadSHA, payload)
 	})
 	t.Run("duplicate delivery is idempotent", func(t *testing.T) {
-		payload := syntheticPullRequestWebhookPayload(t, cfg, pr.Number, pr.Head.SHA)
-		assertDuplicateDeliveryIsIdempotent(t, ctx, forgejo, browser, cfg, repositoryID, pr.Head.SHA, payload)
+		payload := syntheticPullRequestWebhookPayload(t, cfg, pr.Number, newHeadSHA)
+		assertDuplicateDeliveryIsIdempotent(t, ctx, forgejo, browser, cfg, repositoryID, newHeadSHA, payload)
 	})
 
 	liftFreeze(t, ctx, browser)
-	waitForStatus(t, ctx, forgejo, pr.Head.SHA, "success")
+	waitForStatusWithDescription(t, ctx, forgejo, newHeadSHA, "success", "No active freeze applies to this PR")
 	activityPage := waitForOneNewOpenPullRequestSync(t, ctx, browser, openPullRequestSyncsBeforeProbes)
 	requireLatestOpenPullRequestSync(t, activityPage)
+	scanRenderedTokenSurfaces(t, ctx, browser)
 }
 
 func loadConfig(t *testing.T) e2eConfig {
 	t.Helper()
 	cfg := e2eConfig{
-		forgejoURL:        strings.TrimRight(os.Getenv("THAWGUARD_E2E_FORGEJO_URL"), "/"),
-		forgejoToken:      os.Getenv("THAWGUARD_E2E_FORGEJO_TOKEN"),
-		thawguardURL:      "http://127.0.0.1:8080",
-		webhookSecret:     os.Getenv("THAWGUARD_E2E_WEBHOOK_SECRET"),
-		thawguardPassword: os.Getenv("THAWGUARD_E2E_ADMIN_PASSWORD"),
+		forgejoURL:             strings.TrimRight(os.Getenv("THAWGUARD_E2E_FORGEJO_URL"), "/"),
+		forgejoControlToken:    os.Getenv("THAWGUARD_E2E_FORGEJO_CONTROL_TOKEN"),
+		forgejoOwnerPassword:   os.Getenv("THAWGUARD_E2E_FORGEJO_OWNER_PASSWORD"),
+		primaryStatusToken:     os.Getenv("THAWGUARD_E2E_PRIMARY_STATUS_TOKEN"),
+		replacementStatusToken: os.Getenv("THAWGUARD_E2E_REPLACEMENT_STATUS_TOKEN"),
+		thawguardURL:           "http://127.0.0.1:8080",
+		webhookSecret:          os.Getenv("THAWGUARD_E2E_WEBHOOK_SECRET"),
+		thawguardPassword:      os.Getenv("THAWGUARD_E2E_ADMIN_PASSWORD"),
 	}
-	for name, value := range map[string]string{
-		"THAWGUARD_E2E_FORGEJO_URL":    cfg.forgejoURL,
-		"THAWGUARD_E2E_FORGEJO_TOKEN":  cfg.forgejoToken,
-		"THAWGUARD_E2E_WEBHOOK_SECRET": cfg.webhookSecret,
-		"THAWGUARD_E2E_ADMIN_PASSWORD": cfg.thawguardPassword,
+	for _, required := range []struct {
+		name  string
+		value string
+	}{
+		{name: "THAWGUARD_E2E_FORGEJO_URL", value: cfg.forgejoURL},
+		{name: "THAWGUARD_E2E_FORGEJO_CONTROL_TOKEN", value: cfg.forgejoControlToken},
+		{name: "THAWGUARD_E2E_FORGEJO_OWNER_PASSWORD", value: cfg.forgejoOwnerPassword},
+		{name: "THAWGUARD_E2E_PRIMARY_STATUS_TOKEN", value: cfg.primaryStatusToken},
+		{name: "THAWGUARD_E2E_REPLACEMENT_STATUS_TOKEN", value: cfg.replacementStatusToken},
+		{name: "THAWGUARD_E2E_WEBHOOK_SECRET", value: cfg.webhookSecret},
+		{name: "THAWGUARD_E2E_ADMIN_PASSWORD", value: cfg.thawguardPassword},
 	} {
-		if strings.TrimSpace(value) == "" {
-			t.Fatalf("required E2E environment variable is unset: %s", name)
+		if strings.TrimSpace(required.value) == "" {
+			t.Fatalf("required E2E environment variable is unset: %s", required.name)
 		}
 	}
+	if cfg.forgejoControlToken == cfg.primaryStatusToken ||
+		cfg.forgejoControlToken == cfg.replacementStatusToken ||
+		cfg.primaryStatusToken == cfg.replacementStatusToken {
+		t.Fatal("Forgejo E2E credentials must use three distinct token values")
+	}
 	return cfg
+}
+
+func (cfg e2eConfig) sensitiveValues() []string {
+	return []string{
+		cfg.forgejoControlToken,
+		cfg.forgejoOwnerPassword,
+		cfg.primaryStatusToken,
+		cfg.replacementStatusToken,
+		cfg.webhookSecret,
+		cfg.thawguardPassword,
+	}
 }
 
 func provisionForgejoRepository(t *testing.T, ctx context.Context, forgejo *forgejoAPI) {
@@ -246,7 +294,7 @@ func configureThawguard(t *testing.T, ctx context.Context, browser *thawguardBro
 	requirePostForm(t, ctx, browser, "/repositories/status-token", url.Values{
 		"csrf_token":    {csrf},
 		"repository_id": {strconv.FormatInt(repositoryID, 10)},
-		"status_token":  {cfg.forgejoToken},
+		"status_token":  {cfg.primaryStatusToken},
 	}, "store encrypted status token")
 	return repositoryID
 }
@@ -280,6 +328,221 @@ func createForgejoPullRequest(t *testing.T, ctx context.Context, forgejo *forgej
 		t.Fatal("Forgejo pull request response is missing its number or head SHA")
 	}
 	return pr
+}
+
+func revokePrimaryStatusToken(t *testing.T, ctx context.Context, forgejo *forgejoAPI, ownerPassword string) {
+	t.Helper()
+	path := "/api/v1/users/" + url.PathEscape(fixtureOwner) + "/tokens/" + url.PathEscape(primaryStatusTokenName)
+	response, err := forgejo.doBasicAuth(ctx, http.MethodDelete, path, fixtureOwner, ownerPassword)
+	requireAPIStatus(t, response, err, http.StatusNoContent, "revoke primary Forgejo status token by name")
+}
+
+func advanceFeatureBranch(t *testing.T, ctx context.Context, forgejo *forgejoAPI, pr pullRequest) string {
+	t.Helper()
+	response, err := forgejo.do(ctx, http.MethodPost, forgejo.repositoryPath("contents", "token-loss.txt"), map[string]any{
+		"branch":  fixtureFeatureBranch,
+		"message": "Advance fictional E2E feature head",
+		"content": base64.StdEncoding.EncodeToString([]byte("new head for token-loss recovery proof\n")),
+	})
+	requireAPIStatus(t, response, err, http.StatusCreated, "create Forgejo token-loss fixture commit")
+	var created struct {
+		Commit struct {
+			SHA string `json:"sha"`
+		} `json:"commit"`
+	}
+	decodeJSON(t, response.body, &created, "decode Forgejo token-loss fixture commit")
+	newHeadSHA := strings.ToLower(strings.TrimSpace(created.Commit.SHA))
+	if newHeadSHA == "" || newHeadSHA == strings.ToLower(pr.Head.SHA) {
+		t.Fatal("Forgejo token-loss fixture did not create a distinct commit SHA")
+	}
+
+	waitFor(t, 30*time.Second, "Forgejo pull request head advance", func() (bool, error) {
+		response, err := forgejo.do(ctx, http.MethodGet, forgejo.repositoryPath("pulls", strconv.Itoa(pr.Number)), nil)
+		if err != nil {
+			return false, err
+		}
+		if response.statusCode != http.StatusOK {
+			return false, apiStatusError(response, "read advanced Forgejo pull request")
+		}
+		var current pullRequest
+		if err := json.Unmarshal(response.body, &current); err != nil {
+			return false, fmt.Errorf("decode advanced Forgejo pull request: %w", err)
+		}
+		return strings.EqualFold(strings.TrimSpace(current.Head.SHA), newHeadSHA), nil
+	})
+	return newHeadSHA
+}
+
+func waitForTokenFailureEvidence(t *testing.T, ctx context.Context, forgejo *forgejoAPI, browser *thawguardBrowser, repositoryID int64, headSHA string) {
+	t.Helper()
+	webhookPath := "/webhooks?" + url.Values{
+		"repository_id": {strconv.FormatInt(repositoryID, 10)},
+		"event":         {"pull_request"},
+		"processing":    {"retryable_failure"},
+		"limit":         {"100"},
+	}.Encode()
+	waitFor(t, 30*time.Second, "sanitized token-loss failure evidence", func() (bool, error) {
+		webhookPage, err := browser.get(ctx, webhookPath)
+		if err != nil {
+			return false, err
+		}
+		repositoriesPage, err := browser.get(ctx, "/repositories")
+		if err != nil {
+			return false, err
+		}
+		publicationsPage, err := browser.get(ctx, "/publications")
+		if err != nil {
+			return false, err
+		}
+		activityPage, err := browser.get(ctx, "/activity")
+		if err != nil {
+			return false, err
+		}
+		statuses, err := listForgejoFreezeStatuses(ctx, forgejo, headSHA)
+		if err != nil {
+			return false, err
+		}
+		recoveryVisible := strings.Contains(repositoriesPage, "Automatic recovery is pending") ||
+			strings.Contains(repositoriesPage, "Recovery in progress")
+		return len(statuses) == 0 &&
+			strings.Contains(webhookPage, "synchronized") &&
+			strings.Contains(webhookPage, ">verified</span>") &&
+			strings.Contains(webhookPage, ">retryable failure</span>") &&
+			strings.Contains(webhookPage, "webhook processing failed") &&
+			!strings.Contains(webhookPage, "post forgejo commit status") &&
+			strings.Contains(repositoriesPage, "Enforcement is unhealthy: status publication failed") &&
+			strings.Contains(repositoriesPage, `action="/repositories/recover"`) &&
+			recoveryVisible &&
+			strings.Contains(publicationsPage, headSHA) &&
+			strings.Contains(publicationsPage, ">failed</span>") &&
+			strings.Contains(publicationsPage, "Branch is frozen; merge is blocked by Thawguard") &&
+			strings.Contains(publicationsPage, "post forgejo commit status") &&
+			strings.Contains(publicationsPage, "forge returned 401") &&
+			strings.Contains(activityPage, ">Runtime convergence</td>") &&
+			strings.Contains(activityPage, ">Failed</span>") &&
+			strings.Contains(activityPage, "status publication failed; state unhealthy. Automatic recovery remains pending."), nil
+	})
+}
+
+func requireTokenFailureSideEffects(t *testing.T, before, after webhookSideEffectEvidence) {
+	t.Helper()
+	if after.webhookRows != before.webhookRows+1 {
+		t.Fatalf("token-loss webhook changed delivery rows by %d, want 1", after.webhookRows-before.webhookRows)
+	}
+	if after.statusResults != before.statusResults+1 {
+		t.Fatalf("token-loss webhook changed status results by %d, want 1", after.statusResults-before.statusResults)
+	}
+	if after.publicationIntents != before.publicationIntents+1 {
+		t.Fatalf("token-loss webhook changed publication intents by %d, want 1", after.publicationIntents-before.publicationIntents)
+	}
+	if after.publicationAttempts != before.publicationAttempts+1 {
+		t.Fatalf("token-loss webhook changed publication attempts by %d, want 1", after.publicationAttempts-before.publicationAttempts)
+	}
+	if after.activityEvents != before.activityEvents+1 {
+		t.Fatalf("token-loss webhook changed activity events by %d, want 1", after.activityEvents-before.activityEvents)
+	}
+	if len(after.freezeStatuses) != 0 {
+		t.Fatalf("token-loss head has %d %s statuses, want none", len(after.freezeStatuses), requiredContext)
+	}
+}
+
+func assertNoFreezeStatus(t *testing.T, ctx context.Context, forgejo *forgejoAPI, headSHA string) {
+	t.Helper()
+	statuses, err := listForgejoFreezeStatuses(ctx, forgejo, headSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 0 {
+		t.Fatalf("new pull request head has %d %s statuses after token revocation, want none", len(statuses), requiredContext)
+	}
+}
+
+func rotateStatusTokenAndRecover(t *testing.T, ctx context.Context, browser *thawguardBrowser, cfg e2eConfig, repositoryID int64) {
+	t.Helper()
+	repositoryValue := strconv.FormatInt(repositoryID, 10)
+	page := requirePage(t, ctx, browser, "/repositories")
+	if !strings.Contains(page, `action="/repositories/status-token"`) || !strings.Contains(page, `action="/repositories/recover"`) {
+		t.Fatal("unhealthy repository did not offer status-token rotation and enforcement recovery")
+	}
+	csrf := requireHiddenInput(t, page, "csrf_token")
+	rotatedPage, err := browser.postForm(ctx, "/repositories/status-token", url.Values{
+		"csrf_token":    {csrf},
+		"repository_id": {repositoryValue},
+		"status_token":  {cfg.replacementStatusToken},
+	})
+	if err != nil {
+		t.Fatalf("rotate Forgejo status token through Thawguard: %v", err)
+	}
+
+	csrf = requireHiddenInput(t, rotatedPage, "csrf_token")
+	response, err := browser.postFormResponse(ctx, "/repositories/recover", url.Values{
+		"csrf_token":    {csrf},
+		"repository_id": {repositoryValue},
+	})
+	if err != nil {
+		t.Fatalf("trigger Thawguard enforcement recovery: %v", err)
+	}
+	if response.statusCode == http.StatusOK {
+		return
+	}
+	if response.statusCode == http.StatusBadRequest &&
+		(bytes.Contains(response.body, []byte("Enforcement recovery is already in progress.")) ||
+			bytes.Contains(response.body, []byte("Enforcement recovery is only available for an unhealthy repository."))) {
+		return
+	}
+	t.Fatalf("trigger Thawguard enforcement recovery returned HTTP %d", response.statusCode)
+}
+
+func waitForRecoveredEnforcement(t *testing.T, ctx context.Context, forgejo *forgejoAPI, browser *thawguardBrowser, headSHA string) {
+	t.Helper()
+	waitFor(t, 45*time.Second, "manual or harmless worker-race enforcement recovery", func() (bool, error) {
+		repositoriesPage, err := browser.get(ctx, "/repositories")
+		if err != nil {
+			return false, err
+		}
+		activityPage, err := browser.get(ctx, "/activity")
+		if err != nil {
+			return false, err
+		}
+		publicationsPage, err := browser.get(ctx, "/publications")
+		if err != nil {
+			return false, err
+		}
+		statuses, err := listForgejoFreezeStatuses(ctx, forgejo, headSHA)
+		if err != nil {
+			return false, err
+		}
+		statusRecovered := len(statuses) > 0 &&
+			statuses[len(statuses)-1].Status == "failure" &&
+			statuses[len(statuses)-1].Description == "Branch is frozen; merge is blocked by Thawguard"
+		return statusRecovered &&
+			strings.Contains(repositoriesPage, "enforcement active") &&
+			!strings.Contains(repositoriesPage, "Enforcement is unhealthy") &&
+			strings.Contains(activityPage, ">Status token configuration</td>") &&
+			strings.Contains(activityPage, "Status token rotated; the value remains hidden.") &&
+			strings.Contains(activityPage, ">Enforcement recovery</td>") &&
+			strings.Contains(activityPage, ">Succeeded</span>") &&
+			strings.Contains(activityPage, "1 open PRs evaluated; 1 statuses posted and 0 failed.") &&
+			strings.Contains(activityPage, "status publication failed; state unhealthy. Automatic recovery remains pending.") &&
+			strings.Contains(publicationsPage, headSHA) &&
+			strings.Contains(publicationsPage, ">failed</span>") &&
+			strings.Contains(publicationsPage, "post forgejo commit status") &&
+			strings.Contains(publicationsPage, ">posted</span>"), nil
+	})
+}
+
+func scanRenderedTokenSurfaces(t *testing.T, ctx context.Context, browser *thawguardBrowser) {
+	t.Helper()
+	for _, path := range []string{
+		"/repositories",
+		"/freezes",
+		"/decisions",
+		"/activity",
+		"/webhooks",
+		"/publications",
+	} {
+		_ = requirePage(t, ctx, browser, path)
+	}
 }
 
 // syntheticPullRequestWebhookPayload is an in-memory E2E fixture sent by this
@@ -317,7 +580,7 @@ func assertInvalidSignatureHasNoSideEffects(t *testing.T, ctx context.Context, f
 		t.Fatalf("invalid-signature fixture delivery ID %q already exists", invalidDeliveryID)
 	}
 
-	response, err := postSyntheticWebhook(ctx, cfg.thawguardURL, payload, invalidDeliveryID, "invalid-e2e-signing-secret")
+	response, err := postSyntheticWebhook(ctx, cfg, payload, invalidDeliveryID, "invalid-e2e-signing-secret")
 	requireAcceptedWebhookResponse(t, response, err, "invalid-signature fixture")
 
 	after := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, headSHA)
@@ -334,7 +597,7 @@ func assertDuplicateDeliveryIsIdempotent(t *testing.T, ctx context.Context, forg
 		t.Fatalf("duplicate fixture delivery ID %q already exists", duplicateDeliveryID)
 	}
 
-	response, err := postSyntheticWebhook(ctx, cfg.thawguardURL, payload, duplicateDeliveryID, cfg.webhookSecret)
+	response, err := postSyntheticWebhook(ctx, cfg, payload, duplicateDeliveryID, cfg.webhookSecret)
 	requireAcceptedWebhookResponse(t, response, err, "first duplicate fixture request")
 	afterFirst := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, headSHA)
 	requireProcessedVerifiedDelivery(t, afterFirst.webhookPage, duplicateDeliveryID)
@@ -360,15 +623,15 @@ func assertDuplicateDeliveryIsIdempotent(t *testing.T, ctx context.Context, forg
 		t.Fatalf("first duplicate fixture request posted latest %s=%q, want failure", requiredContext, latest.Status)
 	}
 
-	response, err = postSyntheticWebhook(ctx, cfg.thawguardURL, payload, duplicateDeliveryID, cfg.webhookSecret)
+	response, err = postSyntheticWebhook(ctx, cfg, payload, duplicateDeliveryID, cfg.webhookSecret)
 	requireAcceptedWebhookResponse(t, response, err, "second duplicate fixture request")
 	afterSecond := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, headSHA)
 	requireProcessedVerifiedDelivery(t, afterSecond.webhookPage, duplicateDeliveryID)
 	requireIdenticalWebhookEvidence(t, afterFirst, afterSecond, "second duplicate fixture request")
 }
 
-func postSyntheticWebhook(ctx context.Context, baseURL string, payload []byte, deliveryID, signingSecret string) (apiResponse, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/webhooks/forgejo", bytes.NewReader(payload))
+func postSyntheticWebhook(ctx context.Context, cfg e2eConfig, payload []byte, deliveryID, signingSecret string) (apiResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.thawguardURL+"/webhooks/forgejo", bytes.NewReader(payload))
 	if err != nil {
 		return apiResponse{}, fmt.Errorf("create synthetic E2E webhook request: %w", err)
 	}
@@ -376,7 +639,7 @@ func postSyntheticWebhook(ctx context.Context, baseURL string, payload []byte, d
 	req.Header.Set("X-Forgejo-Event", "pull_request")
 	req.Header.Set("X-Forgejo-Delivery", deliveryID)
 	req.Header.Set("X-Forgejo-Signature", syntheticWebhookSignature(payload, signingSecret))
-	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	resp, err := newScanningHTTPClient(10*time.Second, "Thawguard webhook", cfg.sensitiveValues()).Do(req)
 	if err != nil {
 		return apiResponse{}, fmt.Errorf("send synthetic E2E webhook request: %w", err)
 	}
@@ -601,9 +864,9 @@ func liftFreeze(t *testing.T, ctx context.Context, browser *thawguardBrowser) {
 	}, "lift Thawguard freeze")
 }
 
-func waitForStatus(t *testing.T, ctx context.Context, forgejo *forgejoAPI, sha, expected string) {
+func waitForStatusWithDescription(t *testing.T, ctx context.Context, forgejo *forgejoAPI, sha, expected, description string) {
 	t.Helper()
-	waitFor(t, 30*time.Second, requiredContext+"="+expected, func() (bool, error) {
+	waitFor(t, 30*time.Second, requiredContext+"="+expected+" with sanitized description", func() (bool, error) {
 		statuses, err := listForgejoFreezeStatuses(ctx, forgejo, sha)
 		if err != nil {
 			return false, err
@@ -611,28 +874,35 @@ func waitForStatus(t *testing.T, ctx context.Context, forgejo *forgejoAPI, sha, 
 		if len(statuses) == 0 {
 			return false, nil
 		}
-		return statuses[len(statuses)-1].Status == expected, nil
+		latest := statuses[len(statuses)-1]
+		return latest.Status == expected && latest.Description == description, nil
 	})
 }
 
 func assertMergeBlockedByRequiredStatus(t *testing.T, ctx context.Context, forgejo *forgejoAPI, index int) {
 	t.Helper()
-	response, err := forgejo.do(ctx, http.MethodPost, forgejo.repositoryPath("pulls", strconv.Itoa(index), "merge"), map[string]string{"Do": "merge"})
-	if err != nil {
-		t.Fatalf("attempt Forgejo merge: %v", err)
-	}
-	if response.statusCode != http.StatusMethodNotAllowed {
-		t.Fatalf("expected Forgejo to reject merge with 405, got %d", response.statusCode)
-	}
-	var payload struct {
-		Message string `json:"message"`
-	}
-	if err := json.Unmarshal(response.body, &payload); err != nil {
-		t.Fatalf("decode blocked merge response: %v", err)
-	}
-	if !strings.Contains(strings.ToLower(payload.Message), "required status checks") {
-		t.Fatalf("Forgejo rejected the merge without identifying required status checks")
-	}
+	waitFor(t, 30*time.Second, "Forgejo required-status merge-block convergence", func() (bool, error) {
+		response, err := forgejo.do(ctx, http.MethodPost, forgejo.repositoryPath("pulls", strconv.Itoa(index), "merge"), map[string]string{"Do": "merge"})
+		if err != nil {
+			return false, nil
+		}
+		if response.statusCode >= 200 && response.statusCode < 300 {
+			t.Fatal("Forgejo merge unexpectedly succeeded while required status was unsatisfied")
+		}
+		if response.statusCode != http.StatusMethodNotAllowed {
+			t.Fatalf("unexpected HTTP %d while waiting for Forgejo required-status merge block", response.statusCode)
+		}
+
+		var payload struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(response.body, &payload) != nil {
+			return false, nil
+		}
+		message := strings.ToLower(payload.Message)
+		return strings.Contains(message, "required status checks") &&
+			(strings.Contains(message, "not all") || strings.Contains(message, "not successful") || strings.Contains(message, "unsuccessful")), nil
+	})
 }
 
 func (f *forgejoAPI) repositoryPath(parts ...string) string {
@@ -671,15 +941,91 @@ func (f *forgejoAPI) do(ctx context.Context, method, path string, payload any) (
 	return apiResponse{statusCode: resp.StatusCode, body: data}, nil
 }
 
-func newThawguardBrowser(t *testing.T, baseURL string) *thawguardBrowser {
+func (f *forgejoAPI) doBasicAuth(ctx context.Context, method, path, username, password string) (apiResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, method, f.baseURL+path, nil)
+	if err != nil {
+		return apiResponse{}, fmt.Errorf("create Forgejo basic-auth request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.SetBasicAuth(username, password)
+	resp, err := f.client.Do(req)
+	if err != nil {
+		return apiResponse{}, fmt.Errorf("send Forgejo basic-auth request: %w", err)
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return apiResponse{}, fmt.Errorf("read Forgejo basic-auth response: %w", err)
+	}
+	return apiResponse{statusCode: resp.StatusCode, body: data}, nil
+}
+
+type scanningTransport struct {
+	surface         string
+	sensitiveValues []string
+}
+
+func (transport scanningTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := http.DefaultTransport.RoundTrip(request)
+	if err != nil {
+		return nil, err
+	}
+	for _, location := range response.Header.Values("Location") {
+		if containsSensitiveValue([]byte(location), transport.sensitiveValues) {
+			_ = response.Body.Close()
+			return nil, fmt.Errorf("sensitive token detected in %s redirect location", transport.surface)
+		}
+	}
+	const maxScannedResponseBytes = 2 << 20
+	data, err := io.ReadAll(io.LimitReader(response.Body, maxScannedResponseBytes+1))
+	closeErr := response.Body.Close()
+	if err != nil {
+		return nil, fmt.Errorf("scan %s response body: %w", transport.surface, err)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("close %s response body after scan: %w", transport.surface, closeErr)
+	}
+	if len(data) > maxScannedResponseBytes {
+		return nil, fmt.Errorf("%s response body exceeds the redaction scan limit", transport.surface)
+	}
+	if containsSensitiveValue(data, transport.sensitiveValues) {
+		return nil, fmt.Errorf("sensitive token detected in %s response body", transport.surface)
+	}
+	response.Body = io.NopCloser(bytes.NewReader(data))
+	response.ContentLength = int64(len(data))
+	return response, nil
+}
+
+func containsSensitiveValue(data []byte, sensitiveValues []string) bool {
+	for _, sensitive := range sensitiveValues {
+		if sensitive = strings.TrimSpace(sensitive); sensitive != "" && bytes.Contains(data, []byte(sensitive)) {
+			return true
+		}
+	}
+	return false
+}
+
+func newScanningHTTPClient(timeout time.Duration, surface string, sensitiveValues []string) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		Transport: scanningTransport{
+			surface:         surface,
+			sensitiveValues: append([]string(nil), sensitiveValues...),
+		},
+	}
+}
+
+func newThawguardBrowser(t *testing.T, baseURL string, sensitiveValues []string) *thawguardBrowser {
 	t.Helper()
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	client := newScanningHTTPClient(20*time.Second, "Thawguard HTTP", sensitiveValues)
+	client.Jar = jar
 	return &thawguardBrowser{
 		baseURL: baseURL,
-		client:  &http.Client{Jar: jar, Timeout: 20 * time.Second},
+		client:  client,
 	}
 }
 
@@ -704,25 +1050,33 @@ func (b *thawguardBrowser) get(ctx context.Context, path string) (string, error)
 }
 
 func (b *thawguardBrowser) postForm(ctx context.Context, path string, values url.Values) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.baseURL+path, strings.NewReader(values.Encode()))
+	response, err := b.postFormResponse(ctx, path, values)
 	if err != nil {
 		return "", err
+	}
+	if response.statusCode < 200 || response.statusCode >= 300 {
+		return "", fmt.Errorf("POST %s returned HTTP %d", path, response.statusCode)
+	}
+	return string(response.body), nil
+}
+
+func (b *thawguardBrowser) postFormResponse(ctx context.Context, path string, values url.Values) (apiResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.baseURL+path, strings.NewReader(values.Encode()))
+	if err != nil {
+		return apiResponse{}, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Origin", b.baseURL)
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return "", err
+		return apiResponse{}, err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if err != nil {
-		return "", err
+		return apiResponse{}, err
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("POST %s returned %s", path, resp.Status)
-	}
-	return string(body), nil
+	return apiResponse{statusCode: resp.StatusCode, body: body}, nil
 }
 
 func requirePostForm(t *testing.T, ctx context.Context, browser *thawguardBrowser, path string, values url.Values, operation string) {

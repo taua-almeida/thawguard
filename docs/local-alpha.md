@@ -127,20 +127,28 @@ The target:
 
 1. uses the separate `thawguard-e2e` Compose project;
 2. removes any old disposable containers and volumes;
-3. generates all passwords, tokens, secrets, and the Thawguard installation key in memory;
+3. generates all passwords, secrets, the Thawguard installation key, and three distinct Forgejo tokens in memory;
 4. starts fresh Forgejo and Thawguard containers and waits for both health checks;
 5. creates a local Forgejo admin and fictional repository owner through the Forgejo admin CLI;
-6. provisions a private repository, branches, commits, branch protection, and webhook through Forgejo's HTTP API;
-7. creates the first Thawguard admin and configures repository credentials and managed branches through real CSRF-protected HTTP forms;
+6. uses a control token to provision and inspect a private repository, branches, commits, branch protection, and webhook through Forgejo's HTTP API;
+7. creates the first Thawguard admin and stores a separate primary status token, webhook secret, and managed branches through real CSRF-protected HTTP forms;
 8. opens a real Forgejo pull request, causing Forgejo itself to emit the signed webhook;
 9. verifies the real delivery and activates enforcement through the real workflow;
 10. creates a freeze and observes a failing status;
 11. confirms the required status blocks the merge;
-12. sends sanitized in-memory E2E fixtures to the real webhook endpoint, proving an invalid signature has no trusted side effects and one valid repository-scoped delivery ID cannot process or publish twice;
-13. lifts the freeze and observes a succeeding status; and
-14. removes both containers and both named volumes on success or failure.
+12. revokes only the primary status token through Forgejo's supported access-token API, addressed by its non-secret token name and authenticated with the owner's CLI-generated random password because pinned Forgejo rejects token authentication on this endpoint;
+13. advances the existing feature branch with the control token so Forgejo emits a real synchronized-pull-request webhook for a new head SHA;
+14. proves that no `thawguard/freeze` status reaches the new head, the missing required status blocks the merge, the delivery records only generic retryable-failure diagnostics, and Thawguard records sanitized publication and runtime-convergence failure evidence while becoming unhealthy;
+15. rotates to the pre-generated replacement status token through Thawguard's real CSRF-protected form and immediately requests manual recovery, while tolerating a harmless race with the automatic worker;
+16. proves recovery returns enforcement to active, keeps the historical failed publication visible without credentials, republishes `thawguard/freeze=failure` on the new head, and leaves the frozen merge blocked;
+17. records the open-PR sync baseline, then sends sanitized in-memory E2E fixtures to prove an invalid signature has no trusted side effects and one valid repository-scoped delivery ID cannot process or publish twice;
+18. lifts the freeze and observes `thawguard/freeze=success` on the new head;
+19. checks all three token values against rendered diagnostic pages, relevant HTTP responses and redirects, Forgejo status API responses, captured Go test output, and both container logs without printing unsafe content; and
+20. removes both containers and both named volumes on success or failure.
 
-Only the pull request delivery in step 8 is Forgejo-emitted. The rejection and duplicate probes are clearly identified synthetic E2E fixtures; they reuse the fictional repository and never store or print their payloads, signatures, or in-memory secret.
+The pull request deliveries in steps 8 and 13 are Forgejo-emitted. The rejection and duplicate probes are clearly identified synthetic E2E fixtures; they run only after credential recovery, reuse the fictional repository, and never store or print their payloads, signatures, or in-memory secret. Separate status tokens keep fixture control independent from the credential under failure, but all three tokens belong only to the disposable fictional owner.
+
+This is a cooperative-enforcement recovery proof for trusted teams. It demonstrates that a missing required status prevents an ordinary merge and that operators can rotate credentials and converge current policy through audited workflows. A forge collaborator with sufficient permission to post statuses remains outside Thawguard's security boundary.
 
 The Go test has an `e2e` build tag and also requires `THAWGUARD_E2E=1`. Ordinary commands remain Docker-free:
 
@@ -154,24 +162,25 @@ For debugging a failed run only:
 make e2e-keep
 ```
 
-That target leaves a failed `thawguard-e2e` project running and prints the exact cleanup command. Successful runs are always removed.
+That target leaves a failed `thawguard-e2e` project running and prints the exact cleanup command. Successful runs are always removed. Go test output is captured and scanned before it is printed; container logs are scanned before cleanup but are never dumped by the runner. If a generated credential or secret is detected, the runner prints only the affected surface label and withholds the unsafe content.
 
 Maintainers can verify the failure trap without provisioning fixtures:
 
 ```sh
+E2E_FAIL_AFTER_START=1 bash scripts/e2e.sh
 E2E_FAIL_AFTER_START=1 make e2e
 ```
 
-The command intentionally exits with status 97 after both services become healthy; the normal `e2e` target must still remove its containers and volumes.
+The script intentionally exits with status 97 after both services become healthy. When invoked directly, `bash scripts/e2e.sh` exits exactly 97. Through `make e2e`, GNU Make reports the failed recipe as `Error 97` and normally exits 2. Both entry points must still remove the disposable containers and volumes.
 
 ## Prioritized E2E expansion matrix
 
-The disposable smoke covers the freeze/lift path and the first P0 webhook row below. Add the remaining cases in this order:
+The disposable smoke covers the freeze/lift path plus the webhook and token-failure P0 rows below. Add the remaining cases in this order:
 
 | Priority | Scenario | Main proof |
 | --- | --- | --- |
 | P0 (covered) | Invalid webhook signature and duplicate delivery | Invalid input has no side effects; a repository-scoped duplicate is idempotent. |
-| P0 | Token failure and redaction | Posting fails closed, recovery evidence is sanitized, and no token reaches output. |
+| P0 (covered) | Token failure and redaction | Posting fails closed, recovery evidence is sanitized, and no token reaches output. |
 | P0 | Setup readiness failure and recovery | Missing protection/context blocks activation; correcting Forgejo setup allows recovery. |
 | P0 | Restart persistence and reconciliation | Durable state survives restart and current policy converges after recovery. |
 | P1 | Cancel freeze | Cancellation republishes current policy and remains auditable. |
