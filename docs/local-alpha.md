@@ -91,8 +91,8 @@ In Forgejo:
    - event: pull requests
 6. Open a real pull request into `main`. Forgejo should deliver the signed event to Thawguard.
 7. Confirm the verified, processed delivery on `/webhooks`.
-8. Run read-only readiness checks on `/repositories`.
-9. Use **Verify status posting**, then **Activate enforcement**.
+8. Run read-only readiness checks on `/repositories`. Every mandatory check must pass for every exact managed branch before status verification becomes available.
+9. Correct any reported branch protection or required-context failure in Forgejo, rerun readiness, then use **Verify status posting** and **Activate enforcement**. Thawguard reports the required setup but does not configure Forgejo branch protection automatically.
 
 ### 6. Exercise the freeze lifecycle
 
@@ -130,23 +130,25 @@ The target:
 3. generates all passwords, secrets, the Thawguard installation key, and three distinct Forgejo tokens in memory;
 4. starts fresh Forgejo and Thawguard containers and waits for both health checks;
 5. creates a local Forgejo admin and fictional repository owner through the Forgejo admin CLI;
-6. uses a control token to provision and inspect a private repository, branches, commits, branch protection, and webhook through Forgejo's HTTP API;
+6. uses a control token to provision and inspect a private repository, branches, commits, branch protection, and webhook through Forgejo's HTTP API, initially protecting only `main` and deliberately leaving the managed `release` branch unprotected;
 7. creates the first Thawguard admin and stores a separate primary status token, webhook secret, and managed branches through real CSRF-protected HTTP forms;
 8. opens a real Forgejo pull request, causing Forgejo itself to emit the signed webhook;
-9. verifies the real delivery and activates enforcement through the real workflow;
-10. creates a freeze and observes a failing status;
-11. confirms the required status blocks the merge;
-12. revokes only the primary status token through Forgejo's supported access-token API, addressed by its non-secret token name and authenticated with the owner's CLI-generated random password because pinned Forgejo rejects token authentication on this endpoint;
-13. advances the existing feature branch with the control token so Forgejo emits a real synchronized-pull-request webhook for a new head SHA;
-14. proves that no `thawguard/freeze` status reaches the new head, the missing required status blocks the merge, the delivery records only generic retryable-failure diagnostics, and Thawguard records sanitized publication and runtime-convergence failure evidence while becoming unhealthy;
-15. rotates to the pre-generated replacement status token through Thawguard's real CSRF-protected form and immediately requests manual recovery, while tolerating a harmless race with the automatic worker;
-16. proves recovery returns enforcement to active, keeps the historical failed publication visible without credentials, republishes `thawguard/freeze=failure` on the new head, and leaves the frozen merge blocked;
-17. records the open-PR sync baseline, then sends sanitized in-memory E2E fixtures to prove an invalid signature has no trusted side effects and one valid repository-scoped delivery ID cannot process or publish twice;
-18. lifts the freeze and observes `thawguard/freeze=success` on the new head;
-19. checks all three token values against rendered diagnostic pages, relevant HTTP responses and redirects, Forgejo status API responses, captured Go test output, and both container logs without printing unsafe content; and
-20. removes both containers and both named volumes on success or failure.
+9. verifies the real delivery, runs the CSRF-protected readiness check, and proves the `release` branch row reports readable protection evidence but fails protection enabled, required status checks, and the exact `thawguard/freeze` context while the repository remains setup-incomplete and verification and activation stay unavailable;
+10. adds the missing exact `release` protection through Forgejo's API, validates Forgejo's creation response, and proves all four branch checks pass;
+11. completes status-post verification and activates enforcement through the normal workflow only after every mandatory check passes across both managed branches;
+12. creates a freeze and observes a failing status;
+13. confirms the required status blocks the merge;
+14. revokes only the primary status token through Forgejo's supported access-token API, addressed by its non-secret token name and authenticated with the owner's CLI-generated random password because pinned Forgejo rejects token authentication on this endpoint;
+15. advances the existing feature branch with the control token so Forgejo emits a real synchronized-pull-request webhook for a new head SHA;
+16. proves that no `thawguard/freeze` status reaches the new head, the missing required status blocks the merge, the delivery records only generic retryable-failure diagnostics, and Thawguard records sanitized publication and runtime-convergence failure evidence while becoming unhealthy;
+17. rotates to the pre-generated replacement status token through Thawguard's real CSRF-protected form and immediately requests manual recovery, while tolerating a harmless race with the automatic worker;
+18. proves recovery returns enforcement to active, keeps the historical failed publication visible without credentials, republishes `thawguard/freeze=failure` on the new head, and leaves the frozen merge blocked;
+19. records the open-PR sync baseline, then sends sanitized in-memory E2E fixtures to prove an invalid signature has no trusted side effects and one valid repository-scoped delivery ID cannot process or publish twice;
+20. lifts the freeze and observes `thawguard/freeze=success` on the new head;
+21. checks all three token values against rendered diagnostic pages, relevant HTTP responses and redirects, Forgejo status API responses, captured Go test output, and both container logs without printing unsafe content; and
+22. removes both containers and both named volumes on success or failure.
 
-The pull request deliveries in steps 8 and 13 are Forgejo-emitted. The rejection and duplicate probes are clearly identified synthetic E2E fixtures; they run only after credential recovery, reuse the fictional repository, and never store or print their payloads, signatures, or in-memory secret. Separate status tokens keep fixture control independent from the credential under failure, but all three tokens belong only to the disposable fictional owner.
+The initial pull request and later feature-branch advance deliveries are Forgejo-emitted. The rejection and duplicate probes are clearly identified synthetic E2E fixtures; they run only after credential recovery, reuse the fictional repository, and never store or print their payloads, signatures, or in-memory secret. Separate status tokens keep fixture control independent from the credential under failure, but all three tokens belong only to the disposable fictional owner.
 
 This is a cooperative-enforcement recovery proof for trusted teams. It demonstrates that a missing required status prevents an ordinary merge and that operators can rotate credentials and converge current policy through audited workflows. A forge collaborator with sufficient permission to post statuses remains outside Thawguard's security boundary.
 
@@ -175,13 +177,13 @@ The script intentionally exits with status 97 after both services become healthy
 
 ## Prioritized E2E expansion matrix
 
-The disposable smoke covers the freeze/lift path plus the webhook and token-failure P0 rows below. Add the remaining cases in this order:
+The disposable smoke covers the freeze/lift path plus the setup-readiness, webhook, and token-failure P0 rows below. Add the remaining cases in this order:
 
 | Priority | Scenario | Main proof |
 | --- | --- | --- |
 | P0 (covered) | Invalid webhook signature and duplicate delivery | Invalid input has no side effects; a repository-scoped duplicate is idempotent. |
 | P0 (covered) | Token failure and redaction | Posting fails closed, recovery evidence is sanitized, and no token reaches output. |
-| P0 | Setup readiness failure and recovery | Missing protection/context blocks activation; correcting Forgejo setup allows recovery. |
+| P0 (covered) | Setup readiness failure and recovery | An unprotected managed branch blocks verification and activation; adding the missing Forgejo protection allows the normal workflow to proceed. |
 | P0 | Restart persistence and reconciliation | Durable state survives restart and current policy converges after recovery. |
 | P1 | Cancel freeze | Cancellation republishes current policy and remains auditable. |
 | P1 | Immediate per-PR thaw | A real PR/head receives an audited exception and success status. |

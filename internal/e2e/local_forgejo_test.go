@@ -120,7 +120,10 @@ func TestLocalForgejoFreezeLifecycle(t *testing.T) {
 			nonzeroMatchingRows.MatchString(page), nil
 	})
 
+	requireUnprotectedReleaseReadinessFailure(t, ctx, browser, repositoryID)
+	createForgejoBranchProtection(t, ctx, forgejo, fixtureReleaseBranch)
 	activateEnforcement(t, ctx, browser, repositoryID)
+	requireRepairedReleaseReadiness(t, ctx, browser)
 	createFreeze(t, ctx, browser, repositoryID)
 	waitForStatusWithDescription(t, ctx, forgejo, pr.Head.SHA, "failure", "Branch is frozen; merge is blocked by Thawguard")
 	assertMergeBlockedByRequiredStatus(t, ctx, forgejo, pr.Number)
@@ -223,24 +226,7 @@ func provisionForgejoRepository(t *testing.T, ctx context.Context, forgejo *forg
 		requireAPIStatus(t, response, err, http.StatusCreated, "create Forgejo branch")
 	}
 
-	for _, branch := range []string{"main", fixtureReleaseBranch} {
-		response, err = forgejo.do(ctx, http.MethodPost, forgejo.repositoryPath("branch_protections"), map[string]any{
-			"rule_name":             branch,
-			"enable_status_check":   true,
-			"status_check_contexts": []string{requiredContext},
-			"apply_to_admins":       true,
-		})
-		requireAPIStatus(t, response, err, http.StatusCreated, "create Forgejo branch protection")
-		var protection struct {
-			RuleName            string   `json:"rule_name"`
-			EnableStatusCheck   bool     `json:"enable_status_check"`
-			StatusCheckContexts []string `json:"status_check_contexts"`
-		}
-		decodeJSON(t, response.body, &protection, "decode branch protection")
-		if protection.RuleName != branch || !protection.EnableStatusCheck || !slices.Contains(protection.StatusCheckContexts, requiredContext) {
-			t.Fatalf("Forgejo returned incomplete protection for branch %q", branch)
-		}
-	}
+	createForgejoBranchProtection(t, ctx, forgejo, "main")
 
 	response, err = forgejo.do(ctx, http.MethodPost, forgejo.repositoryPath("contents", "fixture.txt"), map[string]any{
 		"branch":  fixtureFeatureBranch,
@@ -248,6 +234,26 @@ func provisionForgejoRepository(t *testing.T, ctx context.Context, forgejo *forg
 		"content": base64.StdEncoding.EncodeToString([]byte("fictional local fixture\n")),
 	})
 	requireAPIStatus(t, response, err, http.StatusCreated, "create Forgejo fixture commit")
+}
+
+func createForgejoBranchProtection(t *testing.T, ctx context.Context, forgejo *forgejoAPI, branch string) {
+	t.Helper()
+	response, err := forgejo.do(ctx, http.MethodPost, forgejo.repositoryPath("branch_protections"), map[string]any{
+		"rule_name":             branch,
+		"enable_status_check":   true,
+		"status_check_contexts": []string{requiredContext},
+		"apply_to_admins":       true,
+	})
+	requireAPIStatus(t, response, err, http.StatusCreated, "create Forgejo branch protection for "+branch)
+	var protection struct {
+		RuleName            string   `json:"rule_name"`
+		EnableStatusCheck   bool     `json:"enable_status_check"`
+		StatusCheckContexts []string `json:"status_check_contexts"`
+	}
+	decodeJSON(t, response.body, &protection, "decode branch protection for "+branch)
+	if protection.RuleName != branch || !protection.EnableStatusCheck || !slices.Contains(protection.StatusCheckContexts, requiredContext) {
+		t.Fatalf("Forgejo returned incomplete protection for branch %q", branch)
+	}
 }
 
 func configureThawguard(t *testing.T, ctx context.Context, browser *thawguardBrowser, cfg e2eConfig) int64 {
@@ -770,17 +776,7 @@ func waitForOneNewOpenPullRequestSync(t *testing.T, ctx context.Context, browser
 
 func requireLatestOpenPullRequestSync(t *testing.T, page string) {
 	t.Helper()
-	marker := `<td data-label="Action">Open pull request sync</td>`
-	markerIndex := strings.Index(page, marker)
-	if markerIndex < 0 {
-		t.Fatal("activity is missing an open pull request sync event")
-	}
-	rowStart := strings.LastIndex(page[:markerIndex], "<tr>")
-	rowEndOffset := strings.Index(page[markerIndex:], "</tr>")
-	if rowStart < 0 || rowEndOffset < 0 {
-		t.Fatal("latest open pull request sync event is missing its activity row")
-	}
-	row := page[rowStart : markerIndex+rowEndOffset]
+	row := requireLatestActivityRow(t, page, "Open pull request sync")
 	if !strings.Contains(row, "1 open PRs synchronized; 0 cached PRs marked closed.") {
 		t.Fatal("latest forge sync did not confirm one real PR and zero invalid-signature cache entries")
 	}
@@ -803,6 +799,106 @@ func requireIdenticalWebhookEvidence(t *testing.T, before, after webhookSideEffe
 			before.activityEvents, after.activityEvents,
 			len(before.freezeStatuses), len(after.freezeStatuses))
 	}
+}
+
+func requireUnprotectedReleaseReadinessFailure(t *testing.T, ctx context.Context, browser *thawguardBrowser, repositoryID int64) {
+	t.Helper()
+	page := requirePage(t, ctx, browser, "/repositories")
+	requirePostForm(t, ctx, browser, "/repositories/setup-check", url.Values{
+		"csrf_token":    {requireHiddenInput(t, page, "csrf_token")},
+		"repository_id": {strconv.FormatInt(repositoryID, 10)},
+	}, "run readiness checks with release unprotected")
+
+	page = requirePage(t, ctx, browser, "/repositories")
+	releaseRow := requireManagedBranchRow(t, page, fixtureReleaseBranch)
+	for _, want := range []string{
+		`<span class="tg-badge status-failed">failed</span>`,
+		`<span class="status status-ok">passed</span><div><strong>Branch protection readable</strong><small>The forge confirmed that this exact managed branch has no branch protection configuration.`,
+		`<span class="status status-failed">failed</span><div><strong>Branch protection enabled</strong>`,
+		`<span class="status status-failed">failed</span><div><strong>Required status checks enabled</strong>`,
+		`<span class="status status-failed">failed</span><div><strong>Required thawguard/freeze context configured</strong>`,
+	} {
+		if !strings.Contains(releaseRow, want) {
+			t.Fatalf("unprotected release readiness row is missing %q", want)
+		}
+	}
+	for _, absent := range []string{
+		`action="/repositories/status-verification"`,
+		`action="/repositories/activate"`,
+	} {
+		if strings.Contains(page, absent) {
+			t.Fatalf("failed readiness unexpectedly offered form %s", absent)
+		}
+	}
+	for _, want := range []string{
+		`<span class="tg-badge status-warning">setup incomplete</span>`,
+		`disabled>Verify status posting</button>`,
+		`Fix the failing readiness checks and rerun them. Verification is offered once every mandatory read-only check passes.`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("failed readiness page is missing %q", want)
+		}
+	}
+
+	activityRow := requireLatestActivityRow(t, requirePage(t, ctx, browser, "/activity"), "Readiness check")
+	if want := "8 passed, 1 warnings, 3 failed across 2 managed branches; webhook evidence fresh."; !strings.Contains(activityRow, want) {
+		t.Fatalf("failed readiness activity is missing %q", want)
+	}
+}
+
+func requireRepairedReleaseReadiness(t *testing.T, ctx context.Context, browser *thawguardBrowser) {
+	t.Helper()
+	page := requirePage(t, ctx, browser, "/repositories")
+	releaseRow := requireManagedBranchRow(t, page, fixtureReleaseBranch)
+	for _, want := range []string{
+		`<span class="tg-badge status-ok">passed</span>`,
+		`<span class="status status-ok">passed</span><div><strong>Branch protection readable</strong>`,
+		`<span class="status status-ok">passed</span><div><strong>Branch protection enabled</strong>`,
+		`<span class="status status-ok">passed</span><div><strong>Required status checks enabled</strong>`,
+		`<span class="status status-ok">passed</span><div><strong>Required thawguard/freeze context configured</strong>`,
+	} {
+		if !strings.Contains(releaseRow, want) {
+			t.Fatalf("repaired release readiness row is missing %q", want)
+		}
+	}
+	if !strings.Contains(page, `<span class="tg-badge status-ok">enforcement active</span>`) {
+		t.Fatal("repaired repository did not reach enforcement-active state")
+	}
+
+	activityRow := requireLatestActivityRow(t, requirePage(t, ctx, browser, "/activity"), "Readiness check")
+	if want := "11 passed, 1 warnings, 0 failed across 2 managed branches; webhook evidence fresh."; !strings.Contains(activityRow, want) {
+		t.Fatalf("successful readiness activity is missing %q", want)
+	}
+}
+
+func requireManagedBranchRow(t *testing.T, page, branch string) string {
+	t.Helper()
+	marker := `<code class="tg-branch">` + html.EscapeString(branch) + `</code>`
+	markerIndex := strings.Index(page, marker)
+	if markerIndex < 0 {
+		t.Fatalf("managed branch %q is missing from repositories page", branch)
+	}
+	rowStart := strings.LastIndex(page[:markerIndex], `<li class="tg-branch-row">`)
+	rowEndOffset := strings.Index(page[markerIndex:], "</li>")
+	if rowStart < 0 || rowEndOffset < 0 {
+		t.Fatalf("managed branch %q is missing its branch row", branch)
+	}
+	return page[rowStart : markerIndex+rowEndOffset+len("</li>")]
+}
+
+func requireLatestActivityRow(t *testing.T, page, action string) string {
+	t.Helper()
+	marker := `<td data-label="Action">` + html.EscapeString(action) + `</td>`
+	markerIndex := strings.Index(page, marker)
+	if markerIndex < 0 {
+		t.Fatalf("activity is missing a %q event", action)
+	}
+	rowStart := strings.LastIndex(page[:markerIndex], "<tr>")
+	rowEndOffset := strings.Index(page[markerIndex:], "</tr>")
+	if rowStart < 0 || rowEndOffset < 0 {
+		t.Fatalf("latest %q event is missing its activity row", action)
+	}
+	return page[rowStart : markerIndex+rowEndOffset+len("</tr>")]
 }
 
 func activateEnforcement(t *testing.T, ctx context.Context, browser *thawguardBrowser, repositoryID int64) {
