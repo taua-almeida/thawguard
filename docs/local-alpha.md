@@ -149,11 +149,15 @@ The target:
 22. rotates to the pre-generated replacement status token through Thawguard's real CSRF-protected form and immediately requests manual recovery, while tolerating a harmless race with the automatic worker;
 23. proves recovery returns enforcement to active, keeps the historical failed publication visible without credentials, republishes `thawguard/freeze=failure` on the new head, and leaves the frozen merge blocked;
 24. records the open-PR sync baseline, then sends sanitized in-memory E2E fixtures to prove an invalid signature has no trusted side effects and one valid repository-scoped delivery ID cannot process or publish twice;
-25. lifts the freeze and observes `thawguard/freeze=success` on the new head;
-26. checks all three token values against rendered diagnostic pages, relevant HTTP responses and redirects, Forgejo status API responses, captured Go test output, and both container logs without printing unsafe content; and
-27. removes both containers and both named volumes on success or failure.
+25. lifts the first freeze, observes `thawguard/freeze=success` on the new head, and completes the existing open-PR sync and cache proof;
+26. creates a second active freeze with a distinct fictional reason, captures its rendered identity and pre-cancel webhook, publication, status, and activity baselines, observes `thawguard/freeze=failure`, and confirms the required status blocks a normal merge;
+27. cancels that exact active freeze through the authenticated CSRF-protected form, proves the newest **Branch freeze** activity is **Cancelled** rather than **Lifted**, and observes `thawguard/freeze=success` with no new webhook row or publication intent, exactly one new publication attempt, and exactly one new Forgejo required-context status;
+28. checks all three token values against rendered diagnostic pages, relevant HTTP responses and redirects, Forgejo status API responses, captured Go test output, and both container logs without printing unsafe content; and
+29. removes both containers and both named volumes on success or failure.
 
 The initial pull request and later feature-branch advance deliveries are Forgejo-emitted. The status drift is a deliberate cooperative-enforcement fixture posted with the disposable fictional control token while Thawguard is stopped; the test does not attempt a merge while that success is newest. The rejection and duplicate probes are clearly identified synthetic E2E fixtures; they run only after credential recovery, reuse the fictional repository, and never store or print their payloads, signatures, or in-memory secret. Separate status tokens keep fixture control independent from the credential under failure, but all three tokens belong only to the disposable fictional owner.
+
+The second lifecycle cancels an already-active freeze. Active **Cancel** records the distinct **Cancelled** outcome and republishes current policy; **Lift** records **Lifted**, while scheduled cancellation applies only to a future window that has not activated. The test does not merge after the passing status because the updated required context is sufficient proof that Thawguard removed its cooperative merge block.
 
 The restart proof covers persisted unhealthy state and already-enqueued recovery work. The restarted worker consumes that existing job when it becomes due; startup does not enqueue or reconcile every otherwise healthy active repository. This is not a universal startup sweep.
 
@@ -184,7 +188,7 @@ The script intentionally exits with status 97 after both services become healthy
 
 ## Prioritized E2E expansion matrix
 
-The disposable smoke covers the freeze/lift path plus the setup-readiness, webhook, and token-failure P0 rows below. Add the remaining cases in this order:
+The disposable smoke covers the freeze/lift and active-cancel paths plus the setup-readiness, webhook, and token-failure P0 rows below. Add the remaining cases in this order:
 
 | Priority | Scenario | Main proof |
 | --- | --- | --- |
@@ -192,7 +196,7 @@ The disposable smoke covers the freeze/lift path plus the setup-readiness, webho
 | P0 (covered) | Token failure and redaction | Posting fails closed, recovery evidence is sanitized, and no token reaches output. |
 | P0 (covered) | Setup readiness failure and recovery | An unprotected managed branch blocks verification and activation; adding the missing Forgejo protection allows the normal workflow to proceed. |
 | P0 (covered) | Restart persistence and reconciliation | A Thawguard-only restart preserves durable state and an existing recovery job converges current frozen policy without implying a universal startup sweep. |
-| P1 | Cancel freeze | Cancellation republishes current policy and remains auditable. |
+| P1 (covered) | Cancel freeze | Active cancellation records **Cancelled**, reuses the desired-status intent, republishes current policy, and remains distinct from Lift and scheduled cancellation. |
 | P1 | Immediate per-PR thaw | A real PR/head receives an audited exception and success status. |
 | P1 | Stale-head thaw invalidation | A new head invalidates the old exception and is reevaluated. |
 | P1 | Shared-head confirmation | SHA-scoped impact is shown and explicit confirmation covers the affected set. |

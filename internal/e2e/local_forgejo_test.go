@@ -138,7 +138,7 @@ func TestLocalForgejoFreezeLifecycle(t *testing.T) {
 	createForgejoBranchProtection(t, ctx, forgejo, fixtureReleaseBranch)
 	activateEnforcement(t, ctx, browser, repositoryID)
 	requireRepairedReleaseReadiness(t, ctx, browser)
-	createFreeze(t, ctx, browser, repositoryID)
+	firstFreeze := createFreeze(t, ctx, browser, repositoryID, "Fictional release verification")
 	waitForStatusWithDescription(t, ctx, forgejo, pr.Head.SHA, "failure", "Branch is frozen; merge is blocked by Thawguard")
 	assertMergeBlockedByRequiredStatus(t, ctx, forgejo, pr.Number)
 	proveRestartPersistenceAndReconciliation(t, ctx, forgejo, browser, cfg, repositoryID, pr)
@@ -169,11 +169,83 @@ func TestLocalForgejoFreezeLifecycle(t *testing.T) {
 		assertDuplicateDeliveryIsIdempotent(t, ctx, forgejo, browser, cfg, repositoryID, newHeadSHA, payload)
 	})
 
-	liftFreeze(t, ctx, browser)
+	liftFreeze(t, ctx, browser, firstFreeze)
 	waitForStatusWithDescription(t, ctx, forgejo, newHeadSHA, "success", "No active freeze applies to this PR")
 	activityPage := waitForOneNewOpenPullRequestSync(t, ctx, browser, openPullRequestSyncsBeforeProbes)
 	requireLatestOpenPullRequestSync(t, activityPage)
 	scanRenderedTokenSurfaces(t, ctx, browser)
+
+	proveActiveFreezeCancellation(t, ctx, forgejo, browser, repositoryID, pr.Number, newHeadSHA, firstFreeze)
+	scanRenderedTokenSurfaces(t, ctx, browser)
+}
+
+func proveActiveFreezeCancellation(t *testing.T, ctx context.Context, forgejo *forgejoAPI, browser *thawguardBrowser, repositoryID int64, pullRequestIndex int, headSHA string, firstFreeze activeFreezeEvidence) {
+	t.Helper()
+	const cancellationReason = "Fictional cancellation verification."
+
+	requireNoActiveFreezeEvidence(t, requirePage(t, ctx, browser, "/freezes"), firstFreeze)
+	firstLiftRow := requireLatestActivityRow(t, requirePage(t, ctx, browser, "/activity"), "Branch freeze")
+	requireBranchFreezeActivityEvidence(t, firstLiftRow, firstFreeze, "Lifted", "ok")
+
+	secondFreeze := createFreeze(t, ctx, browser, repositoryID, cancellationReason)
+	if secondFreeze.id == firstFreeze.id {
+		t.Fatalf("second freeze reused lifted freeze ID %d", secondFreeze.id)
+	}
+	if secondFreeze.reason == firstFreeze.reason {
+		t.Fatalf("second freeze reason %q did not remain distinct from lifted freeze", secondFreeze.reason)
+	}
+	waitForStatusWithDescription(t, ctx, forgejo, headSHA, "failure", "Branch is frozen; merge is blocked by Thawguard")
+	waitForLatestPostedPublicationAttempt(t, ctx, browser, headSHA, "failure", "Branch is frozen; merge is blocked by Thawguard")
+	assertMergeBlockedByRequiredStatus(t, ctx, forgejo, pullRequestIndex)
+
+	if active := requireActiveFreezeEvidence(t, requirePage(t, ctx, browser, "/freezes")); active != secondFreeze {
+		t.Fatalf("second active freeze changed before cancellation: created=%+v rendered=%+v", secondFreeze, active)
+	}
+	activityBefore := requirePage(t, ctx, browser, "/activity")
+	createdRow := requireLatestActivityRow(t, activityBefore, "Branch freeze")
+	requireBranchFreezeActivityEvidence(t, createdRow, secondFreeze, "Frozen", "frozen")
+	before := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, headSHA)
+	if len(before.freezeStatuses) == 0 {
+		t.Fatal("second active freeze is missing its pre-cancel Forgejo status")
+	}
+	latestBefore := before.freezeStatuses[len(before.freezeStatuses)-1]
+	if latestBefore.Context != requiredContext || latestBefore.Status != "failure" || latestBefore.Description != "Branch is frozen; merge is blocked by Thawguard" {
+		t.Fatalf("unexpected pre-cancel required status: id=%d context=%q state=%q description=%q", latestBefore.ID, latestBefore.Context, latestBefore.Status, latestBefore.Description)
+	}
+
+	cancelFreeze(t, ctx, browser, secondFreeze)
+	waitForStatusWithDescription(t, ctx, forgejo, headSHA, "success", "No active freeze applies to this PR")
+	waitForLatestPostedPublicationAttempt(t, ctx, browser, headSHA, "success", "No active freeze applies to this PR")
+	requireNoActiveFreezeEvidence(t, requirePage(t, ctx, browser, "/freezes"), secondFreeze)
+
+	activityAfter := requirePage(t, ctx, browser, "/activity")
+	cancelledRow := requireLatestActivityRow(t, activityAfter, "Branch freeze")
+	requireBranchFreezeActivityEvidence(t, cancelledRow, secondFreeze, "Cancelled", "warning")
+	if strings.Contains(cancelledRow, ">Lifted</span>") || strings.Contains(cancelledRow, firstFreeze.reason) {
+		t.Fatal("cancelled branch-freeze activity was confused with the earlier lifted freeze")
+	}
+	if cancelledRow == firstLiftRow || !strings.Contains(activityAfter, firstLiftRow) {
+		t.Fatal("cancelled branch-freeze activity did not remain distinct from the preserved Lift event")
+	}
+
+	after := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, headSHA)
+	if after.webhookRows != before.webhookRows {
+		t.Fatalf("active freeze cancellation changed webhook rows from %d to %d", before.webhookRows, after.webhookRows)
+	}
+	if after.publicationIntents != before.publicationIntents {
+		t.Fatalf("active freeze cancellation changed publication intents from %d to %d, want existing intent reused", before.publicationIntents, after.publicationIntents)
+	}
+	if after.publicationAttempts != before.publicationAttempts+1 {
+		t.Fatalf("active freeze cancellation changed publication attempts by %d, want 1", after.publicationAttempts-before.publicationAttempts)
+	}
+	if len(after.freezeStatuses) != len(before.freezeStatuses)+1 {
+		t.Fatalf("active freeze cancellation changed Forgejo required-context statuses by %d, want 1", len(after.freezeStatuses)-len(before.freezeStatuses))
+	}
+	latestAfter := after.freezeStatuses[len(after.freezeStatuses)-1]
+	if latestAfter.ID <= latestBefore.ID || latestAfter.Context != requiredContext || latestAfter.Status != "success" || latestAfter.Description != "No active freeze applies to this PR" {
+		t.Fatalf("unexpected post-cancel required status: id=%d context=%q state=%q description=%q", latestAfter.ID, latestAfter.Context, latestAfter.Status, latestAfter.Description)
+	}
+
 }
 
 func loadConfig(t *testing.T) e2eConfig {
@@ -1182,6 +1254,40 @@ func requireActiveFreezeEvidence(t *testing.T, page string) activeFreezeEvidence
 	}
 }
 
+func requireNoActiveFreezeEvidence(t *testing.T, page string, freeze activeFreezeEvidence) {
+	t.Helper()
+	for _, want := range []string{`<span class="tg-badge">0 active</span>`, "No active freezes yet"} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("freezes page is missing inactive evidence %q for freeze %d", want, freeze.id)
+		}
+	}
+	for _, absent := range []string{
+		`name="freeze_id" value="` + strconv.FormatInt(freeze.id, 10) + `"`,
+		html.EscapeString(freeze.reason),
+		`action="/freezes/end"`,
+		`action="/freezes/cancel"`,
+	} {
+		if strings.Contains(page, absent) {
+			t.Fatalf("inactive freeze %d still renders active evidence %q", freeze.id, absent)
+		}
+	}
+}
+
+func requireBranchFreezeActivityEvidence(t *testing.T, row string, freeze activeFreezeEvidence, outcome, outcomeClass string) {
+	t.Helper()
+	for _, want := range []string{
+		`<td data-label="Actor">E2E Admin</td>`,
+		`<td data-label="Action">Branch freeze</td>`,
+		`<td data-label="Target">` + fixtureOwner + `/` + fixtureRepository + ` → ` + html.EscapeString(freeze.branch) + `</td>`,
+		`<td data-label="Outcome"><span class="status status-` + outcomeClass + `">` + outcome + `</span></td>`,
+		`<td data-label="Details">Reason: ` + html.EscapeString(freeze.reason),
+	} {
+		if !strings.Contains(row, want) {
+			t.Fatalf("branch-freeze activity for freeze %d is missing %q", freeze.id, want)
+		}
+	}
+}
+
 func requireLatestPublicationAttemptRow(t *testing.T, page string) string {
 	t.Helper()
 	sectionMarker := "<h2>Recent publication attempts</h2>"
@@ -1204,6 +1310,31 @@ func requireLatestPublicationAttemptRow(t *testing.T, page string) string {
 		t.Fatal("latest publication attempt row is incomplete")
 	}
 	return page[rowStart : rowStart+rowEndOffset+len("</tr>")]
+}
+
+func waitForLatestPostedPublicationAttempt(t *testing.T, ctx context.Context, browser *thawguardBrowser, headSHA, state, description string) {
+	t.Helper()
+	wants := []string{
+		headSHA,
+		`<small class="tg-muted">` + requiredContext + `</small>`,
+		`<td data-label="State"><span class="status status-` + state + `">` + state + `</span></td>`,
+		`<td data-label="Mode"><code>forgejo_status</code></td>`,
+		`<td data-label="Result"><span class="status status-ok">posted</span></td>`,
+		description,
+	}
+	waitFor(t, 30*time.Second, "recorded "+requiredContext+"="+state+" Forgejo publication attempt", func() (bool, error) {
+		page, err := browser.get(ctx, "/publications")
+		if err != nil {
+			return false, err
+		}
+		row := requireLatestPublicationAttemptRow(t, page)
+		for _, want := range wants {
+			if !strings.Contains(row, want) {
+				return false, nil
+			}
+		}
+		return true, nil
+	})
 }
 
 func requirePatternText(t *testing.T, value string, pattern *regexp.Regexp, label string) string {
@@ -1250,7 +1381,7 @@ func activateEnforcement(t *testing.T, ctx context.Context, browser *thawguardBr
 	}
 }
 
-func createFreeze(t *testing.T, ctx context.Context, browser *thawguardBrowser, repositoryID int64) {
+func createFreeze(t *testing.T, ctx context.Context, browser *thawguardBrowser, repositoryID int64, reason string) activeFreezeEvidence {
 	t.Helper()
 	page := requirePage(t, ctx, browser, "/freezes")
 	csrf := requireHiddenInput(t, page, "csrf_token")
@@ -1258,20 +1389,42 @@ func createFreeze(t *testing.T, ctx context.Context, browser *thawguardBrowser, 
 		"csrf_token":              {csrf},
 		"repository_id":           {strconv.FormatInt(repositoryID, 10)},
 		"branch":                  {"main"},
-		"reason":                  {"Fictional release verification"},
+		"reason":                  {reason},
 		"timezone_offset_minutes": {"0"},
 	}, "create Thawguard freeze")
+	created := requireActiveFreezeEvidence(t, requirePage(t, ctx, browser, "/freezes"))
+	if created.branch != "main" || created.reason != reason || created.status != "active" {
+		t.Fatalf("created freeze has unexpected rendered evidence: id=%d branch=%q reason=%q status=%q", created.id, created.branch, created.reason, created.status)
+	}
+	return created
 }
 
-func liftFreeze(t *testing.T, ctx context.Context, browser *thawguardBrowser) {
+func liftFreeze(t *testing.T, ctx context.Context, browser *thawguardBrowser, freeze activeFreezeEvidence) {
 	t.Helper()
 	page := requirePage(t, ctx, browser, "/freezes")
+	if active := requireActiveFreezeEvidence(t, page); active != freeze {
+		t.Fatalf("refusing to lift the wrong freeze: want=%+v rendered=%+v", freeze, active)
+	}
 	csrf := requireHiddenInput(t, page, "csrf_token")
-	freezeID := requireHiddenInput(t, page, "freeze_id")
 	requirePostForm(t, ctx, browser, "/freezes/end", url.Values{
 		"csrf_token": {csrf},
-		"freeze_id":  {freezeID},
+		"freeze_id":  {strconv.FormatInt(freeze.id, 10)},
 	}, "lift Thawguard freeze")
+}
+
+func cancelFreeze(t *testing.T, ctx context.Context, browser *thawguardBrowser, freeze activeFreezeEvidence) {
+	t.Helper()
+	page := requirePage(t, ctx, browser, "/freezes")
+	if active := requireActiveFreezeEvidence(t, page); active != freeze {
+		t.Fatalf("refusing to cancel the wrong freeze: want=%+v rendered=%+v", freeze, active)
+	}
+	if !strings.Contains(page, `action="/freezes/cancel"`) {
+		t.Fatalf("active freeze %d is missing its cancel action", freeze.id)
+	}
+	requirePostForm(t, ctx, browser, "/freezes/cancel", url.Values{
+		"csrf_token": {requireHiddenInput(t, page, "csrf_token")},
+		"freeze_id":  {strconv.FormatInt(freeze.id, 10)},
+	}, "cancel active Thawguard freeze")
 }
 
 func waitForStatusWithDescription(t *testing.T, ctx context.Context, forgejo *forgejoAPI, sha, expected, description string) {
