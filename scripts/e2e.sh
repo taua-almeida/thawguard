@@ -183,6 +183,8 @@ test_output="$(new_private_temp_file)"
 test_status=0
 
 if THAWGUARD_E2E=1 \
+  THAWGUARD_E2E_COMPOSE_PROJECT="$PROJECT_NAME" \
+  THAWGUARD_E2E_REPO_ROOT="$ROOT_DIR" \
   THAWGUARD_E2E_FORGEJO_URL="http://127.0.0.1:3000" \
   THAWGUARD_E2E_FORGEJO_CONTROL_TOKEN="$forgejo_control_token" \
   THAWGUARD_E2E_FORGEJO_OWNER_PASSWORD="$forgejo_owner_password" \

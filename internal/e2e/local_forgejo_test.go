@@ -18,6 +18,8 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -27,14 +29,16 @@ import (
 )
 
 const (
-	fixtureOwner           = "e2e-owner"
-	fixtureRepository      = "icebox-demo"
-	fixtureReleaseBranch   = "release"
-	fixtureFeatureBranch   = "feature/freeze-check"
-	primaryStatusTokenName = "thawguard-e2e-status-primary"
-	requiredContext        = "thawguard/freeze"
-	invalidDeliveryID      = "e2e-invalid-signature-fixture"
-	duplicateDeliveryID    = "e2e-duplicate-delivery-fixture"
+	fixtureOwner             = "e2e-owner"
+	fixtureRepository        = "icebox-demo"
+	fixtureReleaseBranch     = "release"
+	fixtureFeatureBranch     = "feature/freeze-check"
+	primaryStatusTokenName   = "thawguard-e2e-status-primary"
+	requiredContext          = "thawguard/freeze"
+	e2eComposeProject        = "thawguard-e2e"
+	injectedDriftDescription = "E2E injected status drift while Thawguard was stopped"
+	invalidDeliveryID        = "e2e-invalid-signature-fixture"
+	duplicateDeliveryID      = "e2e-duplicate-delivery-fixture"
 )
 
 type e2eConfig struct {
@@ -46,6 +50,9 @@ type e2eConfig struct {
 	thawguardURL           string
 	webhookSecret          string
 	thawguardPassword      string
+	thawguardSecretKey     string
+	composeProject         string
+	repositoryRoot         string
 }
 
 type forgejoAPI struct {
@@ -88,12 +95,19 @@ type webhookSideEffectEvidence struct {
 	freezeStatuses      []commitStatus
 }
 
+type activeFreezeEvidence struct {
+	id     int64
+	branch string
+	reason string
+	status string
+}
+
 func TestLocalForgejoFreezeLifecycle(t *testing.T) {
 	if os.Getenv("THAWGUARD_E2E") != "1" {
 		t.Skip("set THAWGUARD_E2E=1 and use make e2e")
 	}
 	cfg := loadConfig(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	sensitiveValues := cfg.sensitiveValues()
@@ -127,6 +141,7 @@ func TestLocalForgejoFreezeLifecycle(t *testing.T) {
 	createFreeze(t, ctx, browser, repositoryID)
 	waitForStatusWithDescription(t, ctx, forgejo, pr.Head.SHA, "failure", "Branch is frozen; merge is blocked by Thawguard")
 	assertMergeBlockedByRequiredStatus(t, ctx, forgejo, pr.Number)
+	proveRestartPersistenceAndReconciliation(t, ctx, forgejo, browser, cfg, repositoryID, pr)
 
 	beforeTokenFailure := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, pr.Head.SHA)
 	revokePrimaryStatusToken(t, ctx, forgejo, cfg.forgejoOwnerPassword)
@@ -172,6 +187,9 @@ func loadConfig(t *testing.T) e2eConfig {
 		thawguardURL:           "http://127.0.0.1:8080",
 		webhookSecret:          os.Getenv("THAWGUARD_E2E_WEBHOOK_SECRET"),
 		thawguardPassword:      os.Getenv("THAWGUARD_E2E_ADMIN_PASSWORD"),
+		thawguardSecretKey:     os.Getenv("THAWGUARD_SECRET_KEY"),
+		composeProject:         os.Getenv("THAWGUARD_E2E_COMPOSE_PROJECT"),
+		repositoryRoot:         os.Getenv("THAWGUARD_E2E_REPO_ROOT"),
 	}
 	for _, required := range []struct {
 		name  string
@@ -184,6 +202,9 @@ func loadConfig(t *testing.T) e2eConfig {
 		{name: "THAWGUARD_E2E_REPLACEMENT_STATUS_TOKEN", value: cfg.replacementStatusToken},
 		{name: "THAWGUARD_E2E_WEBHOOK_SECRET", value: cfg.webhookSecret},
 		{name: "THAWGUARD_E2E_ADMIN_PASSWORD", value: cfg.thawguardPassword},
+		{name: "THAWGUARD_SECRET_KEY", value: cfg.thawguardSecretKey},
+		{name: "THAWGUARD_E2E_COMPOSE_PROJECT", value: cfg.composeProject},
+		{name: "THAWGUARD_E2E_REPO_ROOT", value: cfg.repositoryRoot},
 	} {
 		if strings.TrimSpace(required.value) == "" {
 			t.Fatalf("required E2E environment variable is unset: %s", required.name)
@@ -193,6 +214,9 @@ func loadConfig(t *testing.T) e2eConfig {
 		cfg.forgejoControlToken == cfg.replacementStatusToken ||
 		cfg.primaryStatusToken == cfg.replacementStatusToken {
 		t.Fatal("Forgejo E2E credentials must use three distinct token values")
+	}
+	if _, _, err := cfg.composeFiles(); err != nil {
+		t.Fatal("invalid E2E Compose metadata")
 	}
 	return cfg
 }
@@ -205,6 +229,47 @@ func (cfg e2eConfig) sensitiveValues() []string {
 		cfg.replacementStatusToken,
 		cfg.webhookSecret,
 		cfg.thawguardPassword,
+		cfg.thawguardSecretKey,
+	}
+}
+
+func (cfg e2eConfig) composeFiles() (string, string, error) {
+	root := strings.TrimSpace(cfg.repositoryRoot)
+	if cfg.composeProject != e2eComposeProject || root == "" || !filepath.IsAbs(root) || filepath.Clean(root) != root {
+		return "", "", fmt.Errorf("compose metadata is outside the E2E allowlist")
+	}
+	composeFile := filepath.Join(root, "compose.yaml")
+	localComposeFile := filepath.Join(root, "compose.local.yaml")
+	for _, path := range []string{composeFile, localComposeFile} {
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() {
+			return "", "", fmt.Errorf("compose metadata is outside the E2E allowlist")
+		}
+	}
+	return composeFile, localComposeFile, nil
+}
+
+func controlThawguardService(t *testing.T, ctx context.Context, cfg e2eConfig, operation string) {
+	t.Helper()
+	if operation != "stop" && operation != "start" {
+		t.Fatal("docker compose Thawguard service operation is not allowed")
+	}
+	composeFile, localComposeFile, err := cfg.composeFiles()
+	if err != nil {
+		t.Fatal("invalid E2E Compose metadata")
+	}
+	commandCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+	output, commandErr := exec.CommandContext(commandCtx, "docker", []string{
+		"compose",
+		"--project-name", e2eComposeProject,
+		"--file", composeFile,
+		"--file", localComposeFile,
+		operation,
+		"thawguard",
+	}...).CombinedOutput()
+	if containsSensitiveValue(output, cfg.sensitiveValues()) || commandErr != nil {
+		t.Fatalf("docker compose %s thawguard failed", operation)
 	}
 }
 
@@ -254,6 +319,12 @@ func createForgejoBranchProtection(t *testing.T, ctx context.Context, forgejo *f
 	if protection.RuleName != branch || !protection.EnableStatusCheck || !slices.Contains(protection.StatusCheckContexts, requiredContext) {
 		t.Fatalf("Forgejo returned incomplete protection for branch %q", branch)
 	}
+}
+
+func deleteForgejoBranchProtection(t *testing.T, ctx context.Context, forgejo *forgejoAPI, branch string) {
+	t.Helper()
+	response, err := forgejo.do(ctx, http.MethodDelete, forgejo.repositoryPath("branch_protections", url.PathEscape(branch)), nil)
+	requireAPIStatus(t, response, err, http.StatusNoContent, "delete Forgejo branch protection for "+branch)
 }
 
 func configureThawguard(t *testing.T, ctx context.Context, browser *thawguardBrowser, cfg e2eConfig) int64 {
@@ -334,6 +405,191 @@ func createForgejoPullRequest(t *testing.T, ctx context.Context, forgejo *forgej
 		t.Fatal("Forgejo pull request response is missing its number or head SHA")
 	}
 	return pr
+}
+
+func proveRestartPersistenceAndReconciliation(t *testing.T, ctx context.Context, forgejo *forgejoAPI, browser *thawguardBrowser, cfg e2eConfig, repositoryID int64, pr pullRequest) {
+	t.Helper()
+	repositoryValue := strconv.FormatInt(repositoryID, 10)
+	repositoriesBefore := requirePage(t, ctx, browser, "/repositories")
+	if !strings.Contains(repositoriesBefore, fixtureOwner+"/"+fixtureRepository) {
+		t.Fatal("authenticated repository page is missing the configured repository before restart")
+	}
+	csrfBefore := requireHiddenInput(t, repositoriesBefore, "csrf_token")
+	freezeBefore := requireActiveFreezeEvidence(t, requirePage(t, ctx, browser, "/freezes"))
+	if freezeBefore.id <= 0 || freezeBefore.branch != "main" || freezeBefore.reason != "Fictional release verification" || freezeBefore.status != "active" {
+		t.Fatalf("active freeze has unexpected pre-restart evidence: id=%d branch=%q reason=%q status=%q", freezeBefore.id, freezeBefore.branch, freezeBefore.reason, freezeBefore.status)
+	}
+	activityBefore := requirePage(t, ctx, browser, "/activity")
+	freezeHistoryBefore := requireLatestActivityRow(t, activityBefore, "Branch freeze")
+	evidenceBefore := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, pr.Head.SHA)
+	if len(evidenceBefore.freezeStatuses) == 0 {
+		t.Fatal("missing pre-restart Thawguard freeze status")
+	}
+	oldFailure := evidenceBefore.freezeStatuses[len(evidenceBefore.freezeStatuses)-1]
+	if oldFailure.Context != requiredContext || oldFailure.Status != "failure" || oldFailure.Description != "Branch is frozen; merge is blocked by Thawguard" {
+		t.Fatalf("unexpected pre-restart required status: id=%d context=%q state=%q description=%q", oldFailure.ID, oldFailure.Context, oldFailure.Status, oldFailure.Description)
+	}
+
+	deleteForgejoBranchProtection(t, ctx, forgejo, fixtureReleaseBranch)
+	failedResponse, err := browser.postFormResponse(ctx, "/repositories/reconcile", url.Values{
+		"csrf_token":    {csrfBefore},
+		"repository_id": {repositoryValue},
+	})
+	if err != nil {
+		t.Fatalf("submit Thawguard reconciliation with failed readiness: %v", err)
+	}
+	if failedResponse.statusCode != http.StatusBadRequest {
+		t.Fatalf("failed-readiness reconciliation returned HTTP %d, want 400", failedResponse.statusCode)
+	}
+
+	controlThawguardService(t, ctx, cfg, "stop")
+	failedBody := string(failedResponse.body)
+	for _, want := range []string{
+		"Reconciliation stopped: readiness checks did not pass, so nothing was synchronized or published.",
+		"Enforcement is unhealthy: readiness checks failed",
+		"Automatic recovery is pending",
+	} {
+		if !strings.Contains(failedBody, want) {
+			t.Fatalf("failed-readiness reconciliation response is missing %q", want)
+		}
+	}
+
+	createForgejoBranchProtection(t, ctx, forgejo, fixtureReleaseBranch)
+	injected := postInjectedDriftStatus(t, ctx, forgejo, pr.Head.SHA)
+	if injected.ID <= oldFailure.ID {
+		t.Fatalf("injected drift status ID %d did not follow old Thawguard failure ID %d", injected.ID, oldFailure.ID)
+	}
+
+	controlThawguardService(t, ctx, cfg, "start")
+	waitFor(t, 45*time.Second, "restarted Thawguard HTTP readiness", func() (bool, error) {
+		_, err := browser.get(ctx, "/healthz")
+		return err == nil, err
+	})
+
+	repositoriesAfterStart := requirePage(t, ctx, browser, "/repositories")
+	if !strings.Contains(repositoriesAfterStart, fixtureOwner+"/"+fixtureRepository) {
+		t.Fatal("restarted browser session is not authenticated to the configured repository")
+	}
+	if csrfAfter := requireHiddenInput(t, repositoriesAfterStart, "csrf_token"); csrfAfter != csrfBefore {
+		t.Fatal("authenticated session CSRF token changed across Thawguard restart")
+	}
+	freezeAfterStart := requireActiveFreezeEvidence(t, requirePage(t, ctx, browser, "/freezes"))
+	if freezeAfterStart != freezeBefore {
+		t.Fatalf("active freeze changed across Thawguard restart: before=%+v after=%+v", freezeBefore, freezeAfterStart)
+	}
+
+	waitFor(t, 75*time.Second, "persisted repository recovery work to converge frozen policy", func() (bool, error) {
+		repositoriesPage, err := browser.get(ctx, "/repositories")
+		if err != nil {
+			return false, err
+		}
+		activityPage, err := browser.get(ctx, "/activity")
+		if err != nil {
+			return false, err
+		}
+		statuses, err := listForgejoFreezeStatuses(ctx, forgejo, pr.Head.SHA)
+		if err != nil {
+			return false, err
+		}
+		if len(statuses) == 0 {
+			return false, nil
+		}
+		latest := statuses[len(statuses)-1]
+		return latest.ID > injected.ID &&
+			latest.Status == "failure" &&
+			latest.Description == "Branch is frozen; merge is blocked by Thawguard" &&
+			strings.Contains(repositoriesPage, `<span class="tg-badge status-ok">enforcement active</span>`) &&
+			!strings.Contains(repositoriesPage, "Enforcement is unhealthy") &&
+			!strings.Contains(repositoriesPage, "Automatic recovery is pending") &&
+			strings.Contains(activityPage, `<td data-label="Actor">Reconciliation runner</td>`) &&
+			strings.Contains(activityPage, `<td data-label="Action">Enforcement recovery</td>`) &&
+			strings.Contains(activityPage, "1 open PRs evaluated; 1 statuses posted and 0 failed."), nil
+	})
+
+	repositoriesAfter := requirePage(t, ctx, browser, "/repositories")
+	if csrfAfter := requireHiddenInput(t, repositoriesAfter, "csrf_token"); csrfAfter != csrfBefore {
+		t.Fatal("authenticated session CSRF token changed after restarted recovery")
+	}
+	for _, want := range []string{
+		"<strong>Webhook secret</strong>",
+		"Stored encrypted. Hidden until you intentionally rotate it.",
+		"<strong>Status token</strong>",
+		"Stored encrypted. Hidden until rotation.",
+	} {
+		if !strings.Contains(repositoriesAfter, want) {
+			t.Fatalf("restarted repository page is missing encrypted credential evidence %q", want)
+		}
+	}
+	if strings.Contains(repositoriesAfter, "Enforcement is unhealthy") || strings.Contains(repositoriesAfter, "Automatic recovery is pending") || strings.Contains(repositoriesAfter, "Recovery in progress") {
+		t.Fatal("restarted repository still reports unhealthy or pending recovery after convergence")
+	}
+	requireRepairedReleaseReadiness(t, ctx, browser)
+	if freezeAfter := requireActiveFreezeEvidence(t, requirePage(t, ctx, browser, "/freezes")); freezeAfter != freezeBefore {
+		t.Fatalf("active freeze changed after restarted recovery: before=%+v after=%+v", freezeBefore, freezeAfter)
+	}
+
+	activityAfter := requirePage(t, ctx, browser, "/activity")
+	recoveryRow := requireLatestActivityRow(t, activityAfter, "Enforcement recovery")
+	for _, want := range []string{
+		`<td data-label="Actor">Reconciliation runner</td>`,
+		`<td data-label="Outcome"><span class="status status-ok">Succeeded</span></td>`,
+		"1 open PRs evaluated; 1 statuses posted and 0 failed.",
+	} {
+		if !strings.Contains(recoveryRow, want) {
+			t.Fatalf("automatic recovery activity row is missing %q", want)
+		}
+	}
+	if !strings.Contains(activityAfter, freezeHistoryBefore) {
+		t.Fatal("pre-restart branch-freeze history row did not survive restart")
+	}
+
+	evidenceAfter := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, pr.Head.SHA)
+	if evidenceAfter.webhookRows != evidenceBefore.webhookRows {
+		t.Fatalf("restart recovery changed webhook rows from %d to %d", evidenceBefore.webhookRows, evidenceAfter.webhookRows)
+	}
+	if evidenceAfter.publicationIntents != evidenceBefore.publicationIntents {
+		t.Fatalf("restart recovery changed publication intents from %d to %d, want existing intent reused", evidenceBefore.publicationIntents, evidenceAfter.publicationIntents)
+	}
+	if evidenceAfter.publicationAttempts != evidenceBefore.publicationAttempts+1 {
+		t.Fatalf("restart recovery changed publication attempts by %d, want 1", evidenceAfter.publicationAttempts-evidenceBefore.publicationAttempts)
+	}
+	publicationRow := requireLatestPublicationAttemptRow(t, requirePage(t, ctx, browser, "/publications"))
+	for _, want := range []string{pr.Head.SHA, requiredContext, ">failure</span>", ">posted</span>", "Branch is frozen; merge is blocked by Thawguard"} {
+		if !strings.Contains(publicationRow, want) {
+			t.Fatalf("restart recovery publication attempt is missing %q", want)
+		}
+	}
+
+	if len(evidenceAfter.freezeStatuses) != len(evidenceBefore.freezeStatuses)+2 {
+		t.Fatalf("restart drift and recovery added %d Forgejo statuses, want 2", len(evidenceAfter.freezeStatuses)-len(evidenceBefore.freezeStatuses))
+	}
+	recovered := evidenceAfter.freezeStatuses[len(evidenceAfter.freezeStatuses)-1]
+	if !(oldFailure.ID < injected.ID && injected.ID < recovered.ID) {
+		t.Fatalf("required status ID ordering is %d < %d < %d, want strict old-failure < injected-success < recovered-failure", oldFailure.ID, injected.ID, recovered.ID)
+	}
+	if injected.Context != requiredContext || injected.Status != "success" || injected.Description != injectedDriftDescription {
+		t.Fatalf("unexpected injected drift status: id=%d context=%q state=%q description=%q", injected.ID, injected.Context, injected.Status, injected.Description)
+	}
+	if recovered.Context != requiredContext || recovered.Status != "failure" || recovered.Description != "Branch is frozen; merge is blocked by Thawguard" {
+		t.Fatalf("unexpected recovered required status: id=%d context=%q state=%q description=%q", recovered.ID, recovered.Context, recovered.Status, recovered.Description)
+	}
+	assertMergeBlockedByRequiredStatus(t, ctx, forgejo, pr.Number)
+}
+
+func postInjectedDriftStatus(t *testing.T, ctx context.Context, forgejo *forgejoAPI, headSHA string) commitStatus {
+	t.Helper()
+	response, err := forgejo.do(ctx, http.MethodPost, forgejo.repositoryPath("statuses", headSHA), map[string]string{
+		"context":     requiredContext,
+		"state":       "success",
+		"description": injectedDriftDescription,
+	})
+	requireAPIStatus(t, response, err, http.StatusCreated, "post fictional Forgejo status drift")
+	var status commitStatus
+	decodeJSON(t, response.body, &status, "decode fictional Forgejo status drift")
+	if status.ID <= 0 || status.Context != requiredContext || status.Status != "success" || status.Description != injectedDriftDescription {
+		t.Fatalf("Forgejo returned invalid fictional drift status: id=%d context=%q state=%q description=%q", status.ID, status.Context, status.Status, status.Description)
+	}
+	return status
 }
 
 func revokePrimaryStatusToken(t *testing.T, ctx context.Context, forgejo *forgejoAPI, ownerPassword string) {
@@ -901,6 +1157,64 @@ func requireLatestActivityRow(t *testing.T, page, action string) string {
 	return page[rowStart : markerIndex+rowEndOffset+len("</tr>")]
 }
 
+func requireActiveFreezeEvidence(t *testing.T, page string) activeFreezeEvidence {
+	t.Helper()
+	marker := `<form method="post" action="/freezes/end"`
+	markerIndex := strings.Index(page, marker)
+	if markerIndex < 0 {
+		t.Fatal("active freeze is missing its desktop action row")
+	}
+	rowStart := strings.LastIndex(page[:markerIndex], "<tr>")
+	rowEndOffset := strings.Index(page[markerIndex:], "</tr>")
+	if rowStart < 0 || rowEndOffset < 0 {
+		t.Fatal("active freeze is missing its desktop table row")
+	}
+	row := page[rowStart : markerIndex+rowEndOffset+len("</tr>")]
+	id, err := strconv.ParseInt(requireHiddenInput(t, row, "freeze_id"), 10, 64)
+	if err != nil || id <= 0 {
+		t.Fatalf("parse active freeze ID: %v", err)
+	}
+	return activeFreezeEvidence{
+		id:     id,
+		branch: requirePatternText(t, row, activeFreezeBranchPattern, "active freeze branch"),
+		reason: requirePatternText(t, row, activeFreezeReasonPattern, "active freeze reason"),
+		status: requirePatternText(t, row, activeFreezeStatusPattern, "active freeze status"),
+	}
+}
+
+func requireLatestPublicationAttemptRow(t *testing.T, page string) string {
+	t.Helper()
+	sectionMarker := "<h2>Recent publication attempts</h2>"
+	sectionStart := strings.Index(page, sectionMarker)
+	if sectionStart < 0 {
+		t.Fatal("publications page is missing recent publication attempts")
+	}
+	tbodyOffset := strings.Index(page[sectionStart:], "<tbody>")
+	if tbodyOffset < 0 {
+		t.Fatal("recent publication attempts are missing their table body")
+	}
+	tbodyStart := sectionStart + tbodyOffset
+	rowStartOffset := strings.Index(page[tbodyStart:], "<tr>")
+	if rowStartOffset < 0 {
+		t.Fatal("recent publication attempts are missing their latest row")
+	}
+	rowStart := tbodyStart + rowStartOffset
+	rowEndOffset := strings.Index(page[rowStart:], "</tr>")
+	if rowEndOffset < 0 {
+		t.Fatal("latest publication attempt row is incomplete")
+	}
+	return page[rowStart : rowStart+rowEndOffset+len("</tr>")]
+}
+
+func requirePatternText(t *testing.T, value string, pattern *regexp.Regexp, label string) string {
+	t.Helper()
+	match := pattern.FindStringSubmatch(value)
+	if len(match) != 2 {
+		t.Fatalf("could not read %s", label)
+	}
+	return html.UnescapeString(strings.TrimSpace(match[1]))
+}
+
 func activateEnforcement(t *testing.T, ctx context.Context, browser *thawguardBrowser, repositoryID int64) {
 	t.Helper()
 	page := requirePage(t, ctx, browser, "/repositories")
@@ -1209,6 +1523,9 @@ var (
 	publicationIntentsPattern  = regexp.MustCompile(`Latest desired statuses</h2><span[^>]*>([0-9]+) shown</span>`)
 	publicationAttemptsPattern = regexp.MustCompile(`Recent publication attempts</h2><span[^>]*>([0-9]+) shown</span>`)
 	activityEventsPattern      = regexp.MustCompile(`Recent activity</h2><span[^>]*>([0-9]+) shown</span>`)
+	activeFreezeBranchPattern  = regexp.MustCompile(`<code class="tg-branch">([^<]+)</code>`)
+	activeFreezeReasonPattern  = regexp.MustCompile(`<td class="tg-freeze-reason">([^<]+)</td>`)
+	activeFreezeStatusPattern  = regexp.MustCompile(`<span class="status status-frozen">([^<]+)</span>`)
 )
 
 func requireAPIStatus(t *testing.T, response apiResponse, err error, expected int, operation string) {
