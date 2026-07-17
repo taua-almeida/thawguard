@@ -145,7 +145,17 @@ func TestLocalForgejoFreezeLifecycle(t *testing.T) {
 
 	beforeTokenFailure := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, pr.Head.SHA)
 	revokePrimaryStatusToken(t, ctx, forgejo, cfg.forgejoOwnerPassword)
-	newHeadSHA := advanceFeatureBranch(t, ctx, forgejo, pr)
+	newHeadSHA := advanceFeatureBranch(
+		t,
+		ctx,
+		forgejo,
+		pr.Number,
+		pr.Head.SHA,
+		"token-loss.txt",
+		"Advance fictional E2E feature head",
+		"new head for token-loss recovery proof\n",
+		"token-loss",
+	)
 	waitForTokenFailureEvidence(t, ctx, forgejo, browser, repositoryID, newHeadSHA)
 	afterTokenFailure := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, newHeadSHA)
 	requireTokenFailureSideEffects(t, beforeTokenFailure, afterTokenFailure)
@@ -178,6 +188,7 @@ func TestLocalForgejoFreezeLifecycle(t *testing.T) {
 	proveActiveFreezeCancellation(t, ctx, forgejo, browser, repositoryID, pr.Number, newHeadSHA, firstFreeze)
 	scanRenderedTokenSurfaces(t, ctx, browser)
 	proveImmediatePerPullRequestThaw(t, ctx, forgejo, browser, repositoryID, pr.Number, newHeadSHA)
+	newHeadSHA = proveStaleHeadThawReevaluation(t, ctx, forgejo, browser, repositoryID, pr.Number, newHeadSHA)
 	scanRenderedTokenSurfaces(t, ctx, browser)
 }
 
@@ -384,6 +395,173 @@ func proveImmediatePerPullRequestThaw(t *testing.T, ctx context.Context, forgejo
 	if active := requireActiveFreezeEvidence(t, requirePage(t, ctx, browser, "/freezes")); active != thirdFreeze {
 		t.Fatalf("third active freeze changed after immediate thaw: created=%+v rendered=%+v", thirdFreeze, active)
 	}
+}
+
+func proveStaleHeadThawReevaluation(t *testing.T, ctx context.Context, forgejo *forgejoAPI, browser *thawguardBrowser, repositoryID int64, pullRequestIndex int, headSHA string) string {
+	t.Helper()
+	const (
+		freezeReason = "Fictional per-PR thaw verification."
+		frozenReason = "Branch is frozen; merge is blocked by Thawguard"
+		explicitThaw = "PR is explicitly thawed during an active freeze"
+	)
+
+	oldHeadSHA := strings.ToLower(strings.TrimSpace(headSHA))
+	if len(oldHeadSHA) < 12 {
+		t.Fatalf("thawed pull request head %q is too short for stale-head evidence", headSHA)
+	}
+
+	before := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, oldHeadSHA)
+	oldStatuses := slices.Clone(before.freezeStatuses)
+	if len(oldStatuses) == 0 {
+		t.Fatal("thawed head is missing its explicit-thaw Forgejo status")
+	}
+	oldLatest := oldStatuses[len(oldStatuses)-1]
+	if oldLatest.Context != requiredContext || oldLatest.Status != "success" || oldLatest.Description != explicitThaw {
+		t.Fatalf("unexpected stale-head pre-advance status: id=%d context=%q state=%q description=%q", oldLatest.ID, oldLatest.Context, oldLatest.Status, oldLatest.Description)
+	}
+
+	decisionsBefore := requirePage(t, ctx, browser, "/decisions")
+	oldDecisionRow := requireLatestDecisionResultRow(t, decisionsBefore)
+	for _, want := range []string{
+		`<a href="#">#` + strconv.Itoa(pullRequestIndex) + `</a>`,
+		`<code>` + fixtureOwner + `/` + fixtureRepository + `</code>`,
+		`<code class="tg-branch">main</code>`,
+		`<code>` + oldHeadSHA + `</code>`,
+		explicitThaw,
+		`<code>` + requiredContext + `</code>`,
+		`<span class="status status-success">Eligible</span>`,
+	} {
+		if !strings.Contains(oldDecisionRow, want) {
+			t.Fatalf("old exact-head decision row is missing %q", want)
+		}
+	}
+
+	activityBefore := requirePage(t, ctx, browser, "/activity")
+	oldThawActivityRow := requireLatestActivityRow(t, activityBefore, "Single-PR thaw")
+	if want := `Branch main; head ` + oldHeadSHA[:12] + `.`; !strings.Contains(oldThawActivityRow, want) {
+		t.Fatalf("old Single-PR thaw activity row is missing %q", want)
+	}
+
+	thirdFreeze := requireActiveFreezeEvidence(t, requirePage(t, ctx, browser, "/freezes"))
+	if thirdFreeze.branch != "main" || thirdFreeze.reason != freezeReason || thirdFreeze.status != "active" {
+		t.Fatalf("unexpected third-freeze evidence before head advance: id=%d branch=%q reason=%q status=%q", thirdFreeze.id, thirdFreeze.branch, thirdFreeze.reason, thirdFreeze.status)
+	}
+
+	newHeadSHA := advanceFeatureBranch(
+		t,
+		ctx,
+		forgejo,
+		pullRequestIndex,
+		oldHeadSHA,
+		"stale-head-thaw.txt",
+		"Advance fictional E2E thawed feature head",
+		"new head for exact-head thaw reevaluation proof\n",
+		"stale-head thaw",
+	)
+	waitForOneNewProcessedSynchronizedDelivery(t, ctx, browser, repositoryID, before.webhookRows)
+	waitForLatestPostedPublicationAttempt(t, ctx, browser, newHeadSHA, "failure", frozenReason)
+	waitForStatusWithDescription(t, ctx, forgejo, newHeadSHA, "failure", frozenReason)
+	assertMergeBlockedByRequiredStatus(t, ctx, forgejo, pullRequestIndex)
+
+	after := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, newHeadSHA)
+	if after.webhookRows != before.webhookRows+1 {
+		t.Fatalf("stale-head reevaluation changed webhook rows by %d, want 1", after.webhookRows-before.webhookRows)
+	}
+	if after.statusResults != before.statusResults+1 {
+		t.Fatalf("stale-head reevaluation changed status results by %d, want 1", after.statusResults-before.statusResults)
+	}
+	if after.publicationIntents != before.publicationIntents+1 {
+		t.Fatalf("stale-head reevaluation changed publication intents by %d, want 1", after.publicationIntents-before.publicationIntents)
+	}
+	if after.publicationAttempts != before.publicationAttempts+1 {
+		t.Fatalf("stale-head reevaluation changed publication attempts by %d, want 1", after.publicationAttempts-before.publicationAttempts)
+	}
+	if after.activityEvents != before.activityEvents {
+		t.Fatalf("stale-head reevaluation changed activity events from %d to %d", before.activityEvents, after.activityEvents)
+	}
+	if len(after.freezeStatuses) != 1 {
+		t.Fatalf("new stale-head SHA has %d %s statuses, want exactly 1", len(after.freezeStatuses), requiredContext)
+	}
+	newStatus := after.freezeStatuses[0]
+	if newStatus.Context != requiredContext || newStatus.Status != "failure" || newStatus.Description != frozenReason {
+		t.Fatalf("unexpected new-head required status: id=%d context=%q state=%q description=%q", newStatus.ID, newStatus.Context, newStatus.Status, newStatus.Description)
+	}
+
+	oldStatusesAfter, err := listForgejoFreezeStatuses(ctx, forgejo, oldHeadSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(oldStatusesAfter, oldStatuses) {
+		t.Fatalf("old exact-head Forgejo status history changed after reevaluation: before=%+v after=%+v", oldStatuses, oldStatusesAfter)
+	}
+	oldLatestAfter := oldStatusesAfter[len(oldStatusesAfter)-1]
+	if oldLatestAfter != oldLatest || oldLatestAfter.Context != requiredContext || oldLatestAfter.Status != "success" || oldLatestAfter.Description != explicitThaw {
+		t.Fatalf("old exact-head latest status changed after reevaluation: before=%+v after=%+v", oldLatest, oldLatestAfter)
+	}
+
+	decisionsAfter := requirePage(t, ctx, browser, "/decisions")
+	if !strings.Contains(decisionsAfter, oldDecisionRow) {
+		t.Fatal("old exact-head Eligible decision row disappeared after head reevaluation")
+	}
+	newDecisionRow := requireLatestDecisionResultRow(t, decisionsAfter)
+	for _, want := range []string{
+		`<a href="#">#` + strconv.Itoa(pullRequestIndex) + `</a>`,
+		`<code>` + fixtureOwner + `/` + fixtureRepository + `</code>`,
+		`<code class="tg-branch">main</code>`,
+		`<code>` + newHeadSHA + `</code>`,
+		frozenReason,
+		`<code>` + requiredContext + `</code>`,
+		`<span class="status status-failure">Blocked</span>`,
+	} {
+		if !strings.Contains(newDecisionRow, want) {
+			t.Fatalf("latest stale-head decision row is missing %q", want)
+		}
+	}
+
+	activityAfter := requirePage(t, ctx, browser, "/activity")
+	if !strings.Contains(activityAfter, oldThawActivityRow) {
+		t.Fatal("old Single-PR thaw activity row disappeared after head reevaluation")
+	}
+	if latest := requireLatestActivityRow(t, activityAfter, "Single-PR thaw"); latest != oldThawActivityRow {
+		t.Fatal("old Single-PR thaw activity evidence changed after head reevaluation")
+	}
+
+	publicationsPage := requirePage(t, ctx, browser, "/publications")
+	newIntentRow := requireLatestPublicationIntentRow(t, publicationsPage)
+	newAttemptRow := requireLatestPublicationAttemptRow(t, publicationsPage)
+	for label, row := range map[string]string{
+		"intent":  newIntentRow,
+		"attempt": newAttemptRow,
+	} {
+		for _, want := range []string{
+			fixtureOwner + `/` + fixtureRepository,
+			`#` + strconv.Itoa(pullRequestIndex) + `<small class="tg-muted">main</small>`,
+			`<code>` + newHeadSHA + `</code>`,
+			`<span class="status status-failure">failure</span>`,
+			`<code>forgejo_status</code>`,
+			frozenReason,
+		} {
+			if !strings.Contains(row, want) {
+				t.Fatalf("latest stale-head publication %s is missing %q", label, want)
+			}
+		}
+	}
+	if !strings.Contains(newIntentRow, `<td data-label="Context"><code>`+requiredContext+`</code></td>`) {
+		t.Fatalf("latest stale-head publication intent is missing %q", requiredContext)
+	}
+	for _, want := range []string{
+		`<small class="tg-muted">` + requiredContext + `</small>`,
+		`<td data-label="Result"><span class="status status-ok">posted</span></td>`,
+	} {
+		if !strings.Contains(newAttemptRow, want) {
+			t.Fatalf("latest stale-head publication attempt is missing %q", want)
+		}
+	}
+
+	if active := requireActiveFreezeEvidence(t, requirePage(t, ctx, browser, "/freezes")); active != thirdFreeze {
+		t.Fatalf("third active freeze changed after stale-head reevaluation: before=%+v after=%+v", thirdFreeze, active)
+	}
+	return newHeadSHA
 }
 
 func loadConfig(t *testing.T) e2eConfig {
@@ -809,27 +987,48 @@ func revokePrimaryStatusToken(t *testing.T, ctx context.Context, forgejo *forgej
 	requireAPIStatus(t, response, err, http.StatusNoContent, "revoke primary Forgejo status token by name")
 }
 
-func advanceFeatureBranch(t *testing.T, ctx context.Context, forgejo *forgejoAPI, pr pullRequest) string {
+func advanceFeatureBranch(t *testing.T, ctx context.Context, forgejo *forgejoAPI, pullRequestIndex int, expectedPreviousSHA, fixtureFilename, commitMessage, content, evidenceLabel string) string {
 	t.Helper()
-	response, err := forgejo.do(ctx, http.MethodPost, forgejo.repositoryPath("contents", "token-loss.txt"), map[string]any{
+	if fixtureFilename != "token-loss.txt" && fixtureFilename != "stale-head-thaw.txt" {
+		t.Fatalf("branch-advance fixture filename %q is not allowlisted", fixtureFilename)
+	}
+	evidenceLabel = strings.TrimSpace(evidenceLabel)
+	if evidenceLabel == "" || strings.ContainsAny(evidenceLabel, "\r\n") {
+		t.Fatal("branch-advance evidence label must be non-empty and single-line")
+	}
+	expectedPreviousSHA = strings.ToLower(strings.TrimSpace(expectedPreviousSHA))
+	if expectedPreviousSHA == "" {
+		t.Fatalf("%s branch advance requires an expected previous SHA", evidenceLabel)
+	}
+
+	response, err := forgejo.do(ctx, http.MethodGet, forgejo.repositoryPath("pulls", strconv.Itoa(pullRequestIndex)), nil)
+	requireAPIStatus(t, response, err, http.StatusOK, "read "+evidenceLabel+" pull request before branch advance")
+	var previous pullRequest
+	decodeJSON(t, response.body, &previous, "decode "+evidenceLabel+" pull request before branch advance")
+	actualPreviousSHA := strings.ToLower(strings.TrimSpace(previous.Head.SHA))
+	if actualPreviousSHA != expectedPreviousSHA {
+		t.Fatalf("%s branch advance found current SHA %q, want exact previous SHA %q", evidenceLabel, actualPreviousSHA, expectedPreviousSHA)
+	}
+
+	response, err = forgejo.do(ctx, http.MethodPost, forgejo.repositoryPath("contents", url.PathEscape(fixtureFilename)), map[string]any{
 		"branch":  fixtureFeatureBranch,
-		"message": "Advance fictional E2E feature head",
-		"content": base64.StdEncoding.EncodeToString([]byte("new head for token-loss recovery proof\n")),
+		"message": commitMessage,
+		"content": base64.StdEncoding.EncodeToString([]byte(content)),
 	})
-	requireAPIStatus(t, response, err, http.StatusCreated, "create Forgejo token-loss fixture commit")
+	requireAPIStatus(t, response, err, http.StatusCreated, "create Forgejo "+evidenceLabel+" fixture commit")
 	var created struct {
 		Commit struct {
 			SHA string `json:"sha"`
 		} `json:"commit"`
 	}
-	decodeJSON(t, response.body, &created, "decode Forgejo token-loss fixture commit")
+	decodeJSON(t, response.body, &created, "decode Forgejo "+evidenceLabel+" fixture commit")
 	newHeadSHA := strings.ToLower(strings.TrimSpace(created.Commit.SHA))
-	if newHeadSHA == "" || newHeadSHA == strings.ToLower(pr.Head.SHA) {
-		t.Fatal("Forgejo token-loss fixture did not create a distinct commit SHA")
+	if newHeadSHA == "" || newHeadSHA == expectedPreviousSHA {
+		t.Fatalf("Forgejo %s fixture did not create a distinct commit SHA", evidenceLabel)
 	}
 
-	waitFor(t, 30*time.Second, "Forgejo pull request head advance", func() (bool, error) {
-		response, err := forgejo.do(ctx, http.MethodGet, forgejo.repositoryPath("pulls", strconv.Itoa(pr.Number)), nil)
+	waitFor(t, 30*time.Second, "Forgejo "+evidenceLabel+" pull request head advance", func() (bool, error) {
+		response, err := forgejo.do(ctx, http.MethodGet, forgejo.repositoryPath("pulls", strconv.Itoa(pullRequestIndex)), nil)
 		if err != nil {
 			return false, err
 		}
@@ -1218,6 +1417,66 @@ func requireProcessedVerifiedDelivery(t *testing.T, page, deliveryID string) {
 	}
 }
 
+func waitForOneNewProcessedSynchronizedDelivery(t *testing.T, ctx context.Context, browser *thawguardBrowser, repositoryID int64, beforeRows int) {
+	t.Helper()
+	webhookPath := "/webhooks?" + url.Values{
+		"repository_id": {strconv.FormatInt(repositoryID, 10)},
+		"event":         {"pull_request"},
+		"limit":         {"100"},
+	}.Encode()
+	expectedRows := beforeRows + 1
+	waitFor(t, 30*time.Second, "one new verified and processed synchronized delivery", func() (bool, error) {
+		page, err := browser.get(ctx, webhookPath)
+		if err != nil {
+			return false, err
+		}
+		rows := requirePageCount(t, page, webhookRowsPattern, "webhook rows")
+		if rows > expectedRows {
+			t.Fatalf("synchronized head advance changed webhook rows from %d to %d, want exactly %d", beforeRows, rows, expectedRows)
+		}
+		if rows != expectedRows {
+			return false, nil
+		}
+		latestRow := requireLatestWebhookDeliveryRow(t, page)
+		for _, want := range []string{
+			`<code>` + fixtureOwner + `/` + fixtureRepository + `</code>`,
+			`<td data-label="Event"><code>pull_request</code><small class="tg-muted">synchronized</small></td>`,
+			`>verified</span>`,
+			`>processed</span>`,
+			`<td data-label="Details">No processing error</td>`,
+		} {
+			if !strings.Contains(latestRow, want) {
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+}
+
+func requireLatestWebhookDeliveryRow(t *testing.T, page string) string {
+	t.Helper()
+	sectionMarker := "<h2>Signed webhook deliveries</h2>"
+	sectionStart := strings.Index(page, sectionMarker)
+	if sectionStart < 0 {
+		t.Fatal("webhook page is missing signed deliveries")
+	}
+	tbodyOffset := strings.Index(page[sectionStart:], "<tbody>")
+	if tbodyOffset < 0 {
+		t.Fatal("signed webhook deliveries are missing their table body")
+	}
+	tbodyStart := sectionStart + tbodyOffset
+	rowStartOffset := strings.Index(page[tbodyStart:], `<tr id="delivery-`)
+	if rowStartOffset < 0 {
+		t.Fatal("signed webhook deliveries are missing their latest row")
+	}
+	rowStart := tbodyStart + rowStartOffset
+	rowEndOffset := strings.Index(page[rowStart:], "</tr>")
+	if rowEndOffset < 0 {
+		t.Fatal("latest signed webhook delivery row is incomplete")
+	}
+	return page[rowStart : rowStart+rowEndOffset+len("</tr>")]
+}
+
 func countOpenPullRequestSyncEvents(page string) int {
 	return strings.Count(page, `<td data-label="Action">Open pull request sync</td>`)
 }
@@ -1424,6 +1683,30 @@ func requireBranchFreezeActivityEvidence(t *testing.T, row string, freeze active
 			t.Fatalf("branch-freeze activity for freeze %d is missing %q", freeze.id, want)
 		}
 	}
+}
+
+func requireLatestPublicationIntentRow(t *testing.T, page string) string {
+	t.Helper()
+	sectionMarker := "<h2>Latest desired statuses</h2>"
+	sectionStart := strings.Index(page, sectionMarker)
+	if sectionStart < 0 {
+		t.Fatal("publications page is missing latest desired statuses")
+	}
+	tbodyOffset := strings.Index(page[sectionStart:], "<tbody>")
+	if tbodyOffset < 0 {
+		t.Fatal("latest desired statuses are missing their table body")
+	}
+	tbodyStart := sectionStart + tbodyOffset
+	rowStartOffset := strings.Index(page[tbodyStart:], "<tr>")
+	if rowStartOffset < 0 {
+		t.Fatal("latest desired statuses are missing their latest row")
+	}
+	rowStart := tbodyStart + rowStartOffset
+	rowEndOffset := strings.Index(page[rowStart:], "</tr>")
+	if rowEndOffset < 0 {
+		t.Fatal("latest desired status row is incomplete")
+	}
+	return page[rowStart : rowStart+rowEndOffset+len("</tr>")]
 }
 
 func requireLatestPublicationAttemptRow(t *testing.T, page string) string {
