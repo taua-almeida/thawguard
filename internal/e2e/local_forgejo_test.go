@@ -177,6 +177,8 @@ func TestLocalForgejoFreezeLifecycle(t *testing.T) {
 
 	proveActiveFreezeCancellation(t, ctx, forgejo, browser, repositoryID, pr.Number, newHeadSHA, firstFreeze)
 	scanRenderedTokenSurfaces(t, ctx, browser)
+	proveImmediatePerPullRequestThaw(t, ctx, forgejo, browser, repositoryID, pr.Number, newHeadSHA)
+	scanRenderedTokenSurfaces(t, ctx, browser)
 }
 
 func proveActiveFreezeCancellation(t *testing.T, ctx context.Context, forgejo *forgejoAPI, browser *thawguardBrowser, repositoryID int64, pullRequestIndex int, headSHA string, firstFreeze activeFreezeEvidence) {
@@ -246,6 +248,142 @@ func proveActiveFreezeCancellation(t *testing.T, ctx context.Context, forgejo *f
 		t.Fatalf("unexpected post-cancel required status: id=%d context=%q state=%q description=%q", latestAfter.ID, latestAfter.Context, latestAfter.Status, latestAfter.Description)
 	}
 
+}
+
+func proveImmediatePerPullRequestThaw(t *testing.T, ctx context.Context, forgejo *forgejoAPI, browser *thawguardBrowser, repositoryID int64, pullRequestIndex int, headSHA string) {
+	t.Helper()
+	const (
+		freezeReason = "Fictional per-PR thaw verification."
+		thawReason   = "Fictional immediate per-PR thaw verification"
+		frozenReason = "Branch is frozen; merge is blocked by Thawguard"
+		explicitThaw = "PR is explicitly thawed during an active freeze"
+	)
+	if len(headSHA) < 12 {
+		t.Fatalf("current pull request head %q is too short for activity evidence", headSHA)
+	}
+
+	thirdFreeze := createFreeze(t, ctx, browser, repositoryID, freezeReason)
+	waitForStatusWithDescription(t, ctx, forgejo, headSHA, "failure", frozenReason)
+	waitForLatestPostedPublicationAttempt(t, ctx, browser, headSHA, "failure", frozenReason)
+	assertMergeBlockedByRequiredStatus(t, ctx, forgejo, pullRequestIndex)
+	if active := requireActiveFreezeEvidence(t, requirePage(t, ctx, browser, "/freezes")); active != thirdFreeze {
+		t.Fatalf("third active freeze changed before immediate thaw: created=%+v rendered=%+v", thirdFreeze, active)
+	}
+
+	before := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, headSHA)
+	if len(before.freezeStatuses) == 0 {
+		t.Fatal("third active freeze is missing its pre-thaw Forgejo status")
+	}
+	latestBefore := before.freezeStatuses[len(before.freezeStatuses)-1]
+	if latestBefore.Context != requiredContext || latestBefore.Status != "failure" || latestBefore.Description != frozenReason {
+		t.Fatalf("unexpected pre-thaw required status: id=%d context=%q state=%q description=%q", latestBefore.ID, latestBefore.Context, latestBefore.Status, latestBefore.Description)
+	}
+	openPullRequestSyncsBefore := countOpenPullRequestSyncEvents(requirePage(t, ctx, browser, "/activity"))
+
+	decisionsPage := requirePage(t, ctx, browser, "/decisions")
+	thawFormMarker := `<form method="post" action="/decisions" class="tg-setup-form tg-thaw-form" data-thaw-form>`
+	thawFormStart := strings.Index(decisionsPage, thawFormMarker)
+	if thawFormStart < 0 {
+		t.Fatal("decisions page is missing the immediate thaw form")
+	}
+	thawFormEnd := strings.Index(decisionsPage[thawFormStart:], "</form>")
+	if thawFormEnd < 0 {
+		t.Fatal("immediate thaw form is incomplete")
+	}
+	renderedThawForm := decisionsPage[thawFormStart : thawFormStart+thawFormEnd+len("</form>")]
+	if strings.Contains(renderedThawForm, `name="head_sha"`) {
+		t.Fatal("immediate thaw form must not submit a client-provided head SHA")
+	}
+	form := url.Values{
+		"csrf_token":         {requireHiddenInput(t, decisionsPage, "csrf_token")},
+		"repository_id":      {strconv.FormatInt(repositoryID, 10)},
+		"pull_request_index": {strconv.Itoa(pullRequestIndex)},
+		"target_branch":      {"main"},
+		"reason":             {thawReason},
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, browser.baseURL+"/decisions", strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", browser.baseURL)
+	client := *browser.client
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatalf("submit immediate per-PR thaw: %v", err)
+	}
+	responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, 2<<20))
+	response.Body.Close()
+	if readErr != nil {
+		t.Fatalf("read immediate per-PR thaw response: %v", readErr)
+	}
+	if response.StatusCode == http.StatusConflict || bytes.Contains(responseBody, []byte("These pull requests share one commit SHA")) {
+		t.Fatal("unique-head immediate thaw unexpectedly required shared-head confirmation")
+	}
+	if response.StatusCode != http.StatusSeeOther || response.Header.Get("Location") != "/decisions" {
+		t.Fatalf("immediate per-PR thaw returned HTTP %d with Location %q, want 303 to /decisions", response.StatusCode, response.Header.Get("Location"))
+	}
+
+	waitForStatusWithDescription(t, ctx, forgejo, headSHA, "success", explicitThaw)
+	waitForLatestPostedPublicationAttempt(t, ctx, browser, headSHA, "success", explicitThaw)
+	activityPage := waitForOneNewOpenPullRequestSync(t, ctx, browser, openPullRequestSyncsBefore)
+	requireLatestOpenPullRequestSync(t, activityPage)
+	after := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, headSHA)
+
+	if after.webhookRows != before.webhookRows {
+		t.Fatalf("immediate per-PR thaw changed webhook rows from %d to %d", before.webhookRows, after.webhookRows)
+	}
+	if after.statusResults != before.statusResults+1 {
+		t.Fatalf("immediate per-PR thaw changed status results by %d, want 1", after.statusResults-before.statusResults)
+	}
+	if after.publicationIntents != before.publicationIntents {
+		t.Fatalf("immediate per-PR thaw changed publication intents from %d to %d, want existing intent reused", before.publicationIntents, after.publicationIntents)
+	}
+	if after.publicationAttempts != before.publicationAttempts+1 {
+		t.Fatalf("immediate per-PR thaw changed publication attempts by %d, want 1", after.publicationAttempts-before.publicationAttempts)
+	}
+	if len(after.freezeStatuses) != len(before.freezeStatuses)+1 {
+		t.Fatalf("immediate per-PR thaw changed Forgejo required-context statuses by %d, want 1", len(after.freezeStatuses)-len(before.freezeStatuses))
+	}
+	if after.activityEvents != before.activityEvents+2 {
+		t.Fatalf("immediate per-PR thaw changed activity events by %d, want one sync and one approval", after.activityEvents-before.activityEvents)
+	}
+	latestAfter := after.freezeStatuses[len(after.freezeStatuses)-1]
+	if latestAfter.ID <= latestBefore.ID || latestAfter.Context != requiredContext || latestAfter.Status != "success" || latestAfter.Description != explicitThaw {
+		t.Fatalf("unexpected post-thaw required status: id=%d context=%q state=%q description=%q", latestAfter.ID, latestAfter.Context, latestAfter.Status, latestAfter.Description)
+	}
+
+	decisionRow := requireLatestDecisionResultRow(t, requirePage(t, ctx, browser, "/decisions"))
+	for _, want := range []string{
+		`<a href="#">#` + strconv.Itoa(pullRequestIndex) + `</a>`,
+		`<code>` + fixtureOwner + `/` + fixtureRepository + `</code>`,
+		`<code class="tg-branch">main</code>`,
+		`<code>` + headSHA + `</code>`,
+		explicitThaw,
+		`<code>` + requiredContext + `</code>`,
+		`<span class="status status-success">Eligible</span>`,
+	} {
+		if !strings.Contains(decisionRow, want) {
+			t.Fatalf("latest immediate-thaw decision row is missing %q", want)
+		}
+	}
+
+	thawActivityRow := requireLatestActivityRow(t, activityPage, "Single-PR thaw")
+	for _, want := range []string{
+		`<td data-label="Actor">E2E Admin</td>`,
+		`<td data-label="Target">` + fixtureOwner + `/` + fixtureRepository + ` → PR #` + strconv.Itoa(pullRequestIndex) + `</td>`,
+		`<td data-label="Outcome"><span class="status status-ok">Approved</span></td>`,
+		`<td data-label="Details">Branch main; head ` + strings.ToLower(headSHA[:12]) + `. Reason: ` + thawReason + `.</td>`,
+	} {
+		if !strings.Contains(thawActivityRow, want) {
+			t.Fatalf("latest Single-PR thaw activity row is missing %q", want)
+		}
+	}
+
+	if active := requireActiveFreezeEvidence(t, requirePage(t, ctx, browser, "/freezes")); active != thirdFreeze {
+		t.Fatalf("third active freeze changed after immediate thaw: created=%+v rendered=%+v", thirdFreeze, active)
+	}
 }
 
 func loadConfig(t *testing.T) e2eConfig {
@@ -1308,6 +1446,30 @@ func requireLatestPublicationAttemptRow(t *testing.T, page string) string {
 	rowEndOffset := strings.Index(page[rowStart:], "</tr>")
 	if rowEndOffset < 0 {
 		t.Fatal("latest publication attempt row is incomplete")
+	}
+	return page[rowStart : rowStart+rowEndOffset+len("</tr>")]
+}
+
+func requireLatestDecisionResultRow(t *testing.T, page string) string {
+	t.Helper()
+	sectionMarker := "<h2>Thaw approval results</h2>"
+	sectionStart := strings.Index(page, sectionMarker)
+	if sectionStart < 0 {
+		t.Fatal("decisions page is missing thaw approval results")
+	}
+	tbodyOffset := strings.Index(page[sectionStart:], "<tbody>")
+	if tbodyOffset < 0 {
+		t.Fatal("thaw approval results are missing their table body")
+	}
+	tbodyStart := sectionStart + tbodyOffset
+	rowStartOffset := strings.Index(page[tbodyStart:], "<tr>")
+	if rowStartOffset < 0 {
+		t.Fatal("thaw approval results are missing their latest row")
+	}
+	rowStart := tbodyStart + rowStartOffset
+	rowEndOffset := strings.Index(page[rowStart:], "</tr>")
+	if rowEndOffset < 0 {
+		t.Fatal("latest thaw approval result row is incomplete")
 	}
 	return page[rowStart : rowStart+rowEndOffset+len("</tr>")]
 }
