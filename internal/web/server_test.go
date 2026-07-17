@@ -810,6 +810,42 @@ func TestRunRepositorySetupCheckPostsToRunner(t *testing.T) {
 	}
 }
 
+func TestRunRepositorySetupCheckPassesAuthenticatedAdminActor(t *testing.T) {
+	ctx := context.Background()
+	database := newWebTestDB(t, ctx)
+	authService := auth.NewService(database)
+	adminSession, err := authService.CreateFirstAdmin(ctx, auth.CreateFirstAdminParams{Email: "admin@example.test", DisplayName: "Admin", Password: "correct horse battery staple"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	runner := &fakeSetupCheckRunner{}
+	server := NewServer(Config{AppName: "Thawguard", AuthService: authService, RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, SetupCheckRunner: runner})
+	cookie := &http.Cookie{Name: sessionCookieName, Value: adminSession.ID}
+
+	page := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/repositories", nil)
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(page, request)
+	if page.Code != http.StatusOK {
+		t.Fatalf("expected repository form, got %d", page.Code)
+	}
+	form := url.Values{"repository_id": {"1"}, csrfFormField: {csrfTokenFromBody(t, page.Body.String())}}
+	recorder := httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPost, "/repositories/setup-check", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusSeeOther || len(runner.actors) != 1 {
+		t.Fatalf("expected one attributed readiness run, status=%d actors=%+v", recorder.Code, runner.actors)
+	}
+	actor := runner.actors[0]
+	if actor.UserID == nil || *actor.UserID != adminSession.User.ID || actor.Kind != domain.ActorKindUser || actor.Role != adminSession.User.Roles.String() {
+		t.Fatalf("readiness runner received actor %+v, want authenticated admin user %d with roles %q", actor, adminSession.User.ID, adminSession.User.Roles.String())
+	}
+}
+
 func TestRunRepositorySetupCheckRejectsMissingCSRFSession(t *testing.T) {
 	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
 	runner := &fakeSetupCheckRunner{}
@@ -3272,6 +3308,7 @@ func (s *fakeSetupCheckStore) ListByRepository(ctx context.Context, repositoryID
 
 type fakeSetupCheckRunner struct {
 	repositories []domain.Repository
+	actors       []domain.Actor
 	err          error
 }
 
@@ -3451,11 +3488,12 @@ func (s *fakeFreezeStore) StartScheduledNow(ctx context.Context, id int64, actor
 	return domain.BranchFreeze{ID: id, Status: domain.BranchFreezeStatusActive, Active: true, Scheduled: true}, nil
 }
 
-func (r *fakeSetupCheckRunner) Run(ctx context.Context, repo domain.Repository) ([]setupcheck.Result, error) {
+func (r *fakeSetupCheckRunner) Run(ctx context.Context, repo domain.Repository, actor domain.Actor) ([]setupcheck.Result, error) {
+	r.repositories = append(r.repositories, repo)
+	r.actors = append(r.actors, actor)
 	if r.err != nil {
 		return nil, r.err
 	}
-	r.repositories = append(r.repositories, repo)
 	return []setupcheck.Result{{Name: setupcheck.CheckStatusPostingUntested, Status: setupcheck.StatusWarning, Description: "Status posting remains untested."}}, nil
 }
 

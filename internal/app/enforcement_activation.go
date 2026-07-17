@@ -28,7 +28,7 @@ const (
 )
 
 type enforcementReadinessRunner interface {
-	Run(ctx context.Context, repo domain.Repository) ([]setupcheck.Result, error)
+	Run(ctx context.Context, repo domain.Repository, actor domain.Actor) ([]setupcheck.Result, error)
 }
 
 type enforcementStatusTokenGetter interface {
@@ -94,7 +94,7 @@ func (s *enforcementService) VerifyStatusPosting(ctx context.Context, repository
 	default:
 		return domain.Repository{}, repository.ValidationError{Message: "Repository enforcement is unhealthy. Recovery is not part of status-post verification yet."}
 	}
-	if err := s.requireVerifiableReadiness(ctx, repo); err != nil {
+	if err := s.requireVerifiableReadiness(ctx, repo, actor); err != nil {
 		return domain.Repository{}, err
 	}
 	head, postErr := s.controlledSetupPost(ctx, repo)
@@ -122,7 +122,7 @@ func (s *enforcementService) ActivateEnforcement(ctx context.Context, repository
 	if repo.EnforcementState != domain.EnforcementReady {
 		return domain.Repository{}, repository.ValidationError{Message: "Repository enforcement can only be activated from the ready state. Verify status posting first."}
 	}
-	if err := s.requireVerifiableReadiness(ctx, repo); err != nil {
+	if err := s.requireVerifiableReadiness(ctx, repo, actor); err != nil {
 		return domain.Repository{}, err
 	}
 	head, postErr := s.controlledSetupPost(ctx, repo)
@@ -383,8 +383,8 @@ func (s *enforcementService) loadRepository(ctx context.Context, repositoryID in
 // requires every mandatory check to be OK. The expected "status posting has
 // not been tested yet" warning is the only allowed non-OK result; a stale
 // webhook warning or any failure blocks before any forge write.
-func (s *enforcementService) requireVerifiableReadiness(ctx context.Context, repo domain.Repository) error {
-	results, err := s.readiness.Run(ctx, repo)
+func (s *enforcementService) requireVerifiableReadiness(ctx context.Context, repo domain.Repository, actor domain.Actor) error {
+	results, err := s.readiness.Run(ctx, repo, actor)
 	if err != nil {
 		return repository.ValidationError{Message: "Readiness checks could not be completed. Fix the reported repository setup problems and retry."}
 	}

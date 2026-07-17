@@ -3,12 +3,14 @@ package setupcheck
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/taua-almeida/thawguard/internal/audit"
+	"github.com/taua-almeida/thawguard/internal/auth"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/jobs"
 	"github.com/taua-almeida/thawguard/internal/repository"
@@ -17,6 +19,7 @@ import (
 )
 
 var readinessNow = time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+var readinessTestActor = domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}
 
 func TestReadinessServiceChecksEveryManagedBranchAndPersistsOneRun(t *testing.T) {
 	ctx := context.Background()
@@ -25,7 +28,7 @@ func TestReadinessServiceChecksEveryManagedBranchAndPersistsOneRun(t *testing.T)
 	inspector := healthyInspector()
 	service := readinessService(database, inspector, fakeTokenProvider{token: "encrypted-token-plaintext", found: true}, recentWebhook(repo.ID))
 
-	results, err := service.Run(ctx, repo)
+	results, err := service.Run(ctx, repo, readinessTestActor)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +84,7 @@ func TestReadinessServiceMissingTokenAvoidsForgeAndPreservesBranchSummary(t *tes
 	})
 	service.now = func() time.Time { return readinessNow }
 
-	results, err := service.Run(ctx, repo)
+	results, err := service.Run(ctx, repo, readinessTestActor)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,17 +133,17 @@ func TestReadinessServicePersistsMixedBranchOutcomesAndOneDriftTransition(t *tes
 	repo := createReadinessRepository(t, ctx, database, "release")
 	healthy := healthyInspector()
 	service := readinessService(database, healthy, fakeTokenProvider{token: "token", found: true}, recentWebhook(repo.ID))
-	if _, err := service.Run(ctx, repo); err != nil {
+	if _, err := service.Run(ctx, repo, readinessTestActor); err != nil {
 		t.Fatal(err)
 	}
 
 	mixed := healthyInspector()
 	mixed.inspections["release"] = unprotectedInspection("release")
 	service = readinessService(database, mixed, fakeTokenProvider{token: "token", found: true}, recentWebhook(repo.ID))
-	if _, err := service.Run(ctx, repo); err != nil {
+	if _, err := service.Run(ctx, repo, readinessTestActor); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.Run(ctx, repo); err != nil {
+	if _, err := service.Run(ctx, repo, readinessTestActor); err != nil {
 		t.Fatal(err)
 	}
 
@@ -167,6 +170,66 @@ func TestReadinessServicePersistsMixedBranchOutcomesAndOneDriftTransition(t *tes
 	assertAuditCount(t, ctx, database, audit.ActionRepositorySetupDriftDetected, 1)
 }
 
+func TestReadinessServiceAttributesRunAndDriftToExplicitUser(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	adminSession, err := auth.NewService(database).CreateFirstAdmin(ctx, auth.CreateFirstAdminParams{
+		Email:       "readiness-admin@example.test",
+		DisplayName: "Readiness Admin",
+		Password:    "correct horse battery staple",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actorUserID := adminSession.User.ID
+	actor := domain.Actor{UserID: &actorUserID, Kind: domain.ActorKindUser, Role: "admin"}
+	repo := createReadinessRepository(t, ctx, database, "release")
+	const token = "readiness-actor-secret-token"
+
+	service := readinessService(database, healthyInspector(), fakeTokenProvider{token: token, found: true}, recentWebhook(repo.ID))
+	if _, err := service.Run(ctx, repo, actor); err != nil {
+		t.Fatal(err)
+	}
+	mixed := healthyInspector()
+	mixed.inspections["release"] = unprotectedInspection("release")
+	service = readinessService(database, mixed, fakeTokenProvider{token: token, found: true}, recentWebhook(repo.ID))
+	if _, err := service.Run(ctx, repo, actor); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, action := range []string{audit.ActionRepositorySetupCheckRun, audit.ActionRepositorySetupDriftDetected} {
+		event := requireLatestAuditEvent(t, ctx, database, action)
+		if event.ActorUserID == nil || *event.ActorUserID != actorUserID {
+			t.Fatalf("%s stored actor user ID %+v, want %d", action, event.ActorUserID, actorUserID)
+		}
+		requireAuditActorDetails(t, event, domain.ActorKindUser, "admin")
+		if strings.Contains(event.DetailsJSON, token) {
+			t.Fatalf("%s audit details exposed readiness token material", action)
+		}
+	}
+}
+
+func TestReadinessServicePersistsExplicitSystemActor(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createReadinessRepository(t, ctx, database)
+	actor := domain.Actor{Kind: domain.ActorKindSystem, Role: "reconciliation_runner"}
+	const token = "system-readiness-secret-token"
+	service := readinessService(database, healthyInspector(), fakeTokenProvider{token: token, found: true}, recentWebhook(repo.ID))
+
+	if _, err := service.Run(ctx, repo, actor); err != nil {
+		t.Fatal(err)
+	}
+	event := requireLatestAuditEvent(t, ctx, database, audit.ActionRepositorySetupCheckRun)
+	if event.ActorUserID != nil {
+		t.Fatalf("system readiness actor unexpectedly stored user ID %+v", event.ActorUserID)
+	}
+	requireAuditActorDetails(t, event, domain.ActorKindSystem, "reconciliation_runner")
+	if strings.Contains(event.DetailsJSON, token) {
+		t.Fatal("system readiness audit details exposed readiness token material")
+	}
+}
+
 func TestReadinessServiceOperationalFailurePreservesEvidenceAndActiveState(t *testing.T) {
 	ctx := context.Background()
 	database := newTestDB(t, ctx)
@@ -178,7 +241,7 @@ func TestReadinessServiceOperationalFailurePreservesEvidenceAndActiveState(t *te
 	active.HasStatusToken = true
 	healthy := healthyInspector()
 	service := readinessService(database, healthy, fakeTokenProvider{token: "secret-token", found: true}, recentWebhook(repo.ID))
-	if _, err := service.Run(ctx, active); err != nil {
+	if _, err := service.Run(ctx, active, readinessTestActor); err != nil {
 		t.Fatal(err)
 	}
 	before, err := NewStore(database).ListByRepository(ctx, repo.ID)
@@ -189,7 +252,7 @@ func TestReadinessServiceOperationalFailurePreservesEvidenceAndActiveState(t *te
 	failing := healthyInspector()
 	failing.branchErr["main"] = errors.New("network failed with secret-token")
 	service = readinessService(database, failing, fakeTokenProvider{token: "secret-token", found: true}, recentWebhook(repo.ID))
-	_, err = service.Run(ctx, active)
+	_, err = service.Run(ctx, active, readinessTestActor)
 	if err == nil {
 		t.Fatal("expected operational error")
 	}
@@ -232,7 +295,7 @@ func TestReadinessServiceDefinitiveFailureMakesActiveRepositoryUnhealthy(t *test
 	inspector := healthyInspector()
 	inspector.inspections["main"] = unprotectedInspection("main")
 	service := readinessService(database, inspector, fakeTokenProvider{token: "token", found: true}, recentWebhook(repo.ID))
-	if _, err := service.Run(ctx, active); err != nil {
+	if _, err := service.Run(ctx, active, readinessTestActor); err != nil {
 		t.Fatal(err)
 	}
 	stored, err := repository.NewStore(database).Get(ctx, repo.ID)
@@ -279,7 +342,7 @@ func TestReadinessServiceDiscardsRunAfterLifecycleChanges(t *testing.T) {
 		}
 	}
 	service := readinessService(database, inspector, fakeTokenProvider{token: "token", found: true}, recentWebhook(repo.ID))
-	if _, err := service.Run(ctx, active); err != nil {
+	if _, err := service.Run(ctx, active, readinessTestActor); err != nil {
 		t.Fatal(err)
 	}
 	checks, err := NewStore(database).ListByRepository(ctx, repo.ID)
@@ -310,7 +373,7 @@ func TestReadinessServiceDiscardsRunAfterManagedBranchChanges(t *testing.T) {
 		}
 	}
 	service := readinessService(database, inspector, fakeTokenProvider{token: "token", found: true}, recentWebhook(repo.ID))
-	if _, err := service.Run(ctx, repo); err != nil {
+	if _, err := service.Run(ctx, repo, readinessTestActor); err != nil {
 		t.Fatal(err)
 	}
 	checks, err := NewStore(database).ListByRepository(ctx, repo.ID)
@@ -341,7 +404,7 @@ func TestReadinessServiceRollsBackChecksAndAuditWhenBranchSummaryFails(t *testin
 		}
 	}
 	service := readinessService(database, inspector, fakeTokenProvider{token: "token", found: true}, recentWebhook(repo.ID))
-	if _, err := service.Run(ctx, repo); err == nil {
+	if _, err := service.Run(ctx, repo, readinessTestActor); err == nil {
 		t.Fatal("expected branch summary persistence failure")
 	}
 	checks, err := NewStore(database).ListByRepository(ctx, repo.ID)
@@ -478,5 +541,31 @@ func assertAuditCount(t *testing.T, ctx context.Context, database *sql.DB, actio
 	}
 	if got != want {
 		t.Fatalf("expected %d %s events, got %d", want, action, got)
+	}
+}
+
+func requireLatestAuditEvent(t *testing.T, ctx context.Context, database *sql.DB, action string) audit.Event {
+	t.Helper()
+	events, err := audit.NewStore(database).List(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Action == action {
+			return event
+		}
+	}
+	t.Fatalf("missing %s audit event", action)
+	return audit.Event{}
+}
+
+func requireAuditActorDetails(t *testing.T, event audit.Event, kind, role string) {
+	t.Helper()
+	var details map[string]any
+	if err := json.Unmarshal([]byte(event.DetailsJSON), &details); err != nil {
+		t.Fatalf("decode %s audit details: %v", event.Action, err)
+	}
+	if details["actor_kind"] != kind || details["actor_role"] != role {
+		t.Fatalf("%s stored actor details kind=%v role=%v, want %q/%q", event.Action, details["actor_kind"], details["actor_role"], kind, role)
 	}
 }

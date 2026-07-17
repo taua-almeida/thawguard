@@ -48,7 +48,7 @@ func (s *enforcementService) ReconcileEnforcement(ctx context.Context, repositor
 }
 
 func (s *enforcementService) reconcileEnforcementCore(ctx context.Context, repo domain.Repository, actor domain.Actor, preserveJobGeneration bool, claim jobs.Job) (domain.Repository, string, error) {
-	if err := s.requireVerifiableReadiness(ctx, repo); err != nil {
+	if err := s.requireVerifiableReadiness(ctx, repo, actor); err != nil {
 		failure := enforcementFailure{action: audit.ActionRepositoryEnforcementReconcileFail, resultState: domain.EnforcementUnhealthy, reason: domain.EnforcementFailureReadinessChecks, persistFailure: true, preserveJobGeneration: preserveJobGeneration}
 		if recordErr := s.recordEnforcementFailure(ctx, repo, actor, failure); recordErr != nil {
 			return domain.Repository{}, domain.EnforcementFailureReadinessChecks, recordErr
@@ -118,7 +118,7 @@ func (s *enforcementService) RecoverEnforcement(ctx context.Context, repositoryI
 }
 
 func (s *enforcementService) recoverEnforcementCore(ctx context.Context, repo domain.Repository, actor domain.Actor, preserveJobGeneration bool, claim jobs.Job) (domain.Repository, string, error) {
-	if err := s.requireVerifiableReadiness(ctx, repo); err != nil {
+	if err := s.requireVerifiableReadiness(ctx, repo, actor); err != nil {
 		failure := enforcementFailure{action: audit.ActionRepositoryEnforcementRecoverFail, resultState: domain.EnforcementUnhealthy, reason: domain.EnforcementFailureReadinessChecks, persistFailure: true, preserveJobGeneration: preserveJobGeneration}
 		if recordErr := s.recordEnforcementFailure(ctx, repo, actor, failure); recordErr != nil {
 			return domain.Repository{}, domain.EnforcementFailureReadinessChecks, recordErr

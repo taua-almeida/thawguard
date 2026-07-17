@@ -102,7 +102,7 @@ type SetupCheckStore interface {
 }
 
 type SetupCheckRunner interface {
-	Run(ctx context.Context, repo domain.Repository) ([]setupcheck.Result, error)
+	Run(ctx context.Context, repo domain.Repository, actor domain.Actor) ([]setupcheck.Result, error)
 }
 
 type FreezeStore interface {
@@ -1553,7 +1553,7 @@ func (s *Server) handleRunRepositorySetupCheck(w http.ResponseWriter, r *http.Re
 		http.Error(w, "setup check runner is not configured", http.StatusServiceUnavailable)
 		return
 	}
-	_, ok := s.requireRepositoryManagerForm(w, r)
+	session, ok := s.requireRepositoryManagerForm(w, r)
 	if !ok {
 		return
 	}
@@ -1573,7 +1573,7 @@ func (s *Server) handleRunRepositorySetupCheck(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	if _, err := s.cfg.SetupCheckRunner.Run(r.Context(), repo); err != nil {
+	if _, err := s.cfg.SetupCheckRunner.Run(r.Context(), repo, session.auditActor()); err != nil {
 		http.Error(w, "setup check failed", http.StatusBadGateway)
 		return
 	}

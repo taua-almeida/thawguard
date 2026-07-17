@@ -53,7 +53,7 @@ func NewReadinessService(db *sql.DB, tokens TokenProvider, deliveries WebhookEvi
 	}
 }
 
-func (s *Service) Run(ctx context.Context, repo domain.Repository) ([]Result, error) {
+func (s *Service) Run(ctx context.Context, repo domain.Repository, actor domain.Actor) ([]Result, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("readiness service has no database")
 	}
@@ -114,7 +114,7 @@ func (s *Service) Run(ctx context.Context, repo domain.Repository) ([]Result, er
 		}
 	}
 
-	if err := s.persistRun(ctx, repo, repositoryResults, branchRuns, webhookFresh, now); err != nil {
+	if err := s.persistRun(ctx, repo, actor, repositoryResults, branchRuns, webhookFresh, now); err != nil {
 		return nil, err
 	}
 	results := append([]Result(nil), repositoryResults...)
@@ -172,7 +172,7 @@ func (s *Service) webhookResult(ctx context.Context, repositoryID int64, now tim
 	}, true, nil
 }
 
-func (s *Service) persistRun(ctx context.Context, repo domain.Repository, repositoryResults []Result, branches []branchRun, webhookFresh bool, checkedAt time.Time) error {
+func (s *Service) persistRun(ctx context.Context, repo domain.Repository, actor domain.Actor, repositoryResults []Result, branches []branchRun, webhookFresh bool, checkedAt time.Time) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin readiness persistence: %w", err)
@@ -247,11 +247,11 @@ func (s *Service) persistRun(ctx context.Context, repo domain.Repository, reposi
 	}
 
 	auditStore := audit.NewStoreTx(tx)
-	if err := auditStore.Record(ctx, setupCheckRunEvent(repo.ID, len(branches), okCount, warningCount, failedCount, webhookFresh)); err != nil {
+	if err := auditStore.Record(ctx, setupCheckRunEvent(repo.ID, actor, len(branches), okCount, warningCount, failedCount, webhookFresh)); err != nil {
 		return fmt.Errorf("record repository.setup_check_run audit event: %w", err)
 	}
 	if len(drifted) > 0 {
-		if err := auditStore.Record(ctx, setupDriftEvent(repo.ID, drifted)); err != nil {
+		if err := auditStore.Record(ctx, setupDriftEvent(repo.ID, actor, drifted)); err != nil {
 			return fmt.Errorf("record repository.setup_drift_detected audit event: %w", err)
 		}
 	}
@@ -360,8 +360,10 @@ func resultCounts(results []Result) (ok, warning, failed int) {
 	return ok, warning, failed
 }
 
-func setupCheckRunEvent(repositoryID int64, branchCount, okCount, warningCount, failedCount int, webhookFresh bool) audit.Event {
+func setupCheckRunEvent(repositoryID int64, actor domain.Actor, branchCount, okCount, warningCount, failedCount int, webhookFresh bool) audit.Event {
 	details, _ := json.Marshal(map[string]any{
+		"actor_kind":             actor.Kind,
+		"actor_role":             actor.Role,
 		"repository_id":          repositoryID,
 		"managed_branch_count":   branchCount,
 		"ok_count":               okCount,
@@ -369,16 +371,18 @@ func setupCheckRunEvent(repositoryID int64, branchCount, okCount, warningCount, 
 		"failed_count":           failedCount,
 		"webhook_evidence_fresh": webhookFresh,
 	})
-	return audit.Event{Action: audit.ActionRepositorySetupCheckRun, SubjectType: audit.SubjectTypeRepository, SubjectID: strconv.FormatInt(repositoryID, 10), DetailsJSON: string(details)}
+	return audit.Event{ActorUserID: actor.UserID, Action: audit.ActionRepositorySetupCheckRun, SubjectType: audit.SubjectTypeRepository, SubjectID: strconv.FormatInt(repositoryID, 10), DetailsJSON: string(details)}
 }
 
-func setupDriftEvent(repositoryID int64, branches []string) audit.Event {
+func setupDriftEvent(repositoryID int64, actor domain.Actor, branches []string) audit.Event {
 	details, _ := json.Marshal(map[string]any{
+		"actor_kind":       actor.Kind,
+		"actor_role":       actor.Role,
 		"repository_id":    repositoryID,
 		"branches":         branches,
 		"drifted_branches": len(branches),
 	})
-	return audit.Event{Action: audit.ActionRepositorySetupDriftDetected, SubjectType: audit.SubjectTypeRepository, SubjectID: strconv.FormatInt(repositoryID, 10), DetailsJSON: string(details)}
+	return audit.Event{ActorUserID: actor.UserID, Action: audit.ActionRepositorySetupDriftDetected, SubjectType: audit.SubjectTypeRepository, SubjectID: strconv.FormatInt(repositoryID, 10), DetailsJSON: string(details)}
 }
 
 func sanitizedTokenError(operation string, err error, token string) error {

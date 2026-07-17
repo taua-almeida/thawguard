@@ -53,11 +53,13 @@ type fakeEnforcementReadiness struct {
 	results []setupcheck.Result
 	err     error
 	runs    int
+	actors  []domain.Actor
 	onRun   func()
 }
 
-func (f *fakeEnforcementReadiness) Run(ctx context.Context, repo domain.Repository) ([]setupcheck.Result, error) {
+func (f *fakeEnforcementReadiness) Run(ctx context.Context, repo domain.Repository, actor domain.Actor) ([]setupcheck.Result, error) {
 	f.runs++
+	f.actors = append(f.actors, actor)
 	if f.onRun != nil {
 		f.onRun()
 	}
@@ -191,6 +193,34 @@ func (h *enforcementHarness) auditEvents(t *testing.T, ctx context.Context, acti
 		}
 	}
 	return matched
+}
+
+func TestVerifyStatusPostingPassesTransitionActorToReadiness(t *testing.T) {
+	ctx := context.Background()
+	h := newEnforcementHarness(t, ctx)
+
+	if _, err := h.service.VerifyStatusPosting(ctx, h.repo.ID, h.admin); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.readiness.actors) != 1 || h.readiness.actors[0] != h.admin {
+		t.Fatalf("status verification readiness actors=%+v, want %+v", h.readiness.actors, h.admin)
+	}
+}
+
+func TestActivateEnforcementPassesTransitionActorToReadiness(t *testing.T) {
+	ctx := context.Background()
+	h := newEnforcementHarness(t, ctx)
+	if _, err := h.service.VerifyStatusPosting(ctx, h.repo.ID, h.admin); err != nil {
+		t.Fatal(err)
+	}
+	h.readiness.actors = nil
+
+	if _, err := h.service.ActivateEnforcement(ctx, h.repo.ID, h.admin); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.readiness.actors) != 1 || h.readiness.actors[0] != h.admin {
+		t.Fatalf("activation readiness actors=%+v, want %+v", h.readiness.actors, h.admin)
+	}
 }
 
 func TestVerifyStatusPostingRejectsIncompleteReadinessBeforeAnyForgeCall(t *testing.T) {
