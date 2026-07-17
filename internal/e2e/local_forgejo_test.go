@@ -82,6 +82,7 @@ type pullRequest struct {
 	Number  int    `json:"number"`
 	Title   string `json:"title"`
 	State   string `json:"state"`
+	Merged  bool   `json:"merged"`
 	HTMLURL string `json:"html_url"`
 	Base    struct {
 		Ref string `json:"ref"`
@@ -134,12 +135,22 @@ type scheduledFreezeRowEvidence struct {
 }
 
 type scheduledFreezeLifecycleFixture struct {
-	freezeID                int64
-	releasePullRequestIndex int
-	releaseHeadSHA          string
-	plannedEndsAt           time.Time
-	activeReleaseFreeze     activeFreezeEvidence
-	mainSharedHeadStatuses  []commitStatus
+	freezeID                       int64
+	releasePullRequestIndex        int
+	releaseHeadSHA                 string
+	plannedEndsAt                  time.Time
+	activeScheduleA                scheduledFreezeRowEvidence
+	cancelledScheduleB             scheduledFreezeRowEvidence
+	activeReleaseFreeze            activeFreezeEvidence
+	activeMainFreeze               activeFreezeEvidence
+	primaryPullRequestIndex        int
+	sharedHeadPullRequestIndex     int
+	sharedHeadSHA                  string
+	mainSharedHeadStatuses         []commitStatus
+	historicalThawedHeadSHA        string
+	historicalThawedHeadStatuses   []commitStatus
+	historicalEligibleDecisionRow  string
+	historicalSinglePRThawActivity string
 }
 
 func TestLocalForgejoFreezeLifecycle(t *testing.T) {
@@ -237,7 +248,7 @@ func TestLocalForgejoFreezeLifecycle(t *testing.T) {
 	if plannedUnfreezeFixture.freezeID <= 0 || plannedUnfreezeFixture.releasePullRequestIndex <= 0 || plannedUnfreezeFixture.releaseHeadSHA == "" || !plannedUnfreezeFixture.plannedEndsAt.After(time.Now().UTC()) || plannedUnfreezeFixture.activeReleaseFreeze.id != plannedUnfreezeFixture.freezeID || len(plannedUnfreezeFixture.mainSharedHeadStatuses) == 0 {
 		t.Fatalf("scheduled lifecycle did not retain a complete planned-unfreeze fixture: %+v", plannedUnfreezeFixture)
 	}
-	scanRenderedTokenSurfaces(t, ctx, browser)
+	provePlannedUnfreezeAcrossRestart(t, ctx, forgejo, browser, cfg, repositoryID, plannedUnfreezeFixture)
 }
 
 func proveActiveFreezeCancellation(t *testing.T, ctx context.Context, forgejo *forgejoAPI, browser *thawguardBrowser, repositoryID int64, pullRequestIndex int, headSHA string, firstFreeze activeFreezeEvidence) {
@@ -1356,13 +1367,424 @@ func proveScheduledFreezeLifecycle(t *testing.T, ctx context.Context, forgejo *f
 	}
 
 	return scheduledFreezeLifecycleFixture{
-		freezeID:                scheduleA.id,
-		releasePullRequestIndex: releasePR.Number,
-		releaseHeadSHA:          releaseHeadSHA,
-		plannedEndsAt:           editedPlannedEndsAt,
-		activeReleaseFreeze:     activeReleaseFreeze,
-		mainSharedHeadStatuses:  slices.Clone(mainSharedStatuses),
+		freezeID:                       scheduleA.id,
+		releasePullRequestIndex:        releasePR.Number,
+		releaseHeadSHA:                 releaseHeadSHA,
+		plannedEndsAt:                  editedPlannedEndsAt,
+		activeScheduleA:                activeScheduleA,
+		cancelledScheduleB:             cancelledScheduleBAfterStart,
+		activeReleaseFreeze:            activeReleaseFreeze,
+		activeMainFreeze:               mainFreezeBefore,
+		primaryPullRequestIndex:        primaryPullRequestIndex,
+		sharedHeadPullRequestIndex:     sharedHeadPR.Number,
+		sharedHeadSHA:                  sharedHeadSHA,
+		mainSharedHeadStatuses:         slices.Clone(mainSharedStatuses),
+		historicalThawedHeadSHA:        historicalThawedHeadSHA,
+		historicalThawedHeadStatuses:   slices.Clone(historicalStatuses),
+		historicalEligibleDecisionRow:  historicalDecisionRow,
+		historicalSinglePRThawActivity: historicalThawRow,
 	}
+}
+
+func provePlannedUnfreezeAcrossRestart(t *testing.T, ctx context.Context, forgejo *forgejoAPI, browser *thawguardBrowser, cfg e2eConfig, repositoryID int64, fixture scheduledFreezeLifecycleFixture) {
+	t.Helper()
+	const (
+		frozenDescription = "Branch is frozen; merge is blocked by Thawguard"
+		thawedDescription = "No active freeze applies to this PR"
+	)
+	sliceStartedAt := time.Now().UTC()
+	plannedEndsAt := fixture.plannedEndsAt.UTC()
+	contextDeadline, hasDeadline := ctx.Deadline()
+	if !hasDeadline {
+		t.Fatal("planned-unfreeze restart proof requires a bounded test context")
+	}
+	remainingBeforeStop := plannedEndsAt.Sub(sliceStartedAt)
+	contextAfterPlannedEnd := contextDeadline.Sub(plannedEndsAt)
+	if remainingBeforeStop < 50*time.Second {
+		t.Fatalf("planned-unfreeze restart proof has only %s before the retained due time, want at least 50s", remainingBeforeStop.Round(time.Millisecond))
+	}
+	if contextAfterPlannedEnd < 120*time.Second {
+		t.Fatalf("planned-unfreeze restart proof has only %s of test context after the retained due time, want at least 120s", contextAfterPlannedEnd.Round(time.Millisecond))
+	}
+	if fixture.freezeID <= 0 || fixture.releasePullRequestIndex <= 0 || len(fixture.releaseHeadSHA) < 12 || fixture.activeReleaseFreeze.id != fixture.freezeID || fixture.activeMainFreeze.id <= 0 || fixture.activeMainFreeze.id == fixture.freezeID || fixture.primaryPullRequestIndex <= 0 || fixture.sharedHeadPullRequestIndex <= 0 || fixture.primaryPullRequestIndex == fixture.sharedHeadPullRequestIndex || len(fixture.sharedHeadSHA) < 12 || len(fixture.mainSharedHeadStatuses) == 0 || len(fixture.historicalThawedHeadSHA) < 12 || len(fixture.historicalThawedHeadStatuses) == 0 || fixture.historicalEligibleDecisionRow == "" || fixture.historicalSinglePRThawActivity == "" {
+		t.Fatalf("planned-unfreeze restart proof received an incomplete retained fixture: %+v", fixture)
+	}
+	t.Logf("planned-unfreeze pre-stop timing: due in %s; test context extends %s beyond due", remainingBeforeStop.Round(time.Millisecond), contextAfterPlannedEnd.Round(time.Millisecond))
+
+	releasePR := requireOpenForgejoPullRequest(t, ctx, forgejo, fixture.releasePullRequestIndex, fixtureReleaseBranch, fixtureScheduledPRTitle, fixture.releaseHeadSHA)
+	if releasePR.Merged {
+		t.Fatalf("release PR #%d is already merged before the planned-unfreeze restart proof", fixture.releasePullRequestIndex)
+	}
+	repositoriesBefore := requirePage(t, ctx, browser, "/repositories")
+	requireHealthyActiveRepository(t, repositoriesBefore)
+	csrfBefore := requireHiddenInput(t, repositoriesBefore, "csrf_token")
+	if csrfBefore == "" {
+		t.Fatal("authenticated session has an empty CSRF token before planned-unfreeze downtime")
+	}
+
+	baseline := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, fixture.releaseHeadSHA)
+	if len(baseline.freezeStatuses) < 2 {
+		t.Fatalf("release head has only %d required-context statuses before planned-unfreeze downtime, want complete success/failure history", len(baseline.freezeStatuses))
+	}
+	scheduleAFailure := baseline.freezeStatuses[len(baseline.freezeStatuses)-1]
+	if scheduleAFailure.Context != requiredContext || scheduleAFailure.Status != "failure" || scheduleAFailure.Description != frozenDescription {
+		t.Fatalf("unexpected newest release status before planned-unfreeze downtime: %+v", scheduleAFailure)
+	}
+
+	schedulesBefore := requirePage(t, ctx, browser, "/scheduled-freezes")
+	scheduleABefore := requireScheduledFreezeRow(t, schedulesBefore, 0, fixture.activeScheduleA.reason)
+	if scheduleABefore != fixture.activeScheduleA || scheduleABefore.id != 0 || scheduleABefore.branch != fixtureReleaseBranch || scheduleABefore.status != "active" || scheduleABefore.plannedEndsAt != scheduleTime(plannedEndsAt) || scheduleABefore.endedAt != "—" {
+		t.Fatalf("Schedule A changed before planned-unfreeze downtime: retained=%+v rendered=%+v", fixture.activeScheduleA, scheduleABefore)
+	}
+	requireNoPendingScheduleActions(t, scheduleABefore)
+	scheduleBBefore := requireScheduledFreezeRow(t, schedulesBefore, 0, fixture.cancelledScheduleB.reason)
+	if scheduleBBefore != fixture.cancelledScheduleB || scheduleBBefore.status != "cancelled" || scheduleBBefore.endedAt == "" || scheduleBBefore.endedAt == "—" {
+		t.Fatalf("cancelled Schedule B changed before planned-unfreeze downtime: retained=%+v rendered=%+v", fixture.cancelledScheduleB, scheduleBBefore)
+	}
+	requireNoPendingScheduleActions(t, scheduleBBefore)
+
+	freezesBefore := requirePage(t, ctx, browser, "/freezes")
+	requireActiveFreezeCount(t, freezesBefore, 2)
+	mainFreezeBefore, _ := requireActiveFreezeEvidenceForBranch(t, freezesBefore, "main")
+	if mainFreezeBefore != fixture.activeMainFreeze {
+		t.Fatalf("active main freeze changed before planned-unfreeze downtime: retained=%+v rendered=%+v", fixture.activeMainFreeze, mainFreezeBefore)
+	}
+	releaseFreezeBefore, _ := requireActiveFreezeEvidenceForBranch(t, freezesBefore, fixtureReleaseBranch)
+	if releaseFreezeBefore != fixture.activeReleaseFreeze || releaseFreezeBefore.id != fixture.freezeID {
+		t.Fatalf("active release freeze changed before planned-unfreeze downtime: retained=%+v rendered=%+v", fixture.activeReleaseFreeze, releaseFreezeBefore)
+	}
+	requireRetainedPlannedUnfreezeFixtureState(t, ctx, forgejo, browser, fixture, "planned-unfreeze pre-stop baseline")
+
+	decisionsBefore := requirePage(t, ctx, browser, "/decisions")
+	failureDecisionRow := requireDecisionResultRowForHead(t, decisionsBefore, fixture.releaseHeadSHA)
+	for _, want := range []string{
+		`<a href="#">#` + strconv.Itoa(fixture.releasePullRequestIndex) + `</a>`,
+		`<code class="tg-branch">` + fixtureReleaseBranch + `</code>`,
+		`<code>` + fixture.releaseHeadSHA + `</code>`,
+		`<code>` + requiredContext + `</code>`,
+		`<span class="status status-failure">Blocked</span>`,
+		frozenDescription,
+	} {
+		if !strings.Contains(failureDecisionRow, want) {
+			t.Fatalf("pre-stop release failure decision is missing %q", want)
+		}
+	}
+	publicationsBefore := requirePage(t, ctx, browser, "/publications")
+	failureIntentRow := requirePublicationIntentRowForHead(t, publicationsBefore, fixture.releaseHeadSHA)
+	for _, want := range []string{
+		fixtureOwner + `/` + fixtureRepository,
+		`#` + strconv.Itoa(fixture.releasePullRequestIndex) + `<small class="tg-muted">` + fixtureReleaseBranch + `</small>`,
+		`<code>` + fixture.releaseHeadSHA + `</code>`,
+		`<td data-label="Context"><code>` + requiredContext + `</code></td>`,
+		`<span class="status status-failure">failure</span>`,
+		`<code>forgejo_status</code>`,
+		frozenDescription,
+	} {
+		if !strings.Contains(failureIntentRow, want) {
+			t.Fatalf("pre-stop release desired-status intent is missing %q", want)
+		}
+	}
+	activityBefore := requirePage(t, ctx, browser, "/activity")
+	plannedUnfreezesBefore := countActivityEvents(activityBefore, "Scheduled planned unfreeze")
+	if plannedUnfreezesBefore != 0 {
+		t.Fatalf("planned-unfreeze restart fixture already has %d Scheduled planned unfreeze activities, want none", plannedUnfreezesBefore)
+	}
+	openPullRequestSyncsBefore := countOpenPullRequestSyncEvents(activityBefore)
+
+	controlThawguardService(t, ctx, cfg, "stop")
+	stoppedAt := time.Now().UTC()
+	stopCompletionMargin := plannedEndsAt.Sub(stoppedAt)
+	if stopCompletionMargin <= 0 {
+		t.Fatalf("Thawguard stop completed %s after Schedule A was due", (-stopCompletionMargin).Round(time.Millisecond))
+	}
+	t.Logf("Thawguard-only stop completed %s before planned unfreeze", stopCompletionMargin.Round(time.Millisecond))
+
+	downtimePR := requireOpenForgejoPullRequest(t, ctx, forgejo, fixture.releasePullRequestIndex, fixtureReleaseBranch, fixtureScheduledPRTitle, fixture.releaseHeadSHA)
+	if downtimePR.Merged {
+		t.Fatalf("release PR #%d merged while Thawguard was stopped", fixture.releasePullRequestIndex)
+	}
+	downtimeStatuses, err := listForgejoFreezeStatuses(ctx, forgejo, fixture.releaseHeadSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(downtimeStatuses, baseline.freezeStatuses) {
+		t.Fatalf("release status history changed immediately after Thawguard-only stop: before=%+v after=%+v", baseline.freezeStatuses, downtimeStatuses)
+	}
+
+	waitUntilContext(t, ctx, plannedEndsAt.Add(time.Second), "Schedule A planned unfreeze to become overdue while Thawguard is down")
+	overduePR := requireOpenForgejoPullRequest(t, ctx, forgejo, fixture.releasePullRequestIndex, fixtureReleaseBranch, fixtureScheduledPRTitle, fixture.releaseHeadSHA)
+	if overduePR.Merged {
+		t.Fatalf("release PR #%d merged while the planned unfreeze was overdue and Thawguard was stopped", fixture.releasePullRequestIndex)
+	}
+	overdueStatuses, err := listForgejoFreezeStatuses(ctx, forgejo, fixture.releaseHeadSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(overdueStatuses, baseline.freezeStatuses) {
+		t.Fatalf("release status history changed while planned unfreeze was overdue and Thawguard was stopped: before=%+v after=%+v", baseline.freezeStatuses, overdueStatuses)
+	}
+
+	controlThawguardService(t, ctx, cfg, "start")
+	restartedAt := time.Now().UTC()
+	waitFor(t, 45*time.Second, "restarted Thawguard HTTP health", func() (bool, error) {
+		_, err := browser.get(ctx, "/healthz")
+		return err == nil, err
+	})
+	repositoriesAfterStart := requirePage(t, ctx, browser, "/repositories")
+	requireHealthyActiveRepository(t, repositoriesAfterStart)
+	if csrfAfter := requireHiddenInput(t, repositoriesAfterStart, "csrf_token"); csrfAfter != csrfBefore {
+		t.Fatalf("authenticated session CSRF token changed across planned-unfreeze restart")
+	}
+
+	var converged webhookSideEffectEvidence
+	waitFor(t, 45*time.Second, "startup planned-unfreeze lifecycle convergence", func() (bool, error) {
+		current := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, fixture.releaseHeadSHA)
+		if current.webhookRows > baseline.webhookRows ||
+			current.statusResults > baseline.statusResults+1 ||
+			current.publicationIntents > baseline.publicationIntents ||
+			current.publicationAttempts > baseline.publicationAttempts+1 ||
+			current.activityEvents > baseline.activityEvents+2 ||
+			len(current.freezeStatuses) > len(baseline.freezeStatuses)+1 {
+			t.Fatalf("startup planned unfreeze overshot its exact deltas: webhooks %d→%d, status results %d→%d, intents %d→%d, attempts %d→%d, activity %d→%d, release statuses %d→%d",
+				baseline.webhookRows, current.webhookRows,
+				baseline.statusResults, current.statusResults,
+				baseline.publicationIntents, current.publicationIntents,
+				baseline.publicationAttempts, current.publicationAttempts,
+				baseline.activityEvents, current.activityEvents,
+				len(baseline.freezeStatuses), len(current.freezeStatuses))
+		}
+		converged = current
+		return current.webhookRows == baseline.webhookRows &&
+			current.statusResults == baseline.statusResults+1 &&
+			current.publicationIntents == baseline.publicationIntents &&
+			current.publicationAttempts == baseline.publicationAttempts+1 &&
+			current.activityEvents == baseline.activityEvents+2 &&
+			len(current.freezeStatuses) == len(baseline.freezeStatuses)+1, nil
+	})
+
+	if !slices.Equal(converged.freezeStatuses[:len(baseline.freezeStatuses)], baseline.freezeStatuses) {
+		t.Fatalf("startup planned unfreeze rewrote the existing release status history: before=%+v after=%+v", baseline.freezeStatuses, converged.freezeStatuses)
+	}
+	startupSuccess := converged.freezeStatuses[len(converged.freezeStatuses)-1]
+	if startupSuccess.ID <= scheduleAFailure.ID || startupSuccess.Context != requiredContext || startupSuccess.Status != "success" || startupSuccess.Description != thawedDescription {
+		t.Fatalf("unexpected startup planned-unfreeze status for full head %s: failure=%+v success=%+v", fixture.releaseHeadSHA, scheduleAFailure, startupSuccess)
+	}
+
+	decisionsAfter := requirePage(t, ctx, browser, "/decisions")
+	if !strings.Contains(decisionsAfter, failureDecisionRow) {
+		t.Fatal("startup planned unfreeze removed the retained release failure decision history")
+	}
+	successDecisionRow := requireDecisionResultRowForHead(t, decisionsAfter, fixture.releaseHeadSHA)
+	for _, want := range []string{
+		`<a href="#">#` + strconv.Itoa(fixture.releasePullRequestIndex) + `</a>`,
+		`<code class="tg-branch">` + fixtureReleaseBranch + `</code>`,
+		`<code>` + fixture.releaseHeadSHA + `</code>`,
+		`<code>` + requiredContext + `</code>`,
+		`<span class="status status-success">Eligible</span>`,
+		thawedDescription,
+	} {
+		if !strings.Contains(successDecisionRow, want) {
+			t.Fatalf("startup planned-unfreeze success decision is missing %q", want)
+		}
+	}
+	publicationsAfter := requirePage(t, ctx, browser, "/publications")
+	successIntentRow := requirePublicationIntentRowForHead(t, publicationsAfter, fixture.releaseHeadSHA)
+	for _, want := range []string{
+		fixtureOwner + `/` + fixtureRepository,
+		`#` + strconv.Itoa(fixture.releasePullRequestIndex) + `<small class="tg-muted">` + fixtureReleaseBranch + `</small>`,
+		`<code>` + fixture.releaseHeadSHA + `</code>`,
+		`<td data-label="Context"><code>` + requiredContext + `</code></td>`,
+		`<span class="status status-success">success</span>`,
+		`<code>forgejo_status</code>`,
+		thawedDescription,
+	} {
+		if !strings.Contains(successIntentRow, want) {
+			t.Fatalf("startup planned-unfreeze reused desired-status intent is missing %q", want)
+		}
+	}
+	if failureIntentRow == successIntentRow {
+		t.Fatal("startup planned unfreeze did not update the existing desired-status intent from failure to success")
+	}
+	startupAttemptRow := requireLatestPublicationAttemptRow(t, publicationsAfter)
+	for _, want := range []string{
+		fixtureOwner + `/` + fixtureRepository,
+		`#` + strconv.Itoa(fixture.releasePullRequestIndex) + `<small class="tg-muted">` + fixtureReleaseBranch + `</small>`,
+		`<code>` + fixture.releaseHeadSHA + `</code>`,
+		`<small class="tg-muted">` + requiredContext + `</small>`,
+		`<td data-label="State"><span class="status status-success">success</span></td>`,
+		`<td data-label="Mode"><code>forgejo_status</code></td>`,
+		`<td data-label="Result"><span class="status status-ok">posted</span></td>`,
+		thawedDescription,
+	} {
+		if !strings.Contains(startupAttemptRow, want) {
+			t.Fatalf("startup planned-unfreeze publication attempt is missing %q", want)
+		}
+	}
+
+	activityAfter := requirePage(t, ctx, browser, "/activity")
+	if got := countActivityEvents(activityAfter, "Scheduled planned unfreeze"); got != plannedUnfreezesBefore+1 || got != 1 {
+		t.Fatalf("startup lifecycle rendered %d Scheduled planned unfreeze activities, want exactly one", got)
+	}
+	if got := countOpenPullRequestSyncEvents(activityAfter); got != openPullRequestSyncsBefore+1 {
+		t.Fatalf("startup lifecycle changed open-PR sync activities from %d to %d, want exactly one new row", openPullRequestSyncsBefore, got)
+	}
+	plannedUnfreezeRow := requireLatestActivityRow(t, activityAfter, "Scheduled planned unfreeze")
+	for _, want := range []string{
+		`<td data-label="Actor">Scheduler</td>`,
+		`<td data-label="Action">Scheduled planned unfreeze</td>`,
+		`<td data-label="Target">` + fixtureOwner + `/` + fixtureRepository + ` → ` + fixtureReleaseBranch + `</td>`,
+		`<td data-label="Outcome"><span class="status status-ok">Completed</span></td>`,
+		`Planned unfreeze ` + scheduleTime(plannedEndsAt) + `. Reason: ` + html.EscapeString(fixture.activeScheduleA.reason) + `.`,
+	} {
+		if !strings.Contains(plannedUnfreezeRow, want) {
+			t.Fatalf("Scheduled planned unfreeze activity is missing %q", want)
+		}
+	}
+	startupSyncRow := requireLatestActivityRow(t, activityAfter, "Open pull request sync")
+	for _, want := range []string{
+		`<td data-label="Actor">Unknown system actor</td>`,
+		`<td data-label="Action">Open pull request sync</td>`,
+		`<td data-label="Target">` + fixtureOwner + `/` + fixtureRepository + ` → all managed branches</td>`,
+		`<td data-label="Outcome"><span class="status status-ok">Succeeded</span></td>`,
+		`3 open PRs synchronized; 0 cached PRs marked closed.`,
+	} {
+		if !strings.Contains(startupSyncRow, want) {
+			t.Fatalf("startup open-PR sync activity is missing %q", want)
+		}
+	}
+
+	schedulesAfter := requirePage(t, ctx, browser, "/scheduled-freezes")
+	completedScheduleA := requireScheduledFreezeRow(t, schedulesAfter, 0, fixture.activeScheduleA.reason)
+	if completedScheduleA.id != 0 || completedScheduleA.branch != fixture.activeScheduleA.branch || completedScheduleA.reason != fixture.activeScheduleA.reason || completedScheduleA.startsAt != fixture.activeScheduleA.startsAt || completedScheduleA.plannedEndsAt != fixture.activeScheduleA.plannedEndsAt || completedScheduleA.status != "completed" || completedScheduleA.endedAt == "" || completedScheduleA.endedAt == "—" {
+		t.Fatalf("Schedule A has unexpected completed evidence after startup planned unfreeze: before=%+v after=%+v", fixture.activeScheduleA, completedScheduleA)
+	}
+	requireNoPendingScheduleActions(t, completedScheduleA)
+	cancelledScheduleBAfter := requireScheduledFreezeRow(t, schedulesAfter, 0, fixture.cancelledScheduleB.reason)
+	if cancelledScheduleBAfter != scheduleBBefore {
+		t.Fatalf("cancelled Schedule B history changed during startup planned unfreeze: before=%+v after=%+v", scheduleBBefore, cancelledScheduleBAfter)
+	}
+	requireNoPendingScheduleActions(t, cancelledScheduleBAfter)
+	for _, absent := range []string{`action="/scheduled-freezes/edit"`, `action="/scheduled-freezes/start-now"`, `action="/scheduled-freezes/cancel"`} {
+		if strings.Contains(schedulesAfter, absent) {
+			t.Fatalf("completed/cancelled schedule history still renders pending control %q", absent)
+		}
+	}
+
+	freezesAfter := requirePage(t, ctx, browser, "/freezes")
+	requireActiveFreezeCount(t, freezesAfter, 1)
+	mainFreezeAfter, _ := requireActiveFreezeEvidenceForBranch(t, freezesAfter, "main")
+	if mainFreezeAfter != fixture.activeMainFreeze {
+		t.Fatalf("startup planned unfreeze changed the active main freeze: before=%+v after=%+v", fixture.activeMainFreeze, mainFreezeAfter)
+	}
+	requireNoActiveFreezeForBranch(t, freezesAfter, fixture.activeReleaseFreeze)
+	repositoriesAfter := requirePage(t, ctx, browser, "/repositories")
+	requireHealthyActiveRepository(t, repositoriesAfter)
+	if csrfAfter := requireHiddenInput(t, repositoriesAfter, "csrf_token"); csrfAfter != csrfBefore {
+		t.Fatal("authenticated session CSRF token changed after startup planned-unfreeze convergence")
+	}
+	requireOpenForgejoPullRequest(t, ctx, forgejo, fixture.releasePullRequestIndex, fixtureReleaseBranch, fixtureScheduledPRTitle, fixture.releaseHeadSHA)
+	requireRetainedPlannedUnfreezeFixtureState(t, ctx, forgejo, browser, fixture, "startup planned-unfreeze convergence")
+	scanRenderedTokenSurfaces(t, ctx, browser)
+
+	quietBefore := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, fixture.releaseHeadSHA)
+	requireIdenticalWebhookEvidence(t, converged, quietBefore, "post-restart observation before quiet lifecycle pass")
+	waitUntilContext(t, ctx, time.Now().UTC().Add(16*time.Second), "one quiet freeze lifecycle interval")
+	quietAfter := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, fixture.releaseHeadSHA)
+	requireIdenticalWebhookEvidence(t, quietBefore, quietAfter, "quiet freeze lifecycle pass")
+
+	quietSchedules := requirePage(t, ctx, browser, "/scheduled-freezes")
+	quietScheduleA := requireScheduledFreezeRow(t, quietSchedules, 0, fixture.activeScheduleA.reason)
+	quietScheduleB := requireScheduledFreezeRow(t, quietSchedules, 0, fixture.cancelledScheduleB.reason)
+	if quietScheduleA != completedScheduleA || quietScheduleB != cancelledScheduleBAfter {
+		t.Fatalf("quiet lifecycle pass changed schedule history: Schedule A %+v→%+v, Schedule B %+v→%+v", completedScheduleA, quietScheduleA, cancelledScheduleBAfter, quietScheduleB)
+	}
+	quietFreezes := requirePage(t, ctx, browser, "/freezes")
+	requireActiveFreezeCount(t, quietFreezes, 1)
+	quietMainFreeze, _ := requireActiveFreezeEvidenceForBranch(t, quietFreezes, "main")
+	if quietMainFreeze != fixture.activeMainFreeze {
+		t.Fatalf("quiet lifecycle pass changed the active main freeze: before=%+v after=%+v", fixture.activeMainFreeze, quietMainFreeze)
+	}
+	requireNoActiveFreezeForBranch(t, quietFreezes, fixture.activeReleaseFreeze)
+	quietActivity := requirePage(t, ctx, browser, "/activity")
+	if requireLatestActivityRow(t, quietActivity, "Scheduled planned unfreeze") != plannedUnfreezeRow || requireLatestActivityRow(t, quietActivity, "Open pull request sync") != startupSyncRow {
+		t.Fatal("quiet lifecycle pass changed planned-unfreeze or open-PR sync activity evidence")
+	}
+	quietRepositories := requirePage(t, ctx, browser, "/repositories")
+	requireHealthyActiveRepository(t, quietRepositories)
+	if csrfAfter := requireHiddenInput(t, quietRepositories, "csrf_token"); csrfAfter != csrfBefore {
+		t.Fatal("authenticated session CSRF token changed during the quiet lifecycle pass")
+	}
+	requireOpenForgejoPullRequest(t, ctx, forgejo, fixture.releasePullRequestIndex, fixtureReleaseBranch, fixtureScheduledPRTitle, fixture.releaseHeadSHA)
+	requireRetainedPlannedUnfreezeFixtureState(t, ctx, forgejo, browser, fixture, "quiet lifecycle pass")
+
+	mergeBaseline := quietAfter
+	closedDeliveriesBefore := countPullRequestDeliveryActions(mergeBaseline.webhookPage, "closed")
+	mergeForgejoPullRequest(t, ctx, forgejo, fixture.releasePullRequestIndex)
+	requireMergedForgejoPullRequest(t, ctx, forgejo, fixture.releasePullRequestIndex, fixtureReleaseBranch, fixtureScheduledPRTitle, fixture.releaseHeadSHA)
+	waitForOneNewProcessedPullRequestDelivery(t, ctx, browser, repositoryID, mergeBaseline.webhookRows, "closed")
+
+	var afterMerge webhookSideEffectEvidence
+	waitFor(t, 30*time.Second, "terminal release merge webhook with no policy side effects", func() (bool, error) {
+		current := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, fixture.releaseHeadSHA)
+		if current.webhookRows > mergeBaseline.webhookRows+1 ||
+			current.statusResults > mergeBaseline.statusResults ||
+			current.publicationIntents > mergeBaseline.publicationIntents ||
+			current.publicationAttempts > mergeBaseline.publicationAttempts ||
+			current.activityEvents > mergeBaseline.activityEvents ||
+			len(current.freezeStatuses) > len(mergeBaseline.freezeStatuses) {
+			t.Fatalf("terminal release merge overshot its exact deltas: webhooks %d→%d, status results %d→%d, intents %d→%d, attempts %d→%d, activity %d→%d, release statuses %d→%d",
+				mergeBaseline.webhookRows, current.webhookRows,
+				mergeBaseline.statusResults, current.statusResults,
+				mergeBaseline.publicationIntents, current.publicationIntents,
+				mergeBaseline.publicationAttempts, current.publicationAttempts,
+				mergeBaseline.activityEvents, current.activityEvents,
+				len(mergeBaseline.freezeStatuses), len(current.freezeStatuses))
+		}
+		afterMerge = current
+		return current.webhookRows == mergeBaseline.webhookRows+1 &&
+			current.statusResults == mergeBaseline.statusResults &&
+			current.publicationIntents == mergeBaseline.publicationIntents &&
+			current.publicationAttempts == mergeBaseline.publicationAttempts &&
+			current.activityEvents == mergeBaseline.activityEvents &&
+			slices.Equal(current.freezeStatuses, mergeBaseline.freezeStatuses), nil
+	})
+	if got := countPullRequestDeliveryActions(afterMerge.webhookPage, "closed"); got != closedDeliveriesBefore+1 {
+		t.Fatalf("terminal release merge changed processed pull_request/closed rows from %d to %d, want exactly one", closedDeliveriesBefore, got)
+	}
+	latestDelivery := requireLatestWebhookDeliveryRow(t, afterMerge.webhookPage)
+	for _, want := range []string{
+		`<code>` + fixtureOwner + `/` + fixtureRepository + `</code>`,
+		`<td data-label="Event"><code>pull_request</code><small class="tg-muted">closed</small></td>`,
+		`>verified</span>`,
+		`>processed</span>`,
+		`<td data-label="Details">No processing error</td>`,
+	} {
+		if !strings.Contains(latestDelivery, want) {
+			t.Fatalf("terminal release merge webhook is missing %q", want)
+		}
+	}
+
+	finalSchedules := requirePage(t, ctx, browser, "/scheduled-freezes")
+	if finalScheduleA := requireScheduledFreezeRow(t, finalSchedules, 0, fixture.activeScheduleA.reason); finalScheduleA != quietScheduleA {
+		t.Fatalf("terminal release merge changed completed Schedule A: before=%+v after=%+v", quietScheduleA, finalScheduleA)
+	}
+	if finalScheduleB := requireScheduledFreezeRow(t, finalSchedules, 0, fixture.cancelledScheduleB.reason); finalScheduleB != quietScheduleB {
+		t.Fatalf("terminal release merge changed cancelled Schedule B: before=%+v after=%+v", quietScheduleB, finalScheduleB)
+	}
+	finalFreezes := requirePage(t, ctx, browser, "/freezes")
+	requireActiveFreezeCount(t, finalFreezes, 1)
+	finalMainFreeze, _ := requireActiveFreezeEvidenceForBranch(t, finalFreezes, "main")
+	if finalMainFreeze != fixture.activeMainFreeze {
+		t.Fatalf("terminal release merge changed the active main freeze: before=%+v after=%+v", fixture.activeMainFreeze, finalMainFreeze)
+	}
+	requireNoActiveFreezeForBranch(t, finalFreezes, fixture.activeReleaseFreeze)
+	finalRepositories := requirePage(t, ctx, browser, "/repositories")
+	requireHealthyActiveRepository(t, finalRepositories)
+	requireRetainedPlannedUnfreezeFixtureState(t, ctx, forgejo, browser, fixture, "terminal release merge")
+	requireMergedForgejoPullRequest(t, ctx, forgejo, fixture.releasePullRequestIndex, fixtureReleaseBranch, fixtureScheduledPRTitle, fixture.releaseHeadSHA)
+	scanRenderedTokenSurfaces(t, ctx, browser)
+
+	t.Logf("planned-unfreeze restart slice passed: stop margin %s; restart began %s overdue; slice runtime %s", stopCompletionMargin.Round(time.Millisecond), restartedAt.Sub(plannedEndsAt).Round(time.Millisecond), time.Since(sliceStartedAt).Round(time.Millisecond))
 }
 
 func loadConfig(t *testing.T) e2eConfig {
@@ -2098,6 +2520,7 @@ func scanRenderedTokenSurfaces(t *testing.T, ctx context.Context, browser *thawg
 	for _, path := range []string{
 		"/repositories",
 		"/freezes",
+		"/scheduled-freezes",
 		"/decisions",
 		"/activity",
 		"/webhooks",
@@ -2310,7 +2733,7 @@ func requireProcessedVerifiedDelivery(t *testing.T, page, deliveryID string) {
 
 func waitForOneNewProcessedPullRequestDelivery(t *testing.T, ctx context.Context, browser *thawguardBrowser, repositoryID int64, beforeRows int, action string) {
 	t.Helper()
-	if action != "opened" && action != "synchronized" {
+	if action != "opened" && action != "synchronized" && action != "closed" {
 		t.Fatalf("pull request delivery action %q is not allowlisted", action)
 	}
 	webhookPath := "/webhooks?" + url.Values{
@@ -2373,6 +2796,10 @@ func requireLatestWebhookDeliveryRow(t *testing.T, page string) string {
 
 func countOpenPullRequestSyncEvents(page string) int {
 	return strings.Count(page, `<td data-label="Action">Open pull request sync</td>`)
+}
+
+func countPullRequestDeliveryActions(page, action string) int {
+	return strings.Count(page, `<td data-label="Event"><code>pull_request</code><small class="tg-muted">`+html.EscapeString(action)+`</small></td>`)
 }
 
 func countActivityEvents(page, action string) int {
@@ -2464,6 +2891,51 @@ func requireMainSharedStateUnchanged(t *testing.T, ctx context.Context, forgejo 
 	}
 	if !slices.Equal(currentStatuses, expectedStatuses) {
 		t.Fatalf("%s changed the shared main-head status history: before=%+v after=%+v", operation, expectedStatuses, currentStatuses)
+	}
+}
+
+func requireRetainedPlannedUnfreezeFixtureState(t *testing.T, ctx context.Context, forgejo *forgejoAPI, browser *thawguardBrowser, fixture scheduledFreezeLifecycleFixture, operation string) {
+	t.Helper()
+	requireOpenForgejoPullRequest(t, ctx, forgejo, fixture.primaryPullRequestIndex, "main", fixturePrimaryPRTitle, fixture.sharedHeadSHA)
+	requireOpenForgejoPullRequest(t, ctx, forgejo, fixture.sharedHeadPullRequestIndex, "main", fixtureSharedHeadPRTitle, fixture.sharedHeadSHA)
+	requireMainSharedStateUnchanged(t, ctx, forgejo, browser, fixture.activeMainFreeze, fixture.sharedHeadSHA, fixture.mainSharedHeadStatuses, operation)
+
+	historicalStatuses, err := listForgejoFreezeStatuses(ctx, forgejo, fixture.historicalThawedHeadSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(historicalStatuses, fixture.historicalThawedHeadStatuses) {
+		t.Fatalf("%s changed historical thawed-head status evidence: before=%+v after=%+v", operation, fixture.historicalThawedHeadStatuses, historicalStatuses)
+	}
+	decisionsPage := requirePage(t, ctx, browser, "/decisions")
+	if !strings.Contains(decisionsPage, fixture.historicalEligibleDecisionRow) {
+		t.Fatalf("%s changed the historical Eligible decision evidence", operation)
+	}
+	activityPage := requirePage(t, ctx, browser, "/activity")
+	if !strings.Contains(activityPage, fixture.historicalSinglePRThawActivity) {
+		t.Fatalf("%s changed the historical Single-PR thaw activity evidence", operation)
+	}
+}
+
+func requireHealthyActiveRepository(t *testing.T, page string) {
+	t.Helper()
+	for _, want := range []string{
+		fixtureOwner + `/` + fixtureRepository,
+		`<span class="tg-badge status-ok">enforcement active</span>`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("healthy active repository evidence is missing %q", want)
+		}
+	}
+	for _, absent := range []string{
+		"Enforcement is unhealthy",
+		"Automatic recovery is pending",
+		"Recovery in progress",
+		`action="/repositories/recover"`,
+	} {
+		if strings.Contains(page, absent) {
+			t.Fatalf("healthy active repository unexpectedly renders %q", absent)
+		}
 	}
 }
 
@@ -2734,6 +3206,28 @@ func requireActiveFreezeEvidenceForBranch(t *testing.T, page, branch string) (ac
 	return evidence, row
 }
 
+func requireActiveFreezeCount(t *testing.T, page string, expected int) {
+	t.Helper()
+	want := `<span class="tg-badge">` + strconv.Itoa(expected) + ` active</span>`
+	if !strings.Contains(page, want) {
+		t.Fatalf("freezes page is missing exact active count %q", want)
+	}
+}
+
+func requireNoActiveFreezeForBranch(t *testing.T, page string, freeze activeFreezeEvidence) {
+	t.Helper()
+	marker := `<code class="tg-branch">` + html.EscapeString(freeze.branch) + `</code>`
+	for _, absent := range []string{
+		marker,
+		`name="freeze_id" value="` + strconv.FormatInt(freeze.id, 10) + `"`,
+		html.EscapeString(freeze.reason),
+	} {
+		if strings.Contains(page, absent) {
+			t.Fatalf("inactive branch %q freeze %d still renders active evidence %q", freeze.branch, freeze.id, absent)
+		}
+	}
+}
+
 func requireNoActiveFreezeEvidence(t *testing.T, page string, freeze activeFreezeEvidence) {
 	t.Helper()
 	for _, want := range []string{`<span class="tg-badge">0 active</span>`, "No active freezes yet"} {
@@ -2790,6 +3284,36 @@ func requireLatestPublicationIntentRow(t *testing.T, page string) string {
 		t.Fatal("latest desired status row is incomplete")
 	}
 	return page[rowStart : rowStart+rowEndOffset+len("</tr>")]
+}
+
+func requirePublicationIntentRowForHead(t *testing.T, page, headSHA string) string {
+	t.Helper()
+	sectionMarker := "<h2>Latest desired statuses</h2>"
+	sectionStart := strings.Index(page, sectionMarker)
+	if sectionStart < 0 {
+		t.Fatal("publications page is missing latest desired statuses")
+	}
+	tbodyOffset := strings.Index(page[sectionStart:], "<tbody>")
+	if tbodyOffset < 0 {
+		t.Fatal("latest desired statuses are missing their table body")
+	}
+	tbodyStart := sectionStart + tbodyOffset
+	tbodyEndOffset := strings.Index(page[tbodyStart:], "</tbody>")
+	if tbodyEndOffset < 0 {
+		t.Fatal("latest desired statuses have an incomplete table body")
+	}
+	tbody := page[tbodyStart : tbodyStart+tbodyEndOffset]
+	marker := `<code>` + html.EscapeString(headSHA) + `</code>`
+	if count := strings.Count(tbody, marker); count != 1 {
+		t.Fatalf("latest desired statuses render head %q in %d desktop rows, want exactly one", headSHA, count)
+	}
+	markerIndex := strings.Index(tbody, marker)
+	rowStart := strings.LastIndex(tbody[:markerIndex], "<tr>")
+	rowEndOffset := strings.Index(tbody[markerIndex:], "</tr>")
+	if rowStart < 0 || rowEndOffset < 0 {
+		t.Fatalf("latest desired status for head %q is incomplete", headSHA)
+	}
+	return tbody[rowStart : markerIndex+rowEndOffset+len("</tr>")]
 }
 
 func requireLatestPublicationAttemptRow(t *testing.T, page string) string {
@@ -3010,6 +3534,64 @@ func waitForStatusWithDescription(t *testing.T, ctx context.Context, forgejo *fo
 	})
 }
 
+func mergeForgejoPullRequest(t *testing.T, ctx context.Context, forgejo *forgejoAPI, index int) {
+	t.Helper()
+	waitFor(t, 30*time.Second, "ordinary Forgejo release mergeability convergence", func() (bool, error) {
+		response, err := forgejo.do(ctx, http.MethodPost, forgejo.repositoryPath("pulls", strconv.Itoa(index), "merge"), map[string]string{"Do": "merge"})
+		if err != nil {
+			return false, err
+		}
+		if response.statusCode >= 200 && response.statusCode < 300 {
+			return true, nil
+		}
+		if response.statusCode == http.StatusMethodNotAllowed && requiredStatusChecksPending(response) {
+			return false, nil
+		}
+		t.Fatalf("ordinary Forgejo release merge returned an unexpected response: %v", apiStatusError(response, "merge release pull request"))
+		return false, nil
+	})
+}
+
+func requireMergedForgejoPullRequest(t *testing.T, ctx context.Context, forgejo *forgejoAPI, index int, base, title, headSHA string) {
+	t.Helper()
+	waitFor(t, 30*time.Second, "Forgejo release pull request to become closed and merged", func() (bool, error) {
+		response, err := forgejo.do(ctx, http.MethodGet, forgejo.repositoryPath("pulls", strconv.Itoa(index)), nil)
+		if err != nil {
+			return false, err
+		}
+		if response.statusCode != http.StatusOK {
+			return false, apiStatusError(response, "read merged Forgejo pull request")
+		}
+		var pr pullRequest
+		if err := json.Unmarshal(response.body, &pr); err != nil {
+			return false, fmt.Errorf("decode merged Forgejo pull request: %w", err)
+		}
+		normalizePullRequest(&pr)
+		if pr.Number != index || pr.Title != title || pr.Base.Ref != base || pr.Head.SHA != headSHA || pr.HTMLURL == "" {
+			t.Fatalf("unexpected merged Forgejo PR #%d evidence: number=%d title=%q state=%q merged=%t base=%q head=%q", index, pr.Number, pr.Title, pr.State, pr.Merged, pr.Base.Ref, pr.Head.SHA)
+		}
+		if pr.State == "open" {
+			return false, nil
+		}
+		if pr.State != "closed" {
+			t.Fatalf("merged Forgejo PR #%d has unexpected state %q", index, pr.State)
+		}
+		return pr.Merged, nil
+	})
+}
+
+func requiredStatusChecksPending(response apiResponse) bool {
+	var payload struct {
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(response.body, &payload) != nil {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(payload.Message))
+	return strings.Contains(message, "required status checks") &&
+		(strings.Contains(message, "not all") || strings.Contains(message, "not successful") || strings.Contains(message, "unsuccessful"))
+}
+
 func assertMergeBlockedByRequiredStatus(t *testing.T, ctx context.Context, forgejo *forgejoAPI, index int) {
 	t.Helper()
 	waitFor(t, 30*time.Second, "Forgejo required-status merge-block convergence", func() (bool, error) {
@@ -3024,15 +3606,7 @@ func assertMergeBlockedByRequiredStatus(t *testing.T, ctx context.Context, forge
 			t.Fatalf("unexpected HTTP %d while waiting for Forgejo required-status merge block", response.statusCode)
 		}
 
-		var payload struct {
-			Message string `json:"message"`
-		}
-		if json.Unmarshal(response.body, &payload) != nil {
-			return false, nil
-		}
-		message := strings.ToLower(payload.Message)
-		return strings.Contains(message, "required status checks") &&
-			(strings.Contains(message, "not all") || strings.Contains(message, "not successful") || strings.Contains(message, "unsuccessful")), nil
+		return requiredStatusChecksPending(response), nil
 	})
 }
 
@@ -3347,6 +3921,21 @@ func decodeJSON(t *testing.T, data []byte, target any, operation string) {
 	t.Helper()
 	if err := json.Unmarshal(data, target); err != nil {
 		t.Fatalf("%s: %v", operation, err)
+	}
+}
+
+func waitUntilContext(t *testing.T, ctx context.Context, deadline time.Time, description string) {
+	t.Helper()
+	delay := time.Until(deadline)
+	if delay <= 0 {
+		return
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+		t.Fatalf("context ended while waiting for %s: %v", description, ctx.Err())
 	}
 }
 
