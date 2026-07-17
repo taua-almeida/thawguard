@@ -39,9 +39,11 @@ const (
 	fixtureSharedHeadPRTitle = "Fictional shared-head confirmation"
 	fixtureScheduledPRTitle  = "Fictional scheduled release transition"
 	fixtureScheduledFilename = "scheduled-transition.txt"
+	fixtureRoleThawFilename  = "role-boundary-thaw.txt"
 	primaryStatusTokenName   = "thawguard-e2e-status-primary"
 	requiredContext          = "thawguard/freeze"
 	e2eComposeProject        = "thawguard-e2e"
+	thawguardSessionCookie   = "thawguard_session"
 	injectedDriftDescription = "E2E injected status drift while Thawguard was stopped"
 	invalidDeliveryID        = "e2e-invalid-signature-fixture"
 	duplicateDeliveryID      = "e2e-duplicate-delivery-fixture"
@@ -153,6 +155,28 @@ type scheduledFreezeLifecycleFixture struct {
 	historicalSinglePRThawActivity string
 }
 
+type roleBoundarySession struct {
+	displayName   string
+	email         string
+	roleLabel     string
+	browser       *thawguardBrowser
+	csrfToken     string
+	sessionCookie string
+}
+
+type roleBoundaryEvidence struct {
+	userCount        int
+	repositoryCount  int
+	activeFreezes    int
+	scheduledCount   int
+	usersPage        string
+	repositoriesPage string
+	mainFreeze       activeFreezeEvidence
+	schedules        []scheduledFreezeRowEvidence
+	sideEffects      webhookSideEffectEvidence
+	statusHistories  [][]commitStatus
+}
+
 func TestLocalForgejoFreezeLifecycle(t *testing.T) {
 	if os.Getenv("THAWGUARD_E2E") != "1" {
 		t.Skip("set THAWGUARD_E2E=1 and use make e2e")
@@ -249,6 +273,7 @@ func TestLocalForgejoFreezeLifecycle(t *testing.T) {
 		t.Fatalf("scheduled lifecycle did not retain a complete planned-unfreeze fixture: %+v", plannedUnfreezeFixture)
 	}
 	provePlannedUnfreezeAcrossRestart(t, ctx, forgejo, browser, cfg, repositoryID, plannedUnfreezeFixture)
+	proveRoleBoundaries(t, ctx, forgejo, browser, cfg, repositoryID, plannedUnfreezeFixture)
 }
 
 func proveActiveFreezeCancellation(t *testing.T, ctx context.Context, forgejo *forgejoAPI, browser *thawguardBrowser, repositoryID int64, pullRequestIndex int, headSHA string, firstFreeze activeFreezeEvidence) {
@@ -1787,6 +1812,532 @@ func provePlannedUnfreezeAcrossRestart(t *testing.T, ctx context.Context, forgej
 	t.Logf("planned-unfreeze restart slice passed: stop margin %s; restart began %s overdue; slice runtime %s", stopCompletionMargin.Round(time.Millisecond), restartedAt.Sub(plannedEndsAt).Round(time.Millisecond), time.Since(sliceStartedAt).Round(time.Millisecond))
 }
 
+func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI, allRoleBrowser *thawguardBrowser, cfg e2eConfig, repositoryID int64, fixture scheduledFreezeLifecycleFixture) {
+	t.Helper()
+	const (
+		adminEmail              = "admin-only@thawguard.test"
+		freezerEmail            = "freezer@thawguard.test"
+		thawApproverEmail       = "thaw-approver@thawguard.test"
+		viewerEmail             = "viewer@thawguard.test"
+		scheduleCReason         = "Fictional role-boundary Schedule C"
+		scheduleCEditedReason   = "Fictional role-boundary Schedule C edited"
+		roleThawReason          = "Fictional role-boundary unique-head thaw"
+		frozenDescription       = "Branch is frozen; merge is blocked by Thawguard"
+		explicitThawDescription = "PR is explicitly thawed during an active freeze"
+	)
+	sliceStartedAt := time.Now().UTC()
+	if fixture.primaryPullRequestIndex <= 0 || fixture.sharedHeadPullRequestIndex <= 0 || fixture.releasePullRequestIndex <= 0 || len(fixture.sharedHeadSHA) < 12 || len(fixture.releaseHeadSHA) < 12 || fixture.activeMainFreeze.id <= 0 {
+		t.Fatalf("role-boundary proof received an incomplete fixture: %+v", fixture)
+	}
+
+	completedScheduleA := requireScheduledFreezeRow(t, requirePage(t, ctx, allRoleBrowser, "/scheduled-freezes"), 0, fixture.activeScheduleA.reason)
+	if completedScheduleA.branch != fixtureReleaseBranch || completedScheduleA.status != "completed" || completedScheduleA.endedAt == "" || completedScheduleA.endedAt == "—" {
+		t.Fatalf("role-boundary baseline has unexpected completed Schedule A: %+v", completedScheduleA)
+	}
+	cancelledScheduleB := requireScheduledFreezeRow(t, requirePage(t, ctx, allRoleBrowser, "/scheduled-freezes"), 0, fixture.cancelledScheduleB.reason)
+	if cancelledScheduleB.branch != fixtureReleaseBranch || cancelledScheduleB.status != "cancelled" || cancelledScheduleB.endedAt == "" || cancelledScheduleB.endedAt == "—" {
+		t.Fatalf("role-boundary baseline has unexpected cancelled Schedule B: %+v", cancelledScheduleB)
+	}
+	baselineFreezes := requirePage(t, ctx, allRoleBrowser, "/freezes")
+	requireActiveFreezeCount(t, baselineFreezes, 1)
+	mainFreeze, _ := requireActiveFreezeEvidenceForBranch(t, baselineFreezes, "main")
+	if mainFreeze != fixture.activeMainFreeze {
+		t.Fatalf("role-boundary baseline changed the retained main freeze: fixture=%+v rendered=%+v", fixture.activeMainFreeze, mainFreeze)
+	}
+	requireNoActiveFreezeForBranch(t, baselineFreezes, fixture.activeReleaseFreeze)
+	requireOpenForgejoPullRequest(t, ctx, forgejo, fixture.primaryPullRequestIndex, "main", fixturePrimaryPRTitle, fixture.sharedHeadSHA)
+	requireOpenForgejoPullRequest(t, ctx, forgejo, fixture.sharedHeadPullRequestIndex, "main", fixtureSharedHeadPRTitle, fixture.sharedHeadSHA)
+	requireMergedForgejoPullRequest(t, ctx, forgejo, fixture.releasePullRequestIndex, fixtureReleaseBranch, fixtureScheduledPRTitle, fixture.releaseHeadSHA)
+	sharedStatusesBeforeRoles, err := listForgejoFreezeStatuses(ctx, forgejo, fixture.sharedHeadSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(sharedStatusesBeforeRoles, fixture.mainSharedHeadStatuses) {
+		t.Fatalf("role-boundary baseline changed shared-main status history: retained=%+v current=%+v", fixture.mainSharedHeadStatuses, sharedStatusesBeforeRoles)
+	}
+	releaseStatusesBeforeRoles, err := listForgejoFreezeStatuses(ctx, forgejo, fixture.releaseHeadSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activityHistory := requirePage(t, ctx, allRoleBrowser, "/activity")
+	sharedThawHistory := requireLatestActivityRow(t, activityHistory, "Shared-head thaw")
+	plannedUnfreezeHistory := requireLatestActivityRow(t, activityHistory, "Scheduled planned unfreeze")
+	terminalReleaseDelivery := requireLatestWebhookDeliveryRow(t, requirePage(t, ctx, allRoleBrowser, "/webhooks?event=pull_request&limit=100"))
+	if !strings.Contains(terminalReleaseDelivery, `<small class="tg-muted">closed</small>`) {
+		t.Fatal("role-boundary baseline did not retain the terminal release closed webhook")
+	}
+
+	createRoleBoundaryUser(t, ctx, allRoleBrowser, adminEmail, "E2E Admin Only", "admin", cfg.thawguardPassword, 1)
+	createRoleBoundaryUser(t, ctx, allRoleBrowser, freezerEmail, "E2E Freezer", "freezer", cfg.thawguardPassword, 2)
+	createRoleBoundaryUser(t, ctx, allRoleBrowser, thawApproverEmail, "E2E Thaw Approver", "thaw_approver", cfg.thawguardPassword, 3)
+
+	adminSession := loginRoleBoundaryUser(t, ctx, cfg, adminEmail, "E2E Admin Only", "Admin")
+	freezerSession := loginRoleBoundaryUser(t, ctx, cfg, freezerEmail, "E2E Freezer", "Freezer")
+	thawApproverSession := loginRoleBoundaryUser(t, ctx, cfg, thawApproverEmail, "E2E Thaw Approver", "Thaw approver")
+	viewerUserID := createRoleBoundaryUser(t, ctx, adminSession.browser, viewerEmail, "E2E Viewer", "viewer", cfg.thawguardPassword, 4)
+	viewerSession := loginRoleBoundaryUser(t, ctx, cfg, viewerEmail, "E2E Viewer", "Viewer")
+	allRoleSession := currentRoleBoundarySession(t, ctx, allRoleBrowser, "admin@thawguard.test", "E2E Admin", "Admin, Freezer, Thaw approver, Viewer")
+	roleSessions := []roleBoundarySession{adminSession, freezerSession, thawApproverSession, viewerSession}
+	requireRoleSessionsIsolated(t, ctx, append([]roleBoundarySession{allRoleSession}, roleSessions...))
+
+	adminPages := requireRoleBoundaryReadAccess(t, ctx, adminSession, true)
+	freezerPages := requireRoleBoundaryReadAccess(t, ctx, freezerSession, false)
+	thawPages := requireRoleBoundaryReadAccess(t, ctx, thawApproverSession, false)
+	viewerPages := requireRoleBoundaryReadAccess(t, ctx, viewerSession, false)
+	requireRoleBoundaryControls(t, adminPages, true, false, false)
+	requireRoleBoundaryControls(t, freezerPages, false, true, false)
+	requireRoleBoundaryControls(t, thawPages, false, false, true)
+	requireRoleBoundaryControls(t, viewerPages, false, false, false)
+
+	scheduleReasons := []string{completedScheduleA.reason, cancelledScheduleB.reason}
+	trackedHeads := []string{fixture.sharedHeadSHA, fixture.releaseHeadSHA}
+	beforeDenied := collectRoleBoundaryEvidence(t, ctx, forgejo, allRoleBrowser, repositoryID, fixture.sharedHeadSHA, scheduleReasons, trackedHeads)
+	if beforeDenied.userCount != 5 || beforeDenied.repositoryCount != 1 || beforeDenied.activeFreezes != 1 || beforeDenied.scheduledCount != 2 {
+		t.Fatalf("unexpected role-boundary baseline counts: users=%d repositories=%d active=%d schedules=%d", beforeDenied.userCount, beforeDenied.repositoryCount, beforeDenied.activeFreezes, beforeDenied.scheduledCount)
+	}
+	repositoryValue := strconv.FormatInt(repositoryID, 10)
+	viewerUserValue := strconv.FormatInt(viewerUserID, 10)
+	adminOnlyRouteProbes := []struct {
+		path   string
+		values url.Values
+		label  string
+	}{
+		{path: "/repositories/branches", values: url.Values{"repository_id": {repositoryValue}, "branch": {fixtureScheduledBranch}}, label: "managed-branch addition"},
+		{path: "/repositories/branches/remove", values: url.Values{"repository_id": {repositoryValue}, "branch": {fixtureReleaseBranch}}, label: "managed-branch removal"},
+		{path: "/repositories/webhook-secret", values: url.Values{"repository_id": {repositoryValue}, "webhook_secret": {cfg.webhookSecret}}, label: "webhook-secret rotation"},
+		{path: "/repositories/status-token", values: url.Values{"repository_id": {repositoryValue}, "status_token": {cfg.replacementStatusToken}}, label: "status-token rotation"},
+		{path: "/repositories/setup-check", values: url.Values{"repository_id": {repositoryValue}}, label: "readiness check"},
+		{path: "/repositories/status-verification", values: url.Values{"repository_id": {repositoryValue}}, label: "status verification"},
+		{path: "/repositories/activate", values: url.Values{"repository_id": {repositoryValue}}, label: "enforcement activation"},
+		{path: "/repositories/deactivate", values: url.Values{"repository_id": {repositoryValue}}, label: "enforcement deactivation"},
+		{path: "/repositories/reconcile", values: url.Values{"repository_id": {repositoryValue}}, label: "enforcement reconciliation"},
+		{path: "/repositories/recover", values: url.Values{"repository_id": {repositoryValue}}, label: "enforcement recovery"},
+		{path: "/users/roles", values: url.Values{"user_id": {viewerUserValue}, "roles": {"freezer"}}, label: "user role update"},
+		{path: "/users/disable", values: url.Values{"user_id": {viewerUserValue}}, label: "user disable"},
+		{path: "/users/enable", values: url.Values{"user_id": {viewerUserValue}}, label: "user enable"},
+		{path: "/users/reset-password", values: url.Values{
+			"user_id":                         {viewerUserValue},
+			"temporary_password":              {cfg.thawguardPassword},
+			"temporary_password_confirmation": {cfg.thawguardPassword},
+		}, label: "user password reset"},
+	}
+
+	for _, session := range []roleBoundarySession{freezerSession, thawApproverSession, viewerSession} {
+		slug := roleBoundarySlug(session.roleLabel)
+		requireForbiddenRoleMutation(t, ctx, session, "/repositories", url.Values{
+			"forge":          {"forgejo"},
+			"base_url":       {cfg.forgejoURL},
+			"owner":          {fixtureOwner},
+			"name":           {"denied-" + slug},
+			"default_branch": {"main"},
+		}, session.roleLabel+" repository creation")
+		requireForbiddenRoleMutation(t, ctx, session, "/users", url.Values{
+			"email":        {"denied-" + slug + "@thawguard.test"},
+			"display_name": {"Denied " + session.roleLabel},
+			"password":     {cfg.thawguardPassword},
+			"roles":        {"viewer"},
+		}, session.roleLabel+" user creation")
+		for _, probe := range adminOnlyRouteProbes {
+			requireForbiddenRoleMutation(t, ctx, session, probe.path, probe.values, session.roleLabel+" "+probe.label)
+		}
+	}
+	deniedScheduleStartsAt := time.Now().UTC().Truncate(time.Second).Add(45 * time.Minute)
+	deniedScheduleEndsAt := deniedScheduleStartsAt.Add(15 * time.Minute)
+	for _, session := range []roleBoundarySession{adminSession, thawApproverSession, viewerSession} {
+		slug := roleBoundarySlug(session.roleLabel)
+		requireForbiddenRoleMutation(t, ctx, session, "/freezes", url.Values{
+			"repository_id":           {strconv.FormatInt(repositoryID, 10)},
+			"branch":                  {fixtureReleaseBranch},
+			"reason":                  {"Denied active freeze by " + session.displayName},
+			"timezone_offset_minutes": {"0"},
+		}, session.roleLabel+" active-freeze creation")
+		for _, path := range []string{"/freezes/end", "/freezes/cancel"} {
+			requireForbiddenRoleMutation(t, ctx, session, path, url.Values{
+				"freeze_id": {strconv.FormatInt(mainFreeze.id, 10)},
+			}, session.roleLabel+" active-freeze close via "+path)
+		}
+		requireForbiddenRoleMutation(t, ctx, session, "/scheduled-freezes", url.Values{
+			"repository_id":           {strconv.FormatInt(repositoryID, 10)},
+			"branch":                  {fixtureReleaseBranch},
+			"reason":                  {"Denied schedule by " + slug},
+			"starts_at":               {deniedScheduleStartsAt.Format(time.RFC3339)},
+			"planned_ends_at":         {deniedScheduleEndsAt.Format(time.RFC3339)},
+			"timezone_offset_minutes": {"0"},
+		}, session.roleLabel+" scheduled-freeze creation")
+	}
+	afterDenied := collectRoleBoundaryEvidence(t, ctx, forgejo, allRoleBrowser, repositoryID, fixture.sharedHeadSHA, scheduleReasons, trackedHeads)
+	requireUnchangedRoleBoundaryEvidence(t, beforeDenied, afterDenied, "initial wrong-role probes")
+	requireRoleSessionsIsolated(t, ctx, append([]roleBoundarySession{allRoleSession}, roleSessions...))
+
+	scheduleCBase := time.Now().UTC().Truncate(time.Second)
+	scheduleCStartsAt := scheduleCBase.Add(20 * time.Minute)
+	scheduleCPlannedEndsAt := scheduleCBase.Add(30 * time.Minute)
+	beforeScheduleCCreate := afterDenied
+	requireRawScheduledFreezeMutation(t, ctx, freezerSession.browser, "/scheduled-freezes", url.Values{
+		"repository_id":           {strconv.FormatInt(repositoryID, 10)},
+		"branch":                  {fixtureReleaseBranch},
+		"reason":                  {scheduleCReason},
+		"starts_at":               {scheduleCStartsAt.Format(time.RFC3339)},
+		"planned_ends_at":         {scheduleCPlannedEndsAt.Format(time.RFC3339)},
+		"timezone_offset_minutes": {"0"},
+	}, "Freezer creates Schedule C")
+	scheduleC := requireScheduledFreezeRow(t, requirePage(t, ctx, freezerSession.browser, "/scheduled-freezes"), 0, scheduleCReason)
+	if scheduleC.id <= 0 || scheduleC.branch != fixtureReleaseBranch || scheduleC.status != "upcoming" || scheduleC.startsAt != scheduleTime(scheduleCStartsAt) || scheduleC.plannedEndsAt != scheduleTime(scheduleCPlannedEndsAt) || scheduleC.endedAt != "—" {
+		t.Fatalf("Schedule C has unexpected creation evidence: %+v", scheduleC)
+	}
+	requirePendingScheduleActions(t, scheduleC, scheduleCStartsAt, scheduleCPlannedEndsAt)
+	scheduleCCreatedActivity := requireLatestActivityRow(t, requirePage(t, ctx, allRoleBrowser, "/activity"), "Freeze schedule")
+	requireRoleBoundaryActivity(t, scheduleCCreatedActivity, "E2E Freezer", "Freeze schedule", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Scheduled", "pending", scheduleCReason, "Starts "+scheduleTime(scheduleCStartsAt), "planned unfreeze "+scheduleTime(scheduleCPlannedEndsAt))
+	afterScheduleCCreate := collectRoleBoundaryEvidence(t, ctx, forgejo, allRoleBrowser, repositoryID, fixture.sharedHeadSHA, append(scheduleReasons, scheduleCReason), trackedHeads)
+	if afterScheduleCCreate.scheduledCount != beforeScheduleCCreate.scheduledCount+1 || afterScheduleCCreate.activeFreezes != beforeScheduleCCreate.activeFreezes || afterScheduleCCreate.userCount != beforeScheduleCCreate.userCount || afterScheduleCCreate.repositoryCount != beforeScheduleCCreate.repositoryCount || afterScheduleCCreate.mainFreeze != beforeScheduleCCreate.mainFreeze {
+		t.Fatal("Schedule C creation changed non-schedule state or the wrong schedule count")
+	}
+	requireScheduleOnlyActivityDelta(t, beforeScheduleCCreate.sideEffects, afterScheduleCCreate.sideEffects, 1, "Schedule C creation")
+	requireRoleStatusHistoriesUnchanged(t, beforeScheduleCCreate.statusHistories, afterScheduleCCreate.statusHistories, "Schedule C creation")
+	requireSameScheduleEvidence(t, completedScheduleA, afterScheduleCCreate.schedules[0], "Schedule C creation changed completed Schedule A")
+	requireSameScheduleEvidence(t, cancelledScheduleB, afterScheduleCCreate.schedules[1], "Schedule C creation changed cancelled Schedule B")
+
+	requireScheduleRoleControls(t, ctx, adminSession, scheduleCReason, false, true, true, false)
+	requireScheduleRoleControls(t, ctx, freezerSession, scheduleCReason, true, true, true, true)
+	requireScheduleRoleControls(t, ctx, thawApproverSession, scheduleCReason, false, false, false, false)
+	requireScheduleRoleControls(t, ctx, viewerSession, scheduleCReason, false, false, false, false)
+
+	beforeDeniedScheduleActions := afterScheduleCCreate
+	requireForbiddenRoleMutation(t, ctx, adminSession, "/scheduled-freezes/cancel", url.Values{"freeze_id": {strconv.FormatInt(scheduleC.id, 10)}}, "Admin-only pending schedule cancellation")
+	for _, session := range []roleBoundarySession{thawApproverSession, viewerSession} {
+		requireForbiddenRoleMutation(t, ctx, session, "/scheduled-freezes/edit", url.Values{
+			"freeze_id":               {strconv.FormatInt(scheduleC.id, 10)},
+			"reason":                  {scheduleCReason},
+			"starts_at":               {scheduleCStartsAt.Format(time.RFC3339)},
+			"planned_ends_at":         {scheduleCPlannedEndsAt.Format(time.RFC3339)},
+			"timezone_offset_minutes": {"0"},
+		}, session.roleLabel+" pending schedule edit")
+		requireForbiddenRoleMutation(t, ctx, session, "/scheduled-freezes/start-now", url.Values{"freeze_id": {strconv.FormatInt(scheduleC.id, 10)}}, session.roleLabel+" pending schedule Start Now")
+		requireForbiddenRoleMutation(t, ctx, session, "/scheduled-freezes/cancel", url.Values{"freeze_id": {strconv.FormatInt(scheduleC.id, 10)}}, session.roleLabel+" pending schedule cancellation")
+	}
+	afterDeniedScheduleActions := collectRoleBoundaryEvidence(t, ctx, forgejo, allRoleBrowser, repositoryID, fixture.sharedHeadSHA, append(scheduleReasons, scheduleCReason), trackedHeads)
+	requireUnchangedRoleBoundaryEvidence(t, beforeDeniedScheduleActions, afterDeniedScheduleActions, "wrong-role pending schedule probes")
+
+	editedScheduleCStartsAt := scheduleCBase.Add(25 * time.Minute)
+	editedScheduleCPlannedEndsAt := scheduleCBase.Add(35 * time.Minute)
+	beforeScheduleCEdit := afterDeniedScheduleActions
+	requireRawScheduledFreezeMutation(t, ctx, adminSession.browser, "/scheduled-freezes/edit", url.Values{
+		"freeze_id":               {strconv.FormatInt(scheduleC.id, 10)},
+		"reason":                  {scheduleCEditedReason},
+		"starts_at":               {editedScheduleCStartsAt.Format(time.RFC3339)},
+		"planned_ends_at":         {editedScheduleCPlannedEndsAt.Format(time.RFC3339)},
+		"timezone_offset_minutes": {"0"},
+	}, "Admin-only edits Schedule C")
+	editedScheduleC := requireScheduledFreezeRow(t, requirePage(t, ctx, adminSession.browser, "/scheduled-freezes"), scheduleC.id, scheduleCEditedReason)
+	if editedScheduleC.id != scheduleC.id || editedScheduleC.branch != fixtureReleaseBranch || editedScheduleC.status != "upcoming" || editedScheduleC.startsAt != scheduleTime(editedScheduleCStartsAt) || editedScheduleC.plannedEndsAt != scheduleTime(editedScheduleCPlannedEndsAt) || editedScheduleC.endedAt != "—" {
+		t.Fatalf("Schedule C has unexpected edit evidence: before=%+v after=%+v", scheduleC, editedScheduleC)
+	}
+	requireScheduleRoleControls(t, ctx, adminSession, scheduleCEditedReason, false, true, true, false)
+	scheduleCEditedActivity := requireLatestActivityRow(t, requirePage(t, ctx, allRoleBrowser, "/activity"), "Freeze schedule")
+	wantScheduleCEdit := "Reason " + scheduleCReason + " → " + scheduleCEditedReason + "; starts " + scheduleTime(scheduleCStartsAt) + " → " + scheduleTime(editedScheduleCStartsAt) + "; planned unfreeze " + scheduleTime(scheduleCPlannedEndsAt) + " → " + scheduleTime(editedScheduleCPlannedEndsAt) + "."
+	requireRoleBoundaryActivity(t, scheduleCEditedActivity, "E2E Admin Only", "Freeze schedule", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Changed", "frozen", scheduleCEditedReason, wantScheduleCEdit)
+	afterScheduleCEdit := collectRoleBoundaryEvidence(t, ctx, forgejo, allRoleBrowser, repositoryID, fixture.sharedHeadSHA, []string{completedScheduleA.reason, cancelledScheduleB.reason, scheduleCEditedReason}, trackedHeads)
+	requireScheduleOnlyActivityDelta(t, beforeScheduleCEdit.sideEffects, afterScheduleCEdit.sideEffects, 1, "Schedule C edit")
+	if afterScheduleCEdit.userCount != beforeScheduleCEdit.userCount || afterScheduleCEdit.repositoryCount != beforeScheduleCEdit.repositoryCount || afterScheduleCEdit.activeFreezes != beforeScheduleCEdit.activeFreezes || afterScheduleCEdit.scheduledCount != beforeScheduleCEdit.scheduledCount || afterScheduleCEdit.mainFreeze != beforeScheduleCEdit.mainFreeze {
+		t.Fatal("Schedule C edit changed unrelated role-boundary state")
+	}
+	requireRoleStatusHistoriesUnchanged(t, beforeScheduleCEdit.statusHistories, afterScheduleCEdit.statusHistories, "Schedule C edit")
+	requireSameScheduleEvidence(t, completedScheduleA, afterScheduleCEdit.schedules[0], "Schedule C edit changed completed Schedule A")
+	requireSameScheduleEvidence(t, cancelledScheduleB, afterScheduleCEdit.schedules[1], "Schedule C edit changed cancelled Schedule B")
+
+	beforeStartNow := afterScheduleCEdit
+	activityBeforeStartNow := requirePage(t, ctx, allRoleBrowser, "/activity")
+	startNowEventsBefore := countActivityEvents(activityBeforeStartNow, "Scheduled freeze Start Now")
+	openSyncsBeforeStartNow := countOpenPullRequestSyncEvents(activityBeforeStartNow)
+	requireRawScheduledFreezeMutation(t, ctx, adminSession.browser, "/scheduled-freezes/start-now", url.Values{"freeze_id": {strconv.FormatInt(scheduleC.id, 10)}}, "Admin-only starts Schedule C now")
+	afterStartNow := collectRoleBoundaryEvidence(t, ctx, forgejo, allRoleBrowser, repositoryID, fixture.sharedHeadSHA, []string{completedScheduleA.reason, cancelledScheduleB.reason, scheduleCEditedReason}, trackedHeads)
+	if afterStartNow.activeFreezes != beforeStartNow.activeFreezes+1 || afterStartNow.scheduledCount != beforeStartNow.scheduledCount || afterStartNow.userCount != beforeStartNow.userCount || afterStartNow.repositoryCount != beforeStartNow.repositoryCount || afterStartNow.mainFreeze != beforeStartNow.mainFreeze {
+		t.Fatal("Schedule C Start Now changed unrelated state or the wrong active-freeze count")
+	}
+	requireScheduleOnlyActivityDelta(t, beforeStartNow.sideEffects, afterStartNow.sideEffects, 2, "Schedule C Start Now without an open release PR")
+	requireRoleStatusHistoriesUnchanged(t, beforeStartNow.statusHistories, afterStartNow.statusHistories, "Schedule C Start Now")
+	activeScheduleC := afterStartNow.schedules[2]
+	if activeScheduleC.id != 0 || activeScheduleC.branch != fixtureReleaseBranch || activeScheduleC.reason != scheduleCEditedReason || activeScheduleC.status != "active" || activeScheduleC.plannedEndsAt != scheduleTime(editedScheduleCPlannedEndsAt) || activeScheduleC.endedAt != "—" {
+		t.Fatalf("Schedule C has unexpected Start Now evidence: %+v", activeScheduleC)
+	}
+	requireNoPendingScheduleActions(t, activeScheduleC)
+	activeReleaseFreeze, _ := requireActiveFreezeEvidenceForBranch(t, requirePage(t, ctx, allRoleBrowser, "/freezes"), fixtureReleaseBranch)
+	if activeReleaseFreeze.id != scheduleC.id || activeReleaseFreeze.reason != scheduleCEditedReason || activeReleaseFreeze.status != "active" {
+		t.Fatalf("Schedule C Start Now created the wrong active release freeze: schedule=%+v active=%+v", editedScheduleC, activeReleaseFreeze)
+	}
+	adminFreezesAfterStart := requirePage(t, ctx, adminSession.browser, "/freezes")
+	for _, absent := range []string{`action="/freezes"`, `action="/freezes/end"`, `action="/freezes/cancel"`} {
+		if strings.Contains(adminFreezesAfterStart, absent) {
+			t.Fatalf("Admin-only active-freeze view unexpectedly renders %q", absent)
+		}
+	}
+	activityAfterStartNow := requirePage(t, ctx, allRoleBrowser, "/activity")
+	if countActivityEvents(activityAfterStartNow, "Scheduled freeze Start Now") != startNowEventsBefore+1 || countOpenPullRequestSyncEvents(activityAfterStartNow) != openSyncsBeforeStartNow+1 {
+		t.Fatal("Schedule C Start Now did not add exactly one Start Now and one open-PR sync activity")
+	}
+	scheduleCStartedActivity := requireLatestActivityRow(t, activityAfterStartNow, "Scheduled freeze Start Now")
+	requireRoleBoundaryActivity(t, scheduleCStartedActivity, "E2E Admin Only", "Scheduled freeze Start Now", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Started", "frozen", scheduleCEditedReason, "planned unfreeze "+scheduleTime(editedScheduleCPlannedEndsAt))
+	requireLatestOpenPullRequestSync(t, activityAfterStartNow, 2)
+	requireMergedForgejoPullRequest(t, ctx, forgejo, fixture.releasePullRequestIndex, fixtureReleaseBranch, fixtureScheduledPRTitle, fixture.releaseHeadSHA)
+	requireOpenForgejoPullRequest(t, ctx, forgejo, fixture.primaryPullRequestIndex, "main", fixturePrimaryPRTitle, fixture.sharedHeadSHA)
+	requireOpenForgejoPullRequest(t, ctx, forgejo, fixture.sharedHeadPullRequestIndex, "main", fixtureSharedHeadPRTitle, fixture.sharedHeadSHA)
+
+	beforeAdminActiveCancel := afterStartNow
+	requireForbiddenRoleMutation(t, ctx, adminSession, "/freezes/cancel", url.Values{"freeze_id": {strconv.FormatInt(activeReleaseFreeze.id, 10)}}, "Admin-only active Schedule C cancellation")
+	afterAdminActiveCancel := collectRoleBoundaryEvidence(t, ctx, forgejo, allRoleBrowser, repositoryID, fixture.sharedHeadSHA, []string{completedScheduleA.reason, cancelledScheduleB.reason, scheduleCEditedReason}, trackedHeads)
+	requireUnchangedRoleBoundaryEvidence(t, beforeAdminActiveCancel, afterAdminActiveCancel, "Admin-only active Schedule C cancellation probe")
+
+	activityBeforeFreezerCancel := requirePage(t, ctx, allRoleBrowser, "/activity")
+	openSyncsBeforeFreezerCancel := countOpenPullRequestSyncEvents(activityBeforeFreezerCancel)
+	freezerFreezePage := requirePage(t, ctx, freezerSession.browser, "/freezes")
+	if !strings.Contains(freezerFreezePage, `name="freeze_id" value="`+strconv.FormatInt(activeReleaseFreeze.id, 10)+`"`) || !strings.Contains(freezerFreezePage, `action="/freezes/cancel"`) {
+		t.Fatal("Freezer session is missing the exact active Schedule C cancellation control")
+	}
+	response, err := freezerSession.browser.postFormNoRedirect(ctx, "/freezes/cancel", url.Values{
+		"csrf_token": {freezerSession.csrfToken},
+		"freeze_id":  {strconv.FormatInt(activeReleaseFreeze.id, 10)},
+	})
+	if err != nil {
+		t.Fatalf("Freezer cancels active Schedule C: %v", err)
+	}
+	if response.statusCode != http.StatusSeeOther || response.location != "/freezes" {
+		t.Fatalf("Freezer active Schedule C cancellation returned HTTP %d with Location %q, want 303 to /freezes", response.statusCode, response.location)
+	}
+	afterFreezerCancel := collectRoleBoundaryEvidence(t, ctx, forgejo, allRoleBrowser, repositoryID, fixture.sharedHeadSHA, []string{completedScheduleA.reason, cancelledScheduleB.reason, scheduleCEditedReason}, trackedHeads)
+	if afterFreezerCancel.activeFreezes != afterAdminActiveCancel.activeFreezes-1 || afterFreezerCancel.scheduledCount != afterAdminActiveCancel.scheduledCount || afterFreezerCancel.userCount != afterAdminActiveCancel.userCount || afterFreezerCancel.repositoryCount != afterAdminActiveCancel.repositoryCount || afterFreezerCancel.mainFreeze != afterAdminActiveCancel.mainFreeze {
+		t.Fatal("Freezer active Schedule C cancellation changed unrelated state or the wrong active-freeze count")
+	}
+	requireScheduleOnlyActivityDelta(t, afterAdminActiveCancel.sideEffects, afterFreezerCancel.sideEffects, 2, "Freezer active Schedule C cancellation without an open release PR")
+	requireRoleStatusHistoriesUnchanged(t, afterAdminActiveCancel.statusHistories, afterFreezerCancel.statusHistories, "Freezer active Schedule C cancellation")
+	cancelledScheduleC := afterFreezerCancel.schedules[2]
+	if cancelledScheduleC.id != 0 || cancelledScheduleC.branch != fixtureReleaseBranch || cancelledScheduleC.reason != scheduleCEditedReason || cancelledScheduleC.status != "cancelled" || cancelledScheduleC.endedAt == "" || cancelledScheduleC.endedAt == "—" {
+		t.Fatalf("Schedule C has unexpected active-cancellation evidence: %+v", cancelledScheduleC)
+	}
+	requireNoPendingScheduleActions(t, cancelledScheduleC)
+	finalFreezesAfterScheduleC := requirePage(t, ctx, allRoleBrowser, "/freezes")
+	requireActiveFreezeCount(t, finalFreezesAfterScheduleC, 1)
+	requireNoActiveFreezeForBranch(t, finalFreezesAfterScheduleC, activeReleaseFreeze)
+	activityAfterFreezerCancel := requirePage(t, ctx, allRoleBrowser, "/activity")
+	if countOpenPullRequestSyncEvents(activityAfterFreezerCancel) != openSyncsBeforeFreezerCancel+1 {
+		t.Fatal("Freezer active Schedule C cancellation did not add exactly one open-PR sync activity")
+	}
+	scheduleCCancelledActivity := requireLatestActivityRow(t, activityAfterFreezerCancel, "Branch freeze")
+	requireRoleBoundaryActivity(t, scheduleCCancelledActivity, "E2E Freezer", "Branch freeze", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Cancelled", "warning", scheduleCEditedReason)
+	requireLatestOpenPullRequestSync(t, activityAfterFreezerCancel, 2)
+
+	beforeUniqueHead := afterFreezerCancel
+	sharedStatusesBeforeAdvance := slices.Clone(beforeUniqueHead.statusHistories[0])
+	webhookRowsBeforeAdvance := beforeUniqueHead.sideEffects.webhookRows
+	uniqueHeadSHA := advanceFeatureBranch(
+		t,
+		ctx,
+		forgejo,
+		fixture.primaryPullRequestIndex,
+		fixture.sharedHeadSHA,
+		fixtureRoleThawFilename,
+		"Advance fictional role-boundary thaw head",
+		"unique head for role-boundary thaw proof\n",
+		"role-boundary thaw",
+	)
+	waitForOneNewProcessedPullRequestDelivery(t, ctx, allRoleBrowser, repositoryID, webhookRowsBeforeAdvance, "synchronized")
+	waitForStatusWithDescription(t, ctx, forgejo, uniqueHeadSHA, "failure", frozenDescription)
+	afterUniqueHead := collectRoleBoundaryEvidence(t, ctx, forgejo, allRoleBrowser, repositoryID, uniqueHeadSHA, []string{completedScheduleA.reason, cancelledScheduleB.reason, scheduleCEditedReason}, []string{uniqueHeadSHA, fixture.sharedHeadSHA, fixture.releaseHeadSHA})
+	if afterUniqueHead.sideEffects.webhookRows != beforeUniqueHead.sideEffects.webhookRows+1 ||
+		afterUniqueHead.sideEffects.statusResults != beforeUniqueHead.sideEffects.statusResults+2 ||
+		afterUniqueHead.sideEffects.publicationIntents != beforeUniqueHead.sideEffects.publicationIntents+1 ||
+		afterUniqueHead.sideEffects.publicationAttempts != beforeUniqueHead.sideEffects.publicationAttempts+2 ||
+		afterUniqueHead.sideEffects.activityEvents != beforeUniqueHead.sideEffects.activityEvents {
+		t.Fatalf("unique-head synchronized webhook had unexpected global deltas: webhooks %d→%d results %d→%d intents %d→%d attempts %d→%d activity %d→%d",
+			beforeUniqueHead.sideEffects.webhookRows, afterUniqueHead.sideEffects.webhookRows,
+			beforeUniqueHead.sideEffects.statusResults, afterUniqueHead.sideEffects.statusResults,
+			beforeUniqueHead.sideEffects.publicationIntents, afterUniqueHead.sideEffects.publicationIntents,
+			beforeUniqueHead.sideEffects.publicationAttempts, afterUniqueHead.sideEffects.publicationAttempts,
+			beforeUniqueHead.sideEffects.activityEvents, afterUniqueHead.sideEffects.activityEvents)
+	}
+	if len(afterUniqueHead.statusHistories[0]) != 1 {
+		t.Fatalf("new unique head has %d Forgejo required-context statuses, want exactly one", len(afterUniqueHead.statusHistories[0]))
+	}
+	uniqueFailure := afterUniqueHead.statusHistories[0][0]
+	if uniqueFailure.Context != requiredContext || uniqueFailure.Status != "failure" || uniqueFailure.Description != frozenDescription {
+		t.Fatalf("new unique head has unexpected synchronized status: %+v", uniqueFailure)
+	}
+	sharedStatusesAfterAdvance := afterUniqueHead.statusHistories[1]
+	if len(sharedStatusesAfterAdvance) != len(sharedStatusesBeforeAdvance)+1 || !slices.Equal(sharedStatusesAfterAdvance[:len(sharedStatusesBeforeAdvance)], sharedStatusesBeforeAdvance) {
+		t.Fatalf("old shared-head history was not retained with exactly one old-head recomputation: before=%+v after=%+v", sharedStatusesBeforeAdvance, sharedStatusesAfterAdvance)
+	}
+	oldHeadRecomputed := sharedStatusesAfterAdvance[len(sharedStatusesAfterAdvance)-1]
+	if oldHeadRecomputed.Context != requiredContext || oldHeadRecomputed.Status != "success" || oldHeadRecomputed.Description != explicitThawDescription {
+		t.Fatalf("secondary PR old-head recomputation has unexpected status: %+v", oldHeadRecomputed)
+	}
+	if !slices.Equal(afterUniqueHead.statusHistories[2], releaseStatusesBeforeRoles) {
+		t.Fatal("unique-head synchronized webhook changed the merged release head status history")
+	}
+	uniqueDecision := requireDecisionResultRowForHead(t, requirePage(t, ctx, allRoleBrowser, "/decisions"), uniqueHeadSHA)
+	for _, want := range []string{`#` + strconv.Itoa(fixture.primaryPullRequestIndex) + `</a>`, `<code class="tg-branch">main</code>`, `<code>` + uniqueHeadSHA + `</code>`, `<span class="status status-failure">Blocked</span>`, frozenDescription} {
+		if !strings.Contains(uniqueDecision, want) {
+			t.Fatalf("unique-head synchronized decision is missing %q", want)
+		}
+	}
+	uniqueIntent := requirePublicationIntentRowForHead(t, requirePage(t, ctx, allRoleBrowser, "/publications"), uniqueHeadSHA)
+	uniqueAttempt := requirePublicationAttemptRowForHead(t, requirePage(t, ctx, allRoleBrowser, "/publications"), uniqueHeadSHA)
+	for label, row := range map[string]string{"intent": uniqueIntent, "attempt": uniqueAttempt} {
+		for _, want := range []string{uniqueHeadSHA, requiredContext, "failure", "forgejo_status", frozenDescription} {
+			if !strings.Contains(row, want) {
+				t.Fatalf("unique-head synchronized %s evidence is missing %q", label, want)
+			}
+		}
+	}
+	requireOpenForgejoPullRequest(t, ctx, forgejo, fixture.primaryPullRequestIndex, "main", fixturePrimaryPRTitle, uniqueHeadSHA)
+	requireOpenForgejoPullRequest(t, ctx, forgejo, fixture.sharedHeadPullRequestIndex, "main", fixtureSharedHeadPRTitle, fixture.sharedHeadSHA)
+	if currentMain, _ := requireActiveFreezeEvidenceForBranch(t, requirePage(t, ctx, allRoleBrowser, "/freezes"), "main"); currentMain != mainFreeze {
+		t.Fatalf("unique-head synchronized webhook changed the active main freeze: before=%+v after=%+v", mainFreeze, currentMain)
+	}
+
+	beforeDeniedThaws := afterUniqueHead
+	deniedThawValues := url.Values{
+		"repository_id":      {strconv.FormatInt(repositoryID, 10)},
+		"pull_request_index": {strconv.Itoa(fixture.primaryPullRequestIndex)},
+		"target_branch":      {"main"},
+		"reason":             {roleThawReason},
+	}
+	for _, session := range []roleBoundarySession{adminSession, freezerSession, viewerSession} {
+		requireForbiddenRoleMutation(t, ctx, session, "/decisions", deniedThawValues, session.roleLabel+" unique-head thaw approval")
+	}
+	afterDeniedThaws := collectRoleBoundaryEvidence(t, ctx, forgejo, allRoleBrowser, repositoryID, uniqueHeadSHA, []string{completedScheduleA.reason, cancelledScheduleB.reason, scheduleCEditedReason}, []string{uniqueHeadSHA, fixture.sharedHeadSHA, fixture.releaseHeadSHA})
+	requireUnchangedRoleBoundaryEvidence(t, beforeDeniedThaws, afterDeniedThaws, "wrong-role unique-head thaw probes")
+
+	decisionsPage := requirePage(t, ctx, thawApproverSession.browser, "/decisions")
+	thawForm := requireRenderedForm(t, decisionsPage, `<form method="post" action="/decisions" class="tg-setup-form tg-thaw-form" data-thaw-form>`, "role-boundary thaw")
+	if strings.Contains(thawForm, `name="head_sha"`) {
+		t.Fatal("role-boundary thaw form must not submit a client-provided head SHA")
+	}
+	openSyncsBeforeThaw := countOpenPullRequestSyncEvents(requirePage(t, ctx, allRoleBrowser, "/activity"))
+	beforeAllowedThaw := afterDeniedThaws
+	response, err = thawApproverSession.browser.postFormNoRedirect(ctx, "/decisions", url.Values{
+		"csrf_token":         {thawApproverSession.csrfToken},
+		"repository_id":      {strconv.FormatInt(repositoryID, 10)},
+		"pull_request_index": {strconv.Itoa(fixture.primaryPullRequestIndex)},
+		"target_branch":      {"main"},
+		"reason":             {roleThawReason},
+	})
+	if err != nil {
+		t.Fatalf("Thaw approver unique-head thaw: %v", err)
+	}
+	if response.statusCode == http.StatusConflict || bytes.Contains(response.body, []byte("These pull requests share one commit SHA")) {
+		t.Fatal("unique-head role-boundary thaw unexpectedly requested shared-head confirmation")
+	}
+	if response.statusCode != http.StatusSeeOther || response.location != "/decisions" {
+		t.Fatalf("Thaw approver unique-head thaw returned HTTP %d with Location %q, want 303 to /decisions", response.statusCode, response.location)
+	}
+	waitForStatusWithDescription(t, ctx, forgejo, uniqueHeadSHA, "success", explicitThawDescription)
+	afterAllowedThaw := collectRoleBoundaryEvidence(t, ctx, forgejo, allRoleBrowser, repositoryID, uniqueHeadSHA, []string{completedScheduleA.reason, cancelledScheduleB.reason, scheduleCEditedReason}, []string{uniqueHeadSHA, fixture.sharedHeadSHA, fixture.releaseHeadSHA})
+	if afterAllowedThaw.sideEffects.webhookRows != beforeAllowedThaw.sideEffects.webhookRows ||
+		afterAllowedThaw.sideEffects.statusResults != beforeAllowedThaw.sideEffects.statusResults+1 ||
+		afterAllowedThaw.sideEffects.publicationIntents != beforeAllowedThaw.sideEffects.publicationIntents ||
+		afterAllowedThaw.sideEffects.publicationAttempts != beforeAllowedThaw.sideEffects.publicationAttempts+1 ||
+		afterAllowedThaw.sideEffects.activityEvents != beforeAllowedThaw.sideEffects.activityEvents+2 ||
+		len(afterAllowedThaw.statusHistories[0]) != len(beforeAllowedThaw.statusHistories[0])+1 {
+		t.Fatalf("allowed role-boundary thaw had unexpected deltas: webhooks %d→%d results %d→%d intents %d→%d attempts %d→%d activity %d→%d statuses %d→%d",
+			beforeAllowedThaw.sideEffects.webhookRows, afterAllowedThaw.sideEffects.webhookRows,
+			beforeAllowedThaw.sideEffects.statusResults, afterAllowedThaw.sideEffects.statusResults,
+			beforeAllowedThaw.sideEffects.publicationIntents, afterAllowedThaw.sideEffects.publicationIntents,
+			beforeAllowedThaw.sideEffects.publicationAttempts, afterAllowedThaw.sideEffects.publicationAttempts,
+			beforeAllowedThaw.sideEffects.activityEvents, afterAllowedThaw.sideEffects.activityEvents,
+			len(beforeAllowedThaw.statusHistories[0]), len(afterAllowedThaw.statusHistories[0]))
+	}
+	if !slices.Equal(afterAllowedThaw.statusHistories[0][:len(beforeAllowedThaw.statusHistories[0])], beforeAllowedThaw.statusHistories[0]) {
+		t.Fatal("allowed role-boundary thaw rewrote the new-head failure history")
+	}
+	allowedThawStatus := afterAllowedThaw.statusHistories[0][len(afterAllowedThaw.statusHistories[0])-1]
+	if allowedThawStatus.ID <= uniqueFailure.ID || allowedThawStatus.Context != requiredContext || allowedThawStatus.Status != "success" || allowedThawStatus.Description != explicitThawDescription {
+		t.Fatalf("allowed role-boundary thaw has unexpected Forgejo status: before=%+v after=%+v", uniqueFailure, allowedThawStatus)
+	}
+	if !slices.Equal(afterAllowedThaw.statusHistories[1], sharedStatusesAfterAdvance) || !slices.Equal(afterAllowedThaw.statusHistories[2], releaseStatusesBeforeRoles) {
+		t.Fatal("allowed unique-head thaw changed the secondary shared head or merged release status history")
+	}
+	activityAfterAllowedThaw := requirePage(t, ctx, allRoleBrowser, "/activity")
+	if countOpenPullRequestSyncEvents(activityAfterAllowedThaw) != openSyncsBeforeThaw+1 {
+		t.Fatal("allowed role-boundary thaw did not add exactly one open-PR sync activity")
+	}
+	requireLatestOpenPullRequestSync(t, activityAfterAllowedThaw, 2)
+	allowedThawActivity := requireLatestActivityRow(t, activityAfterAllowedThaw, "Single-PR thaw")
+	requireRoleBoundaryActivity(t, allowedThawActivity, "E2E Thaw Approver", "Single-PR thaw", fixtureOwner+"/"+fixtureRepository+" → PR #"+strconv.Itoa(fixture.primaryPullRequestIndex), "Approved", "ok", "Branch main; head "+strings.ToLower(uniqueHeadSHA[:12])+". Reason: "+roleThawReason+".")
+	allowedDecision := requireDecisionResultRowForHead(t, requirePage(t, ctx, allRoleBrowser, "/decisions"), uniqueHeadSHA)
+	for _, want := range []string{`#` + strconv.Itoa(fixture.primaryPullRequestIndex) + `</a>`, `<code>` + uniqueHeadSHA + `</code>`, `<span class="status status-success">Eligible</span>`, explicitThawDescription} {
+		if !strings.Contains(allowedDecision, want) {
+			t.Fatalf("allowed role-boundary thaw decision is missing %q", want)
+		}
+	}
+	allowedIntent := requirePublicationIntentRowForHead(t, requirePage(t, ctx, allRoleBrowser, "/publications"), uniqueHeadSHA)
+	allowedAttempt := requirePublicationAttemptRowForHead(t, requirePage(t, ctx, allRoleBrowser, "/publications"), uniqueHeadSHA)
+	for label, row := range map[string]string{"intent": allowedIntent, "attempt": allowedAttempt} {
+		for _, want := range []string{uniqueHeadSHA, requiredContext, "success", "forgejo_status", explicitThawDescription} {
+			if !strings.Contains(row, want) {
+				t.Fatalf("allowed role-boundary thaw %s evidence is missing %q", label, want)
+			}
+		}
+	}
+	if strings.Contains(requirePage(t, ctx, thawApproverSession.browser, "/decisions"), "These pull requests share one commit SHA") {
+		t.Fatal("unique-head role-boundary thaw rendered shared-head confirmation after approval")
+	}
+
+	finalFreezes := requirePage(t, ctx, allRoleBrowser, "/freezes")
+	requireActiveFreezeCount(t, finalFreezes, 1)
+	finalMainFreeze, _ := requireActiveFreezeEvidenceForBranch(t, finalFreezes, "main")
+	if finalMainFreeze != mainFreeze {
+		t.Fatalf("role-boundary slice changed the retained main freeze: before=%+v after=%+v", mainFreeze, finalMainFreeze)
+	}
+	requireNoActiveFreezeForBranch(t, finalFreezes, activeReleaseFreeze)
+	finalSchedules := requirePage(t, ctx, allRoleBrowser, "/scheduled-freezes")
+	finalScheduleA := requireScheduledFreezeRow(t, finalSchedules, 0, completedScheduleA.reason)
+	finalScheduleB := requireScheduledFreezeRow(t, finalSchedules, 0, cancelledScheduleB.reason)
+	finalScheduleC := requireScheduledFreezeRow(t, finalSchedules, 0, scheduleCEditedReason)
+	requireSameScheduleEvidence(t, completedScheduleA, finalScheduleA, "final role-boundary state changed completed Schedule A")
+	requireSameScheduleEvidence(t, cancelledScheduleB, finalScheduleB, "final role-boundary state changed cancelled Schedule B")
+	requireSameScheduleEvidence(t, cancelledScheduleC, finalScheduleC, "final role-boundary state changed cancelled Schedule C")
+	requireOpenForgejoPullRequest(t, ctx, forgejo, fixture.primaryPullRequestIndex, "main", fixturePrimaryPRTitle, uniqueHeadSHA)
+	requireOpenForgejoPullRequest(t, ctx, forgejo, fixture.sharedHeadPullRequestIndex, "main", fixtureSharedHeadPRTitle, fixture.sharedHeadSHA)
+	requireMergedForgejoPullRequest(t, ctx, forgejo, fixture.releasePullRequestIndex, fixtureReleaseBranch, fixtureScheduledPRTitle, fixture.releaseHeadSHA)
+	requireHealthyActiveRepository(t, requirePage(t, ctx, allRoleBrowser, "/repositories"))
+	finalActivity := requirePage(t, ctx, allRoleBrowser, "/activity")
+	for label, retained := range map[string]string{
+		"historical single-PR thaw": fixture.historicalSinglePRThawActivity,
+		"shared-head thaw":          sharedThawHistory,
+		"planned unfreeze":          plannedUnfreezeHistory,
+		"Schedule C creation":       scheduleCCreatedActivity,
+		"Schedule C edit":           scheduleCEditedActivity,
+		"Schedule C Start Now":      scheduleCStartedActivity,
+		"Schedule C cancellation":   scheduleCCancelledActivity,
+		"role-boundary thaw":        allowedThawActivity,
+	} {
+		if !strings.Contains(finalActivity, retained) {
+			t.Fatalf("final activity did not retain %s evidence", label)
+		}
+	}
+	finalDecisions := requirePage(t, ctx, allRoleBrowser, "/decisions")
+	if !strings.Contains(finalDecisions, fixture.historicalEligibleDecisionRow) || !strings.Contains(finalDecisions, allowedDecision) {
+		t.Fatal("final decisions did not retain historical and role-boundary thaw evidence")
+	}
+	historicalThawedStatuses, err := listForgejoFreezeStatuses(ctx, forgejo, fixture.historicalThawedHeadSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(historicalThawedStatuses, fixture.historicalThawedHeadStatuses) {
+		t.Fatal("role-boundary slice changed the historical unique-head thaw status history")
+	}
+	finalWebhookPage := requirePage(t, ctx, allRoleBrowser, "/webhooks?event=pull_request&limit=100")
+	if !strings.Contains(finalWebhookPage, terminalReleaseDelivery) || countPullRequestDeliveryActions(finalWebhookPage, "synchronized") != countPullRequestDeliveryActions(beforeUniqueHead.sideEffects.webhookPage, "synchronized")+1 {
+		t.Fatal("final webhook evidence did not retain the release close and exactly one role-boundary synchronized delivery")
+	}
+
+	for _, session := range roleSessions {
+		scanRenderedTokenSurfaces(t, ctx, session.browser)
+	}
+	_ = requirePage(t, ctx, adminSession.browser, "/users")
+	requireRoleSessionsIsolated(t, ctx, append([]roleBoundarySession{allRoleSession}, roleSessions...))
+	t.Logf("role-boundary slice passed in %s: four isolated single-role sessions, Schedule C lifecycle, and unique-head thaw", time.Since(sliceStartedAt).Round(time.Millisecond))
+}
+
 func loadConfig(t *testing.T) e2eConfig {
 	t.Helper()
 	cfg := e2eConfig{
@@ -2302,7 +2853,7 @@ func revokePrimaryStatusToken(t *testing.T, ctx context.Context, forgejo *forgej
 
 func advanceFeatureBranch(t *testing.T, ctx context.Context, forgejo *forgejoAPI, pullRequestIndex int, expectedPreviousSHA, fixtureFilename, commitMessage, content, evidenceLabel string) string {
 	t.Helper()
-	if fixtureFilename != "token-loss.txt" && fixtureFilename != "stale-head-thaw.txt" {
+	if fixtureFilename != "token-loss.txt" && fixtureFilename != "stale-head-thaw.txt" && fixtureFilename != fixtureRoleThawFilename {
 		t.Fatalf("branch-advance fixture filename %q is not allowlisted", fixtureFilename)
 	}
 	evidenceLabel = strings.TrimSpace(evidenceLabel)
@@ -2515,9 +3066,414 @@ func waitForRecoveredEnforcement(t *testing.T, ctx context.Context, forgejo *for
 	})
 }
 
+func createRoleBoundaryUser(t *testing.T, ctx context.Context, browser *thawguardBrowser, email, displayName, role, password string, expectedUsersBefore int) int64 {
+	t.Helper()
+	page := requirePage(t, ctx, browser, "/users")
+	if count := requirePageCount(t, page, userCountPattern, "users"); count != expectedUsersBefore {
+		t.Fatalf("user creation baseline has %d users, want %d", count, expectedUsersBefore)
+	}
+	if strings.Contains(page, html.EscapeString(email)) || strings.Contains(page, html.EscapeString(displayName)) {
+		t.Fatalf("fictional user %q already exists before creation", email)
+	}
+	response, err := browser.postFormNoRedirect(ctx, "/users", url.Values{
+		"csrf_token":   {requireHiddenInput(t, page, "csrf_token")},
+		"email":        {email},
+		"display_name": {displayName},
+		"password":     {password},
+		"roles":        {role},
+	})
+	if err != nil {
+		t.Fatalf("create fictional role-boundary user %q: %v", email, err)
+	}
+	if response.statusCode != http.StatusSeeOther || response.location != "/users" {
+		t.Fatalf("create fictional role-boundary user %q returned HTTP %d with Location %q, want 303 to /users", email, response.statusCode, response.location)
+	}
+	page = requirePage(t, ctx, browser, "/users")
+	if count := requirePageCount(t, page, userCountPattern, "users"); count != expectedUsersBefore+1 {
+		t.Fatalf("user creation changed configured users from %d to %d, want %d", expectedUsersBefore, count, expectedUsersBefore+1)
+	}
+	row := requireRoleBoundaryUserRow(t, page, email)
+	for _, want := range []string{html.EscapeString(displayName), `<code>` + html.EscapeString(email) + `</code>`, `<span class="status status-ok">Enabled</span>`} {
+		if !strings.Contains(row, want) {
+			t.Fatalf("created user %q row is missing %q", email, want)
+		}
+	}
+	for _, candidate := range []string{"admin", "freezer", "thaw_approver", "viewer"} {
+		selected := strings.Contains(row, `name="roles" value="`+candidate+`" checked`)
+		if selected != (candidate == role) {
+			t.Fatalf("created user %q role %q selected=%v, want %v", email, candidate, selected, candidate == role)
+		}
+	}
+	userID, err := strconv.ParseInt(requireHiddenInput(t, row, "user_id"), 10, 64)
+	if err != nil || userID <= 0 {
+		t.Fatalf("created user %q has an invalid rendered user ID", email)
+	}
+	return userID
+}
+
+func requireRoleBoundaryUserRow(t *testing.T, page, email string) string {
+	t.Helper()
+	marker := `<code>` + html.EscapeString(email) + `</code>`
+	markerIndex := strings.Index(page, marker)
+	if markerIndex < 0 {
+		t.Fatalf("users page is missing fictional user %q", email)
+	}
+	rowStart := strings.LastIndex(page[:markerIndex], "<tr>")
+	rowEndOffset := strings.Index(page[markerIndex:], "</tr>")
+	if rowStart < 0 || rowEndOffset < 0 {
+		t.Fatalf("fictional user %q is missing its desktop row", email)
+	}
+	return page[rowStart : markerIndex+rowEndOffset+len("</tr>")]
+}
+
+func loginRoleBoundaryUser(t *testing.T, ctx context.Context, cfg e2eConfig, email, displayName, roleLabel string) roleBoundarySession {
+	t.Helper()
+	browser := newThawguardBrowser(t, cfg.thawguardURL, cfg.sensitiveValues())
+	loginPage, err := browser.getResponseNoRedirect(ctx, "/login")
+	if err != nil {
+		t.Fatalf("GET /login for %s: %v", roleLabel, err)
+	}
+	if loginPage.statusCode != http.StatusOK || loginPage.location != "" {
+		t.Fatalf("GET /login for %s returned HTTP %d with Location %q, want 200", roleLabel, loginPage.statusCode, loginPage.location)
+	}
+	loginCSRF := requireHiddenInput(t, string(loginPage.body), "csrf_token")
+	if loginCSRF == "" {
+		t.Fatalf("GET /login for %s rendered an empty signed CSRF token", roleLabel)
+	}
+	response, err := browser.postFormNoRedirect(ctx, "/login", url.Values{
+		"csrf_token": {loginCSRF},
+		"email":      {email},
+		"password":   {cfg.thawguardPassword},
+	})
+	if err != nil {
+		t.Fatalf("POST /login for %s: %v", roleLabel, err)
+	}
+	if response.statusCode != http.StatusSeeOther || response.location != "/" {
+		t.Fatalf("POST /login for %s returned HTTP %d with Location %q, want 303 to /", roleLabel, response.statusCode, response.location)
+	}
+	session := currentRoleBoundarySession(t, ctx, browser, email, displayName, roleLabel)
+	if session.csrfToken == loginCSRF {
+		t.Fatalf("%s login reused its pre-auth CSRF token as the authenticated session token", roleLabel)
+	}
+	return session
+}
+
+func currentRoleBoundarySession(t *testing.T, ctx context.Context, browser *thawguardBrowser, email, displayName, roleLabel string) roleBoundarySession {
+	t.Helper()
+	response, err := browser.getResponseNoRedirect(ctx, "/")
+	if err != nil {
+		t.Fatalf("GET dashboard for %s: %v", roleLabel, err)
+	}
+	if response.statusCode != http.StatusOK || response.location != "" {
+		t.Fatalf("GET dashboard for %s returned HTTP %d with Location %q, want 200", roleLabel, response.statusCode, response.location)
+	}
+	page := string(response.body)
+	for _, want := range []string{
+		`<strong>` + html.EscapeString(displayName) + `</strong>`,
+		`<span>` + html.EscapeString(email) + `</span>`,
+		`<span class="tg-badge tg-badge-info">` + html.EscapeString(roleLabel) + `</span>`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("%s dashboard identity is missing %q", roleLabel, want)
+		}
+	}
+	csrf := requireHiddenInput(t, page, "csrf_token")
+	if csrf == "" {
+		t.Fatalf("%s session has an empty CSRF token", roleLabel)
+	}
+	cookie := roleBoundarySessionCookie(t, browser)
+	return roleBoundarySession{displayName: displayName, email: email, roleLabel: roleLabel, browser: browser, csrfToken: csrf, sessionCookie: cookie}
+}
+
+func roleBoundarySessionCookie(t *testing.T, browser *thawguardBrowser) string {
+	t.Helper()
+	baseURL, err := url.Parse(browser.baseURL)
+	if err != nil {
+		t.Fatal("parse Thawguard browser URL for session isolation")
+	}
+	for _, cookie := range browser.client.Jar.Cookies(baseURL) {
+		if cookie.Name == thawguardSessionCookie && cookie.Value != "" {
+			return cookie.Value
+		}
+	}
+	t.Fatal("role-boundary browser cookie jar has no authenticated session")
+	return ""
+}
+
+func requireRoleSessionsIsolated(t *testing.T, ctx context.Context, sessions []roleBoundarySession) {
+	t.Helper()
+	for i, session := range sessions {
+		current := currentRoleBoundarySession(t, ctx, session.browser, session.email, session.displayName, session.roleLabel)
+		if current.csrfToken != session.csrfToken || current.sessionCookie != session.sessionCookie {
+			t.Fatalf("%s session identity changed while proving isolation", session.roleLabel)
+		}
+		page := requirePage(t, ctx, session.browser, "/")
+		for j, other := range sessions {
+			if i != j && strings.Contains(page, `<strong>`+html.EscapeString(other.displayName)+`</strong>`) {
+				t.Fatalf("%s dashboard rendered %s as the signed-in identity", session.roleLabel, other.roleLabel)
+			}
+		}
+		for j := i + 1; j < len(sessions); j++ {
+			other := sessions[j]
+			if session.browser == other.browser || session.sessionCookie == other.sessionCookie || session.csrfToken == other.csrfToken {
+				t.Fatalf("%s and %s did not retain isolated browser, session, and CSRF state", session.roleLabel, other.roleLabel)
+			}
+		}
+	}
+}
+
+func requireRoleBoundaryReadAccess(t *testing.T, ctx context.Context, session roleBoundarySession, canAdmin bool) map[string]string {
+	t.Helper()
+	pages := make(map[string]string)
+	for _, path := range []string{"/", "/repositories", "/freezes", "/scheduled-freezes", "/decisions", "/activity", "/publications", "/webhooks"} {
+		response, err := session.browser.getResponseNoRedirect(ctx, path)
+		if err != nil {
+			t.Fatalf("%s GET %s: %v", session.roleLabel, path, err)
+		}
+		if response.statusCode != http.StatusOK || response.location != "" {
+			t.Fatalf("%s GET %s returned HTTP %d with Location %q, want 200", session.roleLabel, path, response.statusCode, response.location)
+		}
+		page := string(response.body)
+		if !strings.Contains(page, `<strong>`+html.EscapeString(session.displayName)+`</strong>`) || requireHiddenInput(t, page, "csrf_token") != session.csrfToken {
+			t.Fatalf("%s GET %s did not retain its identity and CSRF evidence", session.roleLabel, path)
+		}
+		pages[path] = page
+	}
+	response, err := session.browser.getResponseNoRedirect(ctx, "/users")
+	if err != nil {
+		t.Fatalf("%s GET /users: %v", session.roleLabel, err)
+	}
+	if canAdmin {
+		if response.statusCode != http.StatusOK || response.location != "" {
+			t.Fatalf("%s GET /users returned HTTP %d with Location %q, want 200", session.roleLabel, response.statusCode, response.location)
+		}
+		pages["/users"] = string(response.body)
+		return pages
+	}
+	if response.statusCode != http.StatusForbidden || response.location != "" || string(response.body) != "forbidden\n" {
+		t.Fatalf("%s GET /users returned HTTP %d with Location %q, want exact 403", session.roleLabel, response.statusCode, response.location)
+	}
+	return pages
+}
+
+func requireRoleBoundaryControls(t *testing.T, pages map[string]string, canAdmin, canFreeze, canThaw bool) {
+	t.Helper()
+	for path, page := range pages {
+		hasUsersNav := strings.Contains(page, `href="/users"`)
+		if hasUsersNav != canAdmin {
+			t.Fatalf("%s Users & Roles nav visibility=%v, want %v", path, hasUsersNav, canAdmin)
+		}
+	}
+	repositoryPage := pages["/repositories"]
+	hasRepositoryMutation := strings.Contains(repositoryPage, `<form method="post" action="/repositories`)
+	if hasRepositoryMutation != canAdmin {
+		t.Fatalf("repository setup controls visibility=%v, want %v", hasRepositoryMutation, canAdmin)
+	}
+	if canAdmin {
+		for _, want := range []string{`action="/repositories"`, `action="/repositories/setup-check"`, `action="/repositories/reconcile"`} {
+			if !strings.Contains(repositoryPage, want) {
+				t.Fatalf("Admin-only repository page is missing %q", want)
+			}
+		}
+		if !strings.Contains(pages["/users"], `<form method="post" action="/users"`) {
+			t.Fatal("Admin-only users page is missing the create-user form")
+		}
+	}
+
+	freezesPage := pages["/freezes"]
+	for _, marker := range []string{`<form method="post" action="/freezes"`, `action="/freezes/end"`, `action="/freezes/cancel"`} {
+		if got := strings.Contains(freezesPage, marker); got != canFreeze {
+			t.Fatalf("freeze control %q visibility=%v, want %v", marker, got, canFreeze)
+		}
+	}
+	if got := strings.Contains(pages["/scheduled-freezes"], `<form method="post" action="/scheduled-freezes" class="tg-setup-form tg-freeze-form"`); got != canFreeze {
+		t.Fatalf("scheduled-freeze create visibility=%v, want %v", got, canFreeze)
+	}
+	if got := strings.Contains(pages["/decisions"], `<form method="post" action="/decisions" class="tg-setup-form tg-thaw-form"`); got != canThaw {
+		t.Fatalf("thaw approval form visibility=%v, want %v", got, canThaw)
+	}
+	if got := strings.Contains(pages["/"], `<a class="tg-btn tg-btn-primary" href="/freezes"`); got != canFreeze {
+		t.Fatalf("dashboard Freeze Branch action visibility=%v, want %v", got, canFreeze)
+	}
+	if got := strings.Contains(pages["/"], `<a class="tg-btn tg-btn-secondary" href="/decisions"`); got != canThaw {
+		t.Fatalf("dashboard Thaw PR action visibility=%v, want %v", got, canThaw)
+	}
+	if !canFreeze && (!strings.Contains(freezesPage, "Read-only freeze access") || !strings.Contains(pages["/scheduled-freezes"], "Read-only schedule access")) {
+		t.Fatal("non-Freezer pages are missing their read-only freeze/schedule evidence")
+	}
+	if !canThaw && !strings.Contains(pages["/decisions"], "Read-only thaw access") {
+		t.Fatal("non-Thaw-approver page is missing read-only thaw evidence")
+	}
+}
+
+func roleBoundarySlug(roleLabel string) string {
+	return strings.NewReplacer(" ", "-", "_", "-").Replace(strings.ToLower(roleLabel))
+}
+
+func requireForbiddenRoleMutation(t *testing.T, ctx context.Context, session roleBoundarySession, path string, values url.Values, operation string) {
+	t.Helper()
+	switch path {
+	case "/repositories",
+		"/repositories/branches",
+		"/repositories/branches/remove",
+		"/repositories/webhook-secret",
+		"/repositories/status-token",
+		"/repositories/setup-check",
+		"/repositories/status-verification",
+		"/repositories/activate",
+		"/repositories/deactivate",
+		"/repositories/reconcile",
+		"/repositories/recover",
+		"/users",
+		"/users/roles",
+		"/users/disable",
+		"/users/enable",
+		"/users/reset-password",
+		"/freezes",
+		"/freezes/end",
+		"/freezes/cancel",
+		"/scheduled-freezes",
+		"/scheduled-freezes/edit",
+		"/scheduled-freezes/start-now",
+		"/scheduled-freezes/cancel",
+		"/decisions":
+	default:
+		t.Fatalf("wrong-role mutation path %q is not allowlisted", path)
+	}
+	form := make(url.Values, len(values)+1)
+	for key, entries := range values {
+		form[key] = slices.Clone(entries)
+	}
+	form.Set("csrf_token", session.csrfToken)
+	response, err := session.browser.postFormNoRedirect(ctx, path, form)
+	if err != nil {
+		t.Fatalf("%s: %v", operation, err)
+	}
+	if response.statusCode != http.StatusForbidden || response.location != "" || string(response.body) != "forbidden\n" {
+		t.Fatalf("%s returned HTTP %d with Location %q, want exact 403", operation, response.statusCode, response.location)
+	}
+}
+
+func collectRoleBoundaryEvidence(t *testing.T, ctx context.Context, forgejo *forgejoAPI, browser *thawguardBrowser, repositoryID int64, evidenceHeadSHA string, scheduleReasons, trackedHeads []string) roleBoundaryEvidence {
+	t.Helper()
+	usersPage := requirePage(t, ctx, browser, "/users")
+	dashboardPage := requirePage(t, ctx, browser, "/")
+	freezesPage := requirePage(t, ctx, browser, "/freezes")
+	schedulesPage := requirePage(t, ctx, browser, "/scheduled-freezes")
+	repositoriesPage := requirePage(t, ctx, browser, "/repositories")
+	requireHealthyActiveRepository(t, repositoriesPage)
+	mainFreeze, _ := requireActiveFreezeEvidenceForBranch(t, freezesPage, "main")
+	evidence := roleBoundaryEvidence{
+		userCount:        requirePageCount(t, usersPage, userCountPattern, "users"),
+		repositoryCount:  requirePageCount(t, dashboardPage, repositoryCountPattern, "repositories"),
+		activeFreezes:    requirePageCount(t, freezesPage, activeFreezeCountPattern, "active freezes"),
+		scheduledCount:   requirePageCount(t, schedulesPage, scheduledFreezeCountPattern, "scheduled freezes"),
+		usersPage:        usersPage,
+		repositoriesPage: repositoriesPage,
+		mainFreeze:       mainFreeze,
+		sideEffects:      collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, evidenceHeadSHA),
+	}
+	for _, reason := range scheduleReasons {
+		evidence.schedules = append(evidence.schedules, requireScheduledFreezeRow(t, schedulesPage, 0, reason))
+	}
+	for _, headSHA := range trackedHeads {
+		statuses, err := listForgejoFreezeStatuses(ctx, forgejo, headSHA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		evidence.statusHistories = append(evidence.statusHistories, statuses)
+	}
+	return evidence
+}
+
+func requireUnchangedRoleBoundaryEvidence(t *testing.T, before, after roleBoundaryEvidence, operation string) {
+	t.Helper()
+	if before.userCount != after.userCount || before.repositoryCount != after.repositoryCount || before.activeFreezes != after.activeFreezes || before.scheduledCount != after.scheduledCount || before.mainFreeze != after.mainFreeze {
+		t.Fatalf("%s changed user/repository/freeze/schedule state: users %d→%d repositories %d→%d active %d→%d schedules %d→%d main %+v→%+v",
+			operation,
+			before.userCount, after.userCount,
+			before.repositoryCount, after.repositoryCount,
+			before.activeFreezes, after.activeFreezes,
+			before.scheduledCount, after.scheduledCount,
+			before.mainFreeze, after.mainFreeze)
+	}
+	if before.usersPage != after.usersPage {
+		t.Fatalf("%s changed the full admin Users & Roles state snapshot", operation)
+	}
+	if before.repositoriesPage != after.repositoriesPage {
+		t.Fatalf("%s changed the full admin repository setup/readiness/lifecycle snapshot", operation)
+	}
+	if len(before.schedules) != len(after.schedules) {
+		t.Fatalf("%s changed compared schedule rows from %d to %d", operation, len(before.schedules), len(after.schedules))
+	}
+	for index := range before.schedules {
+		requireSameScheduleEvidence(t, before.schedules[index], after.schedules[index], operation+" changed schedule evidence")
+	}
+	requireIdenticalWebhookEvidence(t, before.sideEffects, after.sideEffects, operation)
+	requireRoleStatusHistoriesUnchanged(t, before.statusHistories, after.statusHistories, operation)
+}
+
+func requireRoleStatusHistoriesUnchanged(t *testing.T, before, after [][]commitStatus, operation string) {
+	t.Helper()
+	if len(before) != len(after) {
+		t.Fatalf("%s changed tracked status-history count from %d to %d", operation, len(before), len(after))
+	}
+	for index := range before {
+		if !slices.Equal(before[index], after[index]) {
+			t.Fatalf("%s changed tracked Forgejo status history %d: before=%+v after=%+v", operation, index, before[index], after[index])
+		}
+	}
+}
+
+func requireSameScheduleEvidence(t *testing.T, before, after scheduledFreezeRowEvidence, operation string) {
+	t.Helper()
+	if before.id != after.id || before.branch != after.branch || before.reason != after.reason || before.startsAt != after.startsAt || before.plannedEndsAt != after.plannedEndsAt || before.status != after.status || before.endedAt != after.endedAt {
+		t.Fatalf("%s: before=%+v after=%+v", operation, before, after)
+	}
+}
+
+func requireRoleBoundaryActivity(t *testing.T, row, actor, action, target, outcome, outcomeClass string, details ...string) {
+	t.Helper()
+	wants := []string{
+		`<td data-label="Actor">` + html.EscapeString(actor) + `</td>`,
+		`<td data-label="Action">` + html.EscapeString(action) + `</td>`,
+		`<td data-label="Target">` + html.EscapeString(target) + `</td>`,
+		`<td data-label="Outcome"><span class="status status-` + outcomeClass + `">` + html.EscapeString(outcome) + `</span></td>`,
+	}
+	for _, detail := range details {
+		wants = append(wants, html.EscapeString(detail))
+	}
+	for _, want := range wants {
+		if !strings.Contains(row, want) {
+			t.Fatalf("%s activity by %s is missing %q", action, actor, want)
+		}
+	}
+}
+
+func requireScheduleRoleControls(t *testing.T, ctx context.Context, session roleBoundarySession, reason string, canCreate, canEdit, canStart, canCancel bool) {
+	t.Helper()
+	page := requirePage(t, ctx, session.browser, "/scheduled-freezes")
+	row := requireScheduledFreezeRow(t, page, 0, reason).row
+	for marker, want := range map[string]bool{
+		`<form method="post" action="/scheduled-freezes" class="tg-setup-form tg-freeze-form"`: canCreate,
+		`action="/scheduled-freezes/edit"`:      canEdit,
+		`action="/scheduled-freezes/start-now"`: canStart,
+		`action="/scheduled-freezes/cancel"`:    canCancel,
+	} {
+		surface := row
+		if marker == `<form method="post" action="/scheduled-freezes" class="tg-setup-form tg-freeze-form"` {
+			surface = page
+		}
+		if got := strings.Contains(surface, marker); got != want {
+			t.Fatalf("%s schedule control %q visibility=%v, want %v", session.roleLabel, marker, got, want)
+		}
+	}
+}
+
 func scanRenderedTokenSurfaces(t *testing.T, ctx context.Context, browser *thawguardBrowser) {
 	t.Helper()
 	for _, path := range []string{
+		"/",
 		"/repositories",
 		"/freezes",
 		"/scheduled-freezes",
@@ -3340,6 +4296,36 @@ func requireLatestPublicationAttemptRow(t *testing.T, page string) string {
 	return page[rowStart : rowStart+rowEndOffset+len("</tr>")]
 }
 
+func requirePublicationAttemptRowForHead(t *testing.T, page, headSHA string) string {
+	t.Helper()
+	sectionMarker := "<h2>Recent publication attempts</h2>"
+	sectionStart := strings.Index(page, sectionMarker)
+	if sectionStart < 0 {
+		t.Fatal("publications page is missing recent publication attempts")
+	}
+	tbodyOffset := strings.Index(page[sectionStart:], "<tbody>")
+	if tbodyOffset < 0 {
+		t.Fatal("recent publication attempts are missing their table body")
+	}
+	tbodyStart := sectionStart + tbodyOffset
+	tbodyEndOffset := strings.Index(page[tbodyStart:], "</tbody>")
+	if tbodyEndOffset < 0 {
+		t.Fatal("recent publication attempts have an incomplete table body")
+	}
+	tbody := page[tbodyStart : tbodyStart+tbodyEndOffset]
+	marker := `<code>` + html.EscapeString(headSHA) + `</code>`
+	markerIndex := strings.Index(tbody, marker)
+	if markerIndex < 0 {
+		t.Fatalf("recent publication attempts are missing head %q", headSHA)
+	}
+	rowStart := strings.LastIndex(tbody[:markerIndex], "<tr>")
+	rowEndOffset := strings.Index(tbody[markerIndex:], "</tr>")
+	if rowStart < 0 || rowEndOffset < 0 {
+		t.Fatalf("recent publication attempt for head %q is incomplete", headSHA)
+	}
+	return tbody[rowStart : markerIndex+rowEndOffset+len("</tr>")]
+}
+
 func requireLatestDecisionResultRow(t *testing.T, page string) string {
 	t.Helper()
 	sectionMarker := "<h2>Thaw approval results</h2>"
@@ -3754,6 +4740,25 @@ func (b *thawguardBrowser) get(ctx context.Context, path string) (string, error)
 	return string(body), nil
 }
 
+func (b *thawguardBrowser) getResponseNoRedirect(ctx context.Context, path string) (apiResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.baseURL+path, nil)
+	if err != nil {
+		return apiResponse{}, err
+	}
+	client := *b.client
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Do(req)
+	if err != nil {
+		return apiResponse{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return apiResponse{}, err
+	}
+	return apiResponse{statusCode: resp.StatusCode, body: body, location: resp.Header.Get("Location")}, nil
+}
+
 func (b *thawguardBrowser) postForm(ctx context.Context, path string, values url.Values) (string, error) {
 	response, err := b.postFormResponse(ctx, path, values)
 	if err != nil {
@@ -3881,6 +4886,10 @@ func requireOnlyFormInputNames(t *testing.T, form string, expected []string) {
 
 var (
 	nonzeroMatchingRows              = regexp.MustCompile(`Showing [1-9][0-9]* of [1-9][0-9]* matching rows`)
+	userCountPattern                 = regexp.MustCompile(`<span class="tg-badge tg-badge-info">([0-9]+) users</span>`)
+	repositoryCountPattern           = regexp.MustCompile(`Repos Monitored</span><strong class="tg-stat-value">([0-9]+)</strong>`)
+	activeFreezeCountPattern         = regexp.MustCompile(`<span class="tg-badge">([0-9]+) active</span>`)
+	scheduledFreezeCountPattern      = regexp.MustCompile(`Scheduled windows</h2><span class="tg-badge tg-badge-scheduled">([0-9]+) shown</span>`)
 	webhookRowsPattern               = regexp.MustCompile(`Showing ([0-9]+) of [0-9]+ matching rows`)
 	statusResultsPattern             = regexp.MustCompile(`Thaw approval results</h2><span[^>]*>([0-9]+) status results</span>`)
 	publicationIntentsPattern        = regexp.MustCompile(`Latest desired statuses</h2><span[^>]*>([0-9]+) shown</span>`)
