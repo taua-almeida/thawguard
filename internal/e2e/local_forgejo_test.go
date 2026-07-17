@@ -47,6 +47,7 @@ const (
 	injectedDriftDescription = "E2E injected status drift while Thawguard was stopped"
 	invalidDeliveryID        = "e2e-invalid-signature-fixture"
 	duplicateDeliveryID      = "e2e-duplicate-delivery-fixture"
+	invalidSignatureSecret   = "invalid-e2e-signing-secret"
 )
 
 type e2eConfig struct {
@@ -177,6 +178,40 @@ type roleBoundaryEvidence struct {
 	statusHistories  [][]commitStatus
 }
 
+type terminalActivityEvidence struct {
+	sharedHeadThaw     string
+	plannedUnfreeze    string
+	scheduleCCreated   string
+	scheduleCEdited    string
+	scheduleCStarted   string
+	scheduleCCancelled string
+	roleBoundaryThaw   string
+}
+
+type terminalDiagnosticsFixture struct {
+	uniqueHeadSHA           string
+	roleSessions            []roleBoundarySession
+	scheduleReasons         []string
+	expectedSideEffects     webhookSideEffectEvidence
+	activity                terminalActivityEvidence
+	allowedDecision         string
+	terminalReleaseDelivery string
+	roleBoundaryDelivery    string
+}
+
+type terminalReadOnlySnapshot struct {
+	evidence        roleBoundaryEvidence
+	roleSessions    []roleBoundarySession
+	pullRequests    []pullRequest
+	diagnosticPages [4]string
+}
+
+type webhookPageSummary struct {
+	showing  int
+	matching int
+	total    int
+}
+
 func TestLocalForgejoFreezeLifecycle(t *testing.T) {
 	if os.Getenv("THAWGUARD_E2E") != "1" {
 		t.Skip("set THAWGUARD_E2E=1 and use make e2e")
@@ -273,7 +308,8 @@ func TestLocalForgejoFreezeLifecycle(t *testing.T) {
 		t.Fatalf("scheduled lifecycle did not retain a complete planned-unfreeze fixture: %+v", plannedUnfreezeFixture)
 	}
 	provePlannedUnfreezeAcrossRestart(t, ctx, forgejo, browser, cfg, repositoryID, plannedUnfreezeFixture)
-	proveRoleBoundaries(t, ctx, forgejo, browser, cfg, repositoryID, plannedUnfreezeFixture)
+	roleBoundaryFixture := proveRoleBoundaries(t, ctx, forgejo, browser, cfg, repositoryID, plannedUnfreezeFixture)
+	proveAuditAndDiagnosticsEvidence(t, ctx, forgejo, cfg, repositoryID, plannedUnfreezeFixture, roleBoundaryFixture)
 }
 
 func proveActiveFreezeCancellation(t *testing.T, ctx context.Context, forgejo *forgejoAPI, browser *thawguardBrowser, repositoryID int64, pullRequestIndex int, headSHA string, firstFreeze activeFreezeEvidence) {
@@ -1812,7 +1848,7 @@ func provePlannedUnfreezeAcrossRestart(t *testing.T, ctx context.Context, forgej
 	t.Logf("planned-unfreeze restart slice passed: stop margin %s; restart began %s overdue; slice runtime %s", stopCompletionMargin.Round(time.Millisecond), restartedAt.Sub(plannedEndsAt).Round(time.Millisecond), time.Since(sliceStartedAt).Round(time.Millisecond))
 }
 
-func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI, allRoleBrowser *thawguardBrowser, cfg e2eConfig, repositoryID int64, fixture scheduledFreezeLifecycleFixture) {
+func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI, allRoleBrowser *thawguardBrowser, cfg e2eConfig, repositoryID int64, fixture scheduledFreezeLifecycleFixture) terminalDiagnosticsFixture {
 	t.Helper()
 	const (
 		adminEmail              = "admin-only@thawguard.test"
@@ -2142,6 +2178,8 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 	waitForOneNewProcessedPullRequestDelivery(t, ctx, allRoleBrowser, repositoryID, webhookRowsBeforeAdvance, "synchronized")
 	waitForStatusWithDescription(t, ctx, forgejo, uniqueHeadSHA, "failure", frozenDescription)
 	afterUniqueHead := collectRoleBoundaryEvidence(t, ctx, forgejo, allRoleBrowser, repositoryID, uniqueHeadSHA, []string{completedScheduleA.reason, cancelledScheduleB.reason, scheduleCEditedReason}, []string{uniqueHeadSHA, fixture.sharedHeadSHA, fixture.releaseHeadSHA})
+	roleBoundaryDelivery := requireLatestWebhookDeliveryRow(t, afterUniqueHead.sideEffects.webhookPage)
+	requireProcessedWebhookRowEvidence(t, roleBoundaryDelivery, "synchronized")
 	if afterUniqueHead.sideEffects.webhookRows != beforeUniqueHead.sideEffects.webhookRows+1 ||
 		afterUniqueHead.sideEffects.statusResults != beforeUniqueHead.sideEffects.statusResults+2 ||
 		afterUniqueHead.sideEffects.publicationIntents != beforeUniqueHead.sideEffects.publicationIntents+1 ||
@@ -2336,6 +2374,624 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 	_ = requirePage(t, ctx, adminSession.browser, "/users")
 	requireRoleSessionsIsolated(t, ctx, append([]roleBoundarySession{allRoleSession}, roleSessions...))
 	t.Logf("role-boundary slice passed in %s: four isolated single-role sessions, Schedule C lifecycle, and unique-head thaw", time.Since(sliceStartedAt).Round(time.Millisecond))
+	return terminalDiagnosticsFixture{
+		uniqueHeadSHA:       uniqueHeadSHA,
+		roleSessions:        append([]roleBoundarySession{allRoleSession}, roleSessions...),
+		scheduleReasons:     []string{completedScheduleA.reason, cancelledScheduleB.reason, scheduleCEditedReason},
+		expectedSideEffects: afterAllowedThaw.sideEffects,
+		activity: terminalActivityEvidence{
+			sharedHeadThaw:     sharedThawHistory,
+			plannedUnfreeze:    plannedUnfreezeHistory,
+			scheduleCCreated:   scheduleCCreatedActivity,
+			scheduleCEdited:    scheduleCEditedActivity,
+			scheduleCStarted:   scheduleCStartedActivity,
+			scheduleCCancelled: scheduleCCancelledActivity,
+			roleBoundaryThaw:   allowedThawActivity,
+		},
+		allowedDecision:         allowedDecision,
+		terminalReleaseDelivery: terminalReleaseDelivery,
+		roleBoundaryDelivery:    roleBoundaryDelivery,
+	}
+}
+
+func proveAuditAndDiagnosticsEvidence(t *testing.T, ctx context.Context, forgejo *forgejoAPI, cfg e2eConfig, repositoryID int64, lifecycle scheduledFreezeLifecycleFixture, fixture terminalDiagnosticsFixture) {
+	t.Helper()
+	const (
+		frozenDescription       = "Branch is frozen; merge is blocked by Thawguard"
+		noFreezeDescription     = "No active freeze applies to this PR"
+		explicitThawDescription = "PR is explicitly thawed during an active freeze"
+		statusDiagnosticLimit   = 25
+	)
+	sliceStartedAt := time.Now().UTC()
+	if len(fixture.uniqueHeadSHA) < 12 || len(fixture.roleSessions) != 5 || len(fixture.scheduleReasons) != 3 || fixture.expectedSideEffects.webhookRows <= 0 {
+		t.Fatalf("terminal diagnostics proof received an incomplete fixture: unique head length=%d sessions=%d schedules=%d webhooks=%d", len(fixture.uniqueHeadSHA), len(fixture.roleSessions), len(fixture.scheduleReasons), fixture.expectedSideEffects.webhookRows)
+	}
+
+	before := collectTerminalReadOnlySnapshot(t, ctx, forgejo, repositoryID, lifecycle, fixture)
+	if before.evidence.userCount != 5 || before.evidence.repositoryCount != 1 || before.evidence.activeFreezes != 1 || before.evidence.scheduledCount != 3 {
+		t.Fatalf("terminal diagnostics baseline has unexpected durable counts: users=%d repositories=%d active=%d schedules=%d", before.evidence.userCount, before.evidence.repositoryCount, before.evidence.activeFreezes, before.evidence.scheduledCount)
+	}
+	if before.evidence.mainFreeze != lifecycle.activeMainFreeze {
+		t.Fatalf("terminal diagnostics baseline changed the retained main freeze: lifecycle=%+v terminal=%+v", lifecycle.activeMainFreeze, before.evidence.mainFreeze)
+	}
+	requireIdenticalWebhookEvidence(t, fixture.expectedSideEffects, before.evidence.sideEffects, "terminal diagnostics baseline")
+	if fixture.expectedSideEffects.webhookPage != before.evidence.sideEffects.webhookPage {
+		t.Fatal("terminal diagnostics baseline changed the complete retained webhook snapshot")
+	}
+	if !slices.Equal(fixture.roleSessions, before.roleSessions) {
+		t.Fatal("terminal diagnostics baseline changed role-session identity")
+	}
+
+	activityPage := requirePage(t, ctx, fixture.roleSessions[0].browser, "/activity")
+	activityCount := requirePageCount(t, activityPage, activityEventsPattern, "activity events")
+	if activityCount != before.evidence.sideEffects.activityEvents || activityCount <= 0 || activityCount >= 100 {
+		t.Fatalf("terminal activity count=%d, want persisted count %d in the untruncated range 1..99", activityCount, before.evidence.sideEffects.activityEvents)
+	}
+	repositoryAdded := requireActivityRowEvidence(t, activityPage, "E2E Admin", "Repository added", fixtureOwner+"/"+fixtureRepository, "Added", "ok", "Default branch main.")
+	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Webhook secret configuration", fixtureOwner+"/"+fixtureRepository, "Configured", "ok", "Webhook secret set; the value remains hidden.")
+	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Status token configuration", fixtureOwner+"/"+fixtureRepository, "Configured", "ok", "Status token set; the value remains hidden.")
+	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Readiness check", fixtureOwner+"/"+fixtureRepository, "Checked", "ok", "11 passed, 1 warnings, 0 failed across 2 managed branches; webhook evidence fresh.")
+	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Status-post verification", fixtureOwner+"/"+fixtureRepository+" → main", "Succeeded", "ok", "Controlled thawguard/setup post verified at head ")
+	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Enforcement activation", fixtureOwner+"/"+fixtureRepository, "Succeeded", "ok", "1 open PRs evaluated; 1 statuses posted and 0 failed.")
+	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Enforcement reconciliation", fixtureOwner+"/"+fixtureRepository, "Failed", "failed", "readiness checks failed; state unhealthy.")
+	requireActivityRowEvidence(t, activityPage, "Runtime process", "Runtime convergence", fixtureOwner+"/"+fixtureRepository, "Failed", "failed", "status publication failed; state unhealthy. Automatic recovery remains pending.")
+	requireActivityRowEvidence(t, activityPage, "Reconciliation runner", "Enforcement recovery", fixtureOwner+"/"+fixtureRepository, "Succeeded", "ok", "1 open PRs evaluated; 1 statuses posted and 0 failed.")
+	requireActivityRowEvidence(t, activityPage, "Unknown system actor", "Open pull request sync", fixtureOwner+"/"+fixtureRepository+" → all managed branches", "Succeeded", "ok", "3 open PRs synchronized; 0 cached PRs marked closed.")
+	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Branch freeze", fixtureOwner+"/"+fixtureRepository+" → main", "Frozen", "frozen", "Reason: Fictional release verification.")
+	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Branch freeze", fixtureOwner+"/"+fixtureRepository+" → main", "Lifted", "ok", "Reason: Fictional release verification.")
+	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Branch freeze", fixtureOwner+"/"+fixtureRepository+" → main", "Cancelled", "warning", "Reason: Fictional cancellation verification..")
+
+	requireRoleBoundaryActivity(t, lifecycle.historicalSinglePRThawActivity, "E2E Admin", "Single-PR thaw", fixtureOwner+"/"+fixtureRepository+" → PR #"+strconv.Itoa(lifecycle.primaryPullRequestIndex), "Approved", "ok", "Branch main; head "+lifecycle.historicalThawedHeadSHA[:12]+". Reason: Fictional immediate per-PR thaw verification.")
+	requireRoleBoundaryActivity(t, fixture.activity.sharedHeadThaw, "E2E Admin", "Shared-head thaw", fixtureOwner+"/"+fixtureRepository+" → shared head "+lifecycle.sharedHeadSHA[:12], "Approved", "ok", "New exceptions: #"+strconv.Itoa(lifecycle.primaryPullRequestIndex)+", #"+strconv.Itoa(lifecycle.sharedHeadPullRequestIndex), "Confirmation reason: Fictional shared-head thaw confirmation.")
+	requireRoleBoundaryActivity(t, fixture.activity.plannedUnfreeze, "Scheduler", "Scheduled planned unfreeze", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Completed", "ok", "Planned unfreeze "+scheduleTime(lifecycle.plannedEndsAt)+". Reason: "+lifecycle.activeScheduleA.reason+".")
+	requireRoleBoundaryActivity(t, fixture.activity.scheduleCCreated, "E2E Freezer", "Freeze schedule", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Scheduled", "pending", "Fictional role-boundary Schedule C")
+	requireRoleBoundaryActivity(t, fixture.activity.scheduleCEdited, "E2E Admin Only", "Freeze schedule", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Changed", "frozen", "Reason Fictional role-boundary Schedule C → Fictional role-boundary Schedule C edited")
+	requireRoleBoundaryActivity(t, fixture.activity.scheduleCStarted, "E2E Admin Only", "Scheduled freeze Start Now", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Started", "frozen", "Fictional role-boundary Schedule C edited")
+	requireRoleBoundaryActivity(t, fixture.activity.scheduleCCancelled, "E2E Freezer", "Branch freeze", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Cancelled", "warning", "Reason: Fictional role-boundary Schedule C edited.")
+	requireRoleBoundaryActivity(t, fixture.activity.roleBoundaryThaw, "E2E Thaw Approver", "Single-PR thaw", fixtureOwner+"/"+fixtureRepository+" → PR #"+strconv.Itoa(lifecycle.primaryPullRequestIndex), "Approved", "ok", "Branch main; head "+fixture.uniqueHeadSHA[:12]+". Reason: Fictional role-boundary unique-head thaw.")
+	for _, retained := range []struct {
+		label string
+		row   string
+	}{
+		{label: "historical single-PR thaw", row: lifecycle.historicalSinglePRThawActivity},
+		{label: "shared-head thaw", row: fixture.activity.sharedHeadThaw},
+		{label: "planned unfreeze", row: fixture.activity.plannedUnfreeze},
+		{label: "Schedule C creation", row: fixture.activity.scheduleCCreated},
+		{label: "Schedule C edit", row: fixture.activity.scheduleCEdited},
+		{label: "Schedule C Start Now", row: fixture.activity.scheduleCStarted},
+		{label: "Schedule C cancellation", row: fixture.activity.scheduleCCancelled},
+		{label: "role-boundary thaw", row: fixture.activity.roleBoundaryThaw},
+	} {
+		if retained.row == "" || !strings.Contains(activityPage, retained.row) {
+			t.Fatalf("terminal activity did not retain exact %s evidence", retained.label)
+		}
+	}
+	if strings.Index(activityPage, fixture.activity.roleBoundaryThaw) >= strings.Index(activityPage, repositoryAdded) {
+		t.Fatal("terminal activity is not newest-first: role-boundary evidence did not precede repository setup evidence")
+	}
+	for _, forbidden := range []string{"repository.runtime_convergence_failed", "actor_kind", "actor_role", "repository_id", "Unrecognized activity", "Stored audit details could not be displayed safely."} {
+		if strings.Contains(activityPage, forbidden) {
+			t.Fatalf("terminal activity exposed internal or uncurated audit material category %q", forbidden)
+		}
+	}
+
+	publicationsPage := requirePage(t, ctx, fixture.roleSessions[0].browser, "/publications")
+	decisionsPage := requirePage(t, ctx, fixture.roleSessions[0].browser, "/decisions")
+	statusResults := requirePageCount(t, decisionsPage, statusResultsPattern, "status results")
+	publicationIntents := requirePageCount(t, publicationsPage, publicationIntentsPattern, "publication intents")
+	publicationAttempts := requirePageCount(t, publicationsPage, publicationAttemptsPattern, "publication attempts")
+	if statusResults != before.evidence.sideEffects.statusResults || publicationIntents != before.evidence.sideEffects.publicationIntents || publicationAttempts != before.evidence.sideEffects.publicationAttempts {
+		t.Fatalf("terminal status diagnostics do not match persisted counters: results=%d/%d intents=%d/%d attempts=%d/%d", statusResults, before.evidence.sideEffects.statusResults, publicationIntents, before.evidence.sideEffects.publicationIntents, publicationAttempts, before.evidence.sideEffects.publicationAttempts)
+	}
+	if statusResults <= 0 || publicationIntents <= 0 || publicationAttempts <= 0 || statusResults >= statusDiagnosticLimit || publicationIntents >= statusDiagnosticLimit || publicationAttempts >= statusDiagnosticLimit {
+		t.Fatalf("terminal status diagnostics reached a presentation boundary: results=%d intents=%d attempts=%d limit=%d", statusResults, publicationIntents, publicationAttempts, statusDiagnosticLimit)
+	}
+	for label, row := range map[string]string{
+		"historical Eligible decision":    lifecycle.historicalEligibleDecisionRow,
+		"role-boundary Eligible decision": fixture.allowedDecision,
+	} {
+		if row == "" || !strings.Contains(decisionsPage, row) {
+			t.Fatalf("terminal decisions did not retain exact %s", label)
+		}
+	}
+
+	tokenAttempts := requireDiagnosticRowsForHead(t, publicationsPage, "<h2>Recent publication attempts</h2>", lifecycle.historicalThawedHeadSHA)
+	tokenFailureIndex := diagnosticRowIndex(tokenAttempts,
+		`<td data-label="State"><span class="status status-failure">failure</span></td>`,
+		`<td data-label="Result"><span class="status status-failed">failed</span></td>`,
+		frozenDescription,
+		"post forgejo commit status",
+		"forge returned 401",
+	)
+	tokenRecoveryIndex := diagnosticRowIndex(tokenAttempts,
+		`<td data-label="State"><span class="status status-failure">failure</span></td>`,
+		`<td data-label="Result"><span class="status status-ok">posted</span></td>`,
+		frozenDescription,
+	)
+	tokenCurrentIndex := diagnosticRowIndex(tokenAttempts,
+		`<td data-label="State"><span class="status status-success">success</span></td>`,
+		`<td data-label="Result"><span class="status status-ok">posted</span></td>`,
+		explicitThawDescription,
+	)
+	if tokenFailureIndex < 0 || tokenRecoveryIndex < 0 || tokenCurrentIndex < 0 || tokenRecoveryIndex >= tokenFailureIndex || tokenCurrentIndex >= tokenFailureIndex {
+		t.Fatalf("token-loss attempt history is incomplete or out of append-only order: failure=%d recovery=%d current=%d rows=%d", tokenFailureIndex, tokenRecoveryIndex, tokenCurrentIndex, len(tokenAttempts))
+	}
+	tokenIntent := requirePublicationIntentRowForHead(t, publicationsPage, lifecycle.historicalThawedHeadSHA)
+	requireDiagnosticRowContains(t, tokenIntent, "token-loss current desired status",
+		fixtureOwner+"/"+fixtureRepository,
+		`#`+strconv.Itoa(lifecycle.primaryPullRequestIndex)+`<small class="tg-muted">main</small>`,
+		`<code>`+lifecycle.historicalThawedHeadSHA+`</code>`,
+		`<td data-label="Context"><code>`+requiredContext+`</code></td>`,
+		`<td data-label="State"><span class="status status-success">success</span></td>`,
+		`<td data-label="Mode"><code>forgejo_status</code></td>`,
+		explicitThawDescription,
+	)
+
+	releaseAttempts := requireDiagnosticRowsForHead(t, publicationsPage, "<h2>Recent publication attempts</h2>", lifecycle.releaseHeadSHA)
+	if len(releaseAttempts) != 3 {
+		t.Fatalf("release head has %d retained publication attempts, want eligible/frozen/eligible", len(releaseAttempts))
+	}
+	requireStatusAttemptEvidence(t, releaseAttempts[2], lifecycle.releasePullRequestIndex, fixtureReleaseBranch, lifecycle.releaseHeadSHA, "success", "posted", noFreezeDescription)
+	requireStatusAttemptEvidence(t, releaseAttempts[1], lifecycle.releasePullRequestIndex, fixtureReleaseBranch, lifecycle.releaseHeadSHA, "failure", "posted", frozenDescription)
+	requireStatusAttemptEvidence(t, releaseAttempts[0], lifecycle.releasePullRequestIndex, fixtureReleaseBranch, lifecycle.releaseHeadSHA, "success", "posted", noFreezeDescription)
+	releaseIntent := requirePublicationIntentRowForHead(t, publicationsPage, lifecycle.releaseHeadSHA)
+	requireCurrentStatusIntentEvidence(t, releaseIntent, lifecycle.releasePullRequestIndex, fixtureReleaseBranch, lifecycle.releaseHeadSHA, "success", noFreezeDescription)
+	requireCommitStatusProgression(t, before.evidence.statusHistories[2], []string{"success", "failure", "success"}, []string{noFreezeDescription, frozenDescription, noFreezeDescription}, "release")
+
+	roleDecisions := requireDiagnosticRowsForHead(t, decisionsPage, "<h2>Thaw approval results</h2>", fixture.uniqueHeadSHA)
+	if len(roleDecisions) != 2 {
+		t.Fatalf("role-boundary unique head has %d decision rows, want frozen then Eligible", len(roleDecisions))
+	}
+	roleEligibleIndex := diagnosticRowIndex(roleDecisions, `<span class="status status-success">Eligible</span>`, explicitThawDescription)
+	roleBlockedIndex := diagnosticRowIndex(roleDecisions, `<span class="status status-failure">Blocked</span>`, frozenDescription)
+	if roleEligibleIndex < 0 || roleBlockedIndex < 0 || roleEligibleIndex >= roleBlockedIndex {
+		t.Fatalf("role-boundary decision chronology is incomplete: Eligible=%d Blocked=%d", roleEligibleIndex, roleBlockedIndex)
+	}
+	for label, row := range map[string]string{"Eligible decision": roleDecisions[roleEligibleIndex], "Blocked decision": roleDecisions[roleBlockedIndex]} {
+		requireDiagnosticRowContains(t, row, "role-boundary "+label,
+			`#`+strconv.Itoa(lifecycle.primaryPullRequestIndex)+`</a>`,
+			`<code>`+fixtureOwner+`/`+fixtureRepository+`</code>`,
+			`<code class="tg-branch">main</code>`,
+			`<code>`+fixture.uniqueHeadSHA+`</code>`,
+			`<code>`+requiredContext+`</code>`,
+		)
+	}
+	roleAttempts := requireDiagnosticRowsForHead(t, publicationsPage, "<h2>Recent publication attempts</h2>", fixture.uniqueHeadSHA)
+	if len(roleAttempts) != 2 {
+		t.Fatalf("role-boundary unique head has %d publication attempts, want failure then success", len(roleAttempts))
+	}
+	requireStatusAttemptEvidence(t, roleAttempts[1], lifecycle.primaryPullRequestIndex, "main", fixture.uniqueHeadSHA, "failure", "posted", frozenDescription)
+	requireStatusAttemptEvidence(t, roleAttempts[0], lifecycle.primaryPullRequestIndex, "main", fixture.uniqueHeadSHA, "success", "posted", explicitThawDescription)
+	roleIntent := requirePublicationIntentRowForHead(t, publicationsPage, fixture.uniqueHeadSHA)
+	requireCurrentStatusIntentEvidence(t, roleIntent, lifecycle.primaryPullRequestIndex, "main", fixture.uniqueHeadSHA, "success", explicitThawDescription)
+	requireCommitStatusProgression(t, before.evidence.statusHistories[0], []string{"failure", "success"}, []string{frozenDescription, explicitThawDescription}, "role-boundary")
+
+	unfilteredWebhookPage := before.evidence.sideEffects.webhookPage
+	unfilteredSummary := requireWebhookPageSummary(t, unfilteredWebhookPage)
+	if unfilteredSummary.showing != before.evidence.sideEffects.webhookRows || unfilteredSummary.matching != unfilteredSummary.showing || unfilteredSummary.total != unfilteredSummary.showing || unfilteredSummary.showing <= 0 || unfilteredSummary.showing >= 100 {
+		t.Fatalf("unfiltered webhook summary is not complete: showing=%d matching=%d total=%d expected=%d", unfilteredSummary.showing, unfilteredSummary.matching, unfilteredSummary.total, before.evidence.sideEffects.webhookRows)
+	}
+	for _, action := range []string{"opened", "synchronized", "closed"} {
+		if countPullRequestDeliveryActions(unfilteredWebhookPage, action) <= 0 {
+			t.Fatalf("unfiltered webhook diagnostics did not retain a processed %s delivery", action)
+		}
+	}
+	requireProcessedWebhookRowEvidence(t, fixture.terminalReleaseDelivery, "closed")
+	requireProcessedWebhookRowEvidence(t, fixture.roleBoundaryDelivery, "synchronized")
+	if !strings.Contains(unfilteredWebhookPage, fixture.terminalReleaseDelivery) || !strings.Contains(unfilteredWebhookPage, fixture.roleBoundaryDelivery) {
+		t.Fatal("unfiltered webhook diagnostics did not retain exact terminal closed and role-boundary synchronized rows")
+	}
+	duplicateRow := requireProcessedVerifiedDelivery(t, unfilteredWebhookPage, duplicateDeliveryID)
+	if countWebhookDesktopRowsContaining(t, unfilteredWebhookPage, html.EscapeString(duplicateDeliveryID)) != 1 {
+		t.Fatal("fixed duplicate delivery is not represented by exactly one persisted webhook row")
+	}
+	if strings.Contains(unfilteredWebhookPage, invalidDeliveryID) {
+		t.Fatal("invalid-signature delivery unexpectedly appears in terminal webhook diagnostics")
+	}
+
+	processedPath := "/webhooks?" + url.Values{
+		"repository_id": {strconv.FormatInt(repositoryID, 10)},
+		"event":         {"pull_request"},
+		"processing":    {"processed"},
+		"sort":          {"received"},
+		"direction":     {"asc"},
+		"limit":         {"50"},
+	}.Encode()
+	processedPage := requirePage(t, ctx, fixture.roleSessions[0].browser, processedPath)
+	requireWebhookFilterControls(t, processedPage, repositoryID, "processed", "pull_request", "received", "asc", 50)
+	processedSummary := requireWebhookPageSummary(t, processedPage)
+	if processedSummary.showing != processedSummary.matching || processedSummary.total != unfilteredSummary.total || processedSummary.showing != unfilteredSummary.showing-1 {
+		t.Fatalf("processed webhook filter has untruthful counts: showing=%d matching=%d total=%d unfiltered=%d", processedSummary.showing, processedSummary.matching, processedSummary.total, unfilteredSummary.showing)
+	}
+	for _, action := range []string{"opened", "synchronized", "closed"} {
+		if countPullRequestDeliveryActions(processedPage, action) <= 0 {
+			t.Fatalf("processed webhook filter did not retain %s evidence", action)
+		}
+	}
+	if !strings.Contains(processedPage, duplicateRow) || !strings.Contains(processedPage, fixture.terminalReleaseDelivery) || !strings.Contains(processedPage, fixture.roleBoundaryDelivery) || strings.Contains(processedPage, ">retryable failure</span>") {
+		t.Fatal("processed webhook filter did not separate retained processed rows from retryable failure evidence")
+	}
+
+	retryPath := "/webhooks?" + url.Values{
+		"repository_id": {strconv.FormatInt(repositoryID, 10)},
+		"event":         {"pull_request"},
+		"processing":    {"retryable_failure"},
+		"sort":          {"received"},
+		"direction":     {"asc"},
+		"limit":         {"50"},
+	}.Encode()
+	retryablePage := requirePage(t, ctx, fixture.roleSessions[0].browser, retryPath)
+	requireWebhookFilterControls(t, retryablePage, repositoryID, "retryable_failure", "pull_request", "received", "asc", 50)
+	retryableSummary := requireWebhookPageSummary(t, retryablePage)
+	if retryableSummary.showing != 1 || retryableSummary.matching != 1 || retryableSummary.total != unfilteredSummary.total {
+		t.Fatalf("retryable-failure webhook filter has unexpected counts: showing=%d matching=%d total=%d", retryableSummary.showing, retryableSummary.matching, retryableSummary.total)
+	}
+	retryableRow := requireLatestWebhookDeliveryRow(t, retryablePage)
+	for _, want := range []string{
+		`<td data-label="Event"><code>pull_request</code><small class="tg-muted">synchronized</small></td>`,
+		`>verified</span>`,
+		`>retryable failure</span>`,
+		`<td data-label="Details">webhook processing failed</td>`,
+	} {
+		if !strings.Contains(retryableRow, want) {
+			t.Fatalf("retryable-failure webhook evidence is missing %q", want)
+		}
+	}
+	if strings.Contains(retryablePage, duplicateRow) || strings.Contains(retryablePage, fixture.terminalReleaseDelivery) || strings.Contains(retryablePage, fixture.roleBoundaryDelivery) || strings.Contains(retryablePage, `>processed</span>`) {
+		t.Fatal("retryable-failure webhook filter retained processed-only delivery evidence")
+	}
+
+	processedDescendingPath := "/webhooks?" + url.Values{
+		"repository_id": {strconv.FormatInt(repositoryID, 10)},
+		"event":         {"pull_request"},
+		"processing":    {"processed"},
+		"sort":          {"received"},
+		"direction":     {"desc"},
+		"limit":         {"50"},
+	}.Encode()
+	processedDescendingPage := requirePage(t, ctx, fixture.roleSessions[0].browser, processedDescendingPath)
+	requireWebhookFilterControls(t, processedDescendingPage, repositoryID, "processed", "pull_request", "received", "desc", 50)
+	ascendingDuplicate := strings.Index(processedPage, duplicateRow)
+	ascendingClosed := strings.Index(processedPage, fixture.terminalReleaseDelivery)
+	descendingDuplicate := strings.Index(processedDescendingPage, duplicateRow)
+	descendingClosed := strings.Index(processedDescendingPage, fixture.terminalReleaseDelivery)
+	if ascendingDuplicate < 0 || ascendingClosed < 0 || descendingDuplicate < 0 || descendingClosed < 0 || ascendingDuplicate >= ascendingClosed || descendingClosed >= descendingDuplicate {
+		t.Fatalf("received-time sorting did not reverse fixed duplicate and terminal closed deliveries: asc duplicate=%d closed=%d desc duplicate=%d closed=%d", ascendingDuplicate, ascendingClosed, descendingDuplicate, descendingClosed)
+	}
+
+	payload := syntheticPullRequestWebhookPayload(t, cfg, lifecycle.primaryPullRequestIndex, lifecycle.historicalThawedHeadSHA)
+	signature := syntheticWebhookSignature(payload, cfg.webhookSecret)
+	requireNoRawDiagnosticMaterial(t, cfg, payload, signature, []struct {
+		label string
+		page  string
+	}{
+		{label: "activity", page: activityPage},
+		{label: "status diagnostics", page: publicationsPage},
+		{label: "decisions", page: decisionsPage},
+		{label: "unfiltered webhooks", page: unfilteredWebhookPage},
+		{label: "processed webhooks", page: processedPage},
+		{label: "processed descending webhooks", page: processedDescendingPage},
+		{label: "retryable webhooks", page: retryablePage},
+	})
+
+	after := collectTerminalReadOnlySnapshot(t, ctx, forgejo, repositoryID, lifecycle, fixture)
+	requireUnchangedTerminalReadOnlySnapshot(t, before, after)
+	t.Logf("terminal audit/diagnostics slice passed in %s: activity=%d, status results=%d, desired intents=%d, attempts=%d, webhooks=%d total/%d processed/%d retryable", time.Since(sliceStartedAt).Round(time.Millisecond), activityCount, statusResults, publicationIntents, publicationAttempts, unfilteredSummary.showing, processedSummary.showing, retryableSummary.showing)
+}
+
+func collectTerminalReadOnlySnapshot(t *testing.T, ctx context.Context, forgejo *forgejoAPI, repositoryID int64, lifecycle scheduledFreezeLifecycleFixture, fixture terminalDiagnosticsFixture) terminalReadOnlySnapshot {
+	t.Helper()
+	snapshot := terminalReadOnlySnapshot{
+		evidence: collectRoleBoundaryEvidence(
+			t,
+			ctx,
+			forgejo,
+			fixture.roleSessions[0].browser,
+			repositoryID,
+			fixture.uniqueHeadSHA,
+			fixture.scheduleReasons,
+			[]string{fixture.uniqueHeadSHA, lifecycle.sharedHeadSHA, lifecycle.releaseHeadSHA, lifecycle.historicalThawedHeadSHA},
+		),
+		pullRequests: []pullRequest{
+			requireOpenForgejoPullRequest(t, ctx, forgejo, lifecycle.primaryPullRequestIndex, "main", fixturePrimaryPRTitle, fixture.uniqueHeadSHA),
+			requireOpenForgejoPullRequest(t, ctx, forgejo, lifecycle.sharedHeadPullRequestIndex, "main", fixtureSharedHeadPRTitle, lifecycle.sharedHeadSHA),
+			requireMergedForgejoPullRequest(t, ctx, forgejo, lifecycle.releasePullRequestIndex, fixtureReleaseBranch, fixtureScheduledPRTitle, lifecycle.releaseHeadSHA),
+		},
+	}
+	for _, session := range fixture.roleSessions {
+		snapshot.roleSessions = append(snapshot.roleSessions, currentRoleBoundarySession(t, ctx, session.browser, session.email, session.displayName, session.roleLabel))
+	}
+	snapshot.diagnosticPages = [4]string{
+		requirePage(t, ctx, fixture.roleSessions[0].browser, "/activity"),
+		requirePage(t, ctx, fixture.roleSessions[0].browser, "/decisions"),
+		requirePage(t, ctx, fixture.roleSessions[0].browser, "/publications"),
+		snapshot.evidence.sideEffects.webhookPage,
+	}
+	return snapshot
+}
+
+func requireUnchangedTerminalReadOnlySnapshot(t *testing.T, before, after terminalReadOnlySnapshot) {
+	t.Helper()
+	requireUnchangedRoleBoundaryEvidence(t, before.evidence, after.evidence, "terminal diagnostic reads and filter queries")
+	if !slices.Equal(before.roleSessions, after.roleSessions) {
+		t.Fatal("terminal diagnostic reads changed a user session or role identity")
+	}
+	if !slices.Equal(before.pullRequests, after.pullRequests) {
+		t.Fatalf("terminal diagnostic reads changed final Forgejo PR states: before=%+v after=%+v", before.pullRequests, after.pullRequests)
+	}
+	if before.diagnosticPages != after.diagnosticPages {
+		t.Fatal("terminal diagnostic reads rewrote rendered activity, decision, publication, or webhook evidence")
+	}
+}
+
+func requireActivityRowEvidence(t *testing.T, page, actor, action, target, outcome, outcomeClass string, details ...string) string {
+	t.Helper()
+	sectionStart := strings.Index(page, "<h2>Recent activity</h2>")
+	if sectionStart < 0 {
+		t.Fatal("activity page is missing recent activity")
+	}
+	tbodyOffset := strings.Index(page[sectionStart:], "<tbody>")
+	if tbodyOffset < 0 {
+		t.Fatal("recent activity is missing its desktop table body")
+	}
+	tbodyStart := sectionStart + tbodyOffset
+	tbodyEndOffset := strings.Index(page[tbodyStart:], "</tbody>")
+	if tbodyEndOffset < 0 {
+		t.Fatal("recent activity has an incomplete desktop table body")
+	}
+	tbody := page[tbodyStart : tbodyStart+tbodyEndOffset]
+	wants := []string{
+		`<td data-label="Actor">` + html.EscapeString(actor) + `</td>`,
+		`<td data-label="Action">` + html.EscapeString(action) + `</td>`,
+		`<td data-label="Target">` + html.EscapeString(target) + `</td>`,
+		`<td data-label="Outcome"><span class="status status-` + outcomeClass + `">` + html.EscapeString(outcome) + `</span></td>`,
+	}
+	for _, detail := range details {
+		wants = append(wants, html.EscapeString(detail))
+	}
+	for remainder := tbody; ; {
+		rowStart := strings.Index(remainder, "<tr>")
+		if rowStart < 0 {
+			break
+		}
+		rowEndOffset := strings.Index(remainder[rowStart:], "</tr>")
+		if rowEndOffset < 0 {
+			t.Fatal("recent activity contains an incomplete desktop row")
+		}
+		rowEnd := rowStart + rowEndOffset + len("</tr>")
+		row := remainder[rowStart:rowEnd]
+		matches := true
+		for _, want := range wants {
+			if !strings.Contains(row, want) {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return row
+		}
+		remainder = remainder[rowEnd:]
+	}
+	t.Fatalf("activity is missing curated %s/%s evidence by %s", action, outcome, actor)
+	return ""
+}
+
+func requireDiagnosticRowsForHead(t *testing.T, page, sectionMarker, headSHA string) []string {
+	t.Helper()
+	sectionStart := strings.Index(page, sectionMarker)
+	if sectionStart < 0 {
+		t.Fatalf("diagnostic page is missing section %q", sectionMarker)
+	}
+	tbodyOffset := strings.Index(page[sectionStart:], "<tbody>")
+	if tbodyOffset < 0 {
+		t.Fatalf("diagnostic section %q is missing its table body", sectionMarker)
+	}
+	tbodyStart := sectionStart + tbodyOffset
+	tbodyEndOffset := strings.Index(page[tbodyStart:], "</tbody>")
+	if tbodyEndOffset < 0 {
+		t.Fatalf("diagnostic section %q has an incomplete table body", sectionMarker)
+	}
+	tbody := page[tbodyStart : tbodyStart+tbodyEndOffset]
+	marker := `<code>` + html.EscapeString(headSHA) + `</code>`
+	var rows []string
+	for remainder := tbody; ; {
+		rowStart := strings.Index(remainder, "<tr>")
+		if rowStart < 0 {
+			break
+		}
+		rowEndOffset := strings.Index(remainder[rowStart:], "</tr>")
+		if rowEndOffset < 0 {
+			t.Fatalf("diagnostic section %q contains an incomplete row", sectionMarker)
+		}
+		rowEnd := rowStart + rowEndOffset + len("</tr>")
+		row := remainder[rowStart:rowEnd]
+		if strings.Contains(row, marker) {
+			rows = append(rows, row)
+		}
+		remainder = remainder[rowEnd:]
+	}
+	if len(rows) == 0 {
+		t.Fatalf("diagnostic section %q has no rows for head %q", sectionMarker, headSHA)
+	}
+	return rows
+}
+
+func diagnosticRowIndex(rows []string, wants ...string) int {
+	for index, row := range rows {
+		matches := true
+		for _, want := range wants {
+			if !strings.Contains(row, want) {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return index
+		}
+	}
+	return -1
+}
+
+func requireDiagnosticRowContains(t *testing.T, row, label string, wants ...string) {
+	t.Helper()
+	for _, want := range wants {
+		if !strings.Contains(row, want) {
+			t.Fatalf("%s is missing %q", label, want)
+		}
+	}
+}
+
+func requireStatusAttemptEvidence(t *testing.T, row string, pullRequestIndex int, branch, headSHA, state, result, description string) {
+	t.Helper()
+	resultClass := "failed"
+	if result == "posted" {
+		resultClass = "ok"
+	}
+	requireDiagnosticRowContains(t, row, "status publication attempt",
+		fixtureOwner+"/"+fixtureRepository,
+		`#`+strconv.Itoa(pullRequestIndex)+`<small class="tg-muted">`+html.EscapeString(branch)+`</small>`,
+		`<code>`+html.EscapeString(headSHA)+`</code>`,
+		`<small class="tg-muted">`+requiredContext+`</small>`,
+		`<td data-label="State"><span class="status status-`+state+`">`+state+`</span></td>`,
+		`<td data-label="Mode"><code>forgejo_status</code></td>`,
+		`<td data-label="Result"><span class="status status-`+resultClass+`">`+result+`</span></td>`,
+		html.EscapeString(description),
+	)
+}
+
+func requireCurrentStatusIntentEvidence(t *testing.T, row string, pullRequestIndex int, branch, headSHA, state, description string) {
+	t.Helper()
+	requireDiagnosticRowContains(t, row, "current desired status",
+		fixtureOwner+"/"+fixtureRepository,
+		`#`+strconv.Itoa(pullRequestIndex)+`<small class="tg-muted">`+html.EscapeString(branch)+`</small>`,
+		`<code>`+html.EscapeString(headSHA)+`</code>`,
+		`<td data-label="Context"><code>`+requiredContext+`</code></td>`,
+		`<td data-label="State"><span class="status status-`+state+`">`+state+`</span></td>`,
+		`<td data-label="Mode"><code>forgejo_status</code></td>`,
+		html.EscapeString(description),
+	)
+}
+
+func requireCommitStatusProgression(t *testing.T, statuses []commitStatus, states, descriptions []string, label string) {
+	t.Helper()
+	if len(statuses) != len(states) || len(states) != len(descriptions) {
+		t.Fatalf("%s Forgejo status history has %d entries, want %d", label, len(statuses), len(states))
+	}
+	for index, status := range statuses {
+		if status.ID <= 0 || status.Context != requiredContext || status.Status != states[index] || status.Description != descriptions[index] {
+			t.Fatalf("%s Forgejo status %d has unexpected correlated evidence: %+v", label, index, status)
+		}
+		if index > 0 && status.ID <= statuses[index-1].ID {
+			t.Fatalf("%s Forgejo status IDs are not append-only: %d then %d", label, statuses[index-1].ID, status.ID)
+		}
+	}
+}
+
+func requireWebhookPageSummary(t *testing.T, page string) webhookPageSummary {
+	t.Helper()
+	match := webhookSummaryPattern.FindStringSubmatch(page)
+	if len(match) != 3 {
+		t.Fatal("webhook diagnostics are missing the matching-row summary")
+	}
+	totalMatch := webhookTotalRowsPattern.FindStringSubmatch(page)
+	if len(totalMatch) != 2 {
+		t.Fatal("webhook diagnostics are missing the loaded-row summary")
+	}
+	parse := func(value, label string) int {
+		count, err := strconv.Atoi(value)
+		if err != nil {
+			t.Fatalf("parse webhook %s count: %v", label, err)
+		}
+		return count
+	}
+	return webhookPageSummary{
+		showing:  parse(match[1], "showing"),
+		matching: parse(match[2], "matching"),
+		total:    parse(totalMatch[1], "total"),
+	}
+}
+
+func requireProcessedWebhookRowEvidence(t *testing.T, row, action string) {
+	t.Helper()
+	for _, want := range []string{
+		`<code>` + fixtureOwner + `/` + fixtureRepository + `</code>`,
+		`<td data-label="Event"><code>pull_request</code><small class="tg-muted">` + action + `</small></td>`,
+		`>verified</span>`,
+		`>processed</span>`,
+		`<td data-label="Details">No processing error</td>`,
+	} {
+		if !strings.Contains(row, want) {
+			t.Fatalf("processed %s webhook row is missing %q", action, want)
+		}
+	}
+}
+
+func countWebhookDesktopRowsContaining(t *testing.T, page, marker string) int {
+	t.Helper()
+	sectionStart := strings.Index(page, "<h2>Signed webhook deliveries</h2>")
+	if sectionStart < 0 {
+		t.Fatal("webhook diagnostics are missing signed deliveries")
+	}
+	tbodyOffset := strings.Index(page[sectionStart:], "<tbody>")
+	if tbodyOffset < 0 {
+		t.Fatal("signed webhook deliveries are missing their desktop table body")
+	}
+	tbodyStart := sectionStart + tbodyOffset
+	tbodyEndOffset := strings.Index(page[tbodyStart:], "</tbody>")
+	if tbodyEndOffset < 0 {
+		t.Fatal("signed webhook deliveries have an incomplete desktop table body")
+	}
+	return strings.Count(page[tbodyStart:tbodyStart+tbodyEndOffset], marker)
+}
+
+func requireWebhookFilterControls(t *testing.T, page string, repositoryID int64, processing, event, sortField, direction string, limit int) {
+	t.Helper()
+	ariaSort := "descending"
+	if direction == "asc" {
+		ariaSort = "ascending"
+	}
+	for _, want := range []string{
+		"Filters active",
+		`<option value="` + strconv.FormatInt(repositoryID, 10) + `" selected>` + fixtureOwner + `/` + fixtureRepository + `</option>`,
+		`<option value="` + processing + `" selected>`,
+		`<option value="` + event + `" selected>` + event + `</option>`,
+		`<input type="hidden" name="sort" value="` + sortField + `">`,
+		`<input type="hidden" name="direction" value="` + direction + `">`,
+		`<input type="hidden" name="limit" value="` + strconv.Itoa(limit) + `">`,
+		`<option value="` + strconv.Itoa(limit) + `" selected>` + strconv.Itoa(limit) + `</option>`,
+		`aria-sort="` + ariaSort + `"`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("webhook filter controls are missing selected evidence %q", want)
+		}
+	}
+}
+
+func requireNoRawDiagnosticMaterial(t *testing.T, cfg e2eConfig, payload []byte, signature string, pages []struct {
+	label string
+	page  string
+}) {
+	t.Helper()
+	for _, surface := range pages {
+		for _, secret := range cfg.sensitiveValues() {
+			if secret != "" && strings.Contains(surface.page, secret) {
+				t.Fatalf("%s diagnostics exposed a generated sensitive value", surface.label)
+			}
+		}
+		for category, forbidden := range map[string]string{
+			"raw payload":                  string(payload),
+			"HTML-escaped raw payload":     html.EscapeString(string(payload)),
+			"computed webhook signature":   signature,
+			"Forgejo signature header":     "X-Forgejo-Signature",
+			"Hub signature header":         "X-Hub-Signature",
+			"invalid-signature secret":     invalidSignatureSecret,
+			"raw payload clone URL marker": "clone_url",
+		} {
+			if forbidden != "" && strings.Contains(surface.page, forbidden) {
+				t.Fatalf("%s diagnostics exposed %s", surface.label, category)
+			}
+		}
+	}
 }
 
 func loadConfig(t *testing.T) e2eConfig {
@@ -3521,7 +4177,7 @@ func assertInvalidSignatureHasNoSideEffects(t *testing.T, ctx context.Context, f
 		t.Fatalf("invalid-signature fixture delivery ID %q already exists", invalidDeliveryID)
 	}
 
-	response, err := postSyntheticWebhook(ctx, cfg, payload, invalidDeliveryID, "invalid-e2e-signing-secret")
+	response, err := postSyntheticWebhook(ctx, cfg, payload, invalidDeliveryID, invalidSignatureSecret)
 	requireAcceptedWebhookResponse(t, response, err, "invalid-signature fixture")
 
 	after := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, headSHA)
@@ -3669,7 +4325,7 @@ func listForgejoFreezeStatuses(ctx context.Context, forgejo *forgejoAPI, headSHA
 	return filtered, nil
 }
 
-func requireProcessedVerifiedDelivery(t *testing.T, page, deliveryID string) {
+func requireProcessedVerifiedDelivery(t *testing.T, page, deliveryID string) string {
 	t.Helper()
 	marker := ">" + html.EscapeString(deliveryID) + "</code>"
 	if count := strings.Count(page, marker); count != 2 {
@@ -3685,6 +4341,7 @@ func requireProcessedVerifiedDelivery(t *testing.T, page, deliveryID string) {
 	if !strings.Contains(row, ">verified</span>") || !strings.Contains(row, ">processed</span>") {
 		t.Fatalf("delivery ID %q is not rendered as verified and processed", deliveryID)
 	}
+	return row
 }
 
 func waitForOneNewProcessedPullRequestDelivery(t *testing.T, ctx context.Context, browser *thawguardBrowser, repositoryID int64, beforeRows int, action string) {
@@ -4538,8 +5195,9 @@ func mergeForgejoPullRequest(t *testing.T, ctx context.Context, forgejo *forgejo
 	})
 }
 
-func requireMergedForgejoPullRequest(t *testing.T, ctx context.Context, forgejo *forgejoAPI, index int, base, title, headSHA string) {
+func requireMergedForgejoPullRequest(t *testing.T, ctx context.Context, forgejo *forgejoAPI, index int, base, title, headSHA string) pullRequest {
 	t.Helper()
+	var merged pullRequest
 	waitFor(t, 30*time.Second, "Forgejo release pull request to become closed and merged", func() (bool, error) {
 		response, err := forgejo.do(ctx, http.MethodGet, forgejo.repositoryPath("pulls", strconv.Itoa(index)), nil)
 		if err != nil {
@@ -4562,8 +5220,12 @@ func requireMergedForgejoPullRequest(t *testing.T, ctx context.Context, forgejo 
 		if pr.State != "closed" {
 			t.Fatalf("merged Forgejo PR #%d has unexpected state %q", index, pr.State)
 		}
+		if pr.Merged {
+			merged = pr
+		}
 		return pr.Merged, nil
 	})
+	return merged
 }
 
 func requiredStatusChecksPending(response apiResponse) bool {
@@ -4891,6 +5553,8 @@ var (
 	activeFreezeCountPattern         = regexp.MustCompile(`<span class="tg-badge">([0-9]+) active</span>`)
 	scheduledFreezeCountPattern      = regexp.MustCompile(`Scheduled windows</h2><span class="tg-badge tg-badge-scheduled">([0-9]+) shown</span>`)
 	webhookRowsPattern               = regexp.MustCompile(`Showing ([0-9]+) of [0-9]+ matching rows`)
+	webhookSummaryPattern            = regexp.MustCompile(`Showing ([0-9]+) of ([0-9]+) matching rows`)
+	webhookTotalRowsPattern          = regexp.MustCompile(`>([0-9]+) total rows loaded</span>`)
 	statusResultsPattern             = regexp.MustCompile(`Thaw approval results</h2><span[^>]*>([0-9]+) status results</span>`)
 	publicationIntentsPattern        = regexp.MustCompile(`Latest desired statuses</h2><span[^>]*>([0-9]+) shown</span>`)
 	publicationAttemptsPattern       = regexp.MustCompile(`Recent publication attempts</h2><span[^>]*>([0-9]+) shown</span>`)
