@@ -159,9 +159,15 @@ The target:
 32. confirms the real PR still has that exact thawed head, creates the allowlisted `stale-head-thaw.txt` fixture through Forgejo's contents API with the control token, requires a distinct new SHA, and waits for the real PR head to advance;
 33. proves Forgejo emits exactly one new real `pull_request/synchronized` delivery that is verified, processed, and error-free; proves the synchronized reevaluation produces exactly one new-SHA `thawguard/freeze=failure` status and one posted attempt with the normal frozen-branch description; and confirms the ordinary merge is blocked again;
 34. proves the synchronized reevaluation adds exactly one webhook row, status result, desired-status intent, publication attempt, and new-head Forgejo status while adding no activity event; separately re-fetches the old SHA and proves its status history, latest explicit-thaw success, **Eligible** decision, and **Single-PR thaw** evidence remain unchanged;
-35. proves the newest blocked decision, publication intent, and posted attempt identify the repository, real PR, new full SHA, `main`, `thawguard/freeze`, and frozen-branch result; proves the exact third freeze remains unchanged and active; and retains the open PR at its new blocked head, with no matching exception for that head, to prepare shared-head confirmation coverage;
-36. checks all three token values against rendered diagnostic pages, relevant HTTP responses and redirects, Forgejo status API responses, captured Go test output, and both container logs without printing unsafe content; and
-37. removes both containers and both named volumes on success or failure.
+35. proves the newest blocked decision, publication intent, and posted attempt identify the repository, real PR, new full SHA, `main`, `thawguard/freeze`, and frozen-branch result; proves the exact third freeze remains unchanged and active; and retains the open PR at its new blocked head, with no matching exception for that head;
+36. creates the static `shared-head-confirmation` branch from `feature/freeze-check` through Forgejo's branch API, validates its returned commit ID exactly matches the first PR's current blocked SHA, and opens a distinct real second PR targeting `main` at that same full SHA;
+37. waits for exactly one new real, verified, processed, error-free `pull_request/opened` delivery and proves it adds one status result, one publication attempt, and one failing Forgejo required-context status while reusing the existing SHA-scoped publication intent and adding no activity event; both ordinary merge attempts remain blocked;
+38. submits the ordinary thaw fields for the first PR with no client-supplied head or affected set, receives `409 Conflict`, and verifies the isolated confirmation warning names both real PRs, their distinct titles, `main`, the shared short SHA, the selected PR, and the explicit statement that nothing has been approved yet;
+39. proves the initial request performs only the intentional audited two-open-PR refresh: it adds no webhook, status result, publication intent, publication attempt, Forgejo status, shared-thaw audit, or success decision, while the active freeze and latest failure remain unchanged;
+40. validates the confirmation form's original request values, full current SHA, and opaque 64-character affected-set fingerprint; submits only those extracted values through the existing forge refresh and staleness recheck instead of trusting client-supplied PR metadata;
+41. proves explicit confirmation atomically records new current-SHA exceptions for both frozen PRs, records one **Shared-head thaw** approval naming both PRs and the exact fictional reason, and publishes one shared `thawguard/freeze=success` status while both PRs remain open at the same SHA and the active freeze remains unchanged;
+42. checks all three token values against rendered diagnostic pages, relevant HTTP responses and redirects, Forgejo status API responses, captured Go test output, and both container logs without printing unsafe content; and
+43. removes both containers and both named volumes on success or failure.
 
 The initial pull request and both later feature-branch advance deliveries are Forgejo-emitted. The status drift is a deliberate cooperative-enforcement fixture posted with the disposable fictional control token while Thawguard is stopped; the test does not attempt a merge while that success is newest. The rejection and duplicate probes are clearly identified synthetic E2E fixtures; they run only after credential recovery, reuse the fictional repository, and never store or print their payloads, signatures, or in-memory secret. Separate status tokens keep fixture control independent from the credential under failure, but all three tokens belong only to the disposable fictional owner.
 
@@ -170,6 +176,8 @@ The second lifecycle cancels an already-active freeze. Active **Cancel** records
 The third lifecycle approves an immediate thaw for one uniquely headed PR while its branch freeze remains active. The submitted form identifies the repository, PR, target branch, and reason but does not submit a head SHA; Thawguard fetches the current head from Forgejo, records the exact-head exception, and publishes the passing status.
 
 The synchronized-head lifecycle then advances that real PR to different code. The old exact-head approval no longer applies to the changed head, so the still-active branch freeze produces the normal failing status again. The old exception row is retained as active for its old SHA rather than expired, revoked, or permanently invalidated; returning the PR to that exact old SHA could make the approval applicable again. No invalidation audit event is invented. The retained new blocked head and unchanged active freeze prepare the same disposable fixture for shared-head confirmation coverage without implying hard enforcement against forge writers who can post statuses.
+
+The shared-head lifecycle creates a second real open PR at that retained blocked SHA. The first ordinary thaw request returns a truthful `409 Conflict` after an audited refresh reports two open PRs, but it records no approval and publishes no status. The follow-up form carries the full server-observed SHA and an opaque affected-set fingerprint used only by the server's staleness recheck; it does not submit an affected-PR list or mutable metadata for those PRs. This smoke round-trips the untouched server-rendered values, while lower-level tests cover reconfirmation after a changed head or affected set. Explicit confirmation refreshes the forge state again, atomically approves both currently frozen PRs, records one shared audit event, and publishes one SHA-scoped success. Both PRs remain open and the branch freeze remains active, so this remains cooperative workflow evidence rather than a claim of hard enforcement against forge writers.
 
 The restart proof covers persisted unhealthy state and already-enqueued recovery work. The restarted worker consumes that existing job when it becomes due; startup does not enqueue or reconcile every otherwise healthy active repository. This is not a universal startup sweep.
 
@@ -200,7 +208,7 @@ The script intentionally exits with status 97 after both services become healthy
 
 ## Prioritized E2E expansion matrix
 
-The disposable smoke covers the freeze/lift, active-cancel, immediate unique-head thaw, and synchronized stale-head reevaluation paths plus the setup-readiness, webhook, and token-failure P0 rows below. Add the remaining cases in this order:
+The disposable smoke covers the freeze/lift, active-cancel, immediate unique-head thaw, synchronized stale-head reevaluation, and shared-head confirmation paths plus the setup-readiness, webhook, and token-failure P0 rows below. Add the remaining cases in this order:
 
 | Priority | Scenario | Main proof |
 | --- | --- | --- |
@@ -211,7 +219,7 @@ The disposable smoke covers the freeze/lift, active-cancel, immediate unique-hea
 | P1 (covered) | Cancel freeze | Active cancellation records **Cancelled**, reuses the desired-status intent, republishes current policy, and remains distinct from Lift and scheduled cancellation. |
 | P1 (covered) | Immediate per-PR thaw | A real PR/head receives an audited exception and success status while its branch remains actively frozen. |
 | P1 (covered) | Stale-head thaw reevaluation | A changed head no longer matches the retained old exact-head approval and is blocked again by the still-active freeze. |
-| P1 | Shared-head confirmation | SHA-scoped impact is shown and explicit confirmation covers the affected set. |
+| P1 (covered) | Shared-head confirmation | SHA-scoped impact is shown, the initial request makes no approval/publication mutation, and explicit confirmation atomically covers the refreshed affected set. |
 | P2 | Scheduled create/edit/Start Now/cancel | One-time schedule transitions use the normal convergence path. |
 | P2 | Planned unfreeze | Due unfreeze republishes success and survives restart. |
 | P2 | Viewer/freezer/thaw-approver/admin permissions | Real sessions enforce each route and action boundary. |

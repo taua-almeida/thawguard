@@ -33,6 +33,9 @@ const (
 	fixtureRepository        = "icebox-demo"
 	fixtureReleaseBranch     = "release"
 	fixtureFeatureBranch     = "feature/freeze-check"
+	fixtureSharedHeadBranch  = "shared-head-confirmation"
+	fixturePrimaryPRTitle    = "Fictional release check"
+	fixtureSharedHeadPRTitle = "Fictional shared-head confirmation"
 	primaryStatusTokenName   = "thawguard-e2e-status-primary"
 	requiredContext          = "thawguard/freeze"
 	e2eComposeProject        = "thawguard-e2e"
@@ -64,6 +67,7 @@ type forgejoAPI struct {
 type apiResponse struct {
 	statusCode int
 	body       []byte
+	location   string
 }
 
 type thawguardBrowser struct {
@@ -72,10 +76,23 @@ type thawguardBrowser struct {
 }
 
 type pullRequest struct {
-	Number int `json:"number"`
-	Head   struct {
+	Number  int    `json:"number"`
+	Title   string `json:"title"`
+	State   string `json:"state"`
+	HTMLURL string `json:"html_url"`
+	Base    struct {
+		Ref string `json:"ref"`
+	} `json:"base"`
+	Head struct {
 		SHA string `json:"sha"`
 	} `json:"head"`
+}
+
+type forgejoBranch struct {
+	Name   string `json:"name"`
+	Commit struct {
+		ID string `json:"id"`
+	} `json:"commit"`
 }
 
 type commitStatus struct {
@@ -121,7 +138,7 @@ func TestLocalForgejoFreezeLifecycle(t *testing.T) {
 	provisionForgejoRepository(t, ctx, forgejo)
 	repositoryID := configureThawguard(t, ctx, browser, cfg)
 	createForgejoWebhook(t, ctx, forgejo, cfg.webhookSecret)
-	pr := createForgejoPullRequest(t, ctx, forgejo)
+	pr := createForgejoPullRequest(t, ctx, forgejo, fixtureFeatureBranch, fixturePrimaryPRTitle)
 
 	waitFor(t, 30*time.Second, "verified Forgejo webhook delivery", func() (bool, error) {
 		page, err := browser.get(ctx, "/webhooks?processing=processed&event=pull_request")
@@ -182,13 +199,16 @@ func TestLocalForgejoFreezeLifecycle(t *testing.T) {
 	liftFreeze(t, ctx, browser, firstFreeze)
 	waitForStatusWithDescription(t, ctx, forgejo, newHeadSHA, "success", "No active freeze applies to this PR")
 	activityPage := waitForOneNewOpenPullRequestSync(t, ctx, browser, openPullRequestSyncsBeforeProbes)
-	requireLatestOpenPullRequestSync(t, activityPage)
+	requireLatestOpenPullRequestSync(t, activityPage, 1)
 	scanRenderedTokenSurfaces(t, ctx, browser)
 
 	proveActiveFreezeCancellation(t, ctx, forgejo, browser, repositoryID, pr.Number, newHeadSHA, firstFreeze)
 	scanRenderedTokenSurfaces(t, ctx, browser)
 	proveImmediatePerPullRequestThaw(t, ctx, forgejo, browser, repositoryID, pr.Number, newHeadSHA)
+	historicalThawedHeadSHA := newHeadSHA
 	newHeadSHA = proveStaleHeadThawReevaluation(t, ctx, forgejo, browser, repositoryID, pr.Number, newHeadSHA)
+	scanRenderedTokenSurfaces(t, ctx, browser)
+	proveSharedHeadConfirmation(t, ctx, forgejo, browser, repositoryID, pr.Number, historicalThawedHeadSHA, newHeadSHA)
 	scanRenderedTokenSurfaces(t, ctx, browser)
 }
 
@@ -339,7 +359,7 @@ func proveImmediatePerPullRequestThaw(t *testing.T, ctx context.Context, forgejo
 	waitForStatusWithDescription(t, ctx, forgejo, headSHA, "success", explicitThaw)
 	waitForLatestPostedPublicationAttempt(t, ctx, browser, headSHA, "success", explicitThaw)
 	activityPage := waitForOneNewOpenPullRequestSync(t, ctx, browser, openPullRequestSyncsBefore)
-	requireLatestOpenPullRequestSync(t, activityPage)
+	requireLatestOpenPullRequestSync(t, activityPage, 1)
 	after := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, headSHA)
 
 	if after.webhookRows != before.webhookRows {
@@ -458,7 +478,7 @@ func proveStaleHeadThawReevaluation(t *testing.T, ctx context.Context, forgejo *
 		"new head for exact-head thaw reevaluation proof\n",
 		"stale-head thaw",
 	)
-	waitForOneNewProcessedSynchronizedDelivery(t, ctx, browser, repositoryID, before.webhookRows)
+	waitForOneNewProcessedPullRequestDelivery(t, ctx, browser, repositoryID, before.webhookRows, "synchronized")
 	waitForLatestPostedPublicationAttempt(t, ctx, browser, newHeadSHA, "failure", frozenReason)
 	waitForStatusWithDescription(t, ctx, forgejo, newHeadSHA, "failure", frozenReason)
 	assertMergeBlockedByRequiredStatus(t, ctx, forgejo, pullRequestIndex)
@@ -562,6 +582,366 @@ func proveStaleHeadThawReevaluation(t *testing.T, ctx context.Context, forgejo *
 		t.Fatalf("third active freeze changed after stale-head reevaluation: before=%+v after=%+v", thirdFreeze, active)
 	}
 	return newHeadSHA
+}
+
+func proveSharedHeadConfirmation(t *testing.T, ctx context.Context, forgejo *forgejoAPI, browser *thawguardBrowser, repositoryID int64, primaryPullRequestIndex int, historicalThawedHeadSHA, sharedHeadSHA string) {
+	t.Helper()
+	const (
+		thawReason   = "Fictional shared-head thaw confirmation"
+		frozenReason = "Branch is frozen; merge is blocked by Thawguard"
+		explicitThaw = "PR is explicitly thawed during an active freeze"
+	)
+	historicalThawedHeadSHA = strings.ToLower(strings.TrimSpace(historicalThawedHeadSHA))
+	sharedHeadSHA = strings.ToLower(strings.TrimSpace(sharedHeadSHA))
+	if len(historicalThawedHeadSHA) < 12 || len(sharedHeadSHA) < 12 || historicalThawedHeadSHA == sharedHeadSHA {
+		t.Fatalf("shared-head confirmation requires distinct full historical and current SHAs: historical=%q current=%q", historicalThawedHeadSHA, sharedHeadSHA)
+	}
+
+	activeFreeze := requireActiveFreezeEvidence(t, requirePage(t, ctx, browser, "/freezes"))
+	if activeFreeze.branch != "main" || activeFreeze.status != "active" {
+		t.Fatalf("shared-head confirmation started without the expected active main freeze: %+v", activeFreeze)
+	}
+	historicalStatuses, err := listForgejoFreezeStatuses(ctx, forgejo, historicalThawedHeadSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(historicalStatuses) == 0 {
+		t.Fatal("historical thawed SHA has no retained Forgejo status evidence")
+	}
+	historicalLatest := historicalStatuses[len(historicalStatuses)-1]
+	if historicalLatest.Context != requiredContext || historicalLatest.Status != "success" || historicalLatest.Description != explicitThaw {
+		t.Fatalf("unexpected historical thawed-SHA status: id=%d context=%q state=%q description=%q", historicalLatest.ID, historicalLatest.Context, historicalLatest.Status, historicalLatest.Description)
+	}
+	historicalActivityPage := requirePage(t, ctx, browser, "/activity")
+	historicalThawRow := requireLatestActivityRow(t, historicalActivityPage, "Single-PR thaw")
+	if !strings.Contains(historicalThawRow, "head "+historicalThawedHeadSHA[:12]+".") {
+		t.Fatalf("historical Single-PR thaw row is missing head %q", historicalThawedHeadSHA[:12])
+	}
+	historicalDecisionRow := requireDecisionResultRowForHead(t, requirePage(t, ctx, browser, "/decisions"), historicalThawedHeadSHA)
+	for _, want := range []string{explicitThaw, `<span class="status status-success">Eligible</span>`} {
+		if !strings.Contains(historicalDecisionRow, want) {
+			t.Fatalf("historical thawed-SHA decision row is missing %q", want)
+		}
+	}
+
+	branchHeadSHA := createForgejoBranch(t, ctx, forgejo, fixtureSharedHeadBranch, fixtureFeatureBranch)
+	if branchHeadSHA != sharedHeadSHA {
+		t.Fatalf("shared-head branch commit %q does not equal PR #%d current SHA %q", branchHeadSHA, primaryPullRequestIndex, sharedHeadSHA)
+	}
+
+	beforeOpened := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, sharedHeadSHA)
+	if len(beforeOpened.freezeStatuses) == 0 {
+		t.Fatal("shared head is missing its pre-second-PR failing status")
+	}
+	latestBeforeOpened := beforeOpened.freezeStatuses[len(beforeOpened.freezeStatuses)-1]
+	if latestBeforeOpened.Context != requiredContext || latestBeforeOpened.Status != "failure" || latestBeforeOpened.Description != frozenReason {
+		t.Fatalf("unexpected pre-second-PR required status: id=%d context=%q state=%q description=%q", latestBeforeOpened.ID, latestBeforeOpened.Context, latestBeforeOpened.Status, latestBeforeOpened.Description)
+	}
+
+	secondaryPR := createForgejoPullRequest(t, ctx, forgejo, fixtureSharedHeadBranch, fixtureSharedHeadPRTitle)
+	if secondaryPR.Number == primaryPullRequestIndex {
+		t.Fatalf("second Forgejo pull request reused primary number %d", primaryPullRequestIndex)
+	}
+	if secondaryPR.Head.SHA != sharedHeadSHA {
+		t.Fatalf("second Forgejo pull request head %q does not equal primary shared SHA %q", secondaryPR.Head.SHA, sharedHeadSHA)
+	}
+	requireOpenForgejoPullRequest(t, ctx, forgejo, primaryPullRequestIndex, fixturePrimaryPRTitle, sharedHeadSHA)
+	requireOpenForgejoPullRequest(t, ctx, forgejo, secondaryPR.Number, fixtureSharedHeadPRTitle, sharedHeadSHA)
+
+	waitForOneNewProcessedPullRequestDelivery(t, ctx, browser, repositoryID, beforeOpened.webhookRows, "opened")
+	var afterOpened webhookSideEffectEvidence
+	waitFor(t, 30*time.Second, "second-PR opened webhook side effects", func() (bool, error) {
+		afterOpened = collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, sharedHeadSHA)
+		if afterOpened.webhookRows > beforeOpened.webhookRows+1 ||
+			afterOpened.statusResults > beforeOpened.statusResults+1 ||
+			afterOpened.publicationIntents > beforeOpened.publicationIntents ||
+			afterOpened.publicationAttempts > beforeOpened.publicationAttempts+1 ||
+			afterOpened.activityEvents > beforeOpened.activityEvents ||
+			len(afterOpened.freezeStatuses) > len(beforeOpened.freezeStatuses)+1 {
+			t.Fatal("second-PR opened webhook exceeded its expected side-effect deltas")
+		}
+		return afterOpened.webhookRows == beforeOpened.webhookRows+1 &&
+			afterOpened.statusResults == beforeOpened.statusResults+1 &&
+			afterOpened.publicationIntents == beforeOpened.publicationIntents &&
+			afterOpened.publicationAttempts == beforeOpened.publicationAttempts+1 &&
+			afterOpened.activityEvents == beforeOpened.activityEvents &&
+			len(afterOpened.freezeStatuses) == len(beforeOpened.freezeStatuses)+1, nil
+	})
+	waitForLatestPostedPublicationAttempt(t, ctx, browser, sharedHeadSHA, "failure", frozenReason)
+	latestAfterOpened := afterOpened.freezeStatuses[len(afterOpened.freezeStatuses)-1]
+	if latestAfterOpened.ID <= latestBeforeOpened.ID || latestAfterOpened.Context != requiredContext || latestAfterOpened.Status != "failure" || latestAfterOpened.Description != frozenReason {
+		t.Fatalf("unexpected second-PR opened required status: id=%d context=%q state=%q description=%q", latestAfterOpened.ID, latestAfterOpened.Context, latestAfterOpened.Status, latestAfterOpened.Description)
+	}
+	assertMergeBlockedByRequiredStatus(t, ctx, forgejo, primaryPullRequestIndex)
+	assertMergeBlockedByRequiredStatus(t, ctx, forgejo, secondaryPR.Number)
+	if current := requireActiveFreezeEvidence(t, requirePage(t, ctx, browser, "/freezes")); current != activeFreeze {
+		t.Fatalf("active freeze changed while opening the shared-head PR: before=%+v after=%+v", activeFreeze, current)
+	}
+
+	decisionsPage := requirePage(t, ctx, browser, "/decisions")
+	ordinaryForm := requireRenderedForm(t, decisionsPage, `<form method="post" action="/decisions" class="tg-setup-form tg-thaw-form" data-thaw-form>`, "ordinary thaw")
+	if strings.Contains(ordinaryForm, `name="head_sha"`) || strings.Contains(ordinaryForm, `name="confirm_shared_head"`) {
+		t.Fatal("ordinary thaw form unexpectedly contains head or confirmation fields")
+	}
+	ordinaryValues := url.Values{
+		"csrf_token":         {requireHiddenInput(t, ordinaryForm, "csrf_token")},
+		"repository_id":      {strconv.FormatInt(repositoryID, 10)},
+		"pull_request_index": {strconv.Itoa(primaryPullRequestIndex)},
+		"target_branch":      {"main"},
+		"reason":             {thawReason},
+	}
+
+	beforeConflict := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, sharedHeadSHA)
+	beforeConflictActivity := requirePage(t, ctx, browser, "/activity")
+	beforeConflictSyncs := countOpenPullRequestSyncEvents(beforeConflictActivity)
+	beforeConflictSharedThaws := countSharedHeadThawEvents(beforeConflictActivity)
+	beforeConflictDecisions := requirePage(t, ctx, browser, "/decisions")
+	beforeConflictDecisionRow := requireLatestDecisionResultRow(t, beforeConflictDecisions)
+	beforeConflictEligibleRows := countEligibleDecisionRows(beforeConflictDecisions)
+	latestBeforeConflict := beforeConflict.freezeStatuses[len(beforeConflict.freezeStatuses)-1]
+
+	conflictResponse, err := browser.postFormNoRedirect(ctx, "/decisions", ordinaryValues)
+	if err != nil {
+		t.Fatalf("submit ordinary shared-head thaw: %v", err)
+	}
+	if conflictResponse.statusCode != http.StatusConflict {
+		t.Fatalf("ordinary shared-head thaw returned HTTP %d, want 409", conflictResponse.statusCode)
+	}
+	conflictBody := string(conflictResponse.body)
+	confirmationForm := requireRenderedForm(t, conflictBody, `<form method="post" action="/decisions" class="tg-shared-head-confirm-form">`, "shared-head confirmation")
+	shortSharedHead := sharedHeadSHA[:10]
+	for _, want := range []string{
+		"These pull requests share one commit SHA",
+		"Nothing has been approved yet.",
+		"shared head <code>" + shortSharedHead + "</code>",
+		"Approve thaw for all 2 PRs",
+	} {
+		if !strings.Contains(conflictBody, want) {
+			t.Fatalf("shared-head confirmation response is missing %q", want)
+		}
+	}
+	primaryRow := requireSharedHeadConfirmationRow(t, conflictBody, primaryPullRequestIndex)
+	secondaryRow := requireSharedHeadConfirmationRow(t, conflictBody, secondaryPR.Number)
+	for _, want := range []string{fixturePrimaryPRTitle, `<code class="tg-branch">main</code>`, `<code>` + shortSharedHead + `</code>`, `>your selection</span>`} {
+		if !strings.Contains(primaryRow, want) {
+			t.Fatalf("selected shared-head confirmation row is missing %q", want)
+		}
+	}
+	for _, want := range []string{fixtureSharedHeadPRTitle, `<code class="tg-branch">main</code>`, `<code>` + shortSharedHead + `</code>`} {
+		if !strings.Contains(secondaryRow, want) {
+			t.Fatalf("second shared-head confirmation row is missing %q", want)
+		}
+	}
+	if strings.Contains(secondaryRow, "your selection") || fixturePrimaryPRTitle == fixtureSharedHeadPRTitle {
+		t.Fatal("shared-head confirmation did not preserve one selected PR and two distinct titles")
+	}
+
+	confirmationFieldNames := []string{
+		"csrf_token",
+		"repository_id",
+		"pull_request_index",
+		"target_branch",
+		"reason",
+		"confirm_shared_head",
+		"confirmed_head_sha",
+		"confirmed_affected_signature",
+	}
+	confirmationValues := make(url.Values, len(confirmationFieldNames))
+	for _, name := range confirmationFieldNames {
+		confirmationValues.Set(name, requireHiddenInput(t, confirmationForm, name))
+	}
+	requireOnlyFormInputNames(t, confirmationForm, confirmationFieldNames)
+	if confirmationValues.Get("csrf_token") == "" {
+		t.Fatal("shared-head confirmation form has an empty CSRF token")
+	}
+	if confirmationValues.Get("repository_id") != strconv.FormatInt(repositoryID, 10) ||
+		confirmationValues.Get("pull_request_index") != strconv.Itoa(primaryPullRequestIndex) ||
+		confirmationValues.Get("target_branch") != "main" ||
+		confirmationValues.Get("reason") != thawReason ||
+		confirmationValues.Get("confirm_shared_head") != "true" ||
+		confirmationValues.Get("confirmed_head_sha") != sharedHeadSHA {
+		t.Fatalf("shared-head confirmation form did not preserve the original request and full current SHA")
+	}
+	affectedFingerprint := confirmationValues.Get("confirmed_affected_signature")
+	if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(affectedFingerprint) {
+		t.Fatalf("shared-head affected-set fingerprint has invalid shape %q", affectedFingerprint)
+	}
+	if strings.Contains(conflictBody, `<code>`+affectedFingerprint+`</code>`) || strings.Contains(conflictBody, affectedFingerprint+`</`) {
+		t.Fatal("shared-head affected-set fingerprint leaked into visible confirmation content")
+	}
+
+	activityAfterConflict := waitForOneNewOpenPullRequestSync(t, ctx, browser, beforeConflictSyncs)
+	requireLatestOpenPullRequestSync(t, activityAfterConflict, 2)
+	afterConflict := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, sharedHeadSHA)
+	if afterConflict.webhookRows != beforeConflict.webhookRows ||
+		afterConflict.statusResults != beforeConflict.statusResults ||
+		afterConflict.publicationIntents != beforeConflict.publicationIntents ||
+		afterConflict.publicationAttempts != beforeConflict.publicationAttempts ||
+		afterConflict.activityEvents != beforeConflict.activityEvents+1 ||
+		!slices.Equal(afterConflict.freezeStatuses, beforeConflict.freezeStatuses) {
+		t.Fatalf("409 confirmation changed approval/publication evidence: webhooks %d→%d, status results %d→%d, intents %d→%d, attempts %d→%d, activity %d→%d, Forgejo statuses %d→%d",
+			beforeConflict.webhookRows, afterConflict.webhookRows,
+			beforeConflict.statusResults, afterConflict.statusResults,
+			beforeConflict.publicationIntents, afterConflict.publicationIntents,
+			beforeConflict.publicationAttempts, afterConflict.publicationAttempts,
+			beforeConflict.activityEvents, afterConflict.activityEvents,
+			len(beforeConflict.freezeStatuses), len(afterConflict.freezeStatuses))
+	}
+	latestAfterConflict := afterConflict.freezeStatuses[len(afterConflict.freezeStatuses)-1]
+	if latestAfterConflict != latestBeforeConflict || latestAfterConflict.Status != "failure" || latestAfterConflict.Description != frozenReason {
+		t.Fatalf("409 confirmation changed the latest failing status: before=%+v after=%+v", latestBeforeConflict, latestAfterConflict)
+	}
+	decisionsAfterConflict := requirePage(t, ctx, browser, "/decisions")
+	if latest := requireLatestDecisionResultRow(t, decisionsAfterConflict); latest != beforeConflictDecisionRow {
+		t.Fatal("409 confirmation added or changed the latest status decision row")
+	}
+	if countEligibleDecisionRows(decisionsAfterConflict) != beforeConflictEligibleRows {
+		t.Fatal("409 confirmation added a success decision row")
+	}
+	if countSharedHeadThawEvents(activityAfterConflict) != beforeConflictSharedThaws || strings.Contains(activityAfterConflict, "Confirmation reason: "+thawReason) {
+		t.Fatal("409 confirmation added Shared-head thaw approval activity")
+	}
+	if current := requireActiveFreezeEvidence(t, requirePage(t, ctx, browser, "/freezes")); current != activeFreeze {
+		t.Fatalf("409 confirmation changed the active freeze: before=%+v after=%+v", activeFreeze, current)
+	}
+
+	beforeConfirmation := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, sharedHeadSHA)
+	if beforeConfirmation.webhookRows != beforeConflict.webhookRows ||
+		beforeConfirmation.statusResults != beforeConflict.statusResults ||
+		beforeConfirmation.publicationIntents != beforeConflict.publicationIntents ||
+		beforeConfirmation.publicationAttempts != beforeConflict.publicationAttempts ||
+		beforeConfirmation.activityEvents != beforeConflict.activityEvents+1 ||
+		!slices.Equal(beforeConfirmation.freezeStatuses, beforeConflict.freezeStatuses) {
+		t.Fatal("409 confirmation evidence changed after its audited refresh settled")
+	}
+	beforeConfirmationActivity := requirePage(t, ctx, browser, "/activity")
+	beforeConfirmationSyncs := countOpenPullRequestSyncEvents(beforeConfirmationActivity)
+	beforeConfirmationSharedThaws := countSharedHeadThawEvents(beforeConfirmationActivity)
+	latestBeforeConfirmation := beforeConfirmation.freezeStatuses[len(beforeConfirmation.freezeStatuses)-1]
+
+	confirmedResponse, err := browser.postFormNoRedirect(ctx, "/decisions", confirmationValues)
+	if err != nil {
+		t.Fatalf("submit explicit shared-head confirmation: %v", err)
+	}
+	if confirmedResponse.statusCode != http.StatusSeeOther || confirmedResponse.location != "/decisions" {
+		t.Fatalf("explicit shared-head confirmation returned HTTP %d with Location %q, want 303 to /decisions", confirmedResponse.statusCode, confirmedResponse.location)
+	}
+
+	var afterConfirmation webhookSideEffectEvidence
+	waitFor(t, 30*time.Second, "confirmed shared-head approval side effects", func() (bool, error) {
+		afterConfirmation = collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, sharedHeadSHA)
+		if afterConfirmation.webhookRows > beforeConfirmation.webhookRows ||
+			afterConfirmation.statusResults > beforeConfirmation.statusResults+1 ||
+			afterConfirmation.publicationIntents > beforeConfirmation.publicationIntents ||
+			afterConfirmation.publicationAttempts > beforeConfirmation.publicationAttempts+1 ||
+			afterConfirmation.activityEvents > beforeConfirmation.activityEvents+2 ||
+			len(afterConfirmation.freezeStatuses) > len(beforeConfirmation.freezeStatuses)+1 {
+			t.Fatal("confirmed shared-head approval exceeded its expected side-effect deltas")
+		}
+		return afterConfirmation.webhookRows == beforeConfirmation.webhookRows &&
+			afterConfirmation.statusResults == beforeConfirmation.statusResults+1 &&
+			afterConfirmation.publicationIntents == beforeConfirmation.publicationIntents &&
+			afterConfirmation.publicationAttempts == beforeConfirmation.publicationAttempts+1 &&
+			afterConfirmation.activityEvents == beforeConfirmation.activityEvents+2 &&
+			len(afterConfirmation.freezeStatuses) == len(beforeConfirmation.freezeStatuses)+1, nil
+	})
+	waitForLatestPostedPublicationAttempt(t, ctx, browser, sharedHeadSHA, "success", explicitThaw)
+	activityAfterConfirmation := waitForOneNewOpenPullRequestSync(t, ctx, browser, beforeConfirmationSyncs)
+	requireLatestOpenPullRequestSync(t, activityAfterConfirmation, 2)
+	if countSharedHeadThawEvents(activityAfterConfirmation) != beforeConfirmationSharedThaws+1 {
+		t.Fatal("confirmed shared-head approval did not add exactly one Shared-head thaw event")
+	}
+	settledAfterConfirmation := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, sharedHeadSHA)
+	if settledAfterConfirmation.webhookRows != beforeConfirmation.webhookRows ||
+		settledAfterConfirmation.statusResults != beforeConfirmation.statusResults+1 ||
+		settledAfterConfirmation.publicationIntents != beforeConfirmation.publicationIntents ||
+		settledAfterConfirmation.publicationAttempts != beforeConfirmation.publicationAttempts+1 ||
+		settledAfterConfirmation.activityEvents != beforeConfirmation.activityEvents+2 ||
+		len(settledAfterConfirmation.freezeStatuses) != len(beforeConfirmation.freezeStatuses)+1 ||
+		!slices.Equal(settledAfterConfirmation.freezeStatuses, afterConfirmation.freezeStatuses) {
+		t.Fatal("confirmed shared-head approval evidence changed after publication and activity settled")
+	}
+	afterConfirmation = settledAfterConfirmation
+	latestAfterConfirmation := afterConfirmation.freezeStatuses[len(afterConfirmation.freezeStatuses)-1]
+	if latestAfterConfirmation.ID <= latestBeforeConfirmation.ID || latestAfterConfirmation.Context != requiredContext || latestAfterConfirmation.Status != "success" || latestAfterConfirmation.Description != explicitThaw {
+		t.Fatalf("unexpected confirmed shared-head required status: id=%d context=%q state=%q description=%q", latestAfterConfirmation.ID, latestAfterConfirmation.Context, latestAfterConfirmation.Status, latestAfterConfirmation.Description)
+	}
+
+	decisionsAfterConfirmation := requirePage(t, ctx, browser, "/decisions")
+	decisionRow := requireLatestDecisionResultRow(t, decisionsAfterConfirmation)
+	for _, want := range []string{
+		`<a href="#">#` + strconv.Itoa(primaryPullRequestIndex) + `</a>`,
+		`<code>` + fixtureOwner + `/` + fixtureRepository + `</code>`,
+		`<code class="tg-branch">main</code>`,
+		`<code>` + sharedHeadSHA + `</code>`,
+		explicitThaw,
+		`<code>` + requiredContext + `</code>`,
+		`<span class="status status-success">Eligible</span>`,
+	} {
+		if !strings.Contains(decisionRow, want) {
+			t.Fatalf("latest shared-head status result is missing %q", want)
+		}
+	}
+
+	publicationsPage := requirePage(t, ctx, browser, "/publications")
+	intentRow := requireLatestPublicationIntentRow(t, publicationsPage)
+	attemptRow := requireLatestPublicationAttemptRow(t, publicationsPage)
+	for label, row := range map[string]string{"intent": intentRow, "attempt": attemptRow} {
+		for _, want := range []string{
+			fixtureOwner + `/` + fixtureRepository,
+			`#` + strconv.Itoa(primaryPullRequestIndex) + `<small class="tg-muted">main</small>`,
+			`<code>` + sharedHeadSHA + `</code>`,
+			`<span class="status status-success">success</span>`,
+			`<code>forgejo_status</code>`,
+			explicitThaw,
+		} {
+			if !strings.Contains(row, want) {
+				t.Fatalf("latest shared-head publication %s is missing %q", label, want)
+			}
+		}
+	}
+	if !strings.Contains(intentRow, `<td data-label="Context"><code>`+requiredContext+`</code></td>`) {
+		t.Fatalf("latest shared-head publication intent is missing %q", requiredContext)
+	}
+	for _, want := range []string{
+		`<small class="tg-muted">` + requiredContext + `</small>`,
+		`<td data-label="Result"><span class="status status-ok">posted</span></td>`,
+	} {
+		if !strings.Contains(attemptRow, want) {
+			t.Fatalf("latest shared-head publication attempt is missing %q", want)
+		}
+	}
+
+	sharedThawRow := requireLatestActivityRow(t, activityAfterConfirmation, "Shared-head thaw")
+	for _, want := range []string{
+		`<td data-label="Actor">E2E Admin</td>`,
+		`<td data-label="Target">` + fixtureOwner + `/` + fixtureRepository + ` → shared head ` + sharedHeadSHA[:12] + `</td>`,
+		`<td data-label="Outcome"><span class="status status-ok">Approved</span></td>`,
+		`<td data-label="Details">New exceptions: #` + strconv.Itoa(primaryPullRequestIndex) + `, #` + strconv.Itoa(secondaryPR.Number) + `; already covered: none. Confirmation reason: ` + thawReason + `.</td>`,
+	} {
+		if !strings.Contains(sharedThawRow, want) {
+			t.Fatalf("latest Shared-head thaw activity is missing %q", want)
+		}
+	}
+	if current := requireActiveFreezeEvidence(t, requirePage(t, ctx, browser, "/freezes")); current != activeFreeze {
+		t.Fatalf("confirmed shared-head approval changed the active freeze: before=%+v after=%+v", activeFreeze, current)
+	}
+
+	historicalStatusesAfter, err := listForgejoFreezeStatuses(ctx, forgejo, historicalThawedHeadSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(historicalStatusesAfter, historicalStatuses) {
+		t.Fatalf("historical thawed-SHA status evidence changed during shared-head confirmation: before=%+v after=%+v", historicalStatuses, historicalStatusesAfter)
+	}
+	if !strings.Contains(decisionsAfterConfirmation, historicalDecisionRow) || requireDecisionResultRowForHead(t, decisionsAfterConfirmation, historicalThawedHeadSHA) != historicalDecisionRow {
+		t.Fatal("historical thawed-SHA Eligible decision row changed during shared-head confirmation")
+	}
+	if !strings.Contains(activityAfterConfirmation, historicalThawRow) || requireLatestActivityRow(t, activityAfterConfirmation, "Single-PR thaw") != historicalThawRow {
+		t.Fatal("historical Single-PR thaw activity changed during shared-head confirmation")
+	}
+	requireOpenForgejoPullRequest(t, ctx, forgejo, primaryPullRequestIndex, fixturePrimaryPRTitle, sharedHeadSHA)
+	requireOpenForgejoPullRequest(t, ctx, forgejo, secondaryPR.Number, fixtureSharedHeadPRTitle, sharedHeadSHA)
 }
 
 func loadConfig(t *testing.T) e2eConfig {
@@ -672,11 +1052,7 @@ func provisionForgejoRepository(t *testing.T, ctx context.Context, forgejo *forg
 	requireAPIStatus(t, response, err, http.StatusCreated, "create Forgejo repository")
 
 	for _, branch := range []string{fixtureReleaseBranch, fixtureFeatureBranch} {
-		response, err = forgejo.do(ctx, http.MethodPost, forgejo.repositoryPath("branches"), map[string]any{
-			"new_branch_name": branch,
-			"old_ref_name":    "main",
-		})
-		requireAPIStatus(t, response, err, http.StatusCreated, "create Forgejo branch")
+		createForgejoBranch(t, ctx, forgejo, branch, "main")
 	}
 
 	createForgejoBranchProtection(t, ctx, forgejo, "main")
@@ -779,20 +1155,69 @@ func createForgejoWebhook(t *testing.T, ctx context.Context, forgejo *forgejoAPI
 	requireAPIStatus(t, response, err, http.StatusCreated, "create Forgejo webhook")
 }
 
-func createForgejoPullRequest(t *testing.T, ctx context.Context, forgejo *forgejoAPI) pullRequest {
+func createForgejoBranch(t *testing.T, ctx context.Context, forgejo *forgejoAPI, branch, sourceRef string) string {
 	t.Helper()
+	allowed := (sourceRef == "main" && (branch == fixtureReleaseBranch || branch == fixtureFeatureBranch)) ||
+		(sourceRef == fixtureFeatureBranch && branch == fixtureSharedHeadBranch)
+	if !allowed {
+		t.Fatalf("Forgejo branch creation %q from %q is not allowlisted", branch, sourceRef)
+	}
+	response, err := forgejo.do(ctx, http.MethodPost, forgejo.repositoryPath("branches"), map[string]any{
+		"new_branch_name": branch,
+		"old_ref_name":    sourceRef,
+	})
+	requireAPIStatus(t, response, err, http.StatusCreated, "create Forgejo branch "+branch)
+	var created forgejoBranch
+	decodeJSON(t, response.body, &created, "decode Forgejo branch "+branch)
+	created.Name = strings.TrimSpace(created.Name)
+	created.Commit.ID = strings.ToLower(strings.TrimSpace(created.Commit.ID))
+	if created.Name != branch || created.Commit.ID == "" {
+		t.Fatalf("Forgejo returned incomplete branch %q evidence: name=%q commit=%q", branch, created.Name, created.Commit.ID)
+	}
+	return created.Commit.ID
+}
+
+func createForgejoPullRequest(t *testing.T, ctx context.Context, forgejo *forgejoAPI, head, title string) pullRequest {
+	t.Helper()
+	allowed := (head == fixtureFeatureBranch && title == fixturePrimaryPRTitle) ||
+		(head == fixtureSharedHeadBranch && title == fixtureSharedHeadPRTitle)
+	if !allowed {
+		t.Fatalf("Forgejo pull request head %q and title %q are not allowlisted", head, title)
+	}
 	response, err := forgejo.do(ctx, http.MethodPost, forgejo.repositoryPath("pulls"), map[string]any{
-		"head":  fixtureFeatureBranch,
+		"head":  head,
 		"base":  "main",
-		"title": "Fictional release check",
+		"title": title,
 	})
 	requireAPIStatus(t, response, err, http.StatusCreated, "create Forgejo pull request")
 	var pr pullRequest
 	decodeJSON(t, response.body, &pr, "decode Forgejo pull request")
-	if pr.Number <= 0 || strings.TrimSpace(pr.Head.SHA) == "" {
-		t.Fatal("Forgejo pull request response is missing its number or head SHA")
+	normalizePullRequest(&pr)
+	if pr.Number <= 0 || pr.Title != title || pr.State != "open" || pr.Base.Ref != "main" || pr.Head.SHA == "" || pr.HTMLURL == "" {
+		t.Fatalf("Forgejo returned incomplete pull request evidence: number=%d title=%q state=%q base=%q head=%q", pr.Number, pr.Title, pr.State, pr.Base.Ref, pr.Head.SHA)
 	}
 	return pr
+}
+
+func requireOpenForgejoPullRequest(t *testing.T, ctx context.Context, forgejo *forgejoAPI, index int, title, headSHA string) pullRequest {
+	t.Helper()
+	response, err := forgejo.do(ctx, http.MethodGet, forgejo.repositoryPath("pulls", strconv.Itoa(index)), nil)
+	requireAPIStatus(t, response, err, http.StatusOK, "read Forgejo pull request")
+	var pr pullRequest
+	decodeJSON(t, response.body, &pr, "decode Forgejo pull request")
+	normalizePullRequest(&pr)
+	if pr.Number != index || pr.Title != title || pr.State != "open" || pr.Base.Ref != "main" || pr.Head.SHA != headSHA || pr.HTMLURL == "" {
+		t.Fatalf("unexpected open Forgejo PR #%d evidence: number=%d title=%q state=%q base=%q head=%q", index, pr.Number, pr.Title, pr.State, pr.Base.Ref, pr.Head.SHA)
+	}
+	return pr
+}
+
+func normalizePullRequest(pr *pullRequest) {
+	pr.Title = strings.TrimSpace(pr.Title)
+	pr.State = strings.ToLower(strings.TrimSpace(pr.State))
+	pr.HTMLURL = strings.TrimSpace(pr.HTMLURL)
+	pr.Base.Ref = strings.TrimSpace(pr.Base.Ref)
+	pr.Head.SHA = strings.ToLower(strings.TrimSpace(pr.Head.SHA))
 }
 
 func proveRestartPersistenceAndReconciliation(t *testing.T, ctx context.Context, forgejo *forgejoAPI, browser *thawguardBrowser, cfg e2eConfig, repositoryID int64, pr pullRequest) {
@@ -1417,22 +1842,25 @@ func requireProcessedVerifiedDelivery(t *testing.T, page, deliveryID string) {
 	}
 }
 
-func waitForOneNewProcessedSynchronizedDelivery(t *testing.T, ctx context.Context, browser *thawguardBrowser, repositoryID int64, beforeRows int) {
+func waitForOneNewProcessedPullRequestDelivery(t *testing.T, ctx context.Context, browser *thawguardBrowser, repositoryID int64, beforeRows int, action string) {
 	t.Helper()
+	if action != "opened" && action != "synchronized" {
+		t.Fatalf("pull request delivery action %q is not allowlisted", action)
+	}
 	webhookPath := "/webhooks?" + url.Values{
 		"repository_id": {strconv.FormatInt(repositoryID, 10)},
 		"event":         {"pull_request"},
 		"limit":         {"100"},
 	}.Encode()
 	expectedRows := beforeRows + 1
-	waitFor(t, 30*time.Second, "one new verified and processed synchronized delivery", func() (bool, error) {
+	waitFor(t, 30*time.Second, "one new verified and processed "+action+" delivery", func() (bool, error) {
 		page, err := browser.get(ctx, webhookPath)
 		if err != nil {
 			return false, err
 		}
 		rows := requirePageCount(t, page, webhookRowsPattern, "webhook rows")
 		if rows > expectedRows {
-			t.Fatalf("synchronized head advance changed webhook rows from %d to %d, want exactly %d", beforeRows, rows, expectedRows)
+			t.Fatalf("%s pull request delivery changed webhook rows from %d to %d, want exactly %d", action, beforeRows, rows, expectedRows)
 		}
 		if rows != expectedRows {
 			return false, nil
@@ -1440,7 +1868,7 @@ func waitForOneNewProcessedSynchronizedDelivery(t *testing.T, ctx context.Contex
 		latestRow := requireLatestWebhookDeliveryRow(t, page)
 		for _, want := range []string{
 			`<code>` + fixtureOwner + `/` + fixtureRepository + `</code>`,
-			`<td data-label="Event"><code>pull_request</code><small class="tg-muted">synchronized</small></td>`,
+			`<td data-label="Event"><code>pull_request</code><small class="tg-muted">` + action + `</small></td>`,
 			`>verified</span>`,
 			`>processed</span>`,
 			`<td data-label="Details">No processing error</td>`,
@@ -1481,6 +1909,14 @@ func countOpenPullRequestSyncEvents(page string) int {
 	return strings.Count(page, `<td data-label="Action">Open pull request sync</td>`)
 }
 
+func countSharedHeadThawEvents(page string) int {
+	return strings.Count(page, `<td data-label="Action">Shared-head thaw</td>`)
+}
+
+func countEligibleDecisionRows(page string) int {
+	return strings.Count(page, `<span class="status status-success">Eligible</span>`)
+}
+
 func waitForOneNewOpenPullRequestSync(t *testing.T, ctx context.Context, browser *thawguardBrowser, before int) string {
 	t.Helper()
 	expected := before + 1
@@ -1499,11 +1935,12 @@ func waitForOneNewOpenPullRequestSync(t *testing.T, ctx context.Context, browser
 	return activityPage
 }
 
-func requireLatestOpenPullRequestSync(t *testing.T, page string) {
+func requireLatestOpenPullRequestSync(t *testing.T, page string, expectedOpen int) {
 	t.Helper()
 	row := requireLatestActivityRow(t, page, "Open pull request sync")
-	if !strings.Contains(row, "1 open PRs synchronized; 0 cached PRs marked closed.") {
-		t.Fatal("latest forge sync did not confirm one real PR and zero invalid-signature cache entries")
+	want := strconv.Itoa(expectedOpen) + " open PRs synchronized; 0 cached PRs marked closed."
+	if !strings.Contains(row, want) {
+		t.Fatalf("latest forge sync did not contain %q", want)
 	}
 }
 
@@ -1755,6 +2192,28 @@ func requireLatestDecisionResultRow(t *testing.T, page string) string {
 		t.Fatal("latest thaw approval result row is incomplete")
 	}
 	return page[rowStart : rowStart+rowEndOffset+len("</tr>")]
+}
+
+func requireDecisionResultRowForHead(t *testing.T, page, headSHA string) string {
+	t.Helper()
+	sectionMarker := "<h2>Thaw approval results</h2>"
+	sectionStart := strings.Index(page, sectionMarker)
+	if sectionStart < 0 {
+		t.Fatal("decisions page is missing thaw approval results")
+	}
+	marker := `<code>` + html.EscapeString(headSHA) + `</code>`
+	markerOffset := strings.Index(page[sectionStart:], marker)
+	if markerOffset < 0 {
+		t.Fatalf("thaw approval results are missing head %q", headSHA)
+	}
+	markerIndex := sectionStart + markerOffset
+	rowStart := strings.LastIndex(page[sectionStart:markerIndex], "<tr>")
+	rowEndOffset := strings.Index(page[markerIndex:], "</tr>")
+	if rowStart < 0 || rowEndOffset < 0 {
+		t.Fatalf("thaw approval result for head %q is incomplete", headSHA)
+	}
+	rowStart += sectionStart
+	return page[rowStart : markerIndex+rowEndOffset+len("</tr>")]
 }
 
 func waitForLatestPostedPublicationAttempt(t *testing.T, ctx context.Context, browser *thawguardBrowser, headSHA, state, description string) {
@@ -2087,6 +2546,27 @@ func (b *thawguardBrowser) postFormResponse(ctx context.Context, path string, va
 	return apiResponse{statusCode: resp.StatusCode, body: body}, nil
 }
 
+func (b *thawguardBrowser) postFormNoRedirect(ctx context.Context, path string, values url.Values) (apiResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.baseURL+path, strings.NewReader(values.Encode()))
+	if err != nil {
+		return apiResponse{}, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", b.baseURL)
+	client := *b.client
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Do(req)
+	if err != nil {
+		return apiResponse{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return apiResponse{}, err
+	}
+	return apiResponse{statusCode: resp.StatusCode, body: body, location: resp.Header.Get("Location")}, nil
+}
+
 func requirePostForm(t *testing.T, ctx context.Context, browser *thawguardBrowser, path string, values url.Values, operation string) {
 	t.Helper()
 	_, err := browser.postForm(ctx, path, values)
@@ -2114,6 +2594,53 @@ func requireHiddenInput(t *testing.T, page, name string) string {
 	return html.UnescapeString(match[1])
 }
 
+func requireRenderedForm(t *testing.T, page, marker, label string) string {
+	t.Helper()
+	start := strings.Index(page, marker)
+	if start < 0 {
+		t.Fatalf("page is missing the %s form", label)
+	}
+	endOffset := strings.Index(page[start:], "</form>")
+	if endOffset < 0 {
+		t.Fatalf("%s form is incomplete", label)
+	}
+	return page[start : start+endOffset+len("</form>")]
+}
+
+func requireSharedHeadConfirmationRow(t *testing.T, page string, pullRequestIndex int) string {
+	t.Helper()
+	marker := `<td class="tg-shared-head-index">#` + strconv.Itoa(pullRequestIndex)
+	markerIndex := strings.Index(page, marker)
+	if markerIndex < 0 {
+		t.Fatalf("shared-head confirmation is missing PR #%d", pullRequestIndex)
+	}
+	rowStart := strings.LastIndex(page[:markerIndex], "<tr>")
+	rowEndOffset := strings.Index(page[markerIndex:], "</tr>")
+	if rowStart < 0 || rowEndOffset < 0 {
+		t.Fatalf("shared-head confirmation PR #%d row is incomplete", pullRequestIndex)
+	}
+	return page[rowStart : markerIndex+rowEndOffset+len("</tr>")]
+}
+
+func requireOnlyFormInputNames(t *testing.T, form string, expected []string) {
+	t.Helper()
+	matches := formInputNamePattern.FindAllStringSubmatch(form, -1)
+	totalInputs := strings.Count(strings.ToLower(form), "<input")
+	if len(matches) != len(expected) || totalInputs != len(expected) {
+		t.Fatalf("confirmation form rendered %d named inputs and %d total inputs, want %d", len(matches), totalInputs, len(expected))
+	}
+	names := make([]string, 0, len(matches))
+	for _, match := range matches {
+		names = append(names, html.UnescapeString(match[1]))
+	}
+	want := slices.Clone(expected)
+	slices.Sort(names)
+	slices.Sort(want)
+	if !slices.Equal(names, want) {
+		t.Fatalf("confirmation form inputs are %q, want only %q", names, want)
+	}
+}
+
 var (
 	nonzeroMatchingRows        = regexp.MustCompile(`Showing [1-9][0-9]* of [1-9][0-9]* matching rows`)
 	webhookRowsPattern         = regexp.MustCompile(`Showing ([0-9]+) of [0-9]+ matching rows`)
@@ -2124,6 +2651,7 @@ var (
 	activeFreezeBranchPattern  = regexp.MustCompile(`<code class="tg-branch">([^<]+)</code>`)
 	activeFreezeReasonPattern  = regexp.MustCompile(`<td class="tg-freeze-reason">([^<]+)</td>`)
 	activeFreezeStatusPattern  = regexp.MustCompile(`<span class="status status-frozen">([^<]+)</span>`)
+	formInputNamePattern       = regexp.MustCompile(`(?i)<input\b[^>]*\bname="([^"]+)"[^>]*>`)
 )
 
 func requireAPIStatus(t *testing.T, response apiResponse, err error, expected int, operation string) {
