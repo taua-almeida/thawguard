@@ -173,8 +173,14 @@ type BranchFreeze struct {
 	StartsAt       *time.Time
 	EndsAt         *time.Time
 	PlannedEndsAt  *time.Time
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	// CreatedByUserID references the user who started or scheduled the
+	// freeze; NULL survives user deletion (ON DELETE SET NULL), so
+	// CreatedByKind keeps removed users distinguishable from actors that
+	// never had a user row.
+	CreatedByUserID *int64
+	CreatedByKind   string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 type ThawException struct {

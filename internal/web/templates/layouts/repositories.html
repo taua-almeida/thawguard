@@ -1,18 +1,3 @@
-{{ define "layouts/repositories" }}<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{ .AppName }}</title>
-  <link rel="stylesheet" href="/static/thawguard.css">
-</head>
-<body>
-  {{ template "components/icons" }}
-  <div class="tg-app">
-{{ template "components/app-sidebar" . }}
-    <div class="tg-content">
+{{ define "layouts/repositories" }}{{ template "shell/start" . }}
 {{ template "pages/repositories" . }}
-{{ template "components/confirmation-dialog" }}
-  </div></div>
-{{ template "components/page-scripts" }}
-</body></html>{{ end }}
+{{ template "shell/end" . }}{{ end }}

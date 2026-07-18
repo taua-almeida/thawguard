@@ -1,14 +1,17 @@
 {{ define "components/repository-filters" }}
-    <div class="tg-repo-filterbar">
-      <form method="get" action="/repositories" class="tg-repo-search" role="search" aria-label="Search repositories">
-        <svg class="tg-icon" aria-hidden="true"><use href="#tg-i-search"></use></svg>
-        <input type="search" name="q" value="{{ .Filter.Query }}" placeholder="Search owner/name" aria-label="Search repositories by owner or name">
-        {{ if .Filter.State }}<input type="hidden" name="state" value="{{ .Filter.State }}">{{ end }}
-        <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm">Search</button>
-      </form>
-      <nav class="tg-state-chips" aria-label="Filter repositories by lifecycle state">
-        {{ range .StateChips }}
-        <a class="tg-state-chip{{ if .Selected }} is-selected{{ end }}" href="{{ .URL }}"{{ if .Selected }} aria-current="true"{{ end }}>{{ .Label }} <span class="tg-state-chip-count">{{ .Count }}</span></a>
-        {{ end }}
-      </nav>
-    </div>{{ end }}
+<div class="flex flex-wrap items-center gap-3">
+  <form method="get" action="/repositories" role="search" aria-label="Search repositories" class="flex items-center gap-2">
+    <div class="relative">
+      <svg class="pointer-events-none absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-text-muted" aria-hidden="true"><use href="#tg-i-search"></use></svg>
+      <input type="search" name="q" value="{{ .Filter.Query }}" placeholder="Search owner/name" aria-label="Search repositories by owner or name" class="h-(--control-height) w-64 max-w-full rounded-control border border-border-input bg-surface pr-3 pl-9 text-sm text-text placeholder:text-text-muted">
+    </div>
+    {{ if .Filter.State }}<input type="hidden" name="state" value="{{ .Filter.State }}">{{ end }}
+    {{ template "ui/button" dict "Label" "Search" "Variant" "secondary" "Type" "submit" }}
+  </form>
+  <nav class="flex flex-wrap items-center gap-1.5" aria-label="Filter repositories by lifecycle state">
+    {{ range .StateChips }}
+    {{ template "ui/chip" dict "Label" .Label "Href" .URL "Active" .Selected "Count" (printf "%d" .Count) }}
+    {{ end }}
+  </nav>
+</div>
+{{ end }}

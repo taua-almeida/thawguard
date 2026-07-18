@@ -1,0 +1,18 @@
+{{/*
+  ui/badge — replaces .tg-badge / .tg-badge-info / .tg-badge-scheduled / .tg-badge-lock / .status-*
+  dict keys: Label (required), Tone neutral|info|success|warning|danger|frozen|scheduled
+  (default neutral), Icon (sprite id, optional)
+*/}}
+{{ define "ui/badge" }}
+{{- $tone := "neutral" }}{{ if .Tone }}{{ $tone = .Tone }}{{ end }}
+{{- $classes := "inline-flex items-center gap-1.5 rounded-pill px-2.5 py-0.5 text-xs font-semibold" }}
+{{- if eq $tone "info" }}{{ $classes = printf "%s %s" $classes "bg-accent-soft text-accent-strong" }}
+{{- else if eq $tone "success" }}{{ $classes = printf "%s %s" $classes "bg-success-soft text-success" }}
+{{- else if eq $tone "warning" }}{{ $classes = printf "%s %s" $classes "bg-warning-soft text-warning" }}
+{{- else if eq $tone "danger" }}{{ $classes = printf "%s %s" $classes "bg-danger-soft text-danger" }}
+{{- else if eq $tone "frozen" }}{{ $classes = printf "%s %s" $classes "bg-frozen-soft text-frozen" }}
+{{- else if eq $tone "scheduled" }}{{ $classes = printf "%s %s" $classes "bg-scheduled-soft text-scheduled" }}
+{{- else }}{{ $classes = printf "%s %s" $classes "bg-neutral-soft text-text-muted" }}
+{{- end -}}
+<span class="{{ $classes }}">{{ if .Icon }}<svg class="h-3.5 w-3.5" aria-hidden="true"><use href="#{{ .Icon }}"></use></svg>{{ end }}{{ .Label }}</span>
+{{- end }}

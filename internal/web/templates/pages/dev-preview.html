@@ -1,0 +1,135 @@
+{{/*
+  pages/dev-preview — dev-only component gallery. Renders every primitive in
+  templates/components/primitives/ inside the real app shell so themes and
+  breakpoints can be reviewed together. Fictional data only.
+*/}}
+{{ define "pages/dev-preview" }}
+<header class="mb-6">
+  <h1 class="m-0 text-page-title font-bold text-text">Component gallery</h1>
+  <p class="m-0 mt-1 text-sm text-text-muted">Dev-only preview of the Phase 0 design system. Not reachable in production.</p>
+  <div class="mt-3 flex gap-2">
+    {{ template "ui/chip" dict "Label" "System theme" "Href" "/dev/preview" "Active" (eq .Theme "") }}
+    {{ template "ui/chip" dict "Label" "Light" "Href" "/dev/preview?theme=light" "Active" (eq .Theme "light") }}
+    {{ template "ui/chip" dict "Label" "Dark" "Href" "/dev/preview?theme=dark" "Active" (eq .Theme "dark") }}
+  </div>
+</header>
+
+<div class="flex flex-col gap-8">
+
+  <section>
+    <h2 class="mb-3 text-section-title font-bold tracking-wide text-text-muted uppercase">Buttons</h2>
+    <div class="flex flex-wrap items-center gap-3">
+      {{ template "ui/button" dict "Label" "Start freeze" "Variant" "primary" "Icon" "tg-i-freeze-branch" }}
+      {{ template "ui/button" dict "Label" "Secondary" "Variant" "secondary" }}
+      {{ template "ui/button" dict "Label" "End freeze" "Variant" "danger" }}
+      {{ template "ui/button" dict "Label" "Ghost" "Variant" "ghost" }}
+      {{ template "ui/button" dict "Label" "Small" "Variant" "secondary" "Size" "sm" }}
+      {{ template "ui/button" dict "Label" "Disabled" "Variant" "primary" "Disabled" true }}
+      {{ template "ui/button" dict "Label" "Close" "Variant" "secondary" "Size" "sm" "Icon" "tg-i-close" "IconOnly" true }}
+      {{ template "ui/button" dict "Label" "Link button" "Variant" "secondary" "Href" "/dev/preview" }}
+    </div>
+  </section>
+
+  <section>
+    <h2 class="mb-3 text-section-title font-bold tracking-wide text-text-muted uppercase">Badges</h2>
+    <div class="flex flex-wrap items-center gap-3">
+      {{ template "ui/badge" dict "Label" "Neutral" }}
+      {{ template "ui/badge" dict "Label" "Info" "Tone" "info" }}
+      {{ template "ui/badge" dict "Label" "Success" "Tone" "success" }}
+      {{ template "ui/badge" dict "Label" "Warning" "Tone" "warning" }}
+      {{ template "ui/badge" dict "Label" "Danger" "Tone" "danger" }}
+      {{ template "ui/badge" dict "Label" "Frozen" "Tone" "frozen" "Icon" "tg-i-lock" }}
+      {{ template "ui/badge" dict "Label" "Scheduled" "Tone" "scheduled" "Icon" "tg-i-schedule" }}
+    </div>
+  </section>
+
+  <section>
+    <h2 class="mb-3 text-section-title font-bold tracking-wide text-text-muted uppercase">Chips</h2>
+    <div class="flex flex-wrap items-center gap-2">
+      {{ template "ui/chip" dict "Label" "Active" "Href" "/dev/preview" "Active" true }}
+      {{ template "ui/chip" dict "Label" "Frozen" "Href" "/dev/preview" "Count" "3" }}
+      {{ template "ui/chip" dict "Label" "Thawed" "Href" "/dev/preview" "Count" "12" }}
+      {{ template "ui/chip" dict "Label" "Static chip" }}
+    </div>
+  </section>
+
+  <section>
+    <h2 class="mb-3 text-section-title font-bold tracking-wide text-text-muted uppercase">Callouts</h2>
+    <div class="flex flex-col gap-3">
+      {{ template "ui/callout" dict "Title" "Cooperative enforcement" "Body" "Thawguard posts commit statuses; it does not replace forge branch protection." }}
+      {{ template "ui/callout" dict "Tone" "success" "Title" "Setup check passed" "Body" "aurora/ice-station is ready for enforcement." }}
+      {{ template "ui/callout" dict "Tone" "warning" "Title" "Webhook secret missing" "Body" "Deliveries for glacier/perma-lab cannot be verified until a secret is set." }}
+      {{ template "ui/callout" dict "Tone" "danger" "Title" "Status posting failed" "Body" "The forge rejected the last status update. Check the repository token." }}
+    </div>
+  </section>
+
+  <section>
+    <h2 class="mb-3 text-section-title font-bold tracking-wide text-text-muted uppercase">Toasts</h2>
+    <p class="mt-0 mb-3 text-xs text-text-muted">Two live toasts render in the #toasts region at the top of this page. All tones:</p>
+    <div class="flex flex-col gap-2">
+      {{ template "ui/toast" dict "Message" "Freeze started for aurora/ice-station." "Tone" "success" "DismissHref" "/dev/preview" }}
+      {{ template "ui/toast" dict "Message" "Reconciliation is running in the background." "Tone" "info" }}
+      {{ template "ui/toast" dict "Message" "Webhook secret not verified yet." "Tone" "warning" "DismissHref" "/dev/preview" }}
+      {{ template "ui/toast" dict "Message" "Could not reach the forge API." "Tone" "danger" "DismissHref" "/dev/preview" }}
+    </div>
+  </section>
+
+  <section>
+    <h2 class="mb-3 text-section-title font-bold tracking-wide text-text-muted uppercase">Cards &amp; stats</h2>
+    <div class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+      {{ template "ui/stat-card" dict "Label" "Active freezes" "Value" "3" "Tone" "frozen" "Hint" "2 repositories" }}
+      {{ template "ui/stat-card" dict "Label" "Scheduled" "Value" "1" "Tone" "scheduled" "Hint" "Starts 2026-07-20" }}
+      {{ template "ui/stat-card" dict "Label" "Open thaw requests" "Value" "2" "Tone" "warning" }}
+      {{ template "ui/stat-card" dict "Label" "Publications today" "Value" "48" "Tone" "success" }}
+    </div>
+    <div class="mt-4">
+      {{ template "ui/card" dict "Title" "About freezes" "Body" "A freeze marks a branch as closed for merging. Thawguard publishes the state as a commit status on open pull requests." }}
+    </div>
+  </section>
+
+  <section>
+    <h2 class="mb-3 text-section-title font-bold tracking-wide text-text-muted uppercase">Table</h2>
+    {{ template "ui/table" dict "Caption" "Fictional repositories" "Headers" .TableHeaders "Rows" .TableRows }}
+    <div class="mt-4">
+      {{ template "ui/table" dict "Caption" "Empty table" "Headers" .TableHeaders "Empty" "No repositories connected yet." }}
+    </div>
+  </section>
+
+  <section>
+    <h2 class="mb-3 text-section-title font-bold tracking-wide text-text-muted uppercase">Empty state</h2>
+    {{ template "ui/empty-state" dict "Title" "No freezes yet" "Hint" "When you freeze a branch it will appear here with its repository and duration." "ActionLabel" "Start a freeze" "ActionHref" "/dev/preview" }}
+  </section>
+
+  <section>
+    <h2 class="mb-3 text-section-title font-bold tracking-wide text-text-muted uppercase">Form controls</h2>
+    <div class="grid max-w-2xl grid-cols-1 gap-4">
+      {{ template "ui/input" dict "ID" "gallery-name" "Name" "name" "Label" "Freeze name" "Placeholder" "Release 2.4 code freeze" "Hint" "Shown on commit statuses and in the activity log." "Required" true }}
+      {{ template "ui/input" dict "ID" "gallery-branch" "Name" "branch" "Label" "Branch" "Value" "release/2.4" "Mono" true }}
+      {{ template "ui/input" dict "ID" "gallery-error" "Name" "email" "Label" "Email" "Type" "email" "Value" "mira.frost@" "Error" "Enter a full email address." }}
+      {{ template "ui/input" dict "ID" "gallery-disabled" "Name" "locked" "Label" "Disabled input" "Value" "Managed by the environment" "Disabled" true }}
+      {{ template "ui/select" dict "ID" "gallery-repo" "Name" "repository" "Label" "Repository" "Hint" "Native select; a JS listbox is deliberately deferred." "Options" .SelectOpts }}
+      {{ template "ui/field" dict "ID" "gallery-notes" "Label" "Notes" "Hint" "Custom control via ui/field." "Control" .FieldControl }}
+      <div class="flex flex-col gap-2.5">
+        {{ template "ui/checkbox" dict "ID" "gallery-check-1" "Name" "can_freeze" "Label" "Can freeze" "Hint" "May start and end freezes." "Checked" true }}
+        {{ template "ui/checkbox" dict "ID" "gallery-check-2" "Name" "can_thaw" "Label" "Can approve thaws" }}
+        {{ template "ui/checkbox" dict "ID" "gallery-check-3" "Name" "is_admin" "Label" "Administrator" "Hint" "Locked for the last remaining admin." "Checked" true "Disabled" true }}
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2 class="mb-3 text-section-title font-bold tracking-wide text-text-muted uppercase">Modal</h2>
+    {{ template "ui/button" dict "Label" "End freeze…" "Variant" "danger" "DialogTarget" "gallery-modal" }}
+    {{ template "ui/modal" dict "ID" "gallery-modal" "Title" "End freeze on aurora/ice-station?" "Body" "Open pull requests will get a success status within a minute. This is recorded in the audit log." "ConfirmLabel" "End freeze" "ConfirmVariant" "danger" }}
+  </section>
+
+  <section>
+    <h2 class="mb-3 text-section-title font-bold tracking-wide text-text-muted uppercase">Stepper &amp; lifecycle</h2>
+    <div class="grid grid-cols-1 gap-6 md:grid-cols-2">
+      <div>{{ template "ui/stepper" . }}</div>
+      <div>{{ template "ui/lifecycle" . }}</div>
+    </div>
+  </section>
+
+</div>
+{{ end }}

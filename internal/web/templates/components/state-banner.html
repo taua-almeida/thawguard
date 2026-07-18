@@ -1,30 +1,30 @@
 {{ define "components/state-banner" }}
-        {{ if .Repository.EnforcementActive }}
-        <div class="tg-state-banner is-active">
-          <svg class="tg-icon" aria-hidden="true"><use href="#tg-i-icy-shield"></use></svg>
-          <p>Enforcement is active{{ if .StatusPostVerifiedAt }}; status posting last verified at {{ .StatusPostVerifiedAt }}{{ end }}. Freezes, schedules, and thaw approvals publish <code>{{ .RequiredContext }}</code> statuses for this repository.</p>
-        </div>
-        {{ else if .IsReady }}
-        <div class="tg-state-banner is-ready">
-          <svg class="tg-icon" aria-hidden="true"><use href="#tg-i-check"></use></svg>
-          <p>Status posting verified{{ if .StatusPostVerifiedAt }} at {{ .StatusPostVerifiedAt }}{{ end }} with a controlled <code>{{ .SetupStatusContext }}</code> status. Ready to activate — enforcement stays off until an admin explicitly activates it.</p>
-        </div>
-        {{ else if .IsUnhealthy }}
-        <div class="tg-state-banner is-unhealthy">
-          <svg class="tg-icon" aria-hidden="true"><use href="#tg-i-warning"></use></svg>
-          <div>
-            <p class="error">Enforcement is unhealthy{{ if .Repository.EnforcementFailureReason }}: {{ .Repository.EnforcementFailureReason }}{{ if .EnforcementFailedAt }} ({{ .EnforcementFailedAt }}){{ end }}{{ else }}: the last enforcement run failed{{ end }}. Freeze, schedule, and thaw actions stay disabled while recovery reruns the complete enforcement proof.</p>
-            {{ if .RecoveryInProgress }}
-            <p class="tg-muted">Recovery in progress. Attempt count: {{ .RecoveryAttempts }}.</p>
-            {{ else }}
-            <p class="tg-muted">Automatic recovery is pending. Attempt count: {{ .RecoveryAttempts }}{{ if .NextRecoveryAt }}. Next retry: {{ .NextRecoveryAt }}{{ end }}.</p>
-            {{ end }}
-            <p class="tg-muted">{{ .FailureRemediation }}</p>
-          </div>
-        </div>
-        {{ else }}
-        <div class="tg-state-banner is-setup">
-          <svg class="tg-icon" aria-hidden="true"><use href="#tg-i-warning"></use></svg>
-          <p>This repository cannot enforce freezes, schedules, or thaws. Readiness checks are read-only; status posting is not tested until the controlled verification below.</p>
-        </div>
-        {{ end }}{{ end }}
+{{ if .Repository.EnforcementActive }}
+<div class="flex w-full items-start gap-3 rounded-card border-l-4 border-accent bg-accent-soft p-3.5 text-accent-strong">
+  <svg class="mt-0.5 h-4 w-4 flex-none" aria-hidden="true"><use href="#tg-i-icy-shield"></use></svg>
+  <p class="m-0 text-sm text-text">Enforcement is active{{ if .StatusPostVerifiedAt }}; status posting last verified at {{ .StatusPostVerifiedAt }}{{ end }}. Freezes, schedules, and thaw approvals publish <code>{{ .RequiredContext }}</code> statuses for this repository.</p>
+</div>
+{{ else if .IsReady }}
+<div class="flex w-full items-start gap-3 rounded-card border-l-4 border-success bg-success-soft p-3.5 text-success">
+  <svg class="mt-0.5 h-4 w-4 flex-none" aria-hidden="true"><use href="#tg-i-check"></use></svg>
+  <p class="m-0 text-sm text-text">Status posting verified{{ if .StatusPostVerifiedAt }} at {{ .StatusPostVerifiedAt }}{{ end }} with a controlled <code>{{ .SetupStatusContext }}</code> status. Ready to activate — enforcement stays off until an admin explicitly activates it.</p>
+</div>
+{{ else if .IsUnhealthy }}
+<div class="flex w-full items-start gap-3 rounded-card border-l-4 border-danger bg-danger-soft p-3.5 text-danger">
+  <svg class="mt-0.5 h-4 w-4 flex-none" aria-hidden="true"><use href="#tg-i-warning"></use></svg>
+  <div class="text-sm">
+    <p class="m-0 font-bold">Enforcement is unhealthy{{ if .Repository.EnforcementFailureReason }}: {{ .Repository.EnforcementFailureReason }}{{ if .EnforcementFailedAt }} ({{ .EnforcementFailedAt }}){{ end }}{{ else }}: the last enforcement run failed{{ end }}. Freeze, schedule, and thaw actions stay disabled while recovery reruns the complete enforcement proof.</p>
+    {{ if .RecoveryInProgress }}
+    <p class="m-0 mt-1 text-text-muted">Recovery in progress. Attempt count: {{ .RecoveryAttempts }}.</p>
+    {{ else }}
+    <p class="m-0 mt-1 text-text-muted">Automatic recovery is pending. Attempt count: {{ .RecoveryAttempts }}{{ if .NextRecoveryAt }}. Next retry: {{ .NextRecoveryAt }}{{ end }}.</p>
+    {{ end }}
+    <p class="m-0 mt-1 text-text-muted">{{ .FailureRemediation }}</p>
+  </div>
+</div>
+{{ else }}
+<div class="flex w-full items-start gap-3 rounded-card border-l-4 border-warning bg-warning-soft p-3.5 text-warning">
+  <svg class="mt-0.5 h-4 w-4 flex-none" aria-hidden="true"><use href="#tg-i-warning"></use></svg>
+  <p class="m-0 text-sm text-text">This repository cannot enforce freezes, schedules, or thaws. Readiness checks are read-only; status posting is not tested until the controlled verification below.</p>
+</div>
+{{ end }}{{ end }}

@@ -1,0 +1,34 @@
+{{/*
+  auth/start + auth/end — centered-card layout for signed-out pages
+  (login, first-run setup). No scripts: auth pages are plain forms.
+  Expected view fields: AppName, PageTitle, Theme ("" | "dark" | "light").
+*/}}
+{{ define "auth/start" }}<!doctype html>
+<html lang="en"{{ with .Theme }} data-theme="{{ . }}"{{ end }}>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ with .PageTitle }}{{ . }} · {{ end }}{{ .AppName }}</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  {{ template "components/icons" }}
+  <main class="flex min-h-dvh items-center justify-center p-6">
+    <div class="w-[min(24rem,100%)]">
+      <div class="mb-5 flex items-center justify-center gap-2.5">
+        <svg class="h-7 w-7 flex-none text-accent" aria-hidden="true"><use href="#tg-i-icy-shield"></use></svg>
+        <span class="text-lg font-bold text-text">{{ .AppName }}</span>
+      </div>
+      <div class="rounded-panel border border-border bg-surface p-6 shadow-card">
+{{ end }}
+
+{{ define "auth/end" }}
+      </div>
+      <p class="mt-4 flex items-center justify-center gap-1.5 text-center text-xs text-text-muted">
+        <span class="size-1.5 rounded-pill bg-accent" aria-hidden="true"></span>
+        Cooperative enforcement — status checks, not a security boundary
+      </p>
+    </div>
+  </main>
+</body>
+</html>{{ end }}

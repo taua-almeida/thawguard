@@ -1,0 +1,14 @@
+{{/*
+  ui/chip — replaces .tg-chip / .tg-state-chip / .tg-state-chips / .tg-state-chip-count
+  Filter chip (link when Href set, static span otherwise) with optional count.
+  dict keys: Label (required), Href, Active (bool), Count (string or number)
+*/}}
+{{ define "ui/chip" }}
+{{- $classes := "inline-flex items-center gap-1.5 rounded-pill border px-3 py-1 text-xs font-semibold no-underline" }}
+{{- if .Active }}{{ $classes = printf "%s %s" $classes "border-accent bg-accent-soft text-accent-strong" }}{{ else }}{{ $classes = printf "%s %s" $classes "border-border text-text-muted hover:text-text" }}{{ end }}
+{{- if .Href }}
+<a class="{{ $classes }}" href="{{ .Href }}"{{ if .Active }} aria-current="true"{{ end }}>{{ .Label }}{{ if .Count }}<span class="rounded-pill bg-neutral-soft px-1.5 text-[0.65rem] text-text-muted">{{ .Count }}</span>{{ end }}</a>
+{{- else }}
+<span class="{{ $classes }}">{{ .Label }}{{ if .Count }}<span class="rounded-pill bg-neutral-soft px-1.5 text-[0.65rem] text-text-muted">{{ .Count }}</span>{{ end }}</span>
+{{- end }}
+{{ end }}

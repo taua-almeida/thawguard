@@ -1,0 +1,2 @@
+{{/* Dev-only auth-layout preview. Route exists only when DevMode is on. */}}
+{{ define "layouts/dev-preview-auth" }}{{ template "auth/start" . }}{{ template "pages/dev-preview-auth" . }}{{ template "auth/end" . }}{{ end }}

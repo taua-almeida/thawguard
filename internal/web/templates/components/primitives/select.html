@@ -1,0 +1,23 @@
+{{/*
+  ui/select — replaces the native selects in the freeze form (repository/branch)
+  and the audit rows-per-page selector. Always a styled NATIVE <select>;
+  a JS listbox/dropdown is deliberately deferred.
+  dict/data keys: ID (required), Name (required), Label (required), Hint, Error,
+  Required (bool), Disabled (bool), Options: slice with .Value .Label .Selected
+*/}}
+{{ define "ui/select" }}
+<div class="flex flex-col gap-1.5">
+  <label for="{{ .ID }}" class="text-sm font-semibold text-text">{{ .Label }}{{ if .Required }}<span class="text-danger" aria-hidden="true"> *</span>{{ end }}</label>
+  {{ if .Hint }}<p id="{{ .ID }}-hint" class="m-0 text-xs text-text-muted">{{ .Hint }}</p>{{ end }}
+  <select
+    id="{{ .ID }}"
+    name="{{ .Name }}"
+    class="h-(--control-height) w-full rounded-control border bg-surface px-3 text-sm text-text disabled:bg-surface-muted disabled:opacity-60 {{ if .Error }}border-danger{{ else }}border-border-input{{ end }}"
+    {{- if .Required }} required{{ end }}
+    {{- if .Disabled }} disabled{{ end }}
+    {{- if .Error }} aria-invalid="true" aria-describedby="{{ .ID }}-error"{{ else if .Hint }} aria-describedby="{{ .ID }}-hint"{{ end }}>
+    {{ range .Options }}<option value="{{ .Value }}"{{ if .Selected }} selected{{ end }}>{{ .Label }}</option>{{ end }}
+  </select>
+  {{ if .Error }}<p id="{{ .ID }}-error" class="m-0 text-xs font-semibold text-danger">{{ .Error }}</p>{{ end }}
+</div>
+{{ end }}

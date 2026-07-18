@@ -1,0 +1,114 @@
+{{/*
+  shell/start + shell/end — the responsive app shell for signed-in pages.
+  >= 64rem: full grouped sidebar; 48-64rem: icon rail; < 48rem: top bar + chip
+  rail (breakpoint behavior lives in web/styles/app.css @layer components).
+
+  Expected view fields (names match the legacy layouts so pages migrate by
+  swapping the layout define only):
+    AppName, PageTitle, Theme ("" | "dark" | "light"), ActivePage,
+    CurrentUser (currentUserView), CSRFField, CSRFToken,
+    Toasts (slice with Message/Tone/DismissHref, rendered via ui/toast).
+
+  ActivePage keys: dashboard, freezes, scheduled, thaws, repositories,
+  activity, publications, webhooks, users.
+*/}}
+{{ define "shell/nav-item" }}<a class="shell-nav-item{{ if eq .Key .Active }} is-active{{ end }}" href="{{ .Href }}"{{ if eq .Key .Active }} aria-current="page"{{ end }}><svg aria-hidden="true"><use href="#{{ .Icon }}"></use></svg><span class="shell-nav-label">{{ .Label }}</span></a>{{ end }}
+
+{{ define "shell/chip-item" }}<a href="{{ .Href }}"{{ if eq .Key .Active }} aria-current="page"{{ end }}>{{ .Label }}</a>{{ end }}
+
+{{ define "shell/nav" }}
+        <p class="shell-nav-group-title">Overview</p>
+        {{ template "shell/nav-item" dict "Href" "/" "Icon" "tg-i-dashboard" "Label" "Dashboard" "Key" "dashboard" "Active" .ActivePage }}
+        <p class="shell-nav-group-title">Freeze control</p>
+        {{ template "shell/nav-item" dict "Href" "/freezes" "Icon" "tg-i-freeze-branch" "Label" "Freezes" "Key" "freezes" "Active" .ActivePage }}
+        {{ template "shell/nav-item" dict "Href" "/scheduled-freezes" "Icon" "tg-i-schedule" "Label" "Scheduled Freezes" "Key" "scheduled" "Active" .ActivePage }}
+        {{ template "shell/nav-item" dict "Href" "/decisions" "Icon" "tg-i-thaw-drop" "Label" "Thaw Requests" "Key" "thaws" "Active" .ActivePage }}
+        <p class="shell-nav-group-title">Setup</p>
+        {{ template "shell/nav-item" dict "Href" "/repositories" "Icon" "tg-i-repositories" "Label" "Repositories" "Key" "repositories" "Active" .ActivePage }}
+        <p class="shell-nav-group-title">Observability</p>
+        {{ template "shell/nav-item" dict "Href" "/activity" "Icon" "tg-i-activity" "Label" "Activity" "Key" "activity" "Active" .ActivePage }}
+        {{ template "shell/nav-item" dict "Href" "/publications" "Icon" "tg-i-audit" "Label" "Publications" "Key" "publications" "Active" .ActivePage }}
+        {{ template "shell/nav-item" dict "Href" "/webhooks" "Icon" "tg-i-health-check" "Label" "System Log" "Key" "webhooks" "Active" .ActivePage }}
+        {{ if .CurrentUser.IsAdmin }}
+        <p class="shell-nav-group-title">Admin</p>
+        {{ template "shell/nav-item" dict "Href" "/users" "Icon" "tg-i-users" "Label" "Users & Roles" "Key" "users" "Active" .ActivePage }}
+        {{ end }}
+{{ end }}
+
+{{ define "shell/start" }}<!doctype html>
+<html lang="en"{{ with .Theme }} data-theme="{{ . }}"{{ end }}>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ with .PageTitle }}{{ . }} · {{ end }}{{ .AppName }}</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/js/htmx.min.js" defer integrity="sha384-H5SrcfygHmAuTDZphMHqBJLc3FhssKjG7w/CeCpFReSfwBWDTKpkzPP8c+cLsK+V"></script>
+  <script src="/static/js/main.js" type="module"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  {{ template "components/icons" }}
+  <div class="shell">
+    <aside class="shell-sidebar" aria-label="Primary navigation">
+      <a class="flex items-center gap-2.5 px-2 font-bold text-text no-underline" href="/" aria-label="{{ .AppName }} dashboard">
+        <svg class="h-6 w-6 flex-none text-accent" aria-hidden="true"><use href="#tg-i-icy-shield"></use></svg>
+        <span class="shell-brand-name">{{ .AppName }}</span>
+      </a>
+      <nav class="mt-2 flex flex-col gap-0.5" aria-label="Primary">
+{{ template "shell/nav" . }}
+      </nav>
+      <div class="shell-user mt-auto border-t border-border pt-3 text-xs">
+        {{ if .CurrentUser.Email }}
+        <p class="m-0 font-bold text-text">{{ .CurrentUser.DisplayName }}</p>
+        <p class="m-0 truncate text-text-muted">{{ .CurrentUser.Email }}</p>
+        <p class="m-0 mt-1">{{ template "ui/badge" dict "Label" .CurrentUser.RoleLabel "Tone" "info" }}</p>
+        <div class="mt-2 flex flex-col gap-1.5">
+          {{ if .CurrentUser.CanChangePassword }}<a class="font-semibold text-accent-strong no-underline hover:underline" href="/account/password">Change password</a>{{ end }}
+          <form method="post" action="/logout">
+            <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+            <button type="submit" class="cursor-pointer border-0 bg-transparent p-0 font-semibold text-text-muted hover:text-text">Log out</button>
+          </form>
+        </div>
+        {{ end }}
+        <p class="m-0 mt-3 flex items-center gap-1.5 text-text-muted">
+          <span class="size-1.5 rounded-pill bg-accent" aria-hidden="true"></span>
+          Cooperative enforcement
+        </p>
+      </div>
+    </aside>
+    <div class="min-w-0">
+      <header class="shell-topbar">
+        <a class="flex items-center gap-2 font-bold text-text no-underline" href="/" aria-label="{{ .AppName }} dashboard">
+          <svg class="h-5 w-5 flex-none text-accent" aria-hidden="true"><use href="#tg-i-icy-shield"></use></svg>
+          {{ .AppName }}
+        </a>
+        {{ if .CurrentUser.Email }}
+        <form method="post" action="/logout" class="m-0">
+          <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+          <button type="submit" class="cursor-pointer border-0 bg-transparent p-0 text-xs font-semibold text-text-muted">Log out</button>
+        </form>
+        {{ end }}
+      </header>
+      <nav class="shell-chiprail" aria-label="Primary">
+        {{ template "shell/chip-item" dict "Href" "/" "Label" "Dashboard" "Key" "dashboard" "Active" .ActivePage }}
+        {{ template "shell/chip-item" dict "Href" "/freezes" "Label" "Freezes" "Key" "freezes" "Active" .ActivePage }}
+        {{ template "shell/chip-item" dict "Href" "/scheduled-freezes" "Label" "Scheduled" "Key" "scheduled" "Active" .ActivePage }}
+        {{ template "shell/chip-item" dict "Href" "/decisions" "Label" "Thaws" "Key" "thaws" "Active" .ActivePage }}
+        {{ template "shell/chip-item" dict "Href" "/repositories" "Label" "Repositories" "Key" "repositories" "Active" .ActivePage }}
+        {{ template "shell/chip-item" dict "Href" "/activity" "Label" "Activity" "Key" "activity" "Active" .ActivePage }}
+        {{ template "shell/chip-item" dict "Href" "/publications" "Label" "Publications" "Key" "publications" "Active" .ActivePage }}
+        {{ template "shell/chip-item" dict "Href" "/webhooks" "Label" "System Log" "Key" "webhooks" "Active" .ActivePage }}
+        {{ if .CurrentUser.IsAdmin }}{{ template "shell/chip-item" dict "Href" "/users" "Label" "Users" "Key" "users" "Active" .ActivePage }}{{ end }}
+      </nav>
+      <main id="main" class="shell-main">
+        <div id="toasts" class="flex flex-col gap-2{{ if .Toasts }} mb-4{{ end }}">
+          {{ range .Toasts }}{{ template "ui/toast" . }}{{ end }}
+        </div>
+{{ end }}
+
+{{ define "shell/end" }}
+      </main>
+    </div>
+  </div>
+</body>
+</html>{{ end }}

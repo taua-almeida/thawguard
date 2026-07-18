@@ -1,0 +1,26 @@
+{{/*
+  ui/input — replaces raw <input> rows inside .tg-compact-field / setup + freeze forms
+  Full field: label + hint + control + error. Border uses --color-border-input
+  (the only border token that meets WCAG 1.4.11 for form controls).
+  dict keys: ID (required), Name (required), Label (required), Type (default text),
+  Value, Placeholder, Autocomplete, Hint, Error, Required (bool), Disabled (bool),
+  Mono (bool, monospace value e.g. tokens/branch names)
+*/}}
+{{ define "ui/input" }}
+<div class="flex flex-col gap-1.5">
+  <label for="{{ .ID }}" class="text-sm font-semibold text-text">{{ .Label }}{{ if .Required }}<span class="text-danger" aria-hidden="true"> *</span>{{ end }}</label>
+  {{ if .Hint }}<p id="{{ .ID }}-hint" class="m-0 text-xs text-text-muted">{{ .Hint }}</p>{{ end }}
+  <input
+    id="{{ .ID }}"
+    name="{{ .Name }}"
+    type="{{ or .Type "text" }}"
+    class="h-(--control-height) w-full rounded-control border bg-surface px-3 text-sm text-text placeholder:text-text-muted disabled:bg-surface-muted disabled:opacity-60 {{ if .Error }}border-danger{{ else }}border-border-input{{ end }}{{ if .Mono }} font-mono{{ end }}"
+    {{- if .Value }} value="{{ .Value }}"{{ end }}
+    {{- if .Placeholder }} placeholder="{{ .Placeholder }}"{{ end }}
+    {{- if .Autocomplete }} autocomplete="{{ .Autocomplete }}"{{ end }}
+    {{- if .Required }} required{{ end }}
+    {{- if .Disabled }} disabled{{ end }}
+    {{- if .Error }} aria-invalid="true" aria-describedby="{{ .ID }}-error"{{ else if .Hint }} aria-describedby="{{ .ID }}-hint"{{ end }}>
+  {{ if .Error }}<p id="{{ .ID }}-error" class="m-0 text-xs font-semibold text-danger">{{ .Error }}</p>{{ end }}
+</div>
+{{ end }}

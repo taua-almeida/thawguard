@@ -1,0 +1,37 @@
+{{/*
+  ui/stepper — replaces .tg-setup-step / .tg-step-number (numbered setup steps)
+  data keys: Steps: slice with .Label and .State (done|current|todo)
+  ui/lifecycle — replaces .tg-lifecycle-rail / .tg-lifecycle-node / .tg-lifecycle-dot
+  data keys: Nodes: slice with .Label and .State (done|current|todo|blocked)
+*/}}
+{{ define "ui/stepper" }}
+<ol class="m-0 flex list-none flex-col gap-3 p-0">
+  {{ range $index, $step := .Steps }}
+  <li class="flex items-center gap-3 text-sm{{ if eq $step.State "todo" }} text-text-muted{{ else }} text-text{{ end }}">
+    {{ if eq $step.State "done" }}
+    <span class="flex size-7 flex-none items-center justify-center rounded-pill bg-success-soft text-success" aria-hidden="true"><svg class="h-3.5 w-3.5"><use href="#tg-i-check"></use></svg></span>
+    {{ else if eq $step.State "current" }}
+    <span class="flex size-7 flex-none items-center justify-center rounded-pill bg-accent font-mono text-xs font-bold text-on-accent" aria-hidden="true">{{ add $index 1 }}</span>
+    {{ else }}
+    <span class="flex size-7 flex-none items-center justify-center rounded-pill bg-neutral-soft font-mono text-xs font-bold text-text-muted" aria-hidden="true">{{ add $index 1 }}</span>
+    {{ end }}
+    <span class="font-semibold">{{ $step.Label }}</span>
+    {{ if eq $step.State "current" }}<span class="sr-only">(current step)</span>{{ end }}
+    {{ if eq $step.State "done" }}<span class="sr-only">(done)</span>{{ end }}
+  </li>
+  {{ end }}
+</ol>
+{{ end }}
+
+{{ define "ui/lifecycle" }}
+<ol class="m-0 flex list-none items-center gap-0 p-0" aria-label="Lifecycle">
+  {{ range $index, $node := .Nodes }}
+  {{ if $index }}<li class="h-px w-6 flex-none bg-border" aria-hidden="true"></li>{{ end }}
+  <li class="flex items-center gap-1.5 text-xs font-semibold{{ if eq $node.State "done" }} text-success{{ else if eq $node.State "current" }} text-accent-strong{{ else if eq $node.State "blocked" }} text-danger{{ else }} text-text-muted{{ end }}">
+    <span class="size-2 flex-none rounded-pill{{ if eq $node.State "done" }} bg-success{{ else if eq $node.State "current" }} bg-accent{{ else if eq $node.State "blocked" }} bg-danger{{ else }} bg-border-strong{{ end }}" aria-hidden="true"></span>
+    {{ $node.Label }}
+    {{ if eq $node.State "current" }}<span class="sr-only">(current)</span>{{ end }}
+  </li>
+  {{ end }}
+</ol>
+{{ end }}

@@ -1,0 +1,12 @@
+{{/*
+  pages/dev-preview-auth — dev-only preview of the centered auth layout,
+  shaped like the login screen. Fictional data only; the form posts nowhere.
+*/}}
+{{ define "pages/dev-preview-auth" }}
+<h1 class="m-0 mb-4 text-base font-bold text-text">Sign in</h1>
+<form class="flex flex-col gap-4" method="get" action="/dev/preview/auth">
+  {{ template "ui/input" dict "ID" "auth-email" "Name" "email" "Label" "Email" "Type" "email" "Autocomplete" "username" "Required" true }}
+  {{ template "ui/input" dict "ID" "auth-password" "Name" "password" "Label" "Password" "Type" "password" "Autocomplete" "current-password" "Error" "Wrong email or password." }}
+  {{ template "ui/button" dict "Label" "Sign in" "Variant" "primary" "Type" "submit" }}
+</form>
+{{ end }}

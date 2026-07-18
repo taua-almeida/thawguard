@@ -1,55 +1,110 @@
 {{ define "components/maintenance" }}
-          {{ if .IsReady }}
-          <p class="tg-muted">Rotating the status token or changing managed branches returns this repository to setup until it is re-verified.</p>
-          {{ end }}
-          <form method="post" action="/repositories/setup-check">
-            <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
-            <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
-            <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-health-check"></use></svg>Run readiness checks</button>
-          </form>
-          {{ if .IsSetupIncomplete }}
-            {{ if .VerifyAvailable }}
-          <form method="post" action="/repositories/status-verification">
-            <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
-            <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
-            <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-check"></use></svg>Verify status posting</button>
-          </form>
-          <p class="tg-muted">Verification reruns the read-only readiness checks, then posts one harmless <code>{{ .SetupStatusContext }}</code> success status against the current default branch head. It proves the token can post statuses without touching the merge-gating <code>{{ .RequiredContext }}</code> context.</p>
-            {{ else }}
-          <button type="button" class="tg-btn tg-btn-secondary tg-btn-sm tg-repo-action-btn" disabled>Verify status posting</button>
-          <p class="tg-muted">{{ .VerifyBlockedReason }}</p>
-            {{ end }}
-          {{ end }}
-          {{ if .IsReady }}
-          <form method="post" action="/repositories/activate" data-confirm-submit data-confirm-title="Activate enforcement?" data-confirm-message="Activation reruns readiness and the controlled thawguard/setup status test, synchronizes current open pull requests, publishes real thawguard/freeze statuses for every affected head SHA, and enables freeze, schedule, and thaw operations for this repository." data-confirm-action="Activate enforcement">
-            <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
-            <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
-            <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-icy-shield"></use></svg>Activate enforcement</button>
-          </form>
-          {{ end }}
-          {{ if .Repository.EnforcementActive }}
-          <form method="post" action="/repositories/reconcile" data-confirm-submit data-confirm-title="Reconcile enforcement now?" data-confirm-message="Reconciliation reruns the read-only readiness checks, refreshes current open pull requests from the forge, and republishes the current thawguard/freeze policy for every affected head SHA. If convergence fails, enforcement is marked unhealthy until recovery succeeds." data-confirm-action="Reconcile now">
-            <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
-            <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
-            <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-health-check"></use></svg>Reconcile now</button>
-          </form>
-            {{ if .ActiveFreezeCount }}
-          <p class="error">Lift all active freezes before deactivating repository enforcement. <a href="/freezes">Manage active freezes</a>.</p>
-            {{ else if .PendingScheduleCount }}
-          <p class="error">Cancel all pending scheduled freezes before deactivating repository enforcement. <a href="/scheduled-freezes">Manage scheduled freezes</a>.</p>
-            {{ else }}
-          <form method="post" action="/repositories/deactivate" data-confirm-submit data-confirm-title="Deactivate repository enforcement?" data-confirm-message="Thawguard will first synchronize current open pull requests and converge thawguard/freeze to success. Enforcement will then become inactive so an admin can replace the status token or edit managed branches. Existing history and thaw exceptions are preserved." data-confirm-action="Deactivate enforcement">
-            <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
-            <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
-            <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-warning"></use></svg>Deactivate for maintenance</button>
-          </form>
-          <p class="tg-muted">Use deactivation only for status-token or managed-branch maintenance. Active freezes must be lifted and pending schedules cancelled through their audited workflows first.</p>
-            {{ end }}
-          {{ end }}
-          {{ if .IsUnhealthy }}
-          <form method="post" action="/repositories/recover" data-confirm-submit data-confirm-title="Retry enforcement recovery?" data-confirm-message="Recovery reruns every read-only readiness check, tests a controlled thawguard/setup status post, synchronizes current open pull requests, and republishes the current thawguard/freeze policy. The repository returns to active only after complete success; any failure keeps it unhealthy." data-confirm-action="Retry recovery">
-            <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
-            <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
-            <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-icy-shield"></use></svg>Retry enforcement recovery</button>
-          </form>
-          {{ end }}{{ end }}
+<div class="flex flex-col gap-2.5 border-t border-border pt-3.5">
+  {{ if .IsReady }}
+  <p class="m-0 text-sm text-text-muted">Rotating the status token or changing managed branches returns this repository to setup until it is re-verified.</p>
+  {{ end }}
+  <div class="flex flex-wrap items-center gap-2">
+    {{ if .IsSetupIncomplete }}
+      {{ if .VerifyAvailable }}
+    <form method="post" action="/repositories/status-verification" hx-post="/repositories/status-verification" hx-target="#repo-{{ .Repository.ID }}" hx-swap="outerHTML" hx-push-url="false">
+      <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+      <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
+      {{ template "ui/button" dict "Label" "Verify status posting" "Variant" "primary" "Size" "sm" "Type" "submit" "Icon" "tg-i-check" }}
+    </form>
+      {{ else }}
+    {{ template "ui/button" dict "Label" "Verify status posting" "Variant" "secondary" "Size" "sm" "Disabled" true }}
+      {{ end }}
+    {{ end }}
+    {{ if .IsReady }}
+    {{ template "ui/button" dict "Label" "Activate enforcement" "Variant" "primary" "Size" "sm" "Icon" "tg-i-icy-shield" "DialogTarget" (printf "repo-%d-activate" .Repository.ID) }}
+    {{ end }}
+    {{ if .Repository.EnforcementActive }}
+    {{ template "ui/button" dict "Label" "Reconcile now" "Variant" "primary" "Size" "sm" "Icon" "tg-i-health-check" "DialogTarget" (printf "repo-%d-reconcile" .Repository.ID) }}
+    {{ end }}
+    {{ if .IsUnhealthy }}
+    {{ template "ui/button" dict "Label" "Retry enforcement recovery" "Variant" "primary" "Size" "sm" "Icon" "tg-i-icy-shield" "DialogTarget" (printf "repo-%d-recover" .Repository.ID) }}
+    {{ end }}
+    <form method="post" action="/repositories/setup-check" hx-post="/repositories/setup-check" hx-target="#repo-{{ .Repository.ID }}" hx-swap="outerHTML" hx-push-url="false">
+      <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+      <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
+      {{ template "ui/button" dict "Label" "Run readiness checks" "Variant" "secondary" "Size" "sm" "Type" "submit" "Icon" "tg-i-health-check" }}
+    </form>
+    {{ if and .Repository.EnforcementActive (not .ActiveFreezeCount) (not .PendingScheduleCount) }}
+    {{ template "ui/button" dict "Label" "Deactivate for maintenance" "Variant" "secondary" "Size" "sm" "Icon" "tg-i-warning" "DialogTarget" (printf "repo-%d-deactivate" .Repository.ID) }}
+    {{ end }}
+  </div>
+
+  {{ if .IsSetupIncomplete }}
+    {{ if .VerifyAvailable }}
+  <p class="m-0 text-sm text-text-muted">Verification reruns the read-only readiness checks, then posts one harmless <code>{{ .SetupStatusContext }}</code> success status against the current default branch head. It proves the token can post statuses without touching the merge-gating <code>{{ .RequiredContext }}</code> context.</p>
+    {{ else }}
+  <p class="m-0 text-sm text-text-muted">{{ .VerifyBlockedReason }}</p>
+    {{ end }}
+  {{ end }}
+
+  {{ if .Repository.EnforcementActive }}
+    {{ if .ActiveFreezeCount }}
+  <div class="flex items-start gap-3 rounded-card border-l-4 border-danger bg-danger-soft p-3.5 text-danger">
+    <svg class="mt-0.5 h-4 w-4 flex-none" aria-hidden="true"><use href="#tg-i-warning"></use></svg>
+    <p class="m-0 text-sm text-text">Lift all active freezes before deactivating repository enforcement. <a href="/freezes">Manage active freezes</a>.</p>
+  </div>
+    {{ else if .PendingScheduleCount }}
+  <div class="flex items-start gap-3 rounded-card border-l-4 border-danger bg-danger-soft p-3.5 text-danger">
+    <svg class="mt-0.5 h-4 w-4 flex-none" aria-hidden="true"><use href="#tg-i-warning"></use></svg>
+    <p class="m-0 text-sm text-text">Cancel all pending scheduled freezes before deactivating repository enforcement. <a href="/scheduled-freezes">Manage scheduled freezes</a>.</p>
+  </div>
+    {{ else }}
+  <p class="m-0 text-sm text-text-muted">Use deactivation only for status-token or managed-branch maintenance. Active freezes must be lifted and pending schedules cancelled through their audited workflows first.</p>
+    {{ end }}
+  {{ end }}
+
+  {{ if .IsReady }}
+  {{ template "ui/modal" dict
+       "ID" (printf "repo-%d-activate" .Repository.ID)
+       "Title" "Activate enforcement?"
+       "Body" "Activation reruns readiness and the controlled thawguard/setup status test, synchronizes current open pull requests, publishes real thawguard/freeze statuses for every affected head SHA, and enables freeze, schedule, and thaw operations for this repository."
+       "ConfirmLabel" "Activate enforcement"
+       "ConfirmVariant" "primary"
+       "Action" "/repositories/activate"
+       "CSRFField" .CSRFField "CSRFToken" .CSRFToken
+       "Fields" (dict "repository_id" (printf "%d" .Repository.ID))
+       "HxTarget" (printf "#repo-%d" .Repository.ID) }}
+  {{ end }}
+  {{ if .Repository.EnforcementActive }}
+  {{ template "ui/modal" dict
+       "ID" (printf "repo-%d-reconcile" .Repository.ID)
+       "Title" "Reconcile enforcement now?"
+       "Body" "Reconciliation reruns the read-only readiness checks, refreshes current open pull requests from the forge, and republishes the current thawguard/freeze policy for every affected head SHA. If convergence fails, enforcement is marked unhealthy until recovery succeeds."
+       "ConfirmLabel" "Reconcile now"
+       "ConfirmVariant" "primary"
+       "Action" "/repositories/reconcile"
+       "CSRFField" .CSRFField "CSRFToken" .CSRFToken
+       "Fields" (dict "repository_id" (printf "%d" .Repository.ID))
+       "HxTarget" (printf "#repo-%d" .Repository.ID) }}
+    {{ if and (not .ActiveFreezeCount) (not .PendingScheduleCount) }}
+  {{ template "ui/modal" dict
+       "ID" (printf "repo-%d-deactivate" .Repository.ID)
+       "Title" "Deactivate repository enforcement?"
+       "Body" "Thawguard will first synchronize current open pull requests and converge thawguard/freeze to success. Enforcement will then become inactive so an admin can replace the status token or edit managed branches. Existing history and thaw exceptions are preserved."
+       "ConfirmLabel" "Deactivate enforcement"
+       "ConfirmVariant" "danger"
+       "Action" "/repositories/deactivate"
+       "CSRFField" .CSRFField "CSRFToken" .CSRFToken
+       "Fields" (dict "repository_id" (printf "%d" .Repository.ID))
+       "HxTarget" (printf "#repo-%d" .Repository.ID) }}
+    {{ end }}
+  {{ end }}
+  {{ if .IsUnhealthy }}
+  {{ template "ui/modal" dict
+       "ID" (printf "repo-%d-recover" .Repository.ID)
+       "Title" "Retry enforcement recovery?"
+       "Body" "Recovery reruns every read-only readiness check, tests a controlled thawguard/setup status post, synchronizes current open pull requests, and republishes the current thawguard/freeze policy. The repository returns to active only after complete success; any failure keeps it unhealthy."
+       "ConfirmLabel" "Retry recovery"
+       "ConfirmVariant" "primary"
+       "Action" "/repositories/recover"
+       "CSRFField" .CSRFField "CSRFToken" .CSRFToken
+       "Fields" (dict "repository_id" (printf "%d" .Repository.ID))
+       "HxTarget" (printf "#repo-%d" .Repository.ID) }}
+  {{ end }}
+</div>
+{{ end }}

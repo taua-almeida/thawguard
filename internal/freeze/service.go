@@ -96,6 +96,7 @@ func (s *Service) CreateActive(ctx context.Context, params CreateParams, actor d
 	}()
 
 	params.CreatedByUserID = actor.UserID
+	params.CreatedByKind = actor.Kind
 	created, err := NewStoreTx(tx).CreateActive(ctx, params)
 	if err != nil {
 		return domain.BranchFreeze{}, err
@@ -130,6 +131,7 @@ func (s *Service) CreateScheduled(ctx context.Context, params ScheduleParams, ac
 	}()
 
 	params.CreatedByUserID = actor.UserID
+	params.CreatedByKind = actor.Kind
 	created, err := NewStoreTx(tx).CreateScheduled(ctx, params)
 	if err != nil {
 		return domain.BranchFreeze{}, err

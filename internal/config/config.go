@@ -8,6 +8,9 @@ type Config struct {
 	PublicURL    string
 	Environment  string
 	SecretKey    string
+	// DevMode enables development-only routes such as the component
+	// gallery at /dev/preview. Never enable in production.
+	DevMode bool
 }
 
 func FromEnv() Config {
@@ -17,6 +20,7 @@ func FromEnv() Config {
 		PublicURL:    env("THAWGUARD_PUBLIC_URL", "http://localhost:8080"),
 		Environment:  env("THAWGUARD_ENV", "development"),
 		SecretKey:    env("THAWGUARD_SECRET_KEY", ""),
+		DevMode:      os.Getenv("THAWGUARD_DEV") == "1",
 	}
 }
 

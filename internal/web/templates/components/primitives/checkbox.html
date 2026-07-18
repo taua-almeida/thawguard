@@ -1,0 +1,22 @@
+{{/*
+  ui/checkbox — replaces the raw role-flag inputs in .tg-user-roles-form
+  dict keys: ID (required), Name (required), Label (required), Value (default 1),
+  Hint, Checked (bool), Disabled (bool)
+*/}}
+{{ define "ui/checkbox" }}
+<label for="{{ .ID }}" class="flex items-start gap-2.5 text-sm text-text{{ if .Disabled }} opacity-60{{ end }}">
+  <input
+    id="{{ .ID }}"
+    name="{{ .Name }}"
+    type="checkbox"
+    value="{{ or .Value "1" }}"
+    class="mt-0.5 size-4 accent-accent"
+    {{- if .Checked }} checked{{ end }}
+    {{- if .Disabled }} disabled{{ end }}
+    {{- if .Hint }} aria-describedby="{{ .ID }}-hint"{{ end }}>
+  <span>
+    <span class="font-semibold">{{ .Label }}</span>
+    {{ if .Hint }}<span id="{{ .ID }}-hint" class="block text-xs text-text-muted">{{ .Hint }}</span>{{ end }}
+  </span>
+</label>
+{{ end }}

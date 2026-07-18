@@ -1,47 +1,118 @@
+{{/*
+  components/active-freezes — full-width active-freezes section and the
+  #active-freezes swap target for lift/cancel. Table on md+, stacked cards
+  below. A live freeze always renders the frozen badge (frozen tone + lock
+  icon), never success or danger. Lift and cancel confirm through ui/modal
+  with deliberately different copy: lift completes the freeze and records it
+  as ended; cancel removes it without recording an end. A freeze whose
+  repository row was deleted keeps rendering as "Repository #<id>" so the
+  freeze stays visible and liftable.
+*/}}
 {{ define "components/active-freezes" }}
-    <section class="tg-panel tg-active-freezes-panel">
-      <div class="tg-panel-head"><h2>Active Freezes</h2><span class="tg-badge">{{ len .ActiveFreezes }} active</span></div>
-      {{ if .ActiveFreezes }}
-      <div class="tg-table-wrap tg-responsive-table">
-        <table class="tg-data-table tg-freezes-table">
-          <thead><tr><th>Repository / branch</th><th>Reason</th><th>Planned unfreeze</th><th>Status</th><th>Actions</th></tr></thead>
-          <tbody>
-          {{ range .ActiveFreezes }}
-            <tr>
-              <td><span class="tg-table-repo"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-freeze-branch"></use></svg><code>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Freeze.RepositoryID }}{{ end }}</code><span class="tg-arrow">→</span><code class="tg-branch">{{ .Freeze.Branch }}</code></span></td>
-              <td class="tg-freeze-reason">{{ .Freeze.Reason }}</td>
-              <td>{{ if .HasPlannedEndAt }}{{ .PlannedEndsAt }}{{ else }}<span class="tg-muted">No planned unfreeze</span>{{ end }}</td>
-              <td><span class="status status-frozen">{{ .Freeze.Status }}</span></td>
-              <td class="tg-table-actions">
-{{ template "components/active-freeze-actions" . }}
-              </td>
-            </tr>
-          {{ end }}
-          </tbody>
-        </table>
-      </div>
-      <div class="tg-mobile-card-list" aria-label="Active freeze mobile cards">
+<section id="active-freezes" class="rounded-panel border border-border bg-surface shadow-card" aria-label="Active freezes">
+  <div class="flex flex-wrap items-center gap-3 border-b border-border px-(--card-spacing) py-4">
+    <h2 class="m-0 text-lg font-bold text-text">Active freezes</h2>
+    {{ if .ActiveFreezes }}{{ template "ui/badge" dict "Label" (printf "%d active" (len .ActiveFreezes)) "Tone" "frozen" "Icon" "tg-i-lock" }}{{ else }}{{ template "ui/badge" dict "Label" "0 active" }}{{ end }}
+  </div>
+  {{ if .ActionError }}
+  <div role="alert" class="border-b border-border px-(--card-spacing) py-4">
+    {{ template "ui/callout" dict "Tone" "danger" "Body" .ActionError }}
+  </div>
+  {{ end }}
+  {{ if .ActiveFreezes }}
+  <div class="hidden overflow-x-auto md:block">
+    <table class="w-full border-collapse text-sm">
+      <caption class="sr-only">Active branch freezes with reason, planned unfreeze, and actions</caption>
+      <thead>
+        <tr class="bg-surface-muted text-left">
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Repository / branch</th>
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Reason</th>
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Planned unfreeze</th>
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Status</th>
+          <th scope="col" class="px-4 py-3 text-right text-xs font-bold tracking-wide text-text-muted uppercase">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
         {{ range .ActiveFreezes }}
-        <article class="tg-mobile-card">
-          <div class="tg-mobile-card-head">
-            <div><span class="tg-mobile-card-kicker">{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Freeze.RepositoryID }}{{ end }}</span><h3>{{ .Freeze.Branch }}</h3></div>
-            <span class="status status-frozen">{{ .Freeze.Status }}</span>
-          </div>
-          <dl class="tg-mobile-card-grid">
-            <div><dt>Planned unfreeze</dt><dd>{{ if .HasPlannedEndAt }}{{ .PlannedEndsAt }}{{ else }}None{{ end }}</dd></div>
-            <div><dt>Policy</dt><dd>Exact branch</dd></div>
-          </dl>
-          <p class="tg-mobile-card-detail">{{ .Freeze.Reason }}</p>
-          <div class="tg-table-actions tg-active-freeze-actions">
-{{ template "components/active-freeze-actions" . }}
-          </div>
-        </article>
+        <tr class="border-t border-border">
+          <td class="px-4 py-3">
+            <span class="flex flex-col gap-0.5">
+              <span class="font-bold text-text">{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Freeze.RepositoryID }}{{ end }}</span>
+              <code class="font-mono text-xs text-text-muted">{{ .Freeze.Branch }}</code>
+            </span>
+          </td>
+          <td class="px-4 py-3 text-text">
+            {{ .Freeze.Reason }}
+            {{ if .StartedLabel }}<span class="mt-0.5 block text-xs text-text-muted">Started <span title="{{ .StartedTitle }}">{{ .StartedLabel }}</span>{{ if .CreatedByLabel }} by {{ .CreatedByLabel }}{{ end }}</span>{{ end }}
+          </td>
+          <td class="px-4 py-3 text-text">{{ if .HasPlannedEndAt }}{{ .PlannedEndsAt }}{{ else }}<span class="text-text-muted">No planned unfreeze</span>{{ end }}</td>
+          <td class="px-4 py-3">{{ template "ui/badge" dict "Label" "Frozen" "Tone" "frozen" "Icon" "tg-i-lock" }}</td>
+          <td class="px-4 py-3"><div class="flex flex-wrap justify-end gap-2">{{ template "components/active-freeze-actions" . }}</div></td>
+        </tr>
         {{ end }}
-      </div>
-      {{ else }}
-        <div class="tg-empty-row">
-          <strong>No active freezes yet</strong>
-          <span>Freeze a repository branch to see it listed here.</span>
+      </tbody>
+    </table>
+  </div>
+  <div class="flex flex-col gap-3 p-(--card-spacing) md:hidden">
+    {{ range .ActiveFreezes }}
+    <article class="rounded-card border border-border p-4">
+      <div class="flex items-start justify-between gap-3">
+        <div class="flex flex-col gap-0.5">
+          <span class="text-sm font-bold text-text">{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Freeze.RepositoryID }}{{ end }}</span>
+          <code class="font-mono text-xs text-text-muted">{{ .Freeze.Branch }}</code>
         </div>
-      {{ end }}
-    </section>{{ end }}
+        {{ template "ui/badge" dict "Label" "Frozen" "Tone" "frozen" "Icon" "tg-i-lock" }}
+      </div>
+      <p class="m-0 mt-2 text-sm text-text">{{ .Freeze.Reason }}</p>
+      {{ if .StartedLabel }}<p class="m-0 mt-1 text-xs text-text-muted">Started <span title="{{ .StartedTitle }}">{{ .StartedLabel }}</span>{{ if .CreatedByLabel }} by {{ .CreatedByLabel }}{{ end }}</p>{{ end }}
+      <p class="m-0 mt-1 text-xs text-text-muted">Planned unfreeze: {{ if .HasPlannedEndAt }}{{ .PlannedEndsAt }}{{ else }}none — lift manually{{ end }}</p>
+      <div class="mt-3 flex flex-wrap gap-2">{{ template "components/active-freeze-actions" . }}</div>
+    </article>
+    {{ end }}
+  </div>
+  {{ range .ActiveFreezes }}{{ if .CanFreeze }}
+  {{ template "ui/modal" dict
+      "ID" (printf "lift-freeze-%d" .Freeze.ID)
+      "Title" "Lift this freeze?"
+      "Body" (printf "Lifting ends the freeze on %s and records it as ended. Thawguard recomputes statuses for known open pull requests, which can pass again if no other freeze applies. This action is auditable." .Freeze.Branch)
+      "ConfirmLabel" "Lift freeze"
+      "ConfirmVariant" "primary"
+      "Action" "/freezes/end"
+      "HxTarget" "#active-freezes"
+      "CSRFField" .CSRFField
+      "CSRFToken" .CSRFToken
+      "Fields" (dict "freeze_id" .Freeze.ID) }}
+  {{ template "ui/modal" dict
+      "ID" (printf "cancel-freeze-%d" .Freeze.ID)
+      "Title" "Cancel this freeze?"
+      "Body" (printf "Cancelling removes the freeze on %s without completing it or recording it as ended. Thawguard will recompute statuses for known open pull requests after the freeze changes." .Freeze.Branch)
+      "ConfirmLabel" "Cancel freeze"
+      "ConfirmVariant" "danger"
+      "CancelLabel" "Keep freeze"
+      "Action" "/freezes/cancel"
+      "HxTarget" "#active-freezes"
+      "CSRFField" .CSRFField
+      "CSRFToken" .CSRFToken
+      "Fields" (dict "freeze_id" .Freeze.ID) }}
+  {{ end }}{{ end }}
+  {{ else }}
+  <div class="p-(--card-spacing)">
+    {{ template "ui/empty-state" dict "Title" "No active freezes" "Hint" "Freeze a repository branch to see it listed here." "Icon" "tg-i-freeze-branch" }}
+  </div>
+  {{ end }}
+</section>
+{{ end }}
+
+{{/*
+  components/active-freeze-actions — lift/cancel triggers for one active
+  freeze (dialog openers, not direct submits; the forms live in the ui/modal
+  confirms above). Viewers see a plain read-only marker instead.
+*/}}
+{{ define "components/active-freeze-actions" }}
+{{- if .CanFreeze }}
+{{ template "ui/button" dict "Label" "Lift" "Variant" "secondary" "Size" "sm" "Icon" "tg-i-thaw-drop" "DialogTarget" (printf "lift-freeze-%d" .Freeze.ID) }}
+{{ template "ui/button" dict "Label" "Cancel" "Variant" "ghost" "Size" "sm" "DialogTarget" (printf "cancel-freeze-%d" .Freeze.ID) }}
+{{- else }}
+<span class="text-xs text-text-muted">Read only</span>
+{{- end }}
+{{ end }}

@@ -1,0 +1,13 @@
+{{/*
+  ui/empty-state — replaces .tg-data-empty / .tg-empty-row
+  dict keys: Title (required), Hint, Icon (sprite id, default tg-i-icy-shield),
+  ActionLabel + ActionHref (optional primary action)
+*/}}
+{{ define "ui/empty-state" }}
+<div class="flex flex-col items-center gap-2 rounded-panel border border-dashed border-border-strong bg-surface px-6 py-10 text-center">
+  <svg class="h-8 w-8 text-text-muted" aria-hidden="true"><use href="#{{ or .Icon "tg-i-icy-shield" }}"></use></svg>
+  <p class="m-0 text-sm font-bold text-text">{{ .Title }}</p>
+  {{ if .Hint }}<p class="m-0 max-w-md text-sm text-text-muted">{{ .Hint }}</p>{{ end }}
+  {{ if .ActionLabel }}<div class="mt-2">{{ template "ui/button" dict "Label" .ActionLabel "Href" .ActionHref "Variant" "primary" }}</div>{{ end }}
+</div>
+{{ end }}

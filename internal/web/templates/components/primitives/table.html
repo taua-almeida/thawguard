@@ -1,0 +1,30 @@
+{{/*
+  ui/table — replaces .tg-data-table / .tg-audit-table / .tg-thaws-table /
+  .tg-shared-head-table / .tg-table-wrap (mobile card stacks migrate with 0.7+ pages)
+  data keys: Caption (sr-only), Headers []string, Rows [][]string, Empty (message)
+  Pages with cell markup richer than plain strings write the same <table>
+  classes by hand; this leaf covers the common string-grid case.
+*/}}
+{{ define "ui/table" }}
+<div class="overflow-x-auto rounded-panel border border-border bg-surface shadow-card">
+  <table class="w-full border-collapse text-sm">
+    {{ if .Caption }}<caption class="sr-only">{{ .Caption }}</caption>{{ end }}
+    <thead>
+      <tr class="bg-surface-muted text-left">
+        {{ range .Headers }}<th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">{{ . }}</th>{{ end }}
+      </tr>
+    </thead>
+    <tbody>
+      {{ range .Rows }}
+      <tr class="border-t border-border">
+        {{ range . }}<td class="px-4 py-3 text-text">{{ . }}</td>{{ end }}
+      </tr>
+      {{ else }}
+      <tr class="border-t border-border">
+        <td class="px-4 py-6 text-center text-text-muted" colspan="{{ len .Headers }}">{{ if .Empty }}{{ .Empty }}{{ else }}No data yet.{{ end }}</td>
+      </tr>
+      {{ end }}
+    </tbody>
+  </table>
+</div>
+{{ end }}

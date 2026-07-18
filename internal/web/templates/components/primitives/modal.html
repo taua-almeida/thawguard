@@ -1,0 +1,36 @@
+{{/*
+  ui/modal — replaces .tg-alert-dialog / .tg-alert-backdrop / .tg-alert-card /
+  .tg-filter-modal / .tg-connect-modal
+  Confirm-dialog shape over a native <dialog>; opened by ui/button with
+  DialogTarget (dialog.js calls showModal and restores trigger focus).
+  dict keys: ID (required), Title (required), Body, ConfirmLabel,
+  ConfirmVariant (default danger), CancelLabel (default Cancel),
+  Action + CSRFField + CSRFToken (optional POST form for the confirm button),
+  Fields (map of extra hidden input name -> value on the confirm form),
+  HxTarget (opt in to an htmx outerHTML swap of that CSS target; the form
+  still posts normally without JS)
+*/}}
+{{ define "ui/modal" }}
+<dialog id="{{ .ID }}" class="m-auto w-[min(26rem,90vw)] rounded-panel border border-border bg-surface p-6 text-text shadow-card" aria-labelledby="{{ .ID }}-title">
+  <h2 id="{{ .ID }}-title" class="m-0 text-base font-bold">{{ .Title }}</h2>
+  {{ if .Body }}<p class="mt-2 mb-0 text-sm text-text-muted">{{ .Body }}</p>{{ end }}
+  <div class="mt-5 flex justify-end gap-2">
+    <form method="dialog">
+      {{ template "ui/button" dict "Label" (or .CancelLabel "Cancel") "Variant" "secondary" "Type" "submit" }}
+    </form>
+    {{ if .ConfirmLabel }}
+    {{ if .Action }}
+    <form method="post" action="{{ .Action }}"{{ if .HxTarget }} hx-post="{{ .Action }}" hx-target="{{ .HxTarget }}" hx-swap="outerHTML" hx-push-url="false"{{ end }}>
+      <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+      {{ range $name, $value := .Fields }}<input type="hidden" name="{{ $name }}" value="{{ $value }}">{{ end }}
+      {{ template "ui/button" dict "Label" .ConfirmLabel "Variant" (or .ConfirmVariant "danger") "Type" "submit" }}
+    </form>
+    {{ else }}
+    <form method="dialog">
+      {{ template "ui/button" dict "Label" .ConfirmLabel "Variant" (or .ConfirmVariant "danger") "Type" "submit" }}
+    </form>
+    {{ end }}
+    {{ end }}
+  </div>
+</dialog>
+{{ end }}

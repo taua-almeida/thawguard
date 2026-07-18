@@ -1,32 +1,99 @@
+{{/*
+  components/repository-card — one repository entity card. Two tiers keep
+  large installs scannable: attention states (unhealthy, setup incomplete)
+  always render the full card; ready/active repositories collapse to a
+  native <details> summary row wrapping the same full body. Expanded forces
+  the disclosure open on htmx fragment swaps so acting inside a card never
+  collapses it.
+*/}}
 {{ define "components/repository-card" }}
-      <article class="tg-repo-card">
-        <div class="tg-repo-card-head">
-          <div>
-            <p class="tg-repo-kicker">{{ .Repository.Forge }}</p>
-            <h3>{{ .Repository.FullName }}</h3>
-            {{ template "components/lifecycle-rail" . }}
-          </div>
-          <div class="tg-repo-badges">
-            <span class="tg-badge {{ .EnforcementClass }}">{{ .EnforcementLabel }}</span>
-            {{ if .Repository.HasWebhookSecret }}<span class="tg-badge status-ok">webhook configured</span>{{ else }}<span class="tg-badge status-warning">webhook missing</span>{{ end }}
-            {{ if .Repository.HasStatusToken }}<span class="tg-badge status-ok">status token configured</span>{{ else }}<span class="tg-badge status-warning">status token missing</span>{{ end }}
-          </div>
-        </div>
-        {{ template "components/state-banner" . }}
-        <dl class="tg-repo-meta">
-          <div><span class="tg-meta-icon"><svg class="tg-icon"><use href="#tg-i-git-branch"></use></svg></span><dt>Default branch</dt><dd><code>{{ .Repository.DefaultBranch }}</code></dd></div>
-          <div><span class="tg-meta-icon"><svg class="tg-icon"><use href="#tg-i-check"></use></svg></span><dt>Required context</dt><dd><code>{{ .RequiredContext }}</code></dd></div>
-          <div><span class="tg-meta-icon"><svg class="tg-icon"><use href="#tg-i-key"></use></svg></span><dt>Status token</dt><dd>{{ if .Repository.HasStatusToken }}<span class="tg-badge status-ok">stored encrypted</span>{{ else }}<span class="tg-badge status-warning">not stored</span>{{ end }}</dd></div>
-          <div><span class="tg-meta-icon"><svg class="tg-icon"><use href="#tg-i-schedule"></use></svg></span><dt>Last readiness check</dt><dd>{{ if .LastCheckedAt }}{{ .LastCheckedAt }}{{ else }}<span class="tg-badge status-warning">not checked</span>{{ end }}</dd></div>
-        </dl>
+<article id="repo-{{ .Repository.ID }}" class="rounded-panel border border-border bg-surface shadow-card">
+  {{ if .Compact }}
+  <details class="group"{{ if .Expanded }} open{{ end }}>
+    <summary class="flex cursor-pointer flex-wrap items-center gap-x-3 gap-y-1.5 px-(--card-spacing) py-3 select-none">
+      <span aria-hidden="true" class="inline-block text-xs text-text-muted group-open:rotate-90">&#9656;</span>
+      <span class="font-mono text-xs tracking-wide text-text-muted uppercase">{{ .Repository.Forge }}</span>
+      <span class="text-sm font-bold text-text">{{ .Repository.FullName }}</span>
+      {{ template "ui/badge" dict "Label" .EnforcementLabel "Tone" .EnforcementTone }}
+      {{ if .ActiveFreezeCount }}{{ template "ui/badge" dict "Label" (printf "%d frozen" .ActiveFreezeCount) "Tone" "frozen" }}{{ end }}
+      {{ if .PendingScheduleCount }}{{ template "ui/badge" dict "Label" (printf "%d scheduled" .PendingScheduleCount) "Tone" "scheduled" }}{{ end }}
+      <span class="ms-auto text-xs text-text-muted">{{ if eq (len .Branches) 1 }}1 managed branch{{ else }}{{ len .Branches }} managed branches{{ end }}</span>
+    </summary>
+    <div class="flex flex-col gap-4 border-t border-border p-(--card-spacing)">
+      {{ template "components/repository-card-body" . }}
+    </div>
+  </details>
+  {{ else }}
+  <div class="flex flex-col gap-4 p-(--card-spacing)">
+    {{ template "components/repository-card-body" . }}
+  </div>
+  {{ end }}
+</article>
+{{ end }}
+
+{{ define "components/repository-card-body" }}
+  <div class="flex flex-wrap items-start justify-between gap-3">
+    <div class="flex flex-col gap-1.5">
+      <p class="m-0 font-mono text-xs tracking-wide text-text-muted uppercase">{{ .Repository.Forge }}</p>
+      <h3 class="m-0 text-lg font-bold text-text">{{ .Repository.FullName }}</h3>
+      {{ template "ui/lifecycle" dict "Nodes" .Lifecycle }}
+    </div>
+    <div class="flex flex-wrap justify-end gap-1.5">
+      {{ template "ui/badge" dict "Label" .EnforcementLabel "Tone" .EnforcementTone }}
+      {{ if .Repository.HasWebhookSecret }}{{ template "ui/badge" dict "Label" "webhook configured" "Tone" "success" }}{{ else }}{{ template "ui/badge" dict "Label" "webhook missing" "Tone" "warning" }}{{ end }}
+      {{ if .Repository.HasStatusToken }}{{ template "ui/badge" dict "Label" "status token configured" "Tone" "success" }}{{ else }}{{ template "ui/badge" dict "Label" "status token missing" "Tone" "warning" }}{{ end }}
+    </div>
+  </div>
+
+  {{ template "components/state-banner" . }}
+
+  {{ if .ActionError }}
+  <div role="alert">
+    {{ template "ui/callout" dict "Tone" "danger" "Body" .ActionError }}
+  </div>
+  {{ end }}
+
+  <dl class="m-0 grid gap-x-6 gap-y-3 text-sm sm:grid-cols-2 xl:grid-cols-4">
+    <div><dt class="text-xs font-bold tracking-wide text-text-muted uppercase">Default branch</dt><dd class="m-0 mt-0.5"><code>{{ .Repository.DefaultBranch }}</code></dd></div>
+    <div><dt class="text-xs font-bold tracking-wide text-text-muted uppercase">Required context</dt><dd class="m-0 mt-0.5"><code>{{ .RequiredContext }}</code></dd></div>
+    <div><dt class="text-xs font-bold tracking-wide text-text-muted uppercase">Status token</dt><dd class="m-0 mt-0.5">{{ if .Repository.HasStatusToken }}{{ template "ui/badge" dict "Label" "stored encrypted" "Tone" "success" }}{{ else }}{{ template "ui/badge" dict "Label" "not stored" "Tone" "warning" }}{{ end }}</dd></div>
+    <div><dt class="text-xs font-bold tracking-wide text-text-muted uppercase">Last readiness check</dt><dd class="m-0 mt-0.5">{{ if .LastCheckedAt }}{{ .LastCheckedAt }}{{ else }}{{ template "ui/badge" dict "Label" "not checked" "Tone" "warning" }}{{ end }}</dd></div>
+  </dl>
+
+  <div class="flex flex-col gap-2">
+    <details class="rounded-card border border-border">
+      <summary class="cursor-pointer px-3.5 py-2.5 text-sm font-semibold text-text select-none">Repository readiness ({{ len .RepositoryChecks }})</summary>
+      <div class="flex flex-col gap-3 border-t border-border px-3.5 py-3">
         {{ template "components/readiness" . }}
+      </div>
+    </details>
+    <details class="rounded-card border border-border">
+      <summary class="cursor-pointer px-3.5 py-2.5 text-sm font-semibold text-text select-none">Managed branches ({{ len .Branches }})</summary>
+      <div class="flex flex-col gap-3 border-t border-border px-3.5 py-3">
         {{ template "components/managed-branches" . }}
-        {{ if .CurrentUser.CanManageRepositories }}
-        <div class="tg-repo-actions">
-          {{ template "components/credentials" . }}
-          {{ template "components/maintenance" . }}
-        </div>
-        {{ else }}
-        <div class="tg-empty-row"><strong>Read-only readiness evidence</strong><span>Ask an admin to change repository credentials or run readiness checks.</span></div>
-        {{ end }}
-      </article>{{ end }}
+      </div>
+    </details>
+    {{ if .CurrentUser.CanManageRepositories }}
+    <details class="rounded-card border border-border">
+      <summary class="cursor-pointer px-3.5 py-2.5 text-sm font-semibold text-text select-none">Credentials</summary>
+      <div class="flex flex-col gap-3 border-t border-border px-3.5 py-3">
+        {{ template "components/credentials" . }}
+      </div>
+    </details>
+    {{ end }}
+  </div>
+
+  {{ if .CurrentUser.CanManageRepositories }}
+  {{ template "components/maintenance" . }}
+  {{ else }}
+  <p class="m-0 text-sm text-text-muted"><strong class="text-text">Read-only readiness evidence.</strong> Ask an admin to change repository credentials or run readiness checks.</p>
+  {{ end }}
+{{ end }}
+
+{{/*
+  components/repository-card-fragment — htmx swap payload for one card.
+  Data: {Card repositoryCard, Toast *toastView}. The optional toast rides
+  along out-of-band into the shell's #toasts region.
+*/}}
+{{ define "components/repository-card-fragment" }}{{ template "components/repository-card" .Card }}
+{{ if .Toast }}<div id="toasts" hx-swap-oob="true" class="mb-4 flex flex-col gap-2">{{ template "ui/toast" .Toast }}</div>{{ end }}{{ end }}

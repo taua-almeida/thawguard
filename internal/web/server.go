@@ -50,8 +50,15 @@ type Config struct {
 	PullRequestWebhookProcessor          PullRequestWebhookProcessor
 	WebhookMaxBodyBytes                  int64
 	AuthService                          AuthService
-	EnforcementService                   EnforcementService
-	ReconciliationJobStore               ReconciliationJobStore
+	// PullRequestStore feeds the freeze-impact preview from the
+	// webhook-synced local cache; optional (the preview degrades to the
+	// zero state when absent).
+	PullRequestStore       PullRequestStore
+	EnforcementService     EnforcementService
+	ReconciliationJobStore ReconciliationJobStore
+	// DevMode registers development-only routes (the component gallery
+	// under /dev/preview). Must stay false in production.
+	DevMode bool
 }
 
 // EnforcementService performs the explicit admin transitions of the
@@ -103,6 +110,12 @@ type SetupCheckStore interface {
 
 type SetupCheckRunner interface {
 	Run(ctx context.Context, repo domain.Repository, actor domain.Actor) ([]setupcheck.Result, error)
+}
+
+// PullRequestStore reads the webhook-synced pull request cache for the
+// freeze-impact preview. It is a local lookup, never a live forge call.
+type PullRequestStore interface {
+	ListOpenByTargetBranch(ctx context.Context, repositoryID int64, targetBranch string) ([]domain.PullRequest, error)
 }
 
 type FreezeStore interface {
@@ -358,6 +371,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /repositories/reconcile", s.handleReconcileEnforcement)
 	s.mux.HandleFunc("POST /repositories/recover", s.handleRecoverEnforcement)
 	s.mux.HandleFunc("GET /freezes", s.handleFreezes)
+	s.mux.HandleFunc("GET /freezes/impact", s.handleFreezeImpact)
 	s.mux.HandleFunc("POST /freezes", s.handleCreateFreeze)
 	s.mux.HandleFunc("POST /freezes/end", s.handleEndFreeze)
 	s.mux.HandleFunc("POST /freezes/cancel", s.handleCancelFreeze)
@@ -381,6 +395,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /account/password", s.handleAccountPassword)
 	s.mux.HandleFunc("POST /account/password", s.handleAccountPasswordPost)
 	s.mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(webassets.StaticFS()))))
+	if s.cfg.DevMode {
+		s.mux.HandleFunc("GET /dev/preview", s.handleDevPreview)
+		s.mux.HandleFunc("GET /dev/preview/auth", s.handleDevPreviewAuth)
+		s.mux.HandleFunc("GET /dev/preview/repositories", s.handleDevPreviewRepositories)
+		s.mux.HandleFunc("GET /dev/preview/freezes", s.handleDevPreviewFreezes)
+	}
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -556,7 +576,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		"RepositoryCount":             len(repositories),
 		"ActiveFreezeCount":           len(freezes),
 		"ScheduledFreezePreviewCount": len(scheduledFreezes),
-		"Freezes":                     s.freezeViews(repositories, freezes),
+		"Freezes":                     s.freezeViews(repositories, freezes, nil),
 		"ScheduledFreezes":            scheduledFreezeViews(repositories, scheduledFreezes, scheduledFreezePageState{}),
 	})
 }
@@ -994,19 +1014,20 @@ func (s *Server) handleCreateRepository(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleAddRepositoryBranch(w http.ResponseWriter, r *http.Request) {
-	s.handleRepositoryBranchMutation(w, r, func(ctx context.Context, repositoryID int64, branch string, actor domain.Actor) error {
+	s.handleRepositoryBranchMutation(w, r, "Managed branch added.", func(ctx context.Context, repositoryID int64, branch string, actor domain.Actor) error {
 		_, err := s.cfg.RepositoryStore.AddBranch(ctx, repositoryID, branch, actor)
 		return err
 	})
 }
 
 func (s *Server) handleRemoveRepositoryBranch(w http.ResponseWriter, r *http.Request) {
-	s.handleRepositoryBranchMutation(w, r, func(ctx context.Context, repositoryID int64, branch string, actor domain.Actor) error {
+	s.handleRepositoryBranchMutation(w, r, "Managed branch removed.", func(ctx context.Context, repositoryID int64, branch string, actor domain.Actor) error {
 		return s.cfg.RepositoryStore.RemoveBranch(ctx, repositoryID, branch, actor)
 	})
 }
 
-func (s *Server) handleRepositoryBranchMutation(w http.ResponseWriter, r *http.Request, mutate func(ctx context.Context, repositoryID int64, branch string, actor domain.Actor) error) {
+func (s *Server) handleRepositoryBranchMutation(w http.ResponseWriter, r *http.Request, toastMessage string, mutate func(ctx context.Context, repositoryID int64, branch string, actor domain.Actor) error) {
+	w.Header().Add("Vary", "HX-Request")
 	if s.cfg.RepositoryStore == nil {
 		http.Error(w, "repository store is not configured", http.StatusServiceUnavailable)
 		return
@@ -1015,23 +1036,71 @@ func (s *Server) handleRepositoryBranchMutation(w http.ResponseWriter, r *http.R
 	if !ok {
 		return
 	}
-	repositoryID, err := strconv.ParseInt(strings.TrimSpace(r.PostFormValue("repository_id")), 10, 64)
-	if err != nil {
-		repositoryID = 0
-	}
+	repositoryID := repositoryIDFromForm(r)
 	if err := mutate(r.Context(), repositoryID, r.PostFormValue("branch"), session.auditActor()); err != nil {
-		s.renderRepositoriesValidationError(w, r, err, session)
+		s.renderRepositoriesValidationError(w, r, err, session, repositoryID)
 		return
 	}
-	http.Redirect(w, r, "/repositories", http.StatusSeeOther)
+	s.completeRepositoryMutation(w, r, session, repositoryID, toastMessage, "/repositories")
 }
 
-// renderRepositoriesValidationError re-renders the repositories page for a
-// typed validation error and hides internal error details.
-func (s *Server) renderRepositoriesValidationError(w http.ResponseWriter, r *http.Request, err error, session sessionState) {
-	message, ok := repositoryValidationMessage(err)
-	if !ok {
+// isHXRequest reports whether the request came from htmx and expects an HTML
+// fragment instead of a full page or redirect.
+func isHXRequest(r *http.Request) bool {
+	return r.Header.Get("HX-Request") == "true"
+}
+
+// repositoryIDFromForm parses the posted repository_id, treating malformed
+// values as 0 so the store/service rejects them with a typed not-found error.
+func repositoryIDFromForm(r *http.Request) int64 {
+	repositoryID, err := strconv.ParseInt(strings.TrimSpace(r.PostFormValue("repository_id")), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return repositoryID
+}
+
+// completeRepositoryMutation finishes a successful repository POST. htmx
+// requests receive the refreshed card fragment plus an out-of-band success
+// toast; regular browsers keep the existing redirect-after-POST flow.
+func (s *Server) completeRepositoryMutation(w http.ResponseWriter, r *http.Request, session sessionState, repositoryID int64, toastMessage, successLocation string) {
+	if !isHXRequest(r) {
+		http.Redirect(w, r, successLocation, http.StatusSeeOther)
+		return
+	}
+	card, found, err := s.repositoryCardByID(r.Context(), repositoryID, session)
+	if err != nil {
 		internalServerError(w)
+		return
+	}
+	if !found {
+		// The repository disappeared mid-request; let htmx reload the page.
+		w.Header().Set("HX-Redirect", successLocation)
+		return
+	}
+	s.renderPage(w, "components/repository-card-fragment", repositoryCardFragment{
+		Card:  card,
+		Toast: &toastView{Message: toastMessage, Tone: "success"},
+	})
+}
+
+// renderRepositoryMutationError renders a typed validation failure for a
+// repository POST. htmx requests get a 200 card fragment carrying the message
+// (the client does not swap 4xx responses); browsers keep the 400 full-page
+// re-render of the unfiltered list.
+func (s *Server) renderRepositoryMutationError(w http.ResponseWriter, r *http.Request, session sessionState, repositoryID int64, message string) {
+	if isHXRequest(r) {
+		card, found, err := s.repositoryCardByID(r.Context(), repositoryID, session)
+		if err != nil {
+			internalServerError(w)
+			return
+		}
+		if !found {
+			w.Header().Set("HX-Redirect", "/repositories")
+			return
+		}
+		card.ActionError = message
+		s.renderPage(w, "components/repository-card-fragment", repositoryCardFragment{Card: card})
 		return
 	}
 	repositories, listErr := s.repositories(r.Context())
@@ -1049,6 +1118,17 @@ func (s *Server) renderRepositoriesValidationError(w http.ResponseWriter, r *htt
 	s.renderRepositories(w, views, message, session)
 }
 
+// renderRepositoriesValidationError re-renders for a typed validation error
+// and hides internal error details.
+func (s *Server) renderRepositoriesValidationError(w http.ResponseWriter, r *http.Request, err error, session sessionState, repositoryID int64) {
+	message, ok := repositoryValidationMessage(err)
+	if !ok {
+		internalServerError(w)
+		return
+	}
+	s.renderRepositoryMutationError(w, r, session, repositoryID, message)
+}
+
 func repositoryValidationMessage(err error) (string, bool) {
 	var repositoryErr repository.ValidationError
 	if errors.As(err, &repositoryErr) {
@@ -1062,125 +1142,83 @@ func repositoryValidationMessage(err error) (string, bool) {
 }
 
 func (s *Server) handleSetRepositoryWebhookSecret(w http.ResponseWriter, r *http.Request) {
-	if s.cfg.RepositoryStore == nil {
-		http.Error(w, "repository store is not configured", http.StatusServiceUnavailable)
-		return
-	}
-	if !s.cfg.RepositorySecretEncryptionConfigured {
-		http.Error(w, "webhook secret encryption is not configured", http.StatusServiceUnavailable)
-		return
-	}
-	session, ok := s.requireRepositoryManagerForm(w, r)
-	if !ok {
-		return
-	}
-	repositoryID, err := strconv.ParseInt(strings.TrimSpace(r.PostFormValue("repository_id")), 10, 64)
-	if err != nil {
-		repositoryID = 0
-	}
-	_, err = s.cfg.RepositoryStore.SetWebhookSecret(r.Context(), repositoryID, r.PostFormValue("webhook_secret"), session.auditActor())
-	if err != nil {
-		if repositorysetup.IsConfigurationError(err) {
-			http.Error(w, "webhook secret encryption is not configured", http.StatusServiceUnavailable)
-			return
-		}
-		if !repositorysetup.IsValidationError(err) {
-			internalServerError(w)
-			return
-		}
-		repositories, listErr := s.repositories(r.Context())
-		if listErr != nil {
-			internalServerError(w)
-			return
-		}
-		views, viewErr := s.repositoryViews(r.Context(), repositories)
-		if viewErr != nil {
-			internalServerError(w)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusBadRequest)
-		s.renderRepositories(w, views, err.Error(), session)
-		return
-	}
-	http.Redirect(w, r, "/repositories", http.StatusSeeOther)
+	s.handleSetRepositoryCredential(w, r, "webhook secret encryption is not configured", "webhook_secret", "Webhook secret saved.",
+		func(ctx context.Context, repositoryID int64, value string, actor domain.Actor) error {
+			_, err := s.cfg.RepositoryStore.SetWebhookSecret(ctx, repositoryID, value, actor)
+			return err
+		})
 }
 
 func (s *Server) handleSetRepositoryStatusToken(w http.ResponseWriter, r *http.Request) {
+	s.handleSetRepositoryCredential(w, r, "status token encryption is not configured", "status_token", "Status token saved.",
+		func(ctx context.Context, repositoryID int64, value string, actor domain.Actor) error {
+			_, err := s.cfg.RepositoryStore.SetStatusToken(ctx, repositoryID, value, actor)
+			return err
+		})
+}
+
+// handleSetRepositoryCredential is the shared admin-only CSRF-protected flow
+// for the write-only repository credentials (webhook secret, status token).
+func (s *Server) handleSetRepositoryCredential(w http.ResponseWriter, r *http.Request, encryptionMessage, field, toastMessage string, save func(ctx context.Context, repositoryID int64, value string, actor domain.Actor) error) {
+	w.Header().Add("Vary", "HX-Request")
 	if s.cfg.RepositoryStore == nil {
 		http.Error(w, "repository store is not configured", http.StatusServiceUnavailable)
 		return
 	}
 	if !s.cfg.RepositorySecretEncryptionConfigured {
-		http.Error(w, "status token encryption is not configured", http.StatusServiceUnavailable)
+		http.Error(w, encryptionMessage, http.StatusServiceUnavailable)
 		return
 	}
 	session, ok := s.requireRepositoryManagerForm(w, r)
 	if !ok {
 		return
 	}
-	repositoryID, err := strconv.ParseInt(strings.TrimSpace(r.PostFormValue("repository_id")), 10, 64)
-	if err != nil {
-		repositoryID = 0
-	}
-	_, err = s.cfg.RepositoryStore.SetStatusToken(r.Context(), repositoryID, r.PostFormValue("status_token"), session.auditActor())
-	if err != nil {
+	repositoryID := repositoryIDFromForm(r)
+	if err := save(r.Context(), repositoryID, r.PostFormValue(field), session.auditActor()); err != nil {
 		if repositorysetup.IsConfigurationError(err) {
-			http.Error(w, "status token encryption is not configured", http.StatusServiceUnavailable)
+			http.Error(w, encryptionMessage, http.StatusServiceUnavailable)
 			return
 		}
 		if !repositorysetup.IsValidationError(err) {
 			internalServerError(w)
 			return
 		}
-		repositories, listErr := s.repositories(r.Context())
-		if listErr != nil {
-			internalServerError(w)
-			return
-		}
-		views, viewErr := s.repositoryViews(r.Context(), repositories)
-		if viewErr != nil {
-			internalServerError(w)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusBadRequest)
-		s.renderRepositories(w, views, err.Error(), session)
+		s.renderRepositoryMutationError(w, r, session, repositoryID, err.Error())
 		return
 	}
-	http.Redirect(w, r, "/repositories", http.StatusSeeOther)
+	s.completeRepositoryMutation(w, r, session, repositoryID, toastMessage, "/repositories")
 }
 
 func (s *Server) handleVerifyStatusPosting(w http.ResponseWriter, r *http.Request) {
-	s.handleEnforcementTransition(w, r, func(ctx context.Context, repositoryID int64, actor domain.Actor) error {
+	s.handleEnforcementTransition(w, r, "Status posting verified.", func(ctx context.Context, repositoryID int64, actor domain.Actor) error {
 		_, err := s.cfg.EnforcementService.VerifyStatusPosting(ctx, repositoryID, actor)
 		return err
 	})
 }
 
 func (s *Server) handleActivateEnforcement(w http.ResponseWriter, r *http.Request) {
-	s.handleEnforcementTransition(w, r, func(ctx context.Context, repositoryID int64, actor domain.Actor) error {
+	s.handleEnforcementTransition(w, r, "Enforcement activated.", func(ctx context.Context, repositoryID int64, actor domain.Actor) error {
 		_, err := s.cfg.EnforcementService.ActivateEnforcement(ctx, repositoryID, actor)
 		return err
 	})
 }
 
 func (s *Server) handleDeactivateEnforcement(w http.ResponseWriter, r *http.Request) {
-	s.handleEnforcementTransitionTo(w, r, "/repositories?notice=enforcement-deactivated", func(ctx context.Context, repositoryID int64, actor domain.Actor) error {
+	s.handleEnforcementTransitionTo(w, r, "Repository enforcement is inactive. The repository is ready for status-token or managed-branch maintenance.", "/repositories?notice=enforcement-deactivated", func(ctx context.Context, repositoryID int64, actor domain.Actor) error {
 		_, err := s.cfg.EnforcementService.DeactivateEnforcement(ctx, repositoryID, actor)
 		return err
 	})
 }
 
 func (s *Server) handleReconcileEnforcement(w http.ResponseWriter, r *http.Request) {
-	s.handleEnforcementTransition(w, r, func(ctx context.Context, repositoryID int64, actor domain.Actor) error {
+	s.handleEnforcementTransition(w, r, "Reconciliation completed.", func(ctx context.Context, repositoryID int64, actor domain.Actor) error {
 		_, err := s.cfg.EnforcementService.ReconcileEnforcement(ctx, repositoryID, actor)
 		return err
 	})
 }
 
 func (s *Server) handleRecoverEnforcement(w http.ResponseWriter, r *http.Request) {
-	s.handleEnforcementTransition(w, r, func(ctx context.Context, repositoryID int64, actor domain.Actor) error {
+	s.handleEnforcementTransition(w, r, "Enforcement recovery succeeded.", func(ctx context.Context, repositoryID int64, actor domain.Actor) error {
 		_, err := s.cfg.EnforcementService.RecoverEnforcement(ctx, repositoryID, actor)
 		return err
 	})
@@ -1189,11 +1227,12 @@ func (s *Server) handleRecoverEnforcement(w http.ResponseWriter, r *http.Request
 // handleEnforcementTransition guards the admin-only CSRF-protected enforcement
 // actions and re-renders the repositories page with the typed validation
 // message when the service rejects or reports a sanitized failure.
-func (s *Server) handleEnforcementTransition(w http.ResponseWriter, r *http.Request, transition func(ctx context.Context, repositoryID int64, actor domain.Actor) error) {
-	s.handleEnforcementTransitionTo(w, r, "/repositories", transition)
+func (s *Server) handleEnforcementTransition(w http.ResponseWriter, r *http.Request, toastMessage string, transition func(ctx context.Context, repositoryID int64, actor domain.Actor) error) {
+	s.handleEnforcementTransitionTo(w, r, toastMessage, "/repositories", transition)
 }
 
-func (s *Server) handleEnforcementTransitionTo(w http.ResponseWriter, r *http.Request, successLocation string, transition func(ctx context.Context, repositoryID int64, actor domain.Actor) error) {
+func (s *Server) handleEnforcementTransitionTo(w http.ResponseWriter, r *http.Request, toastMessage, successLocation string, transition func(ctx context.Context, repositoryID int64, actor domain.Actor) error) {
+	w.Header().Add("Vary", "HX-Request")
 	if s.cfg.EnforcementService == nil {
 		http.Error(w, "enforcement service is not configured", http.StatusServiceUnavailable)
 		return
@@ -1202,15 +1241,12 @@ func (s *Server) handleEnforcementTransitionTo(w http.ResponseWriter, r *http.Re
 	if !ok {
 		return
 	}
-	repositoryID, err := strconv.ParseInt(strings.TrimSpace(r.PostFormValue("repository_id")), 10, 64)
-	if err != nil {
-		repositoryID = 0
-	}
+	repositoryID := repositoryIDFromForm(r)
 	if err := transition(r.Context(), repositoryID, session.auditActor()); err != nil {
-		s.renderRepositoriesValidationError(w, r, err, session)
+		s.renderRepositoriesValidationError(w, r, err, session, repositoryID)
 		return
 	}
-	http.Redirect(w, r, successLocation, http.StatusSeeOther)
+	s.completeRepositoryMutation(w, r, session, repositoryID, toastMessage, successLocation)
 }
 
 func (s *Server) handleFreezes(w http.ResponseWriter, r *http.Request) {
@@ -1218,15 +1254,20 @@ func (s *Server) handleFreezes(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	repositories, freezes, branchOptions, err := s.freezePageData(r.Context())
-	if err != nil {
-		internalServerError(w)
-		return
+	state := freezesPageState{}
+	switch r.URL.Query().Get("notice") {
+	case "freeze-started":
+		state.Notice = "Freeze started."
+	case "freeze-lifted":
+		state.Notice = "Freeze lifted."
+	case "freeze-cancelled":
+		state.Notice, state.NoticeTone = "Freeze cancelled.", "info"
 	}
-	s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), branchOptions, freezesPageState{}, session)
+	s.renderFreezes(w, r, http.StatusOK, state, session)
 }
 
 func (s *Server) handleCreateFreeze(w http.ResponseWriter, r *http.Request) {
+	w.Header().Add("Vary", "HX-Request")
 	if s.cfg.FreezeStore == nil {
 		http.Error(w, "freeze store is not configured", http.StatusServiceUnavailable)
 		return
@@ -1245,31 +1286,50 @@ func (s *Server) handleCreateFreeze(w http.ResponseWriter, r *http.Request) {
 			internalServerError(w)
 			return
 		}
-		repositories, freezes, branchOptions, dataErr := s.freezePageData(r.Context())
-		if dataErr != nil {
-			internalServerError(w)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusBadRequest)
-		s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), branchOptions, freezesPageState{
+		state := freezesPageState{
 			FormError:  err.Error(),
 			FreezeForm: freezeFormStateFromRequest(r),
-		}, session)
+		}
+		if isHXRequest(r) {
+			// main.js only swaps 2xx/5xx, so validation errors come back as
+			// 200 fragments re-rendering the live region with the error and
+			// the submitted values preserved.
+			s.renderFreezesFragment(w, r, "components/freezes-live-fragment", state, session, nil)
+			return
+		}
+		s.renderFreezes(w, r, http.StatusBadRequest, state, session)
 		return
 	}
-	http.Redirect(w, r, "/freezes", http.StatusSeeOther)
+	if isHXRequest(r) {
+		s.renderFreezesFragment(w, r, "components/freezes-live-fragment", freezesPageState{}, session, &toastView{Message: "Freeze started.", Tone: "success"})
+		return
+	}
+	http.Redirect(w, r, "/freezes?notice=freeze-started", http.StatusSeeOther)
+}
+
+// closeFreezeOutcome carries the lift-vs-cancel success messaging so the two
+// semantically different actions stay distinguishable in toasts and notices.
+type closeFreezeOutcome struct {
+	notice string
+	toast  toastView
 }
 
 func (s *Server) handleEndFreeze(w http.ResponseWriter, r *http.Request) {
-	s.handleCloseFreeze(w, r, s.endFreeze)
+	s.handleCloseFreeze(w, r, s.endFreeze, closeFreezeOutcome{
+		notice: "freeze-lifted",
+		toast:  toastView{Message: "Freeze lifted.", Tone: "success"},
+	})
 }
 
 func (s *Server) handleCancelFreeze(w http.ResponseWriter, r *http.Request) {
-	s.handleCloseFreeze(w, r, s.cancelFreeze)
+	s.handleCloseFreeze(w, r, s.cancelFreeze, closeFreezeOutcome{
+		notice: "freeze-cancelled",
+		toast:  toastView{Message: "Freeze cancelled.", Tone: "info"},
+	})
 }
 
-func (s *Server) handleCloseFreeze(w http.ResponseWriter, r *http.Request, closeFreeze func(context.Context, int64, domain.Actor) error) {
+func (s *Server) handleCloseFreeze(w http.ResponseWriter, r *http.Request, closeFreeze func(context.Context, int64, domain.Actor) error, outcome closeFreezeOutcome) {
+	w.Header().Add("Vary", "HX-Request")
 	if s.cfg.FreezeStore == nil {
 		http.Error(w, "freeze store is not configured", http.StatusServiceUnavailable)
 		return
@@ -1288,17 +1348,21 @@ func (s *Server) handleCloseFreeze(w http.ResponseWriter, r *http.Request, close
 			internalServerError(w)
 			return
 		}
-		repositories, freezes, branchOptions, dataErr := s.freezePageData(r.Context())
-		if dataErr != nil {
-			internalServerError(w)
+		if isHXRequest(r) {
+			// 200 fragment for the same main.js swap policy as create; the
+			// error renders inside the re-rendered active-freezes section.
+			s.renderFreezesFragment(w, r, "components/active-freezes-fragment", freezesPageState{ActionError: err.Error()}, session, nil)
 			return
 		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusBadRequest)
-		s.renderFreezes(w, repositories, s.freezeViews(repositories, freezes), branchOptions, freezesPageState{FormError: err.Error()}, session)
+		s.renderFreezes(w, r, http.StatusBadRequest, freezesPageState{FormError: err.Error()}, session)
 		return
 	}
-	http.Redirect(w, r, "/freezes", http.StatusSeeOther)
+	if isHXRequest(r) {
+		toast := outcome.toast
+		s.renderFreezesFragment(w, r, "components/active-freezes-fragment", freezesPageState{}, session, &toast)
+		return
+	}
+	http.Redirect(w, r, "/freezes?notice="+outcome.notice, http.StatusSeeOther)
 }
 
 func (s *Server) endFreeze(ctx context.Context, id int64, actor domain.Actor) error {
@@ -1549,6 +1613,7 @@ func parseScheduledFreezeFormTime(raw string, timezoneOffsetMinutes int) (time.T
 }
 
 func (s *Server) handleRunRepositorySetupCheck(w http.ResponseWriter, r *http.Request) {
+	w.Header().Add("Vary", "HX-Request")
 	if s.cfg.SetupCheckRunner == nil {
 		http.Error(w, "setup check runner is not configured", http.StatusServiceUnavailable)
 		return
@@ -1558,8 +1623,8 @@ func (s *Server) handleRunRepositorySetupCheck(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	repositoryID, err := strconv.ParseInt(strings.TrimSpace(r.PostFormValue("repository_id")), 10, 64)
-	if err != nil || repositoryID <= 0 {
+	repositoryID := repositoryIDFromForm(r)
+	if repositoryID <= 0 {
 		http.Error(w, "invalid repository id", http.StatusBadRequest)
 		return
 	}
@@ -1577,7 +1642,7 @@ func (s *Server) handleRunRepositorySetupCheck(w http.ResponseWriter, r *http.Re
 		http.Error(w, "setup check failed", http.StatusBadGateway)
 		return
 	}
-	http.Redirect(w, r, "/repositories", http.StatusSeeOther)
+	s.completeRepositoryMutation(w, r, session, repositoryID, "Readiness checks completed.", "/repositories")
 }
 
 func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {

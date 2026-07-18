@@ -1,0 +1,21 @@
+{{/*
+  ui/toast — the locked no-JS notice: a server-rendered dismissible callout in
+  the shell's #toasts region. There is no toast.js and none is planned; the
+  Dismiss affordance is a plain link back to the page without its notice
+  query parameter. Replaces inline Notice rendering / .tg-local-note flashes.
+  dict keys: Message (required), Tone info|success|warning|danger (default success),
+  DismissHref (optional; current path without the notice param)
+*/}}
+{{ define "ui/toast" }}
+{{- $tone := "success" }}{{ if .Tone }}{{ $tone = .Tone }}{{ end }}
+{{- $toneClass := "border-success bg-success-soft" }}{{ $icon := "tg-i-check" }}
+{{- if eq $tone "info" }}{{ $toneClass = "border-accent bg-accent-soft" }}{{ $icon = "tg-i-icy-shield" }}
+{{- else if eq $tone "warning" }}{{ $toneClass = "border-warning bg-warning-soft" }}{{ $icon = "tg-i-warning" }}
+{{- else if eq $tone "danger" }}{{ $toneClass = "border-danger bg-danger-soft" }}{{ $icon = "tg-i-warning" }}
+{{- end }}
+<div class="flex items-center gap-3 rounded-card border-l-4 p-3 text-sm text-text shadow-card {{ $toneClass }}" role="status">
+  <svg class="h-4 w-4 flex-none" aria-hidden="true"><use href="#{{ $icon }}"></use></svg>
+  <p class="m-0 flex-1">{{ .Message }}</p>
+  {{ if .DismissHref }}<a class="font-semibold text-text-muted no-underline hover:text-text" href="{{ .DismissHref }}">Dismiss</a>{{ end }}
+</div>
+{{ end }}

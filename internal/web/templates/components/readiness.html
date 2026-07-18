@@ -1,13 +1,18 @@
 {{ define "components/readiness" }}
-        <div class="tg-repo-checks">
-          <strong>Repository readiness</strong>
-          {{ if .RepositoryChecks }}
-            {{ range .RepositoryChecks }}
-            {{ template "components/readiness-check" . }}
-            {{ end }}
-          {{ else }}
-            <p class="tg-muted">No repository-level readiness evidence has been recorded yet.</p>
-          {{ end }}
-        </div>{{ end }}
+{{ if .RepositoryChecks }}
+<div class="flex flex-col gap-2.5">
+  {{ range .RepositoryChecks }}
+  {{ template "components/readiness-check" . }}
+  {{ end }}
+</div>
+{{ else }}
+<p class="m-0 text-sm text-text-muted">No repository-level readiness evidence has been recorded yet.</p>
+{{ end }}
+{{ end }}
 
-{{ define "components/readiness-check" }}<div class="tg-repo-check"><span class="status status-{{ .Result.Status }}">{{ if eq .Result.Status "ok" }}passed{{ else }}{{ .Result.Status }}{{ end }}</span><div><strong>{{ .Result.Name }}</strong><small>{{ .Result.Description }}{{ if .Result.Remediation }} {{ .Result.Remediation }}{{ end }}</small></div></div>{{ end }}
+{{ define "components/readiness-check" }}
+<div class="flex items-start gap-2.5 text-sm">
+  {{ if eq .Result.Status "ok" }}{{ template "ui/badge" dict "Label" "passed" "Tone" "success" }}{{ else if eq .Result.Status "failed" }}{{ template "ui/badge" dict "Label" .Result.Status "Tone" "danger" }}{{ else }}{{ template "ui/badge" dict "Label" .Result.Status "Tone" "warning" }}{{ end }}
+  <div><strong class="text-text">{{ .Result.Name }}</strong> <span class="text-text-muted">{{ .Result.Description }}{{ if .Result.Remediation }} {{ .Result.Remediation }}{{ end }}</span></div>
+</div>
+{{ end }}

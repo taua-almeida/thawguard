@@ -416,6 +416,15 @@ CREATE TABLE branch_freezes (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE audit_events (
+  id INTEGER PRIMARY KEY,
+  actor_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  action TEXT NOT NULL,
+  subject_type TEXT NOT NULL,
+  subject_id TEXT NOT NULL,
+  details_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
 CREATE TABLE status_results (
   id INTEGER PRIMARY KEY,
   repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE
@@ -533,6 +542,15 @@ CREATE TABLE branch_freezes (
   created_by INTEGER,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+CREATE TABLE audit_events (
+  id INTEGER PRIMARY KEY,
+  actor_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  action TEXT NOT NULL,
+  subject_type TEXT NOT NULL,
+  subject_id TEXT NOT NULL,
+  details_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
 );
 CREATE TABLE webhook_deliveries (
   id INTEGER PRIMARY KEY,
@@ -767,6 +785,59 @@ VALUES ('existing-session', 301, 'csrf-token', '2027-01-01T00:00:00.000000000Z',
 	}
 	if applied != 1 {
 		t.Fatalf("expected account management migration applied once, got %d", applied)
+	}
+}
+
+func TestCreatedByKindMigrationBackfillsFromAuditEvents(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-test.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdByKindIndex := migrationIndex(t, migrations, "0026_branch_freeze_created_by_kind.sql")
+	if err := ApplyMigrations(ctx, database, migrations[:createdByKindIndex]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO repositories(id, forge, base_url, owner, name, default_branch, active, created_at, updated_at)
+VALUES (81, 'forgejo', 'https://codeberg.org', 'example', 'release', 'main', 1, '2026-07-12T10:00:00.000000000Z', '2026-07-12T10:00:00.000000000Z');
+INSERT INTO branch_freezes(id, repository_id, branch, status, reason, starts_at, scheduled, created_at, updated_at)
+VALUES
+  (801, 81, 'main', 'active', 'user freeze', '2026-07-12T10:00:00.000000000Z', 0, '2026-07-12T10:00:00.000000000Z', '2026-07-12T10:00:00.000000000Z'),
+  (802, 81, 'release', 'scheduled', 'scheduled freeze', '2026-07-20T10:00:00.000000000Z', 1, '2026-07-12T11:00:00.000000000Z', '2026-07-12T11:00:00.000000000Z'),
+  (803, 81, 'develop', 'ended', 'no audit trail', '2026-07-12T09:00:00.000000000Z', 0, '2026-07-12T09:00:00.000000000Z', '2026-07-12T09:30:00.000000000Z');
+INSERT INTO audit_events(actor_user_id, action, subject_type, subject_id, details_json, created_at)
+VALUES
+  (NULL, 'branch_freeze.created', 'branch_freeze', '801', '{"actor_kind":"user"}', '2026-07-12T10:00:00.000000000Z'),
+  (NULL, 'freeze_schedule.created', 'branch_freeze', '802', '{"actor_kind":"bootstrap_admin"}', '2026-07-12T11:00:00.000000000Z');`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ApplyMigrations(ctx, database, migrations[:createdByKindIndex+1]); err != nil {
+		t.Fatal(err)
+	}
+	assertColumnExists(t, database, "branch_freezes", "created_by_kind")
+	for _, tc := range []struct {
+		freezeID int64
+		want     string
+	}{
+		{801, "user"},
+		{802, "bootstrap_admin"},
+		{803, ""},
+	} {
+		var kind string
+		if err := database.QueryRowContext(ctx, `SELECT created_by_kind FROM branch_freezes WHERE id = ?`, tc.freezeID).Scan(&kind); err != nil {
+			t.Fatal(err)
+		}
+		if kind != tc.want {
+			t.Fatalf("expected freeze %d created_by_kind %q, got %q", tc.freezeID, tc.want, kind)
+		}
 	}
 }
 

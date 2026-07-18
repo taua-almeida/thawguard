@@ -1,0 +1,15 @@
+{{/*
+  ui/field — replaces .tg-compact-field / .tg-field-wide / .form-grid label blocks
+  Generic wrapper for a custom control; for plain text inputs and selects use
+  ui/input / ui/select, which render the same chrome around their own control.
+  dict keys: ID (required, must match the control's id), Label (required),
+  Hint, Error, Required (bool), Control (pre-rendered html/template.HTML)
+*/}}
+{{ define "ui/field" }}
+<div class="flex flex-col gap-1.5">
+  <label for="{{ .ID }}" class="text-sm font-semibold text-text">{{ .Label }}{{ if .Required }}<span class="text-danger" aria-hidden="true"> *</span>{{ end }}</label>
+  {{ if .Hint }}<p id="{{ .ID }}-hint" class="m-0 text-xs text-text-muted">{{ .Hint }}</p>{{ end }}
+  {{ .Control }}
+  {{ if .Error }}<p id="{{ .ID }}-error" class="m-0 text-xs font-semibold text-danger">{{ .Error }}</p>{{ end }}
+</div>
+{{ end }}

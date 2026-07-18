@@ -1,0 +1,30 @@
+{{/*
+  ui/card — replaces .panel / .tg-data-panel / .tg-scheduled-panel and the shell
+  of .tg-repo-card / .tg-impact-card / .tg-eligibility-card / .tg-thaw-freeze-card
+  dict keys: Title, Body (plain text or pre-rendered template.HTML)
+  ui/stat-card — replaces .tg-stat / .tg-stats entries
+  dict keys: Label (required), Value (required), Hint, Tone info|success|warning|danger|frozen|scheduled (colors the value)
+*/}}
+{{ define "ui/card" }}
+<section class="rounded-panel border border-border bg-surface p-(--card-spacing) shadow-card">
+  {{ if .Title }}<h2 class="m-0 mb-2 text-section-title font-bold text-text">{{ .Title }}</h2>{{ end }}
+  {{ if .Body }}<div class="text-sm text-text-muted">{{ .Body }}</div>{{ end }}
+</section>
+{{ end }}
+
+{{ define "ui/stat-card" }}
+{{- $tone := "" }}{{ if .Tone }}{{ $tone = .Tone }}{{ end }}
+{{- $valueClass := "text-text" }}
+{{- if eq $tone "info" }}{{ $valueClass = "text-accent-strong" }}
+{{- else if eq $tone "success" }}{{ $valueClass = "text-success" }}
+{{- else if eq $tone "warning" }}{{ $valueClass = "text-warning" }}
+{{- else if eq $tone "danger" }}{{ $valueClass = "text-danger" }}
+{{- else if eq $tone "frozen" }}{{ $valueClass = "text-frozen" }}
+{{- else if eq $tone "scheduled" }}{{ $valueClass = "text-scheduled" }}
+{{- end }}
+<div class="rounded-panel border border-border bg-surface p-(--card-spacing) shadow-card">
+  <p class="m-0 text-xs font-bold tracking-wide text-text-muted uppercase">{{ .Label }}</p>
+  <p class="m-0 mt-1 text-2xl font-bold {{ $valueClass }}">{{ .Value }}</p>
+  {{ if .Hint }}<p class="m-0 mt-1 text-xs text-text-muted">{{ .Hint }}</p>{{ end }}
+</div>
+{{ end }}

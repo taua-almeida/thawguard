@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -56,7 +57,7 @@ func TestRepositoriesPageShowsManualSetupContext(t *testing.T) {
 	if !strings.Contains(body, "taua-almeida/thawguard") {
 		t.Fatalf("expected body to include repository full name, got %q", body)
 	}
-	for _, want := range []string{"webhook configured", "status token configured", "Rotate secret", "Rotate token", "Connect a repository", "Credential values are write-only", "data-alert-dialog"} {
+	for _, want := range []string{"webhook configured", "status token configured", "Rotate secret", "Rotate token", "Add repository", "Credential values are write-only", `<dialog id="connect-repository"`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
@@ -426,19 +427,21 @@ func TestRepositoriesPageKeepsConfiguredCredentialsHiddenByDefault(t *testing.T)
 	}
 	body := recorder.Body.String()
 	for _, want := range []string{
-		`data-confirm-title="Rotate webhook secret?"`,
-		`data-confirm-action="Reveal secret input"`,
-		`data-confirm-title="Rotate status token?"`,
-		`data-confirm-action="Reveal token input"`,
-		`id="webhook-secret-7" class="tg-secret-form tg-credential-form" hidden data-credential-form`,
-		`id="status-token-7" class="tg-secret-form tg-credential-form" hidden data-credential-form`,
-		`name="webhook_secret" minlength="16" maxlength="512" autocomplete="new-password" placeholder="New webhook secret" aria-label="New webhook secret for taua-almeida/thawguard" required disabled data-credential-input`,
-		`name="status_token" minlength="16" maxlength="1024" autocomplete="new-password" placeholder="New status token" aria-label="New status token for taua-almeida/thawguard" required disabled data-credential-input`,
-		`data-alert-dialog hidden`,
+		"Rotate webhook secret?",
+		"Rotate status token?",
+		`<dialog id="webhook-secret-7"`,
+		`<dialog id="status-token-7"`,
+		`aria-controls="webhook-secret-7"`,
+		`aria-controls="status-token-7"`,
+		`type="password" name="webhook_secret" minlength="16" maxlength="512" autocomplete="new-password" placeholder="New webhook secret" aria-label="New webhook secret for taua-almeida/thawguard" required`,
+		`type="password" name="status_token" minlength="16" maxlength="1024" autocomplete="new-password" placeholder="New status token" aria-label="New status token for taua-almeida/thawguard" required`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
+	}
+	if strings.Contains(body, `<dialog id="webhook-secret-7" open`) || strings.Contains(body, `<dialog id="status-token-7" open`) {
+		t.Fatalf("expected credential dialogs to render closed, got %q", body)
 	}
 }
 
@@ -932,7 +935,43 @@ func TestFreezesPageShowsRepositoriesAndActiveFreezes(t *testing.T) {
 	if token := csrfTokenFromBody(t, body); token == "" {
 		t.Fatal("expected CSRF token in freeze form")
 	}
-	for _, want := range []string{"Create a freeze", "Freeze effect", "Evaluated on submit", "policy summary, not a live forge lookup", "Active Freezes", "taua-almeida/thawguard", "dev", "QA freeze", "Freeze Branch", "Planned unfreeze", `name="planned_ends_at"`, `name="timezone_offset_minutes"`, "Enabled when browser-local timezone conversion is available; stored as UTC.", "Planned unfreeze is unavailable without JavaScript", "data-local-datetime disabled", "2026-07-13 09:00 UTC", "No planned unfreeze", "&lt;script&gt;alert", "Lift", "Cancel", "tg-responsive-table", "Active freeze mobile cards", `<form method="post" action="/freezes/end" data-confirm-submit data-confirm-title="Lift freeze?"`, `data-confirm-action="Lift freeze"`, `<button type="submit" class="tg-btn tg-btn-primary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg>Lift</button>`, `<form method="post" action="/freezes/cancel" data-confirm-submit data-confirm-title="Cancel freeze?"`, `data-confirm-action="Cancel freeze"`, `data-alert-dialog hidden`} {
+	for _, want := range []string{
+		"Start a freeze",
+		"Freeze impact",
+		`id="freeze-impact"`,
+		"How freezes work",
+		"From webhook sync, not a live forge lookup.",
+		`hx-get="/freezes/impact"`,
+		"Active freezes",
+		"taua-almeida/thawguard",
+		"QA freeze",
+		"Start freeze",
+		`id="freezes-live"`,
+		`id="active-freezes"`,
+		`hx-post="/freezes" hx-target="#freezes-live" hx-swap="outerHTML" hx-push-url="false"`,
+		"Planned unfreeze",
+		`name="planned_ends_at"`,
+		`name="timezone_offset_minutes"`,
+		"Enabled when browser-local timezone conversion is available; stored as UTC.",
+		"Planned unfreeze is unavailable without JavaScript",
+		"data-local-datetime disabled",
+		"2026-07-13 09:00 UTC",
+		"No planned unfreeze",
+		"&lt;script&gt;alert",
+		"Frozen</span>",
+		`<dialog id="lift-freeze-1"`,
+		"Lift this freeze?",
+		"records it as ended",
+		`<form method="post" action="/freezes/end" hx-post="/freezes/end" hx-target="#active-freezes" hx-swap="outerHTML" hx-push-url="false">`,
+		`name="freeze_id" value="1"`,
+		`aria-controls="lift-freeze-1"`,
+		`<dialog id="cancel-freeze-1"`,
+		"Cancel this freeze?",
+		"without completing it or recording it as ended",
+		`<form method="post" action="/freezes/cancel" hx-post="/freezes/cancel" hx-target="#active-freezes" hx-swap="outerHTML" hx-push-url="false">`,
+		`aria-controls="cancel-freeze-1"`,
+		"Keep freeze",
+	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
@@ -947,6 +986,112 @@ func TestFreezesPageShowsRepositoriesAndActiveFreezes(t *testing.T) {
 		if strings.Contains(body, fictional) {
 			t.Fatalf("expected freezes page not to present fictional live data %q, got %q", fictional, body)
 		}
+	}
+	// The aside warning callout is the single per-page positioning statement;
+	// the old page-header badge must stay gone.
+	if strings.Contains(body, "Cooperative enforcement — auditable, not a hard security gate") {
+		t.Fatalf("expected freezes page not to repeat the positioning badge, got %q", body)
+	}
+}
+
+func newFreezeImpactTestServer(pullRequests []domain.PullRequest) *Server {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
+	return NewServer(Config{
+		AppName: "Thawguard",
+		RepositoryStore: &fakeRepositoryStore{
+			repositories: []domain.Repository{repo},
+			branches: map[int64][]domain.RepositoryBranch{
+				1: {{ID: 1, RepositoryID: 1, Name: "main"}, {ID: 2, RepositoryID: 1, Name: "release/1.8"}},
+			},
+		},
+		FreezeStore:      &fakeFreezeStore{},
+		PullRequestStore: &fakePullRequestStore{pullRequests: pullRequests},
+	})
+}
+
+func freezeImpactPullRequests(count int) []domain.PullRequest {
+	pullRequests := make([]domain.PullRequest, 0, count)
+	for i := range count {
+		pullRequests = append(pullRequests, domain.PullRequest{
+			ID: int64(100 + i), RepositoryID: 1, Index: 200 + i, State: "open", TargetBranch: "main",
+			Title: fmt.Sprintf("Impact fixture pull request %d", 200+i),
+			URL:   fmt.Sprintf("https://forge.example.test/taua-almeida/thawguard/pulls/%d", 200+i),
+		})
+	}
+	return pullRequests
+}
+
+func TestFreezeImpactFragmentListsOpenPullRequestsWithOverflow(t *testing.T) {
+	server := newFreezeImpactTestServer(freezeImpactPullRequests(7))
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/freezes/impact?repository_id=1&branch=main", nil)
+	request.Header.Set("HX-Request", "true")
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	if vary := recorder.Header().Get("Vary"); !strings.Contains(vary, "HX-Request") {
+		t.Fatalf("expected Vary to include HX-Request, got %q", vary)
+	}
+	body := recorder.Body.String()
+	if strings.Contains(body, "<!doctype html>") {
+		t.Fatalf("expected fragment without page shell, got %q", body)
+	}
+	for _, want := range []string{
+		`id="freeze-impact"`,
+		"taua-almeida/thawguard",
+		"7 known open pull requests",
+		domain.RequiredStatusContext,
+		"#200",
+		"#204",
+		"Show all 7",
+		"#205",
+		"#206",
+		`rel="noopener noreferrer"`,
+		"From webhook sync, not a live forge lookup.",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected impact fragment to contain %q, got %q", want, body)
+		}
+	}
+}
+
+func TestFreezeImpactFragmentRendersZeroStateForUnknownBranch(t *testing.T) {
+	server := newFreezeImpactTestServer(freezeImpactPullRequests(2))
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/freezes/impact?repository_id=1&branch=ghost", nil)
+	request.Header.Set("HX-Request", "true")
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, "No known open pull requests target this branch right now.") {
+		t.Fatalf("expected zero state for unknown branch, got %q", body)
+	}
+	if strings.Contains(body, "#200") {
+		t.Fatalf("expected no pull request rows for unknown branch, got %q", body)
+	}
+}
+
+func TestFreezeImpactRedirectsNonHXRequestsToFreezes(t *testing.T) {
+	server := newFreezeImpactTestServer(nil)
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/freezes/impact?repository_id=1&branch=main", nil))
+
+	if recorder.Code != http.StatusSeeOther {
+		t.Fatalf("expected status 303, got %d", recorder.Code)
+	}
+	if location := recorder.Header().Get("Location"); location != "/freezes" {
+		t.Fatalf("expected redirect to /freezes, got %q", location)
+	}
+	if vary := recorder.Header().Get("Vary"); !strings.Contains(vary, "HX-Request") {
+		t.Fatalf("expected Vary to include HX-Request, got %q", vary)
 	}
 }
 
@@ -1008,13 +1153,13 @@ func TestRepositoriesPageOrdersByAttentionAndShowsFilters(t *testing.T) {
 		previous = index
 	}
 	for _, want := range []string{
-		`class="tg-stat tg-stat-scheduled tg-stat-link" href="/repositories?state=active"`,
+		`href="/repositories?state=active" aria-label="Show repositories with active enforcement"`,
 		`href="/repositories?state=unhealthy"`,
 		`href="/repositories?state=setup-incomplete"`,
 		`href="/repositories?state=ready"`,
-		">All <span class=\"tg-state-chip-count\">4</span>",
-		"tg-lifecycle-rail",
-		"is-broken",
+		`>All<span class="rounded-pill bg-neutral-soft px-1.5 text-[0.65rem] text-text-muted">4</span>`,
+		`aria-label="Lifecycle"`,
+		"text-xs font-semibold text-danger",
 		`name="q"`,
 	} {
 		if !strings.Contains(body, want) {
@@ -1023,6 +1168,25 @@ func TestRepositoriesPageOrdersByAttentionAndShowsFilters(t *testing.T) {
 	}
 	if strings.Contains(body, "showing") {
 		t.Fatalf("expected no filtered count without an active filter, got %q", body)
+	}
+}
+
+func TestRepositoriesPageCollapsesHealthyRepositoriesToSummaryRows(t *testing.T) {
+	server := newRepositoriesFindabilityServer()
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	// Only the ready and active repositories collapse to summary rows; the
+	// unhealthy and setup-incomplete cards stay fully expanded.
+	if got := strings.Count(body, "1 managed branch</span>"); got != 2 {
+		t.Fatalf("expected exactly 2 compact summary rows (ready + active), got %d", got)
+	}
+	if strings.Contains(body, `class="group" open`) {
+		t.Fatalf("expected compact rows to render closed on full page loads, got %q", body)
 	}
 }
 
@@ -1079,8 +1243,8 @@ func TestRepositoriesPageFiltersBySearchQuery(t *testing.T) {
 		"acme/delta-ready",
 		"showing 1 of 4",
 		`value="DELTA"`,
-		`>All <span class="tg-state-chip-count">1</span>`,
-		`>Ready <span class="tg-state-chip-count">1</span>`,
+		`>All<span class="rounded-pill bg-neutral-soft px-1.5 text-[0.65rem] text-text-muted">1</span>`,
+		`>Ready<span class="rounded-pill bg-neutral-soft px-1.5 text-[0.65rem] text-text-muted">1</span>`,
 		"Rotating the status token or changing managed branches returns this repository to setup until it is re-verified.",
 	} {
 		if !strings.Contains(body, want) {
@@ -1124,10 +1288,10 @@ func TestMutationPagesShowSetupRequiredWithoutEnforceableRepositories(t *testing
 		StatusDecisionStore:  &fakeStatusDecisionStore{},
 	})
 
-	for path, formMarker := range map[string]string{
-		"/freezes":           `<form method="post" action="/freezes" `,
-		"/scheduled-freezes": `<form method="post" action="/scheduled-freezes" `,
-		"/decisions":         `<form method="post" action="/decisions" `,
+	for path, expect := range map[string]struct{ formMarker, message string }{
+		"/freezes":           {`<form method="post" action="/freezes" `, "No repository has active enforcement"},
+		"/scheduled-freezes": {`<form method="post" action="/scheduled-freezes" `, "Repository enforcement is not active"},
+		"/decisions":         {`<form method="post" action="/decisions" `, "Repository enforcement is not active"},
 	} {
 		recorder := httptest.NewRecorder()
 		server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
@@ -1135,10 +1299,10 @@ func TestMutationPagesShowSetupRequiredWithoutEnforceableRepositories(t *testing
 			t.Fatalf("%s: expected status 200, got %d", path, recorder.Code)
 		}
 		body := recorder.Body.String()
-		if strings.Contains(body, formMarker) {
+		if strings.Contains(body, expect.formMarker) {
 			t.Fatalf("%s: expected mutation form to be omitted for setup-incomplete repositories", path)
 		}
-		if !strings.Contains(body, "Repository enforcement is not active") {
+		if !strings.Contains(body, expect.message) {
 			t.Fatalf("%s: expected setup-required message, got %q", path, body)
 		}
 	}
@@ -1164,7 +1328,7 @@ func TestFreezesPageHidesNonFreezeAuditEvents(t *testing.T) {
 	if strings.Contains(body, audit.ActionRepositoryCreated) {
 		t.Fatalf("expected repository audit events to be hidden, got %q", body)
 	}
-	if !strings.Contains(body, "No active freezes yet") {
+	if !strings.Contains(body, "No active freezes") {
 		t.Fatalf("expected empty active freeze state, got %q", body)
 	}
 }
@@ -1187,7 +1351,7 @@ func TestFreezesPageDoesNotDependOnOrPresentAuditHistory(t *testing.T) {
 			t.Fatalf("expected freezes page not to present duplicate audit history %q, got %q", unwanted, body)
 		}
 	}
-	if !strings.Contains(body, "No active freezes yet") {
+	if !strings.Contains(body, "No active freezes") {
 		t.Fatalf("expected empty active freeze state, got %q", body)
 	}
 }
@@ -1317,7 +1481,8 @@ func TestCreateFreezeRendersPastPlannedUnfreezeValidation(t *testing.T) {
 	for _, preserved := range []string{
 		`<option value="1" selected>taua-almeida/thawguard</option>`,
 		`<option value="main" data-repository="1" selected>main</option>`,
-		`<input name="reason" value="release window"`,
+		`id="freeze-reason"`,
+		`value="release window"`,
 		`name="planned_ends_at" value="2020-01-01T00:00"`,
 	} {
 		if !strings.Contains(body, preserved) {
@@ -3394,6 +3559,24 @@ func (s *fakeAuditStore) List(ctx context.Context, limit int) ([]audit.Event, er
 		return s.events[:limit], nil
 	}
 	return s.events, nil
+}
+
+type fakePullRequestStore struct {
+	pullRequests []domain.PullRequest
+	err          error
+}
+
+func (s *fakePullRequestStore) ListOpenByTargetBranch(ctx context.Context, repositoryID int64, targetBranch string) ([]domain.PullRequest, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	var matched []domain.PullRequest
+	for _, pr := range s.pullRequests {
+		if pr.RepositoryID == repositoryID && pr.TargetBranch == targetBranch && pr.IsOpen() {
+			matched = append(matched, pr)
+		}
+	}
+	return matched, nil
 }
 
 type fakeFreezeStore struct {

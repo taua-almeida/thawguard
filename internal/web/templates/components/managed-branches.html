@@ -1,52 +1,57 @@
 {{ define "components/managed-branches" }}
-        <div class="tg-repo-branches">
-          <div class="tg-repo-branches-head">
-            <strong>Managed branches</strong>
-            <span class="tg-badge tg-badge-info">exact names only</span>
-            {{ if .Repository.EnforcementActive }}<span class="tg-badge tg-badge-lock"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-lock"></use></svg>locked while active</span>{{ end }}
-          </div>
-          <p class="tg-muted">Freezes and scheduled freezes only apply to these exact branch names. Each branch is checked independently.</p>
-          {{ if .Branches }}
-          <ul class="tg-branch-list">
-            {{ range .Branches }}
-            <li class="tg-branch-row">
-              <code class="tg-branch">{{ .Name }}</code>
-              {{ if .IsDefault }}<span class="tg-badge tg-badge-info">default</span>{{ end }}
-              <span class="tg-badge {{ .SetupClass }}">{{ .SetupLabel }}</span>
-              {{ if .LastCheckedAt }}<small>checked {{ .LastCheckedAt }}</small>{{ end }}
-              {{ if and $.CurrentUser.CanManageRepositories (not .IsDefault) (not $.Repository.EnforcementActive) }}
-              <form method="post" action="/repositories/branches/remove" data-confirm-submit data-confirm-title="Remove managed branch?" data-confirm-message="Freezes and schedules can no longer target this branch. Removal is rejected while the branch has an active or scheduled freeze." data-confirm-action="Remove branch">
-                <input type="hidden" name="{{ $.CSRFField }}" value="{{ $.CSRFToken }}">
-                <input type="hidden" name="repository_id" value="{{ $.Repository.ID }}">
-                <input type="hidden" name="branch" value="{{ .Name }}">
-                <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-close"></use></svg>Remove</button>
-              </form>
-              {{ end }}
-              {{ if .Checks }}
-              <div class="tg-repo-checks">
-                {{ range .Checks }}
-                {{ template "components/readiness-check" . }}
-                {{ end }}
-              </div>
-              {{ else }}
-              <small>No readiness evidence recorded for this branch.</small>
-              {{ end }}
-            </li>
-            {{ end }}
-          </ul>
-          {{ else }}
-          <p class="tg-muted">No managed branches are recorded for this repository. Add the exact branch names Thawguard should manage.</p>
-          {{ end }}
-          {{ if .CurrentUser.CanManageRepositories }}
-            {{ if .Repository.EnforcementActive }}
-            <p class="tg-muted">Branch editing is disabled while enforcement is active. Deactivate repository enforcement before changing managed branches.</p>
-            {{ else }}
-            <form method="post" action="/repositories/branches" class="tg-branch-add-form">
-              <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
-              <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
-              <input name="branch" maxlength="255" placeholder="release/1.4" aria-label="Add managed branch for {{ .Repository.FullName }}" required>
-              <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm tg-repo-action-btn"><svg class="tg-icon"><use href="#tg-i-git-branch"></use></svg>Add branch</button>
-            </form>
-            {{ end }}
-          {{ end }}
-        </div>{{ end }}
+<div class="flex flex-wrap items-center gap-1.5">
+  {{ template "ui/badge" dict "Label" "exact names only" "Tone" "info" }}
+  {{ if .Repository.EnforcementActive }}{{ template "ui/badge" dict "Label" "locked while active" "Tone" "frozen" "Icon" "tg-i-lock" }}{{ end }}
+</div>
+<p class="m-0 text-sm text-text-muted">Freezes and scheduled freezes only apply to these exact branch names. Each branch is checked independently.</p>
+{{ if .Branches }}
+<ul class="m-0 flex list-none flex-col gap-3 p-0">
+  {{ range $i, $branch := .Branches }}
+  <li class="flex flex-col gap-2 rounded-card border border-border p-3">
+    <div class="flex flex-wrap items-center gap-2">
+      <code class="text-sm font-semibold">{{ $branch.Name }}</code>
+      {{ if $branch.IsDefault }}{{ template "ui/badge" dict "Label" "default" "Tone" "info" }}{{ end }}
+      {{ template "ui/badge" dict "Label" $branch.SetupLabel "Tone" $branch.SetupTone }}
+      {{ if $branch.LastCheckedAt }}<small class="text-xs text-text-muted">checked {{ $branch.LastCheckedAt }}</small>{{ end }}
+      {{ if and $.CurrentUser.CanManageRepositories (not $branch.IsDefault) (not $.Repository.EnforcementActive) }}
+      <span class="ml-auto">{{ template "ui/button" dict "Label" "Remove" "Variant" "secondary" "Size" "sm" "Icon" "tg-i-close" "DialogTarget" (printf "repo-%d-remove-branch-%d" $.Repository.ID $i) }}</span>
+      {{ template "ui/modal" dict
+           "ID" (printf "repo-%d-remove-branch-%d" $.Repository.ID $i)
+           "Title" "Remove managed branch?"
+           "Body" "Freezes and schedules can no longer target this branch. Removal is rejected while the branch has an active or scheduled freeze."
+           "ConfirmLabel" "Remove branch"
+           "ConfirmVariant" "danger"
+           "Action" "/repositories/branches/remove"
+           "CSRFField" $.CSRFField "CSRFToken" $.CSRFToken
+           "Fields" (dict "repository_id" (printf "%d" $.Repository.ID) "branch" $branch.Name)
+           "HxTarget" (printf "#repo-%d" $.Repository.ID) }}
+      {{ end }}
+    </div>
+    {{ if $branch.Checks }}
+    <div class="flex flex-col gap-2">
+      {{ range $branch.Checks }}
+      {{ template "components/readiness-check" . }}
+      {{ end }}
+    </div>
+    {{ else }}
+    <small class="text-xs text-text-muted">No readiness evidence recorded for this branch.</small>
+    {{ end }}
+  </li>
+  {{ end }}
+</ul>
+{{ else }}
+<p class="m-0 text-sm text-text-muted">No managed branches are recorded for this repository. Add the exact branch names Thawguard should manage.</p>
+{{ end }}
+{{ if .CurrentUser.CanManageRepositories }}
+  {{ if .Repository.EnforcementActive }}
+<p class="m-0 text-sm text-text-muted">Branch editing is disabled while enforcement is active. Deactivate repository enforcement before changing managed branches.</p>
+  {{ else }}
+<form method="post" action="/repositories/branches" hx-post="/repositories/branches" hx-target="#repo-{{ .Repository.ID }}" hx-swap="outerHTML" hx-push-url="false" class="flex flex-wrap items-center gap-2">
+  <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+  <input type="hidden" name="repository_id" value="{{ .Repository.ID }}">
+  <input name="branch" maxlength="255" placeholder="release/1.4" aria-label="Add managed branch for {{ .Repository.FullName }}" required class="h-8 w-56 max-w-full rounded-control border border-border-input bg-surface px-3 font-mono text-xs text-text placeholder:text-text-muted">
+  {{ template "ui/button" dict "Label" "Add branch" "Variant" "secondary" "Size" "sm" "Type" "submit" "Icon" "tg-i-git-branch" }}
+</form>
+  {{ end }}
+{{ end }}
+{{ end }}

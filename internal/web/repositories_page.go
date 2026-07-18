@@ -20,7 +20,7 @@ type repositoryView struct {
 	Branches             []repositoryBranchView
 	LastCheckedAt        string
 	EnforcementLabel     string
-	EnforcementClass     string
+	EnforcementTone      string
 	StatusPostVerifiedAt string
 	IsSetupIncomplete    bool
 	IsReady              bool
@@ -45,10 +45,20 @@ type repositoryView struct {
 	Lifecycle []lifecycleNode
 }
 
-// lifecycleNode is one step of the enforcement lifecycle rail.
+// Compact reports whether the card collapses to a summary row. States that
+// need no operator attention (ready, active) collapse so large installs stay
+// scannable; unhealthy and setup-incomplete repositories always render the
+// full card.
+func (v repositoryView) Compact() bool {
+	state := v.Repository.EnforcementState
+	return state == domain.EnforcementReady || state == domain.EnforcementActive
+}
+
+// lifecycleNode is one step of the enforcement lifecycle rail. State is one
+// of the ui/lifecycle primitive states: done, current, todo, or blocked.
 type lifecycleNode struct {
 	Label string
-	Class string
+	State string
 }
 
 // repositoryListFilter narrows the repositories page by full-name substring
@@ -72,7 +82,7 @@ type repositoryBranchView struct {
 	Name          string
 	IsDefault     bool
 	SetupLabel    string
-	SetupClass    string
+	SetupTone     string
 	LastCheckedAt string
 	Checks        []setupcheck.Check
 }
@@ -89,12 +99,33 @@ type repositoryOverview struct {
 // admin copy need.
 type repositoryCard struct {
 	repositoryView
-	CSRFToken                         string
-	CSRFField                         string
-	CurrentUser                       currentUserView
+	CSRFToken   string
+	CSRFField   string
+	CurrentUser currentUserView
+	// ActionError carries a per-card validation message for htmx fragment
+	// re-renders; the full-page fallback uses repositoriesPageData.FormError.
+	ActionError string
+	// Expanded forces a compact-tier card to render its disclosure open. Set
+	// only on htmx fragment responses: the user just acted inside the card,
+	// so the swap must not collapse it.
+	Expanded                          bool
 	RequiredContext                   string
 	SetupStatusContext                string
 	WebhookSecretEncryptionConfigured bool
+}
+
+// toastView is one transient success/notice message rendered by ui/toast.
+type toastView struct {
+	Message     string
+	Tone        string
+	DismissHref string
+}
+
+// repositoryCardFragment is the htmx response payload for a repository
+// mutation: the refreshed card plus an optional out-of-band success toast.
+type repositoryCardFragment struct {
+	Card  repositoryCard
+	Toast *toastView
 }
 
 // repositoriesPageData is the explicit, fully prepared model for the
@@ -102,6 +133,8 @@ type repositoryCard struct {
 // domain and permission decisions happen before rendering.
 type repositoriesPageData struct {
 	AppName                           string
+	PageTitle                         string
+	Theme                             string
 	ActivePage                        string
 	Overview                          repositoryOverview
 	RepositoryViews                   []repositoryCard
@@ -110,7 +143,7 @@ type repositoriesPageData struct {
 	TotalCount                        int
 	VisibleCount                      int
 	FormError                         string
-	Notice                            string
+	Toasts                            []toastView
 	CSRFToken                         string
 	CSRFField                         string
 	CurrentUser                       currentUserView
@@ -153,7 +186,7 @@ func (s *Server) repositoryViews(ctx context.Context, repositories []domain.Repo
 		view := repositoryView{Repository: repo}
 		view.ActiveFreezeCount = activeFreezesByRepository[repo.ID]
 		view.PendingScheduleCount = pendingSchedulesByRepository[repo.ID]
-		view.EnforcementLabel, view.EnforcementClass = enforcementView(repo.EnforcementState)
+		view.EnforcementLabel, view.EnforcementTone = enforcementView(repo.EnforcementState)
 		view.Lifecycle = lifecycleRail(repo.EnforcementState)
 		view.IsSetupIncomplete = repo.EnforcementState == domain.EnforcementSetupIncomplete
 		view.IsReady = repo.EnforcementState == domain.EnforcementReady
@@ -230,7 +263,7 @@ func groupReadinessChecks(repo domain.Repository, branches []domain.RepositoryBr
 	views := make([]repositoryBranchView, 0, len(branches))
 	for _, branch := range branches {
 		branchChecks := checksByBranch[branch.Name]
-		label, class := readinessStatus(branchChecks)
+		label, tone := readinessStatus(branchChecks)
 		lastCheckedAt := ""
 		if branch.LastCheckedAt != nil {
 			lastCheckedAt = formatReadinessTime(*branch.LastCheckedAt)
@@ -239,7 +272,7 @@ func groupReadinessChecks(repo domain.Repository, branches []domain.RepositoryBr
 			Name:          branch.Name,
 			IsDefault:     branch.Name == repo.DefaultBranch,
 			SetupLabel:    label,
-			SetupClass:    class,
+			SetupTone:     tone,
 			LastCheckedAt: lastCheckedAt,
 			Checks:        branchChecks,
 		})
@@ -247,23 +280,25 @@ func groupReadinessChecks(repo domain.Repository, branches []domain.RepositoryBr
 	return repositoryChecks, views
 }
 
+// readinessStatus summarizes a branch's latest checks as a badge label and
+// ui/badge tone.
 func readinessStatus(checks []setupcheck.Check) (string, string) {
 	if len(checks) == 0 {
-		return "not checked", "status-warning"
+		return "not checked", "warning"
 	}
 	status := setupcheck.StatusOK
 	for _, check := range checks {
 		if check.Result.Status == setupcheck.StatusFailed {
-			return "failed", "status-failed"
+			return "failed", "danger"
 		}
 		if check.Result.Status == setupcheck.StatusWarning {
 			status = setupcheck.StatusWarning
 		}
 	}
 	if status == setupcheck.StatusWarning {
-		return "warning", "status-warning"
+		return "warning", "warning"
 	}
-	return "passed", "status-ok"
+	return "passed", "success"
 }
 
 // enforcementFailureRemediation maps the stable stored failure categories to
@@ -287,29 +322,31 @@ func enforcementFailureRemediation(reason string) string {
 	}
 }
 
+// enforcementView maps the enforcement state to a badge label and ui/badge
+// tone.
 func enforcementView(state domain.EnforcementState) (string, string) {
 	switch state {
 	case domain.EnforcementActive:
-		return "enforcement active", "status-ok"
+		return "enforcement active", "success"
 	case domain.EnforcementUnhealthy:
-		return "unhealthy", "status-failed"
+		return "unhealthy", "danger"
 	case domain.EnforcementReady:
-		return "ready", "status-warning"
+		return "ready", "info"
 	default:
-		return "setup incomplete", "status-warning"
+		return "setup incomplete", "warning"
 	}
 }
 
 func lifecycleRail(state domain.EnforcementState) []lifecycleNode {
 	switch state {
 	case domain.EnforcementReady:
-		return []lifecycleNode{{"Setup", "is-done"}, {"Ready", "is-current"}, {"Active", "is-pending"}}
+		return []lifecycleNode{{"Setup", "done"}, {"Ready", "current"}, {"Active", "todo"}}
 	case domain.EnforcementActive:
-		return []lifecycleNode{{"Setup", "is-done"}, {"Ready", "is-done"}, {"Active", "is-current"}}
+		return []lifecycleNode{{"Setup", "done"}, {"Ready", "done"}, {"Active", "current"}}
 	case domain.EnforcementUnhealthy:
-		return []lifecycleNode{{"Setup", "is-done"}, {"Ready", "is-done"}, {"Active", "is-broken"}}
+		return []lifecycleNode{{"Setup", "done"}, {"Ready", "done"}, {"Active", "blocked"}}
 	default:
-		return []lifecycleNode{{"Setup", "is-current"}, {"Ready", "is-pending"}, {"Active", "is-pending"}}
+		return []lifecycleNode{{"Setup", "current"}, {"Ready", "todo"}, {"Active", "todo"}}
 	}
 }
 
@@ -448,6 +485,13 @@ func (s *Server) renderRepositories(w http.ResponseWriter, views []repositoryVie
 }
 
 func (s *Server) renderRepositoriesPage(w http.ResponseWriter, views []repositoryView, formError, notice string, session sessionState, filter repositoryListFilter) {
+	data := s.repositoriesPageData(views, formError, notice, session.CSRFToken, currentUserFromSession(session), filter)
+	s.renderPage(w, "layouts/repositories", data)
+}
+
+// repositoriesPageData assembles the full page model from prepared views; it
+// is shared by the live renderer and the dev-only preview fixtures.
+func (s *Server) repositoriesPageData(views []repositoryView, formError, notice, csrfToken string, currentUser currentUserView, filter repositoryListFilter) repositoriesPageData {
 	overview := repositoryOverview{RepositoryCount: len(views)}
 	for _, view := range views {
 		if view.Repository.HasWebhookSecret {
@@ -464,6 +508,7 @@ func (s *Server) renderRepositoriesPage(w http.ResponseWriter, views []repositor
 	visible := filterRepositoryViews(views, filter)
 	data := repositoriesPageData{
 		AppName:                           s.cfg.AppName,
+		PageTitle:                         "Repositories",
 		ActivePage:                        "repositories",
 		Overview:                          overview,
 		Filter:                            filter,
@@ -471,13 +516,15 @@ func (s *Server) renderRepositoriesPage(w http.ResponseWriter, views []repositor
 		TotalCount:                        len(views),
 		VisibleCount:                      len(visible),
 		FormError:                         formError,
-		Notice:                            notice,
-		CSRFToken:                         session.CSRFToken,
+		CSRFToken:                         csrfToken,
 		CSRFField:                         csrfFormField,
-		CurrentUser:                       currentUserFromSession(session),
+		CurrentUser:                       currentUser,
 		RequiredContext:                   domain.RequiredStatusContext,
 		SetupStatusContext:                domain.SetupStatusContext,
 		WebhookSecretEncryptionConfigured: s.cfg.RepositorySecretEncryptionConfigured,
+	}
+	if notice != "" {
+		data.Toasts = []toastView{{Message: notice, Tone: "success", DismissHref: "/repositories"}}
 	}
 	data.RepositoryViews = make([]repositoryCard, 0, len(visible))
 	for _, view := range visible {
@@ -491,5 +538,34 @@ func (s *Server) renderRepositoriesPage(w http.ResponseWriter, views []repositor
 			WebhookSecretEncryptionConfigured: data.WebhookSecretEncryptionConfigured,
 		})
 	}
-	s.renderPage(w, "layouts/repositories", data)
+	return data
+}
+
+// repositoryCardByID rebuilds the current repository views and returns the
+// fully prepared card for one repository, for htmx fragment responses.
+func (s *Server) repositoryCardByID(ctx context.Context, repositoryID int64, session sessionState) (repositoryCard, bool, error) {
+	repositories, err := s.repositories(ctx)
+	if err != nil {
+		return repositoryCard{}, false, err
+	}
+	views, err := s.repositoryViews(ctx, repositories)
+	if err != nil {
+		return repositoryCard{}, false, err
+	}
+	for _, view := range views {
+		if view.Repository.ID != repositoryID {
+			continue
+		}
+		return repositoryCard{
+			repositoryView:                    view,
+			CSRFToken:                         session.CSRFToken,
+			CSRFField:                         csrfFormField,
+			CurrentUser:                       currentUserFromSession(session),
+			Expanded:                          true,
+			RequiredContext:                   domain.RequiredStatusContext,
+			SetupStatusContext:                domain.SetupStatusContext,
+			WebhookSecretEncryptionConfigured: s.cfg.RepositorySecretEncryptionConfigured,
+		}, true, nil
+	}
+	return repositoryCard{}, false, nil
 }

@@ -1,3 +1,7 @@
 Thawguard
 Original project: https://github.com/taua-almeida/thawguard
 Copyright (c) 2026 Taua Almeida
+
+Bundled third-party assets:
+- web/static/js/htmx.min.js: htmx 2.0.10 (https://htmx.org), Zero-Clause BSD.
+  License text: web/static/js/htmx.LICENSE

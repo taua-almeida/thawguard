@@ -1,0 +1,22 @@
+{{/*
+  ui/callout — replaces .tg-dev-callout / .tg-warning-callout / .tg-shared-head-callout /
+  .tg-impact-warning / .tg-local-note / .warning / .tg-state-banner (full-width variant)
+  dict keys: Tone info|success|warning|danger (default info), Title, Body,
+  Icon (sprite id; defaults per tone), Banner (bool: full-width state-banner styling)
+*/}}
+{{ define "ui/callout" }}
+{{- $tone := "info" }}{{ if .Tone }}{{ $tone = .Tone }}{{ end }}
+{{- $toneClass := "border-accent bg-accent-soft text-accent-strong" }}{{ $icon := "tg-i-icy-shield" }}
+{{- if eq $tone "success" }}{{ $toneClass = "border-success bg-success-soft text-success" }}{{ $icon = "tg-i-check" }}
+{{- else if eq $tone "warning" }}{{ $toneClass = "border-warning bg-warning-soft text-warning" }}{{ $icon = "tg-i-warning" }}
+{{- else if eq $tone "danger" }}{{ $toneClass = "border-danger bg-danger-soft text-danger" }}{{ $icon = "tg-i-warning" }}
+{{- end }}
+{{- if .Icon }}{{ $icon = .Icon }}{{ end }}
+<div class="flex items-start gap-3 rounded-card border-l-4 p-3.5 {{ $toneClass }}{{ if .Banner }} w-full{{ end }}">
+  <svg class="mt-0.5 h-4 w-4 flex-none" aria-hidden="true"><use href="#{{ $icon }}"></use></svg>
+  <div class="text-sm">
+    {{ if .Title }}<p class="m-0 font-bold">{{ .Title }}</p>{{ end }}
+    {{ if .Body }}<p class="m-0{{ if .Title }} mt-0.5{{ end }} text-text">{{ .Body }}</p>{{ end }}
+  </div>
+</div>
+{{ end }}

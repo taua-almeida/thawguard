@@ -1,0 +1,51 @@
+{{/*
+  components/freeze-impact — the #freeze-impact swap region inside the freeze
+  workbench aside: the repo→branch echo plus the known open pull requests a
+  freeze on that pair would hit, from the webhook-synced local cache (never a
+  live forge lookup). Server-rendered for the initial pair; refreshed via
+  GET /freezes/impact when the form selection changes. Every row is in the
+  DOM: rows past the visible cap sit inside a closed native <details>, so the
+  full list is reachable without JavaScript. The echo carries the
+  data-preview-* hooks so main.js keeps it current even before the htmx swap
+  lands; without JS the server-rendered echo labels which pair the panel is
+  about. Context is *impactView; nil renders an empty (but swappable) region.
+*/}}
+{{ define "components/freeze-impact" }}
+<div id="freeze-impact" class="flex flex-col gap-3">
+  {{ if . }}
+  <p class="m-0 flex flex-wrap items-center gap-2 font-mono text-xs text-text">
+    <svg class="h-4 w-4 text-text-muted" aria-hidden="true"><use href="#tg-i-git-branch"></use></svg>
+    <code data-preview-repository>{{ .Repository }}</code><span class="text-text-muted" aria-hidden="true">→</span><code data-preview-branch>{{ .Branch }}</code>
+  </p>
+  {{ if .Total }}
+  <p class="m-0 text-sm text-text"><strong>{{ .Total }} known open pull request{{ if ne .Total 1 }}s{{ end }}</strong> will receive a failing <code>{{ .RequiredContext }}</code> check:</p>
+  <ul class="m-0 flex list-none flex-col gap-1.5 p-0">
+    {{ range .Visible }}{{ template "components/freeze-impact-row" . }}{{ end }}
+  </ul>
+  {{ if .Overflow }}
+  <details class="text-sm">
+    <summary class="cursor-pointer text-xs font-semibold text-accent-strong">Show all {{ .Total }}</summary>
+    <ul class="m-0 mt-1.5 flex list-none flex-col gap-1.5 p-0">
+      {{ range .Overflow }}{{ template "components/freeze-impact-row" . }}{{ end }}
+    </ul>
+  </details>
+  {{ end }}
+  {{ else }}
+  <p class="m-0 text-sm text-text-muted">No known open pull requests target this branch right now. Pull requests opened while the freeze is active receive the failing check.</p>
+  {{ end }}
+  <p class="m-0 text-xs text-text-muted">From webhook sync, not a live forge lookup.</p>
+  {{ end }}
+</div>
+{{ end }}
+
+{{/*
+  components/freeze-impact-row — one open pull request in the impact list:
+  mono index, truncating single-line title, external link to the forge.
+*/}}
+{{ define "components/freeze-impact-row" }}
+<li class="flex min-w-0 items-center gap-2 text-sm">
+  <code class="flex-none font-mono text-xs text-text-muted">#{{ .Index }}</code>
+  <span class="min-w-0 flex-1 truncate text-text" title="{{ .Title }}">{{ .Title }}</span>
+  {{ if .URL }}<a href="{{ .URL }}" target="_blank" rel="noopener noreferrer" class="flex-none text-text-muted transition-colors hover:text-accent-strong" aria-label="Open pull request #{{ .Index }} on the forge (new tab)"><svg class="h-3.5 w-3.5" aria-hidden="true"><use href="#tg-i-external-link"></use></svg></a>{{ end }}
+</li>
+{{ end }}

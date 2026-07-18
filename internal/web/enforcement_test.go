@@ -158,8 +158,8 @@ func TestRepositoriesPageShowsActivateActionOnlyWhenReady(t *testing.T) {
 	if !strings.Contains(body, `action="/repositories/activate"`) || !strings.Contains(body, "Activate enforcement") {
 		t.Fatalf("expected activate action for ready repository, got %q", body)
 	}
-	if !strings.Contains(body, `data-confirm-title="Activate enforcement?"`) || !strings.Contains(body, "synchronizes current open pull requests") {
-		t.Fatalf("expected custom confirmation metadata explaining activation, got %q", body)
+	if !strings.Contains(body, `<dialog id="repo-7-activate"`) || !strings.Contains(body, "Activate enforcement?") || !strings.Contains(body, "synchronizes current open pull requests") {
+		t.Fatalf("expected confirmation dialog explaining activation, got %q", body)
 	}
 	if !strings.Contains(body, "Status posting verified") || !strings.Contains(body, "2026-07-12 09:00 UTC") {
 		t.Fatalf("expected verification evidence with time, got %q", body)
@@ -178,13 +178,14 @@ func TestRepositoriesPageOffersReconcileActionForActiveRepository(t *testing.T) 
 	if !strings.Contains(body, `action="/repositories/reconcile"`) || !strings.Contains(body, "Reconcile now") {
 		t.Fatalf("expected reconcile action for active repository, got %q", body)
 	}
-	if !strings.Contains(body, `action="/repositories/deactivate"`) || !strings.Contains(body, "Deactivate for maintenance") || !strings.Contains(body, `data-confirm-title="Deactivate repository enforcement?"`) {
+	if !strings.Contains(body, `action="/repositories/deactivate"`) || !strings.Contains(body, "Deactivate for maintenance") || !strings.Contains(body, `<dialog id="repo-7-deactivate"`) || !strings.Contains(body, "Deactivate repository enforcement?") {
 		t.Fatalf("expected confirmed maintenance deactivation action, got %q", body)
 	}
-	if strings.Contains(body, `data-credential-target="status-token-7"`) || !strings.Contains(body, "Deactivate enforcement before replacing the status token") {
+	if strings.Contains(body, `action="/repositories/status-token"`) || !strings.Contains(body, "Deactivate enforcement before replacing the status token") {
 		t.Fatalf("expected active status-token maintenance lock in UI, got %q", body)
 	}
-	if !strings.Contains(body, `data-confirm-title="Reconcile enforcement now?"`) ||
+	if !strings.Contains(body, `<dialog id="repo-7-reconcile"`) ||
+		!strings.Contains(body, "Reconcile enforcement now?") ||
 		!strings.Contains(body, "refreshes current open pull requests") ||
 		!strings.Contains(body, "republishes the current thawguard/freeze policy") ||
 		!strings.Contains(body, "marked unhealthy") {
@@ -207,7 +208,8 @@ func TestRepositoriesPageOffersRecoveryForUnhealthyRepository(t *testing.T) {
 	if !strings.Contains(body, `action="/repositories/recover"`) || !strings.Contains(body, "Retry enforcement recovery") {
 		t.Fatalf("expected recovery action for unhealthy repository, got %q", body)
 	}
-	if !strings.Contains(body, `data-confirm-title="Retry enforcement recovery?"`) ||
+	if !strings.Contains(body, `<dialog id="repo-7-recover"`) ||
+		!strings.Contains(body, "Retry enforcement recovery?") ||
 		!strings.Contains(body, "reruns every read-only readiness check") ||
 		!strings.Contains(body, "controlled thawguard/setup status post") ||
 		!strings.Contains(body, "returns to active only after complete success") {

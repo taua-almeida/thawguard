@@ -22,14 +22,16 @@ func TestRepositoriesLayoutTemplateExecutesWithTypedData(t *testing.T) {
 			HasStatusToken:   true,
 		},
 		EnforcementLabel:    "setup incomplete",
-		EnforcementClass:    "status-warning",
+		EnforcementTone:     "warning",
 		IsSetupIncomplete:   true,
 		VerifyBlockedReason: "Run readiness checks first.",
-		Lifecycle:           []lifecycleNode{{Label: "Setup", Class: "is-current"}},
+		Lifecycle:           []lifecycleNode{{Label: "Setup", State: "current"}},
 	}
 	data := repositoriesPageData{
 		AppName:    "Thawguard",
+		PageTitle:  "Repositories",
 		ActivePage: "repositories",
+		Toasts:     []toastView{{Message: "Repository enforcement is inactive.", Tone: "success", DismissHref: "/repositories"}},
 		RepositoryViews: []repositoryCard{{
 			repositoryView:                    view,
 			CSRFToken:                         "test-token",
@@ -56,18 +58,61 @@ func TestRepositoriesLayoutTemplateExecutesWithTypedData(t *testing.T) {
 	body := buf.String()
 	for _, want := range []string{
 		"<!doctype html>",
-		"/static/thawguard.css",
-		"tg-repo-card",
+		"/static/app.css",
+		`id="repo-7"`,
 		"taua-almeida/thawguard",
 		`name="` + csrfFormField + `" value="test-token"`,
 		domain.RequiredStatusContext,
-		"data-alert-dialog",
-		"data-confirm-submit",
+		`<dialog id="connect-repository"`,
+		"Run readiness checks first.",
+		`id="toasts"`,
+		"Repository enforcement is inactive.",
 		"</html>",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected rendered layout to contain %q", want)
 		}
+	}
+	if strings.Contains(body, "/static/thawguard.css") {
+		t.Fatalf("expected repositories layout to use app.css, not the legacy stylesheet")
+	}
+}
+
+func TestRepositoryCardFragmentRendersCardAndOOBToast(t *testing.T) {
+	card := repositoryCard{
+		repositoryView: repositoryView{
+			Repository:       domain.Repository{ID: 7, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"},
+			EnforcementLabel: "setup incomplete",
+			EnforcementTone:  "warning",
+			Lifecycle:        []lifecycleNode{{Label: "Setup", State: "current"}},
+		},
+		CSRFToken:       "test-token",
+		CSRFField:       csrfFormField,
+		CurrentUser:     currentUserView{Email: "taua@example.com", DisplayName: "Taua", RoleLabel: "Admin", IsAdmin: true, CanManageRepositories: true},
+		RequiredContext: domain.RequiredStatusContext,
+		ActionError:     "branch name is invalid",
+	}
+
+	var buf bytes.Buffer
+	if err := pageTemplates.ExecuteTemplate(&buf, "components/repository-card-fragment", repositoryCardFragment{
+		Card:  card,
+		Toast: &toastView{Message: "Managed branch added.", Tone: "success"},
+	}); err != nil {
+		t.Fatalf("expected card fragment to execute, got error: %v", err)
+	}
+	body := buf.String()
+	for _, want := range []string{
+		`id="repo-7"`,
+		"branch name is invalid",
+		`id="toasts" hx-swap-oob="true"`,
+		"Managed branch added.",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected rendered fragment to contain %q", want)
+		}
+	}
+	if strings.Contains(body, "<!doctype html>") {
+		t.Fatalf("expected fragment to render without the page shell")
 	}
 }
 
@@ -104,6 +149,11 @@ func TestFreezesLayoutTemplateExecutesWithTypedData(t *testing.T) {
 		CSRFToken:       "test-token",
 		CSRFField:       csrfFormField,
 		RequiredContext: domain.RequiredStatusContext,
+		Impact: &impactView{
+			Repository:      "taua-almeida/thawguard",
+			Branch:          "main",
+			RequiredContext: domain.RequiredStatusContext,
+		},
 	}
 
 	var buf bytes.Buffer
@@ -113,9 +163,13 @@ func TestFreezesLayoutTemplateExecutesWithTypedData(t *testing.T) {
 	body := buf.String()
 	for _, want := range []string{
 		"<!doctype html>",
-		"Branch Freezes",
-		"Freeze effect",
-		"Active freeze mobile cards",
+		"Start a freeze",
+		"Freeze impact",
+		`id="freeze-impact"`,
+		"How freezes work",
+		"No known open pull requests target this branch right now.",
+		"From webhook sync, not a live forge lookup.",
+		`hx-get="/freezes/impact"`,
 		"data-local-datetime disabled",
 		"Planned unfreeze is unavailable without JavaScript",
 		`name="` + csrfFormField + `" value="test-token"`,
@@ -123,11 +177,9 @@ func TestFreezesLayoutTemplateExecutesWithTypedData(t *testing.T) {
 		`action="/freezes/cancel"`,
 		domain.RequiredStatusContext,
 		"release &lt;cut&gt;",
-		"data-alert-dialog",
-		`tabindex="-1"`,
-		"previouslyFocused",
-		"plannedEndsAt.addEventListener('change', updateTimezoneOffset)",
-		"form.addEventListener('submit', updateTimezoneOffset)",
+		`<dialog id="lift-freeze-11"`,
+		`<dialog id="cancel-freeze-11"`,
+		`data-timezone-offset-minutes`,
 		"</html>",
 	} {
 		if !strings.Contains(body, want) {
@@ -166,12 +218,12 @@ func TestFreezesLayoutKeepsReadOnlyStateMutationFree(t *testing.T) {
 		t.Fatalf("expected read-only freezes layout to execute, got error: %v", err)
 	}
 	body := buf.String()
-	for _, want := range []string{"Read-only freeze access", "Policy summary", "Read only"} {
+	for _, want := range []string{"Read-only freeze access", "How freezes work", "Read only"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected read-only freezes layout to contain %q", want)
 		}
 	}
-	for _, mutation := range []string{`action="/freezes"`, `action="/freezes/end"`, `action="/freezes/cancel"`, "Evaluated on submit"} {
+	for _, mutation := range []string{`action="/freezes"`, `action="/freezes/end"`, `action="/freezes/cancel"`, "Evaluated on submit", "Freeze impact", `id="freeze-impact"`} {
 		if strings.Contains(body, mutation) {
 			t.Fatalf("expected read-only freezes layout not to contain mutation marker %q", mutation)
 		}
@@ -188,7 +240,6 @@ func TestStaticAssetsServedFromEmbeddedFS(t *testing.T) {
 		{"/static/css/tokens.css", ":root"},
 		{"/static/css/legacy.css", ".tg-sidebar"},
 		{"/static/css/pages/freezes.css", ".tg-freezes-page"},
-		{"/static/css/pages/repositories.css", ".tg-repo-grid"},
 	}
 	for _, tc := range cases {
 		recorder := httptest.NewRecorder()
