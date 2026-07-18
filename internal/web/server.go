@@ -407,6 +407,7 @@ func (s *Server) routes() {
 		s.mux.HandleFunc("GET /dev/preview/auth", s.handleDevPreviewAuth)
 		s.mux.HandleFunc("GET /dev/preview/repositories", s.handleDevPreviewRepositories)
 		s.mux.HandleFunc("GET /dev/preview/freezes", s.handleDevPreviewFreezes)
+		s.mux.HandleFunc("GET /dev/preview/dashboard", s.handleDevPreviewDashboard)
 	}
 }
 

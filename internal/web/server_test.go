@@ -3748,3 +3748,49 @@ func (s *fakeRepositoryStore) SetStatusToken(ctx context.Context, repositoryID i
 	}
 	return domain.Repository{}, repositorysetup.ValidationError{Message: "repository not found"}
 }
+
+func TestDevPreviewDashboardRequiresDevMode(t *testing.T) {
+	// Without DevMode the route is never registered: the path falls through
+	// to the catch-all "GET /" (the real, auth-gated dashboard), so the
+	// fictional preview fixtures must never appear in the response.
+	prod := NewServer(Config{AppName: "Thawguard"})
+	recorder := httptest.NewRecorder()
+	prod.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dev/preview/dashboard", nil))
+	for _, leaked := range []string{"mira.frost@example.test", "Repository #17", "dev-preview-fictional-token"} {
+		if strings.Contains(recorder.Body.String(), leaked) {
+			t.Fatalf("expected non-dev server not to serve preview fixture %q", leaked)
+		}
+	}
+	// The dev handler itself also re-checks the flag, so even a stray route
+	// registration cannot serve the preview in production.
+	recorder = httptest.NewRecorder()
+	prod.handleDevPreviewDashboard(recorder, httptest.NewRequest(http.MethodGet, "/dev/preview/dashboard", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("expected dev preview dashboard handler to 404 without dev mode, got %d", recorder.Code)
+	}
+
+	dev := NewServer(Config{AppName: "Thawguard", DevMode: true})
+	recorder = httptest.NewRecorder()
+	dev.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dev/preview/dashboard", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected /dev/preview/dashboard to render in dev mode, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{"Dashboard", "aurora/ice-station", "Repository #17", "mira.frost@example.test"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected dev preview dashboard to contain %q", want)
+		}
+	}
+
+	recorder = httptest.NewRecorder()
+	dev.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dev/preview/dashboard?variant=empty&role=viewer", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected empty-variant dev preview dashboard to render, got %d", recorder.Code)
+	}
+	body = recorder.Body.String()
+	for _, want := range []string{"No active freezes", "No recorded activity yet.", `text-text">0 of 0`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected empty dev preview dashboard to contain %q", want)
+		}
+	}
+}

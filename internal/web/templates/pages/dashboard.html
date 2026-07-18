@@ -24,7 +24,8 @@
     <a class="block rounded-panel no-underline focus-visible:outline-2 focus-visible:outline-accent" href="/freezes" aria-label="View active freezes">
       {{ template "ui/stat-card" dict "Label" "Active freezes" "Value" .ActiveFreezeCount "Tone" "frozen" }}
     </a>
-    {{ $enforcingTone := "success" }}{{ if lt .EnforcingCount .RepositoryCount }}{{ $enforcingTone = "warning" }}{{ end }}
+    {{/* Neutral on a fresh install: green "0 of 0" would misread as healthy. */}}
+    {{ $enforcingTone := "" }}{{ if .RepositoryCount }}{{ $enforcingTone = "success" }}{{ if lt .EnforcingCount .RepositoryCount }}{{ $enforcingTone = "warning" }}{{ end }}{{ end }}
     <a class="block rounded-panel no-underline focus-visible:outline-2 focus-visible:outline-accent" href="/repositories" aria-label="View repository enforcement setup">
       {{ template "ui/stat-card" dict "Label" "Enforcing" "Value" (printf "%d of %d" .EnforcingCount .RepositoryCount) "Tone" $enforcingTone "Hint" "Repositories with active enforcement" }}
     </a>

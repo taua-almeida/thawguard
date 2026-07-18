@@ -28,6 +28,7 @@
 @source "../../internal/web/templates/components/freeze-workbench.html";
 @source "../../internal/web/templates/components/freeze-impact.html";
 @source "../../internal/web/templates/components/active-freezes.html";
+@source "../../internal/web/templates/pages/dashboard.html";
 
 /*
  * Semantic tokens - LIGHT values (the default theme).

@@ -182,6 +182,120 @@ func (s *Server) handleDevPreviewRepositories(w http.ResponseWriter, r *http.Req
 	s.renderPage(w, "layouts/repositories", data)
 }
 
+// handleDevPreviewDashboard renders the dashboard from fictional fixtures
+// (GET /dev/preview/dashboard). Query knobs: ?role=viewer, ?variant=empty,
+// ?theme=dark|light. The default variant is a populated admin view; "empty"
+// is a fresh install with zero repositories and no recorded data.
+func (s *Server) handleDevPreviewDashboard(w http.ResponseWriter, r *http.Request) {
+	if !s.cfg.DevMode {
+		http.NotFound(w, r)
+		return
+	}
+	user := currentUserView{
+		Email:                 "mira.frost@example.test",
+		DisplayName:           "Mira Frost",
+		RoleLabel:             "Admin",
+		CanChangePassword:     true,
+		IsAdmin:               true,
+		CanManageRepositories: true,
+		CanFreeze:             true,
+		CanThaw:               true,
+	}
+	if r.URL.Query().Get("role") == "viewer" {
+		user = currentUserView{
+			Email:             "sten.hale@example.test",
+			DisplayName:       "Sten Hale",
+			RoleLabel:         "Viewer",
+			CanChangePassword: true,
+		}
+	}
+	data := dashboardPageData{
+		AppName:     s.cfg.AppName,
+		PageTitle:   "Dashboard",
+		Theme:       devPreviewTheme(r),
+		ActivePage:  "dashboard",
+		CurrentUser: user,
+		CSRFToken:   "dev-preview-fictional-token",
+		CSRFField:   csrfFormField,
+	}
+	if r.URL.Query().Get("variant") == "empty" {
+		s.renderPage(w, "layouts/dashboard", data)
+		return
+	}
+	auroraIceStation := domain.Repository{ID: 46, Forge: "forgejo", BaseURL: "https://forge.example.test", Owner: "aurora", Name: "ice-station", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
+	borealisFrostAPI := domain.Repository{ID: 47, Forge: "codeberg", BaseURL: "https://codeberg.org", Owner: "borealis", Name: "frost-api", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
+	data.RepositoryCount = 4
+	data.EnforcingCount = 3
+	data.SetupIncompleteCount = 1
+	data.ActiveFreezeCount = 6
+	data.ScheduledFreezeCount = 2
+	data.ActiveThawCount = 1
+	data.ActiveFreezes = []freezeView{
+		{
+			Freeze:         domain.BranchFreeze{ID: 301, RepositoryID: 46, Branch: "main", Reason: "Release cut 2026-07 — QA verification in progress"},
+			Repository:     auroraIceStation,
+			StartedLabel:   "2026-07-16",
+			StartedTitle:   "2026-07-16T14:05:00Z",
+			CreatedByLabel: "rana.kall@example.test",
+		},
+		{
+			Freeze:         domain.BranchFreeze{ID: 302, RepositoryID: 47, Branch: "main", Reason: "Incident 4821 — hold deploys until the postmortem lands"},
+			Repository:     borealisFrostAPI,
+			StartedLabel:   "2026-07-15",
+			StartedTitle:   "2026-07-15T22:41:00Z",
+			CreatedByLabel: "bootstrap admin",
+		},
+		{
+			Freeze:         domain.BranchFreeze{ID: 304, RepositoryID: 46, Branch: "release/1.8", Reason: "Recurring release-week freeze"},
+			Repository:     auroraIceStation,
+			StartedLabel:   "2026-07-14",
+			StartedTitle:   "2026-07-14T06:00:00Z",
+			CreatedByLabel: "via schedule",
+		},
+		{
+			Freeze:         domain.BranchFreeze{ID: 305, RepositoryID: 47, Branch: "main", Reason: "Offboarding hold — access review in progress"},
+			Repository:     borealisFrostAPI,
+			StartedLabel:   "2026-07-12",
+			StartedTitle:   "2026-07-12T11:30:00Z",
+			CreatedByLabel: "a removed user",
+		},
+		{
+			// Deleted repository: the zero-value Repository exercises the
+			// "Repository #17" fallback; no StartedLabel (pre-backfill row).
+			Freeze: domain.BranchFreeze{ID: 303, RepositoryID: 17, Branch: "release/0.9", Reason: "Repository disconnected mid-freeze — evidence retained"},
+		},
+	}
+	data.ScheduledFreezes = []scheduledFreezeView{
+		{
+			Freeze:           domain.BranchFreeze{ID: 401, RepositoryID: 46, Branch: "main", Reason: "Aurora launch window"},
+			Repository:       auroraIceStation,
+			StartsAt:         "2026-07-20 06:00 UTC",
+			StartsAtUTC:      "2026-07-20T06:00:00Z",
+			PlannedEndsAt:    "2026-07-22 18:00 UTC",
+			PlannedEndsAtUTC: "2026-07-22T18:00:00Z",
+			StatusLabel:      "Pending",
+			StateClass:       "pending",
+		},
+		{
+			Freeze:      domain.BranchFreeze{ID: 402, RepositoryID: 47, Branch: "main", Reason: "Quarterly audit hold"},
+			Repository:  borealisFrostAPI,
+			StartsAt:    "2026-07-28 00:00 UTC",
+			StartsAtUTC: "2026-07-28T00:00:00Z",
+			StatusLabel: "Pending",
+			StateClass:  "pending",
+		},
+	}
+	data.RecentActivity = []activityEventView{
+		{CreatedAt: "2026-07-17 11:20 UTC", Actor: "rana.kall@example.test", ActionLabel: "Freeze started", Target: "aurora/ice-station main", Outcome: "Enforced", OutcomeClass: "frozen"},
+		{CreatedAt: "2026-07-17 09:02 UTC", Actor: "mira.frost@example.test", ActionLabel: "Thaw approved", Target: "borealis/frost-api pull 241", Outcome: "Granted", OutcomeClass: "ok"},
+		{CreatedAt: "2026-07-16 21:40 UTC", ActionLabel: "Status publication", Target: "glacier/perma-lab main", Outcome: "Failed", OutcomeClass: "failed"},
+		{CreatedAt: "2026-07-16 18:00 UTC", Actor: "via schedule", ActionLabel: "Scheduled freeze started", Target: "aurora/ice-station release/1.8", Outcome: "Enforced", OutcomeClass: "frozen"},
+		{CreatedAt: "2026-07-16 09:12 UTC", Actor: "mira.frost@example.test", ActionLabel: "Setup check", Target: "cirrus/ice-docs main", Outcome: "Warning", OutcomeClass: "warning"},
+		{CreatedAt: "2026-07-15 22:41 UTC", Actor: "sten.hale@example.test", ActionLabel: "Repository connected", Target: "borealis/frost-api"},
+	}
+	s.renderPage(w, "layouts/dashboard", data)
+}
+
 func devPreviewCheck(branch, name string, status setupcheck.Status, description, remediation string) setupcheck.Check {
 	return setupcheck.Check{
 		Branch: branch,

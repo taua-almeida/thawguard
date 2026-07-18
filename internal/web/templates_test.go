@@ -344,7 +344,7 @@ func TestDashboardLayoutKeepsViewerReadOnlyAndEmptyStates(t *testing.T) {
 	}
 	body := buf.String()
 	for _, want := range []string{
-		"2 of 2",
+		`text-success">2 of 2`,
 		"0 active",
 		"No active freezes",
 		"Start one from the Freezes page.",
@@ -360,6 +360,31 @@ func TestDashboardLayoutKeepsViewerReadOnlyAndEmptyStates(t *testing.T) {
 		if strings.Contains(body, unwanted) {
 			t.Fatalf("expected viewer dashboard layout not to contain %q", unwanted)
 		}
+	}
+}
+
+// A fresh install has zero repositories; "0 of 0" enforcing must render in
+// the neutral tone — success green would misread as "everything is healthy".
+func TestDashboardEnforcingStatIsNeutralWithZeroRepositories(t *testing.T) {
+	data := dashboardPageData{
+		AppName:     "Thawguard",
+		PageTitle:   "Dashboard",
+		ActivePage:  "dashboard",
+		CurrentUser: currentUserView{Email: "admin@example.com", DisplayName: "Admin", RoleLabel: "Admin", IsAdmin: true},
+		CSRFToken:   "test-token",
+		CSRFField:   csrfFormField,
+	}
+
+	var buf bytes.Buffer
+	if err := pageTemplates.ExecuteTemplate(&buf, "layouts/dashboard", data); err != nil {
+		t.Fatalf("expected empty dashboard layout to execute, got error: %v", err)
+	}
+	body := buf.String()
+	if !strings.Contains(body, `text-text">0 of 0`) {
+		t.Fatalf("expected 0-of-0 enforcing stat to render in the neutral tone")
+	}
+	if strings.Contains(body, `text-success">0 of 0`) || strings.Contains(body, `text-warning">0 of 0`) {
+		t.Fatalf("expected 0-of-0 enforcing stat not to render in success or warning tone")
 	}
 }
 
