@@ -1,0 +1,141 @@
+{{/*
+  pages/dashboard — read-only overview: linked stat row, a setup warning that
+  only appears while repositories cannot enforce, previews of active and
+  scheduled freezes, and the newest audit events. Every panel links to the
+  page that owns the data; nothing here mutates state, so viewers see the
+  same panels as admins (only the header actions are role-gated).
+*/}}
+{{ define "pages/dashboard" }}
+<div class="flex flex-col gap-6">
+  <header class="flex flex-wrap items-start justify-between gap-4">
+    <div>
+      <h1 class="m-0 text-page-title font-bold text-text">Dashboard</h1>
+      <p class="m-0 mt-1 text-sm text-text-muted">What is frozen, what is scheduled, and what changed — at a glance.</p>
+    </div>
+    {{ if or .CurrentUser.CanFreeze .CurrentUser.CanThaw }}
+    <div class="flex flex-wrap gap-2">
+      {{ if .CurrentUser.CanFreeze }}{{ template "ui/button" dict "Label" "Start freeze" "Variant" "primary" "Icon" "tg-i-freeze-branch" "Href" "/freezes" }}{{ end }}
+      {{ if .CurrentUser.CanThaw }}{{ template "ui/button" dict "Label" "Review thaws" "Variant" "secondary" "Icon" "tg-i-thaw-drop" "Href" "/decisions" }}{{ end }}
+    </div>
+    {{ end }}
+  </header>
+
+  <section class="grid gap-4 sm:grid-cols-2 xl:grid-cols-4" aria-label="Dashboard summary">
+    <a class="block rounded-panel no-underline focus-visible:outline-2 focus-visible:outline-accent" href="/freezes" aria-label="View active freezes">
+      {{ template "ui/stat-card" dict "Label" "Active freezes" "Value" .ActiveFreezeCount "Tone" "frozen" }}
+    </a>
+    {{ $enforcingTone := "success" }}{{ if lt .EnforcingCount .RepositoryCount }}{{ $enforcingTone = "warning" }}{{ end }}
+    <a class="block rounded-panel no-underline focus-visible:outline-2 focus-visible:outline-accent" href="/repositories" aria-label="View repository enforcement setup">
+      {{ template "ui/stat-card" dict "Label" "Enforcing" "Value" (printf "%d of %d" .EnforcingCount .RepositoryCount) "Tone" $enforcingTone "Hint" "Repositories with active enforcement" }}
+    </a>
+    <a class="block rounded-panel no-underline focus-visible:outline-2 focus-visible:outline-accent" href="/scheduled-freezes" aria-label="View scheduled freezes">
+      {{ template "ui/stat-card" dict "Label" "Scheduled freezes" "Value" .ScheduledFreezeCount "Tone" "scheduled" "Hint" "Upcoming windows" }}
+    </a>
+    {{ $thawTone := "" }}{{ if gt .ActiveThawCount 0 }}{{ $thawTone = "warning" }}{{ end }}
+    <a class="block rounded-panel no-underline focus-visible:outline-2 focus-visible:outline-accent" href="/decisions" aria-label="View thaw decisions">
+      {{ template "ui/stat-card" dict "Label" "Active thaws" "Value" .ActiveThawCount "Tone" $thawTone "Hint" "Approved exceptions in effect" }}
+    </a>
+  </section>
+
+  {{ if .SetupIncompleteCount }}
+  <section class="flex flex-wrap items-center justify-between gap-3 rounded-card border-l-4 border-warning bg-warning-soft p-3.5" aria-label="Enforcement setup warning">
+    <div class="flex items-start gap-3 text-warning">
+      <svg class="mt-0.5 h-4 w-4 flex-none" aria-hidden="true"><use href="#tg-i-warning"></use></svg>
+      <div class="text-sm">
+        <p class="m-0 font-bold">{{ .SetupIncompleteCount }} of {{ .RepositoryCount }} repositories can't enforce freezes yet.</p>
+        <p class="m-0 mt-0.5 text-text">Freezes on those repositories are recorded but not enforced until setup completes.</p>
+      </div>
+    </div>
+    {{ template "ui/button" dict "Label" "View setup" "Variant" "secondary" "Size" "sm" "Href" "/repositories" }}
+  </section>
+  {{ end }}
+
+  <div class="grid items-start gap-6 lg:grid-cols-[2fr_1fr]">
+    <div class="flex flex-col gap-6">
+      <section class="rounded-panel border border-border bg-surface shadow-card" aria-label="Active freezes">
+        <div class="flex flex-wrap items-center gap-3 border-b border-border px-(--card-spacing) py-4">
+          <h2 class="m-0 text-lg font-bold text-text">Active freezes</h2>
+          {{ if .ActiveFreezes }}{{ template "ui/badge" dict "Label" (printf "%d active" .ActiveFreezeCount) "Tone" "frozen" "Icon" "tg-i-lock" }}{{ else }}{{ template "ui/badge" dict "Label" "0 active" }}{{ end }}
+          <a class="ml-auto text-sm font-semibold text-accent-strong no-underline hover:underline" href="/freezes">{{ if gt .ActiveFreezeCount (len .ActiveFreezes) }}View all {{ .ActiveFreezeCount }} →{{ else }}View all →{{ end }}</a>
+        </div>
+        {{ if .ActiveFreezes }}
+        <ul class="m-0 list-none p-0">
+          {{ range .ActiveFreezes }}
+          <li class="flex items-start gap-3 border-t border-border px-(--card-spacing) py-3 first:border-t-0">
+            <svg class="mt-0.5 h-4 w-4 flex-none text-frozen" aria-hidden="true"><use href="#tg-i-freeze-branch"></use></svg>
+            <div class="min-w-0 text-sm">
+              <p class="m-0 font-bold text-text">{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Freeze.RepositoryID }}{{ end }} <code class="font-mono text-xs font-normal text-text-muted">{{ .Freeze.Branch }}</code></p>
+              <p class="m-0 mt-0.5 text-text">{{ .Freeze.Reason }}</p>
+              {{ if .StartedLabel }}<p class="m-0 mt-0.5 text-xs text-text-muted">Started <span title="{{ .StartedTitle }}">{{ .StartedLabel }}</span>{{ if .CreatedByLabel }} by {{ .CreatedByLabel }}{{ end }}</p>{{ end }}
+            </div>
+          </li>
+          {{ end }}
+        </ul>
+        {{ else }}
+        <div class="p-(--card-spacing)">
+          {{ template "ui/empty-state" dict "Title" "No active freezes" "Hint" "Start one from the Freezes page." "Icon" "tg-i-freeze-branch" }}
+        </div>
+        {{ end }}
+      </section>
+
+      <section class="rounded-panel border border-border bg-surface shadow-card" aria-label="Scheduled next">
+        <div class="flex flex-wrap items-center gap-3 border-b border-border px-(--card-spacing) py-4">
+          <h2 class="m-0 text-lg font-bold text-text">Scheduled next</h2>
+          <a class="ml-auto text-sm font-semibold text-accent-strong no-underline hover:underline" href="/scheduled-freezes">View schedules →</a>
+        </div>
+        {{ if .ScheduledFreezes }}
+        <ul class="m-0 list-none p-0">
+          {{ range .ScheduledFreezes }}
+          <li class="flex items-start gap-3 border-t border-border px-(--card-spacing) py-3 first:border-t-0">
+            <svg class="mt-0.5 h-4 w-4 flex-none text-scheduled" aria-hidden="true"><use href="#tg-i-schedule"></use></svg>
+            <div class="min-w-0 flex-1 text-sm">
+              <p class="m-0 font-bold text-text">{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Freeze.RepositoryID }}{{ end }} <code class="font-mono text-xs font-normal text-text-muted">{{ .Freeze.Branch }}</code></p>
+              <p class="m-0 mt-0.5 text-xs text-text-muted">Starts <span title="{{ .StartsAtUTC }}">{{ .StartsAt }}</span>{{ if .PlannedEndsAt }} · Planned end <span title="{{ .PlannedEndsAtUTC }}">{{ .PlannedEndsAt }}</span>{{ end }}</p>
+            </div>
+            {{ $scheduleTone := "info" }}
+            {{- if eq .StateClass "pending" }}{{ $scheduleTone = "scheduled" }}
+            {{- else if eq .StateClass "ok" }}{{ $scheduleTone = "success" }}
+            {{- else if eq .StateClass "warning" }}{{ $scheduleTone = "warning" }}
+            {{- else if eq .StateClass "failed" }}{{ $scheduleTone = "frozen" }}
+            {{- end }}
+            {{ template "ui/badge" dict "Label" .StatusLabel "Tone" $scheduleTone }}
+          </li>
+          {{ end }}
+        </ul>
+        {{ else }}
+        <p class="m-0 p-(--card-spacing) text-sm text-text-muted">No scheduled windows yet.</p>
+        {{ end }}
+      </section>
+    </div>
+
+    <section class="rounded-panel border border-border bg-surface shadow-card" aria-label="Recent activity">
+      <div class="flex flex-wrap items-center gap-3 border-b border-border px-(--card-spacing) py-4">
+        <h2 class="m-0 text-lg font-bold text-text">Recent activity</h2>
+        <a class="ml-auto text-sm font-semibold text-accent-strong no-underline hover:underline" href="/activity">View all →</a>
+      </div>
+      {{ if .RecentActivity }}
+      <ol class="m-0 list-none p-0">
+        {{ range .RecentActivity }}
+        <li class="flex items-start gap-3 border-t border-border px-(--card-spacing) py-3 first:border-t-0">
+          {{ $dot := "bg-accent" }}
+          {{- if eq .OutcomeClass "ok" }}{{ $dot = "bg-success" }}
+          {{- else if eq .OutcomeClass "warning" }}{{ $dot = "bg-warning" }}
+          {{- else if eq .OutcomeClass "failed" }}{{ $dot = "bg-danger" }}
+          {{- else if eq .OutcomeClass "frozen" }}{{ $dot = "bg-frozen" }}
+          {{- end }}
+          <span class="mt-1.5 size-2 flex-none rounded-pill {{ $dot }}" aria-hidden="true"></span>
+          <div class="min-w-0 text-sm">
+            <p class="m-0 font-semibold text-text">{{ .ActionLabel }}{{ if .Outcome }} — {{ .Outcome }}{{ end }}</p>
+            {{ if .Target }}<p class="m-0 mt-0.5 text-xs text-text-muted">{{ .Target }}</p>{{ end }}
+            <p class="m-0 mt-0.5 text-xs text-text-muted">{{ .CreatedAt }}{{ if .Actor }} · {{ .Actor }}{{ end }}</p>
+          </div>
+        </li>
+        {{ end }}
+      </ol>
+      {{ else }}
+      <p class="m-0 p-(--card-spacing) text-sm text-text-muted">No recorded activity yet.</p>
+      {{ end }}
+    </section>
+  </div>
+</div>
+{{ end }}

@@ -101,6 +101,7 @@ func (a *App) Run(ctx context.Context) error {
 			FreezeStore:                          freezeStoreForWeb,
 			ScheduledFreezeStore:                 freezeStoreForWeb,
 			AuditStore:                           auditStore,
+			ThawExceptionStore:                   thawExceptionStore,
 			StatusDecisionStore:                  thawApprovalStore,
 			StatusPublicationStore:               statusPublicationStore,
 			WebhookRepositoryStore:               repositorySetup,

@@ -43,13 +43,16 @@ type Config struct {
 	FreezeStore                          FreezeStore
 	ScheduledFreezeStore                 ScheduledFreezeStore
 	AuditStore                           AuditStore
-	StatusDecisionStore                  StatusDecisionStore
-	StatusPublicationStore               StatusPublicationStore
-	WebhookRepositoryStore               WebhookRepositoryStore
-	WebhookDeliveryStore                 WebhookDeliveryStore
-	PullRequestWebhookProcessor          PullRequestWebhookProcessor
-	WebhookMaxBodyBytes                  int64
-	AuthService                          AuthService
+	// ThawExceptionStore feeds the dashboard's active-thaws stat; optional
+	// (the stat degrades to zero when absent).
+	ThawExceptionStore          ThawExceptionStore
+	StatusDecisionStore         StatusDecisionStore
+	StatusPublicationStore      StatusPublicationStore
+	WebhookRepositoryStore      WebhookRepositoryStore
+	WebhookDeliveryStore        WebhookDeliveryStore
+	PullRequestWebhookProcessor PullRequestWebhookProcessor
+	WebhookMaxBodyBytes         int64
+	AuthService                 AuthService
 	// PullRequestStore feeds the freeze-impact preview from the
 	// webhook-synced local cache; optional (the preview degrades to the
 	// zero state when absent).
@@ -135,6 +138,10 @@ type ScheduledFreezeStore interface {
 
 type AuditStore interface {
 	List(ctx context.Context, limit int) ([]audit.Event, error)
+}
+
+type ThawExceptionStore interface {
+	CountActive(ctx context.Context) (int, error)
 }
 
 type StatusDecisionStore interface {
@@ -553,32 +560,12 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	repositories, err := s.repositories(r.Context())
+	data, err := s.dashboardPageData(r.Context(), session)
 	if err != nil {
 		internalServerError(w)
 		return
 	}
-	freezes, err := s.activeFreezes(r.Context())
-	if err != nil {
-		internalServerError(w)
-		return
-	}
-	scheduledFreezes, err := s.scheduledFreezes(r.Context(), 3)
-	if err != nil {
-		internalServerError(w)
-		return
-	}
-	s.render(w, dashboardTemplate, map[string]any{
-		"AppName":                     s.cfg.AppName,
-		"ActivePage":                  "dashboard",
-		"CurrentUser":                 currentUserFromSession(session),
-		"CSRFToken":                   session.CSRFToken,
-		"RepositoryCount":             len(repositories),
-		"ActiveFreezeCount":           len(freezes),
-		"ScheduledFreezePreviewCount": len(scheduledFreezes),
-		"Freezes":                     s.freezeViews(repositories, freezes, nil),
-		"ScheduledFreezes":            scheduledFreezeViews(repositories, scheduledFreezes, scheduledFreezePageState{}),
-	})
+	s.renderPage(w, "layouts/dashboard", data)
 }
 
 func (s *Server) handleDecisions(w http.ResponseWriter, r *http.Request) {
@@ -3772,99 +3759,6 @@ const accountPasswordTemplate = authPageHead + `
           <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm">Log out</button>
         </form>
       </div>` + authPageFoot
-
-const dashboardTemplate = pageHead + `
-  <main class="tg-main tg-dashboard">
-    <header class="tg-header">
-      <div>
-        <h1 class="tg-title">Dashboard</h1>
-        <p class="tg-subtitle">Freeze branches. Thaw exceptions. Keep release flow auditable.</p>
-      </div>
-      <div class="tg-header-actions">
-        {{ if .CurrentUser.CanFreeze }}
-        <a class="tg-btn tg-btn-primary" href="/freezes"><svg class="tg-icon"><use href="#tg-i-freeze-branch"></use></svg>Freeze Branch</a>
-        {{ end }}
-        {{ if .CurrentUser.CanThaw }}
-        <a class="tg-btn tg-btn-secondary" href="/decisions"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg>Thaw PR</a>
-        {{ end }}
-      </div>
-    </header>
-
-    <section class="tg-stats" aria-label="Dashboard summary">
-      <article class="tg-stat">
-        <span class="tg-stat-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-freeze-branch"></use></svg></span>
-        <span><span class="tg-stat-label">Active Freezes</span><strong class="tg-stat-value">{{ .ActiveFreezeCount }}</strong></span>
-      </article>
-      <article class="tg-stat">
-        <span class="tg-stat-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg></span>
-        <span><span class="tg-stat-label">Active Thaws</span><strong class="tg-stat-value">0</strong></span>
-      </article>
-      <article class="tg-stat">
-        <span class="tg-stat-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-activity"></use></svg></span>
-        <span><span class="tg-stat-label">Events Today</span><strong class="tg-stat-value">0</strong></span>
-      </article>
-      <article class="tg-stat">
-        <span class="tg-stat-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-repositories"></use></svg></span>
-        <span><span class="tg-stat-label">Repos Monitored</span><strong class="tg-stat-value">{{ .RepositoryCount }}</strong></span>
-      </article>
-      <article class="tg-stat tg-stat-scheduled">
-        <span class="tg-stat-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-schedule"></use></svg></span>
-        <span><span class="tg-stat-label">Schedules shown</span><strong class="tg-stat-value">{{ .ScheduledFreezePreviewCount }}</strong></span>
-      </article>
-    </section>
-
-    <section class="tg-columns">
-      <article class="tg-panel">
-        <div class="tg-panel-head"><h2>Active Freezes</h2><span class="tg-badge">{{ .ActiveFreezeCount }} active</span></div>
-        {{ if .Freezes }}
-          {{ range .Freezes }}
-          <div class="tg-freeze-row">
-            <div class="tg-freeze-main"><span class="tg-lock" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-freeze-branch"></use></svg></span><code>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Freeze.RepositoryID }}{{ end }}</code><span class="tg-arrow">→</span><code class="tg-branch">{{ .Freeze.Branch }}</code></div>
-            <div class="tg-freeze-meta"><span>{{ .Freeze.Reason }}</span><span class="tg-dot">·</span><span class="tg-muted">recorded locally</span></div>
-          </div>
-          {{ end }}
-        {{ else }}
-          <div class="tg-empty-row">
-            <strong>No active freezes yet</strong>
-            <span>Create a local freeze to see branch cards here.</span>
-          </div>
-        {{ end }}
-      </article>
-
-      <article class="tg-panel">
-        <div class="tg-panel-head"><h2>Recent Events</h2><a class="tg-btn tg-btn-secondary tg-btn-sm" href="/activity">View All</a></div>
-        <div class="tg-event-row"><span class="tg-event-icon tg-event-freeze"><svg class="tg-icon"><use href="#tg-i-freeze-branch"></use></svg></span><span>Branch freeze workflow is ready for local records</span><span class="tg-muted">local</span></div>
-        <div class="tg-event-row"><span class="tg-event-icon tg-event-ok"><svg class="tg-icon"><use href="#tg-i-check"></use></svg></span><span>Commit statuses post only for enforcement-active repositories</span><span class="tg-muted">enforcement</span></div>
-        <div class="tg-event-row"><span class="tg-event-icon tg-event-fail"><svg class="tg-icon"><use href="#tg-i-warning"></use></svg></span><span>Signed webhook receiver stores sanitized delivery metadata only</span><span class="tg-muted">safe</span></div>
-        <div class="tg-event-row"><span class="tg-event-icon tg-event-ok"><svg class="tg-icon"><use href="#tg-i-check"></use></svg></span><span>Required status context is <code>` + domain.RequiredStatusContext + `</code></span><span class="tg-muted">future</span></div>
-      </article>
-    </section>
-
-    <section class="tg-panel tg-scheduled-panel">
-      <div class="tg-panel-head tg-scheduled-head">
-        <h2>Scheduled Windows</h2>
-        <span class="tg-badge tg-badge-scheduled">{{ .ScheduledFreezePreviewCount }} shown</span>
-        <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/scheduled-freezes">View Schedules</a>
-      </div>
-      {{ if .ScheduledFreezes }}
-        {{ range .ScheduledFreezes }}
-        <div class="tg-schedule-row">
-          <div class="tg-schedule-main"><span class="tg-scheduled-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-schedule"></use></svg></span><code>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Freeze.RepositoryID }}{{ end }}</code><span class="tg-arrow">→</span><code class="tg-branch tg-branch-scheduled">{{ .Freeze.Branch }}</code></div>
-          <div class="tg-schedule-meta"><span><span class="tg-caps">Starts</span> {{ .StartsAt }}</span><span><span class="tg-caps">Planned end</span> {{ .PlannedEndsAt }}</span><span class="tg-dot">·</span><span>{{ .Freeze.Reason }}</span></div>
-          <div class="tg-schedule-actions"><span class="status status-{{ .StateClass }}">{{ .StatusLabel }}</span></div>
-        </div>
-        {{ end }}
-      {{ else }}
-        <div class="tg-empty-row"><strong>No scheduled windows yet</strong><span>Create a one-time freeze window from Scheduled Freezes.</span></div>
-      {{ end }}
-    </section>
-
-    <section class="tg-warning-callout">
-      <span aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-warning"></use></svg></span>
-      <span>Repositories start setup-incomplete and cannot enforce freezes yet. Read-only readiness checks are available, but activation still requires a later controlled status-post test.</span>
-      <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/repositories">View Setup</a>
-    </section>
-  </main>` + pageFoot
 
 const activityTemplate = pageHead + `
   <main class="tg-main tg-setup-page tg-activity-page">

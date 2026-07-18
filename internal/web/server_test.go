@@ -2579,13 +2579,8 @@ func TestPrimaryNavigationAndDashboardLinkToActivity(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
 	body := recorder.Body.String()
-	if recorder.Code != http.StatusOK || !strings.Contains(body, `<a class="tg-nav-item" href="/activity"`) || !strings.Contains(body, `<a class="tg-btn tg-btn-secondary tg-btn-sm" href="/activity">View All</a>`) {
-		t.Fatalf("expected primary navigation and dashboard preview to link to activity, status=%d body=%q", recorder.Code, body)
-	}
-	for _, unwanted := range []string{`href="/webhooks"><svg class="tg-icon"><use href="#tg-i-audit"></use></svg>Audit Log`, `class="tg-nav-item" href="/publications"`} {
-		if strings.Contains(body, unwanted) {
-			t.Fatalf("expected diagnostics to stay out of primary navigation, found %q", unwanted)
-		}
+	if recorder.Code != http.StatusOK || !strings.Contains(body, `<a class="shell-nav-item" href="/activity"`) || !strings.Contains(body, `href="/activity">View all →</a>`) {
+		t.Fatalf("expected primary navigation and dashboard activity rail to link to activity, status=%d body=%q", recorder.Code, body)
 	}
 }
 

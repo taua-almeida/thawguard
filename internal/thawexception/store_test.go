@@ -68,6 +68,50 @@ func TestStoreActiveForPullRequestIgnoresChangedOrExpiredHead(t *testing.T) {
 	}
 }
 
+func TestStoreCountActiveIgnoresExpiredExceptions(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	store := NewStore(database)
+
+	count, err := store.CountActive(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("expected zero active thaw exceptions before approvals, got %d", count)
+	}
+
+	actor := domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}
+	if _, err := store.Approve(ctx, ApproveParams{RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "abc123", Reason: "production fix"}, actor); err != nil {
+		t.Fatal(err)
+	}
+	futureExpiry := time.Now().UTC().Add(time.Hour)
+	if _, err := store.Approve(ctx, ApproveParams{RepositoryID: repo.ID, PullRequestIndex: 43, TargetBranch: "main", HeadSHA: "def456", Reason: "production fix", ExpiresAt: &futureExpiry}, actor); err != nil {
+		t.Fatal(err)
+	}
+	pastExpiry := time.Now().UTC().Add(-time.Hour)
+	if _, err := store.Approve(ctx, ApproveParams{RepositoryID: repo.ID, PullRequestIndex: 44, TargetBranch: "main", HeadSHA: "fed789", Reason: "production fix", ExpiresAt: &pastExpiry}, actor); err != nil {
+		t.Fatal(err)
+	}
+
+	count, err = store.CountActive(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("expected two active thaw exceptions (expired one ignored), got %d", count)
+	}
+
+	serviceCount, err := NewService(database).CountActive(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if serviceCount != count {
+		t.Fatalf("expected service CountActive to match store, got %d and %d", serviceCount, count)
+	}
+}
+
 func TestStoreRejectsInvalidApproveParams(t *testing.T) {
 	ctx := context.Background()
 	database := newTestDB(t, ctx)

@@ -143,6 +143,25 @@ LIMIT 1`, pr.RepositoryID, pr.Index, pr.HeadSHA, pr.TargetBranch, now)
 	return &exception, nil
 }
 
+// CountActive counts thaw exceptions that are in effect right now: status
+// 'active' and either no expiry or an expiry still in the future.
+func (s *Store) CountActive(ctx context.Context) (int, error) {
+	if s == nil || s.db == nil {
+		return 0, errors.New("thaw exception store has no database")
+	}
+	now := s.now().UTC().Format(time.RFC3339Nano)
+	var count int
+	err := s.db.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM thaw_exceptions
+WHERE status = 'active'
+  AND (expires_at IS NULL OR expires_at > ?)`, now).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count active thaw exceptions: %w", err)
+	}
+	return count, nil
+}
+
 func (s *Store) requireEnforcementActiveRepository(ctx context.Context, repositoryID int64) error {
 	var existing int64
 	err := s.db.QueryRowContext(ctx, `SELECT id FROM repositories WHERE id = ? AND active = 1 AND enforcement_state = ?`, repositoryID, domain.EnforcementActive).Scan(&existing)

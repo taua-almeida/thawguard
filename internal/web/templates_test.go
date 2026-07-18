@@ -230,6 +230,139 @@ func TestFreezesLayoutKeepsReadOnlyStateMutationFree(t *testing.T) {
 	}
 }
 
+func TestDashboardLayoutTemplateExecutesWithTypedData(t *testing.T) {
+	repo := domain.Repository{
+		ID:               7,
+		Owner:            "taua-almeida",
+		Name:             "thawguard",
+		DefaultBranch:    "main",
+		EnforcementState: domain.EnforcementActive,
+	}
+	data := dashboardPageData{
+		AppName:              "Thawguard",
+		PageTitle:            "Dashboard",
+		ActivePage:           "dashboard",
+		CurrentUser:          currentUserView{Email: "taua@example.com", DisplayName: "Taua", RoleLabel: "Admin", IsAdmin: true, CanFreeze: true, CanThaw: true},
+		CSRFToken:            "test-token",
+		CSRFField:            csrfFormField,
+		RepositoryCount:      4,
+		EnforcingCount:       3,
+		SetupIncompleteCount: 1,
+		ActiveFreezeCount:    6,
+		ScheduledFreezeCount: 1,
+		ActiveThawCount:      2,
+		ActiveFreezes: []freezeView{
+			{
+				Freeze:         domain.BranchFreeze{ID: 11, RepositoryID: repo.ID, Branch: "main", Status: domain.BranchFreezeStatusActive, Reason: "release <cut>"},
+				Repository:     repo,
+				StartedLabel:   "2026-07-17",
+				StartedTitle:   "2026-07-17T09:00:00Z",
+				CreatedByLabel: "Taua",
+			},
+			{
+				Freeze: domain.BranchFreeze{ID: 12, RepositoryID: 9, Branch: "main", Status: domain.BranchFreezeStatusActive, Reason: "incident hold"},
+			},
+		},
+		ScheduledFreezes: []scheduledFreezeView{{
+			Freeze:      domain.BranchFreeze{ID: 21, RepositoryID: repo.ID, Branch: "main"},
+			Repository:  repo,
+			StartsAt:    "2026-07-20 08:00",
+			StartsAtUTC: "2026-07-20T08:00:00Z",
+			StatusLabel: "upcoming",
+			StateClass:  "pending",
+		}},
+		RecentActivity: []activityEventView{{
+			CreatedAt:    "2026-07-18 10:00 UTC",
+			Actor:        "Taua",
+			ActionLabel:  "Freeze started",
+			Target:       "taua-almeida/thawguard → main",
+			Outcome:      "Frozen",
+			OutcomeClass: "frozen",
+		}},
+	}
+
+	var buf bytes.Buffer
+	if err := pageTemplates.ExecuteTemplate(&buf, "layouts/dashboard", data); err != nil {
+		t.Fatalf("expected dashboard layout to execute, got error: %v", err)
+	}
+	body := buf.String()
+	for _, want := range []string{
+		"<!doctype html>",
+		"Dashboard",
+		"What is frozen, what is scheduled, and what changed — at a glance.",
+		"Start freeze",
+		"Review thaws",
+		"3 of 4",
+		`href="/scheduled-freezes"`,
+		`href="/decisions"`,
+		"Approved exceptions in effect",
+		"1 of 4 repositories can't enforce freezes yet.",
+		"Freezes on those repositories are recorded but not enforced until setup completes.",
+		"View setup",
+		"View all 6 →",
+		"taua-almeida/thawguard",
+		"release &lt;cut&gt;",
+		"Started",
+		"by Taua",
+		"Repository #9",
+		"Scheduled next",
+		"upcoming",
+		"2026-07-20 08:00",
+		"Recent activity",
+		"Freeze started",
+		"Frozen",
+		"bg-frozen",
+		"2026-07-18 10:00 UTC",
+		"</html>",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected rendered dashboard layout to contain %q", want)
+		}
+	}
+	for _, unwanted := range []string{"aurora/ice-station", "borealis/frost-api", "rana.kall"} {
+		if strings.Contains(body, unwanted) {
+			t.Fatalf("expected rendered dashboard layout not to contain fictional data %q", unwanted)
+		}
+	}
+}
+
+func TestDashboardLayoutKeepsViewerReadOnlyAndEmptyStates(t *testing.T) {
+	data := dashboardPageData{
+		AppName:         "Thawguard",
+		PageTitle:       "Dashboard",
+		ActivePage:      "dashboard",
+		CurrentUser:     currentUserView{Email: "viewer@example.com", DisplayName: "Viewer", RoleLabel: "Viewer"},
+		CSRFToken:       "test-token",
+		CSRFField:       csrfFormField,
+		RepositoryCount: 2,
+		EnforcingCount:  2,
+	}
+
+	var buf bytes.Buffer
+	if err := pageTemplates.ExecuteTemplate(&buf, "layouts/dashboard", data); err != nil {
+		t.Fatalf("expected viewer dashboard layout to execute, got error: %v", err)
+	}
+	body := buf.String()
+	for _, want := range []string{
+		"2 of 2",
+		"0 active",
+		"No active freezes",
+		"Start one from the Freezes page.",
+		"No scheduled windows yet.",
+		"No recorded activity yet.",
+		"Recent activity",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected viewer dashboard layout to contain %q", want)
+		}
+	}
+	for _, unwanted := range []string{"Start freeze", "Review thaws", "can't enforce freezes yet", "View setup"} {
+		if strings.Contains(body, unwanted) {
+			t.Fatalf("expected viewer dashboard layout not to contain %q", unwanted)
+		}
+	}
+}
+
 func TestStaticAssetsServedFromEmbeddedFS(t *testing.T) {
 	server := NewServer(Config{AppName: "Thawguard"})
 	cases := []struct {

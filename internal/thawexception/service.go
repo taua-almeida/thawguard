@@ -127,6 +127,13 @@ func (s *Service) ActiveForPullRequest(ctx context.Context, pr domain.PullReques
 	return NewStore(s.db).ActiveForPullRequest(ctx, pr)
 }
 
+func (s *Service) CountActive(ctx context.Context) (int, error) {
+	if s == nil || s.db == nil {
+		return 0, errors.New("thaw exception service has no database")
+	}
+	return NewStore(s.db).CountActive(ctx)
+}
+
 func thawExceptionApprovedEvent(thaw domain.ThawException, actor domain.Actor) audit.Event {
 	details := map[string]string{
 		"actor_kind":         actor.Kind,
