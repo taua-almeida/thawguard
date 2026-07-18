@@ -423,14 +423,14 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	}
 	hasUsers, err := s.cfg.AuthService.HasUsers(r.Context())
 	if err != nil {
-		internalServerError(w)
+		s.renderErrorPage(w, http.StatusInternalServerError, true)
 		return
 	}
 	if hasUsers {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
-	s.renderSetup(w, r, "")
+	s.renderSetupStatus(w, r, "", "", "", http.StatusOK)
 }
 
 func (s *Server) handleCreateFirstAdmin(w http.ResponseWriter, r *http.Request) {
@@ -440,7 +440,7 @@ func (s *Server) handleCreateFirstAdmin(w http.ResponseWriter, r *http.Request) 
 	}
 	hasUsers, err := s.cfg.AuthService.HasUsers(r.Context())
 	if err != nil {
-		internalServerError(w)
+		s.renderErrorPage(w, http.StatusInternalServerError, true)
 		return
 	}
 	if hasUsers {
@@ -451,25 +451,26 @@ func (s *Server) handleCreateFirstAdmin(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+	email, displayName := r.PostFormValue("email"), r.PostFormValue("display_name")
 	if !sameOriginRequest(r) {
-		s.renderSetupStatus(w, r, "Setup form expired. Please try again.", http.StatusForbidden)
+		s.renderSetupStatus(w, r, email, displayName, "Setup form expired. Please try again.", http.StatusForbidden)
 		return
 	}
 	if !s.validSetupCSRFToken(r) {
-		s.renderSetupStatus(w, r, "Setup form expired. Please try again.", http.StatusForbidden)
+		s.renderSetupStatus(w, r, email, displayName, "Setup form expired. Please try again.", http.StatusForbidden)
 		return
 	}
 	session, err := s.cfg.AuthService.CreateFirstAdmin(r.Context(), auth.CreateFirstAdminParams{
-		Email:       r.PostFormValue("email"),
-		DisplayName: r.PostFormValue("display_name"),
+		Email:       email,
+		DisplayName: displayName,
 		Password:    r.PostFormValue("password"),
 	})
 	if err != nil {
 		if !auth.IsValidationError(err) {
-			internalServerError(w)
+			s.renderErrorPage(w, http.StatusInternalServerError, true)
 			return
 		}
-		s.renderSetupStatus(w, r, err.Error(), http.StatusBadRequest)
+		s.renderSetupStatus(w, r, email, displayName, err.Error(), http.StatusBadRequest)
 		return
 	}
 	clearSetupCSRFCookie(w, r)
@@ -484,7 +485,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	hasUsers, err := s.cfg.AuthService.HasUsers(r.Context())
 	if err != nil {
-		internalServerError(w)
+		s.renderErrorPage(w, http.StatusInternalServerError, true)
 		return
 	}
 	if !hasUsers {
@@ -492,13 +493,13 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if session, ok, err := s.currentSession(r); err != nil {
-		internalServerError(w)
+		s.renderErrorPage(w, http.StatusInternalServerError, true)
 		return
 	} else if ok {
 		http.Redirect(w, r, postLoginPath(session.MustChangePassword), http.StatusSeeOther)
 		return
 	}
-	s.renderLoginStatus(w, r, "", http.StatusOK)
+	s.renderLoginStatus(w, r, "", "", http.StatusOK)
 }
 
 func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
@@ -510,21 +511,22 @@ func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+	email := r.PostFormValue("email")
 	if !sameOriginRequest(r) {
-		http.Error(w, "forbidden", http.StatusForbidden)
+		s.renderLoginStatus(w, r, email, "Your sign-in form expired. Please try again.", http.StatusForbidden)
 		return
 	}
 	if !s.validLoginCSRFToken(r) {
-		http.Error(w, "forbidden", http.StatusForbidden)
+		s.renderLoginStatus(w, r, email, "Your sign-in form expired. Please try again.", http.StatusForbidden)
 		return
 	}
-	session, err := s.cfg.AuthService.Login(r.Context(), auth.LoginParams{Email: r.PostFormValue("email"), Password: r.PostFormValue("password")})
+	session, err := s.cfg.AuthService.Login(r.Context(), auth.LoginParams{Email: email, Password: r.PostFormValue("password")})
 	if err != nil {
 		if !auth.IsAuthenticationError(err) {
-			internalServerError(w)
+			s.renderErrorPage(w, http.StatusInternalServerError, true)
 			return
 		}
-		s.renderLoginStatus(w, r, err.Error(), http.StatusUnauthorized)
+		s.renderLoginStatus(w, r, email, err.Error(), http.StatusUnauthorized)
 		return
 	}
 	clearLoginCSRFCookie(w, r)
@@ -546,7 +548,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.cfg.AuthService != nil {
 		if err := s.cfg.AuthService.Logout(r.Context(), session.ID); err != nil {
-			internalServerError(w)
+			s.renderErrorPage(w, http.StatusInternalServerError, false)
 			return
 		}
 	} else {
@@ -1823,7 +1825,7 @@ func (s *Server) handleAccountPasswordPost(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if session.UserID == nil {
-		http.Error(w, "forbidden", http.StatusForbidden)
+		s.renderErrorPage(w, http.StatusForbidden, true)
 		return
 	}
 	if r.PostFormValue("new_password") != r.PostFormValue("new_password_confirmation") {
@@ -1837,7 +1839,7 @@ func (s *Server) handleAccountPasswordPost(w http.ResponseWriter, r *http.Reques
 	})
 	if err != nil {
 		if !auth.IsValidationError(err) {
-			internalServerError(w)
+			s.renderErrorPage(w, http.StatusInternalServerError, false)
 			return
 		}
 		s.renderAccountPassword(w, err.Error(), http.StatusBadRequest, session)
@@ -1848,20 +1850,13 @@ func (s *Server) handleAccountPasswordPost(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) renderAccountPassword(w http.ResponseWriter, formError string, status int, session sessionState) {
-	tpl, err := template.New("page").Parse(accountPasswordTemplate)
-	if err != nil {
-		internalServerError(w)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if status != http.StatusOK {
-		w.WriteHeader(status)
-	}
-	_ = tpl.Execute(w, map[string]any{
-		"AppName":            s.cfg.AppName,
-		"FormError":          formError,
-		"CSRFToken":          session.CSRFToken,
-		"MustChangePassword": session.MustChangePassword,
+	s.renderPageStatus(w, status, "layouts/account-password", authAccountPasswordData{
+		AppName:            s.cfg.AppName,
+		PageTitle:          "Change password",
+		CSRFField:          csrfFormField,
+		CSRFToken:          session.CSRFToken,
+		FormError:          formError,
+		MustChangePassword: session.MustChangePassword,
 	})
 }
 
@@ -3293,51 +3288,36 @@ func (s *Server) render(w http.ResponseWriter, source string, data any) {
 	_ = tpl.Execute(w, data)
 }
 
-func (s *Server) renderSetup(w http.ResponseWriter, r *http.Request, formError string) {
-	s.renderSetupStatus(w, r, formError, http.StatusOK)
-}
-
-func (s *Server) renderSetupStatus(w http.ResponseWriter, r *http.Request, formError string, status int) {
+func (s *Server) renderSetupStatus(w http.ResponseWriter, r *http.Request, email, displayName, formError string, status int) {
 	csrfToken, err := s.newSetupCSRFToken(w, r)
 	if err != nil {
-		internalServerError(w)
+		s.renderErrorPage(w, http.StatusInternalServerError, true)
 		return
 	}
-	tpl, err := template.New("page").Parse(setupTemplate)
-	if err != nil {
-		internalServerError(w)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if status != http.StatusOK {
-		w.WriteHeader(status)
-	}
-	_ = tpl.Execute(w, map[string]any{
-		"AppName":   s.cfg.AppName,
-		"FormError": formError,
-		"CSRFToken": csrfToken,
+	s.renderPageStatus(w, status, "layouts/setup", authSetupData{
+		AppName:     s.cfg.AppName,
+		PageTitle:   "Set up",
+		CSRFField:   csrfFormField,
+		CSRFToken:   csrfToken,
+		FormError:   formError,
+		Email:       email,
+		DisplayName: displayName,
 	})
 }
 
-func (s *Server) renderLoginStatus(w http.ResponseWriter, r *http.Request, formError string, status int) {
+func (s *Server) renderLoginStatus(w http.ResponseWriter, r *http.Request, email, formError string, status int) {
 	csrfToken, err := s.newLoginCSRFToken(w, r)
 	if err != nil {
-		internalServerError(w)
+		s.renderErrorPage(w, http.StatusInternalServerError, true)
 		return
 	}
-	tpl, err := template.New("page").Parse(loginTemplate)
-	if err != nil {
-		internalServerError(w)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if status != http.StatusOK {
-		w.WriteHeader(status)
-	}
-	_ = tpl.Execute(w, map[string]any{
-		"AppName":   s.cfg.AppName,
-		"FormError": formError,
-		"CSRFToken": csrfToken,
+	s.renderPageStatus(w, status, "layouts/login", authLoginData{
+		AppName:   s.cfg.AppName,
+		PageTitle: "Sign in",
+		CSRFField: csrfFormField,
+		CSRFToken: csrfToken,
+		FormError: formError,
+		Email:     email,
 	})
 }
 
@@ -3514,61 +3494,6 @@ const pageFoot = `
   </script>
 </body></html>`
 
-const authPageHead = `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{ .AppName }}</title>
-  <link rel="stylesheet" href="/static/thawguard.css">
-</head>
-<body>
-  <main class="tg-main tg-auth-page">
-    <section class="tg-panel tg-auth-card">
-      <div class="tg-auth-brand">
-        <span class="tg-logo-mark" aria-hidden="true"><svg class="tg-brand-icon" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M12 21.7c4.5-2.2 7-5.7 7-9.7V5.3L12 2.6 5 5.3V12c0 4 2.5 7.5 7 9.7z M12 8v8 M8.5 10l7 4 M15.5 10l-7 4"/></svg></span>
-        <span>{{ .AppName }}</span>
-      </div>`
-
-const authPageFoot = `
-    </section>
-  </main>
-</body></html>`
-
-const setupTemplate = authPageHead + `
-      <div class="tg-panel-head tg-panel-head-stacked">
-        <div>
-          <p class="eyebrow">First admin setup</p>
-          <h1 class="tg-title">Create the first Thawguard admin</h1>
-          <p class="tg-subtitle">Create a local admin account. The first account starts with all MVP roles so a fresh install can configure repositories and run freeze/thaw flows.</p>
-        </div>
-      </div>
-      {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
-      <form method="post" action="/setup" class="tg-setup-form tg-auth-form">
-        <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
-        <label>Email <input type="email" name="email" autocomplete="email" required></label>
-        <label>Display name <input name="display_name" autocomplete="name" required></label>
-        <label class="tg-field-wide">Password <input type="password" name="password" autocomplete="new-password" minlength="12" required></label>
-        <div class="tg-form-submit tg-field-wide"><button type="submit" class="tg-btn tg-btn-primary">Create admin</button></div>
-      </form>
-      <p class="tg-local-note"><span>Use a strong local password. Thawguard remains cooperative enforcement for trusted teams, not an unbypassable forge security boundary.</span></p>` + authPageFoot
-
-const loginTemplate = authPageHead + `
-      <div class="tg-panel-head tg-panel-head-stacked">
-        <div>
-          <p class="eyebrow">Local sign in</p>
-          <h1 class="tg-title">Sign in to Thawguard</h1>
-          <p class="tg-subtitle">Freeze branches. Thaw exceptions. Keep release flow auditable.</p>
-        </div>
-      </div>
-      {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
-      <form method="post" action="/login" class="tg-setup-form tg-auth-form">
-        <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
-        <label class="tg-field-wide">Email <input type="email" name="email" autocomplete="email" required autofocus></label>
-        <label class="tg-field-wide">Password <input type="password" name="password" autocomplete="current-password" required></label>
-        <div class="tg-form-submit tg-field-wide"><button type="submit" class="tg-btn tg-btn-primary">Sign in</button></div>
-      </form>` + authPageFoot
-
 const usersTemplate = pageHead + `
   <main class="tg-main tg-setup-page tg-users-page">
     <header class="tg-header">
@@ -3732,34 +3657,6 @@ const usersTemplate = pageHead + `
       {{ end }}
     </section>
   </main>` + pageFoot
-
-const accountPasswordTemplate = authPageHead + `
-      <div class="tg-panel-head tg-panel-head-stacked">
-        <div>
-          <p class="eyebrow">Account security</p>
-          <h1 class="tg-title">Change your password</h1>
-          {{ if .MustChangePassword }}
-          <p class="tg-subtitle">A temporary password was set for this account. Choose a new password to continue using {{ .AppName }}.</p>
-          {{ else }}
-          <p class="tg-subtitle">Changing your password signs out every session for this account and starts a fresh one here.</p>
-          {{ end }}
-        </div>
-      </div>
-      {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
-      <form method="post" action="/account/password" class="tg-setup-form tg-auth-form">
-        <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
-        <label class="tg-field-wide">Current password <input type="password" name="current_password" autocomplete="current-password" required></label>
-        <label class="tg-field-wide">New password <input type="password" name="new_password" autocomplete="new-password" minlength="12" required></label>
-        <label class="tg-field-wide">Confirm new password <input type="password" name="new_password_confirmation" autocomplete="new-password" minlength="12" required></label>
-        <div class="tg-form-submit tg-field-wide"><button type="submit" class="tg-btn tg-btn-primary">Change password</button></div>
-      </form>
-      <div class="tg-account-links">
-        {{ if not .MustChangePassword }}<a class="tg-btn tg-btn-secondary tg-btn-sm" href="/">Back to dashboard</a>{{ end }}
-        <form method="post" action="/logout">
-          <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
-          <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm">Log out</button>
-        </form>
-      </div>` + authPageFoot
 
 const activityTemplate = pageHead + `
   <main class="tg-main tg-setup-page tg-activity-page">

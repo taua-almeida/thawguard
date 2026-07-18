@@ -81,7 +81,7 @@ func TestAuthRedirectsToFirstAdminSetupBeforeUsersExist(t *testing.T) {
 	}
 	namedCookieFromRecorder(t, recorder, setupCookieName)
 	setupBody := recorder.Body.String()
-	if !strings.Contains(setupBody, "tg-brand-icon") || strings.Contains(setupBody, ">TG</span>") {
+	if !strings.Contains(setupBody, "#tg-i-icy-shield") || strings.Contains(setupBody, ">TG</span>") {
 		t.Fatalf("expected setup page to use shield brand icon, body=%q", setupBody)
 	}
 	setupCSRF := csrfTokenFromBody(t, setupBody)
@@ -121,8 +121,11 @@ func TestFirstAdminSetupRejectsMissingCSRFToken(t *testing.T) {
 		t.Fatalf("expected setup without csrf to be forbidden, got %d", recorder.Code)
 	}
 	body := recorder.Body.String()
-	if !strings.Contains(body, "Setup form expired") || !strings.Contains(body, "Create the first Thawguard admin") {
+	if !strings.Contains(body, "Setup form expired") || !strings.Contains(body, "Create the first admin") {
 		t.Fatalf("expected setup csrf failure to re-render setup form, body=%q", body)
+	}
+	if !strings.Contains(body, `value="admin@example.test"`) || !strings.Contains(body, `value="Admin"`) {
+		t.Fatalf("expected setup csrf failure to preserve email and display name, body=%q", body)
 	}
 	refreshedCookie := namedCookieFromRecorder(t, recorder, setupCookieName)
 	refreshedCSRF := csrfTokenFromBody(t, body)

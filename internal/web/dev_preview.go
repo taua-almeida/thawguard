@@ -122,16 +122,96 @@ func (s *Server) handleDevPreview(w http.ResponseWriter, r *http.Request) {
 	s.renderPage(w, "layouts/dev-preview", view)
 }
 
+// handleDevPreviewAuth renders the auth shell demo and the real auth screens
+// from fictional fixtures (GET /dev/preview/auth). Query knobs:
+// ?screen=login|setup|account-password|error (default: shell demo),
+// ?state=error|expired|forced, ?code=403|404|500|503, ?signed-out=1,
+// ?theme=dark|light. Always answers 200 — the real handlers own status codes.
 func (s *Server) handleDevPreviewAuth(w http.ResponseWriter, r *http.Request) {
 	if !s.cfg.DevMode {
 		http.NotFound(w, r)
 		return
 	}
-	s.renderPage(w, "layouts/dev-preview-auth", devPreviewAuthView{
-		AppName:   s.cfg.AppName,
-		PageTitle: "Auth layout preview",
-		Theme:     devPreviewTheme(r),
-	})
+	theme := devPreviewTheme(r)
+	state := r.URL.Query().Get("state")
+	switch r.URL.Query().Get("screen") {
+	case "login":
+		data := authLoginData{
+			AppName:   s.cfg.AppName,
+			PageTitle: "Sign in",
+			Theme:     theme,
+			CSRFField: csrfFormField,
+			CSRFToken: "dev-preview-fictional-token",
+		}
+		switch state {
+		case "error":
+			data.FormError = "invalid email or password"
+			data.Email = "mira.frost@example.test"
+		case "expired":
+			data.FormError = "Your sign-in form expired. Please try again."
+			data.Email = "mira.frost@example.test"
+		}
+		s.renderPage(w, "layouts/login", data)
+	case "setup":
+		data := authSetupData{
+			AppName:   s.cfg.AppName,
+			PageTitle: "Set up",
+			Theme:     theme,
+			CSRFField: csrfFormField,
+			CSRFToken: "dev-preview-fictional-token",
+		}
+		if state == "error" {
+			data.FormError = "password must be at least 12 characters"
+			data.Email = "mira.frost@example.test"
+			data.DisplayName = "Mira Frost"
+		}
+		s.renderPage(w, "layouts/setup", data)
+	case "account-password":
+		data := authAccountPasswordData{
+			AppName:            s.cfg.AppName,
+			PageTitle:          "Change password",
+			Theme:              theme,
+			CSRFField:          csrfFormField,
+			CSRFToken:          "dev-preview-fictional-token",
+			MustChangePassword: state == "forced",
+		}
+		if state == "error" {
+			data.FormError = "new passwords do not match"
+		}
+		s.renderPage(w, "layouts/account-password", data)
+	case "error":
+		status := http.StatusInternalServerError
+		switch r.URL.Query().Get("code") {
+		case "403":
+			status = http.StatusForbidden
+		case "404":
+			status = http.StatusNotFound
+		case "503":
+			status = http.StatusServiceUnavailable
+		}
+		heading, message := errorPageContent(status)
+		data := authErrorData{
+			AppName:     s.cfg.AppName,
+			PageTitle:   heading,
+			Theme:       theme,
+			Status:      status,
+			Heading:     heading,
+			Message:     message,
+			ActionHref:  "/",
+			ActionLabel: "Back to dashboard",
+		}
+		if r.URL.Query().Get("signed-out") == "1" {
+			data.ActionHref = "/login"
+			data.ActionLabel = "Sign in"
+		}
+		s.renderPage(w, "layouts/error", data)
+	default:
+		s.renderPage(w, "layouts/dev-preview-auth", devPreviewAuthView{
+			AppName:   s.cfg.AppName,
+			PageTitle: "Auth layout preview",
+			Theme:     theme,
+		})
+	}
 }
 
 // handleDevPreviewRepositories renders the repositories page from fictional

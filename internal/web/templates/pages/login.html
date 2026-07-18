@@ -1,0 +1,18 @@
+{{/*
+  pages/login — signed-out sign-in card (GET /login, POST /login re-renders).
+  View: authLoginData. FormError covers bad credentials (401) and the
+  form-expired CSRF re-render (403); Email is preserved on error, the
+  password never is.
+*/}}
+{{ define "pages/login" }}
+<h1 class="m-0 mb-4 text-base font-bold text-text">Sign in</h1>
+{{ if .FormError }}
+<div class="mb-4">{{ template "ui/callout" dict "Tone" "danger" "Body" .FormError }}</div>
+{{ end }}
+<form method="post" action="/login" class="flex flex-col gap-4">
+  <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+  {{ template "ui/input" dict "ID" "login-email" "Name" "email" "Label" "Email" "Type" "email" "Autocomplete" "email" "Required" true "Autofocus" true "Value" .Email }}
+  {{ template "ui/input" dict "ID" "login-password" "Name" "password" "Label" "Password" "Type" "password" "Autocomplete" "current-password" "Required" true }}
+  {{ template "ui/button" dict "Label" "Sign in" "Variant" "primary" "Type" "submit" }}
+</form>
+{{ end }}

@@ -1,0 +1,16 @@
+{{/*
+  pages/error — one generic full-page error card for 404 / page-level 403 /
+  500 / 503. View: authErrorData. The caller sets the real status code; this
+  template only styles the body. htmx fragments, webhooks, and health checks
+  keep their plain-text responses. Copy must never imply a hard security
+  boundary.
+*/}}
+{{ define "pages/error" }}
+<div class="flex flex-col items-center gap-3 text-center">
+  <span class="flex size-10 flex-none items-center justify-center rounded-pill bg-danger-soft text-danger"><svg class="h-5 w-5" aria-hidden="true"><use href="#tg-i-warning"></use></svg></span>
+  <h1 class="m-0 text-base font-bold text-text">{{ .Heading }}</h1>
+  <p class="m-0 text-sm text-text-muted">{{ .Message }}</p>
+  <p class="m-0 text-xs text-text-muted">HTTP {{ .Status }}</p>
+  {{ template "ui/button" dict "Label" .ActionLabel "Variant" "secondary" "Href" .ActionHref }}
+</div>
+{{ end }}

@@ -1,0 +1,21 @@
+{{/*
+  pages/setup — first-run admin creation card (GET /setup, POST /setup
+  re-renders). View: authSetupData. Email and DisplayName are preserved on
+  error re-renders, the password never is. The strong-password note lives in
+  the password hint; positioning stays in the shell footer.
+*/}}
+{{ define "pages/setup" }}
+<h1 class="m-0 text-base font-bold text-text">Create the first admin</h1>
+<p class="m-0 mt-1 mb-4 text-sm text-text-muted">This first account gets every role, so you can connect repositories and run freeze and thaw flows.</p>
+{{ if .FormError }}
+<div class="mb-4">{{ template "ui/callout" dict "Tone" "danger" "Body" .FormError }}</div>
+{{ end }}
+<form method="post" action="/setup" class="flex flex-col gap-4">
+  <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+  {{ template "ui/input" dict "ID" "setup-email" "Name" "email" "Label" "Email" "Type" "email" "Autocomplete" "email" "Required" true "Value" .Email }}
+  {{ template "ui/input" dict "ID" "setup-display-name" "Name" "display_name" "Label" "Display name" "Autocomplete" "name" "Required" true "Value" .DisplayName }}
+  {{ template "ui/input" dict "ID" "setup-password" "Name" "password" "Label" "Password" "Type" "password" "Autocomplete" "new-password" "Minlength" "12" "Required" true "Hint" "At least 12 characters. Use a strong local password." }}
+  {{ template "ui/button" dict "Label" "Create admin" "Variant" "primary" "Type" "submit" }}
+  <p class="m-0 text-center text-xs text-text-muted">You&rsquo;ll be signed in and taken to the dashboard.</p>
+</form>
+{{ end }}
