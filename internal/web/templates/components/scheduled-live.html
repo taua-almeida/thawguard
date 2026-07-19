@@ -1,0 +1,30 @@
+{{/*
+  components/scheduled-live — everything on /scheduled-freezes that mutations
+  can change: the page-level create error, the schedule workbench, and the
+  scheduled-windows section. Creating a schedule swaps this whole region
+  (fresh form or preserved values with the error, plus the updated list);
+  edit/start-now/cancel and the filter/pagination links swap only the nested
+  #scheduled-windows section.
+*/}}
+{{ define "components/scheduled-live" }}
+<div id="scheduled-live" class="flex flex-col gap-6">
+  {{ if .FormError }}
+  <div role="alert">
+    {{ template "ui/callout" dict "Tone" "danger" "Body" .FormError }}
+  </div>
+  {{ end }}
+  {{ template "components/scheduled-workbench" . }}
+  {{ template "components/scheduled-windows" . }}
+</div>
+{{ end }}
+
+{{/*
+  components/scheduled-live-fragment / scheduled-windows-fragment — htmx swap
+  payloads. Data: {Data scheduledFreezesPageData, Toast *toastView}. The
+  optional toast rides along out-of-band into the shell's #toasts region.
+*/}}
+{{ define "components/scheduled-live-fragment" }}{{ template "components/scheduled-live" .Data }}
+{{ if .Toast }}<div id="toasts" hx-swap-oob="true" class="mb-4 flex flex-col gap-2">{{ template "ui/toast" .Toast }}</div>{{ end }}{{ end }}
+
+{{ define "components/scheduled-windows-fragment" }}{{ template "components/scheduled-windows" .Data }}
+{{ if .Toast }}<div id="toasts" hx-swap-oob="true" class="mb-4 flex flex-col gap-2">{{ template "ui/toast" .Toast }}</div>{{ end }}{{ end }}

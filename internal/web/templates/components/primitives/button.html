@@ -2,7 +2,9 @@
   ui/button — replaces .tg-btn / .tg-btn-secondary / .tg-btn-sm / .tg-repo-action-btn / legacy .button
   dict keys: Label (required), Variant primary|secondary|danger|ghost (default primary),
   Size ""|sm, Type (default button), Href (renders <a>), Icon (sprite id), IconOnly (bool),
-  Disabled (bool), DialogTarget (dialog id; wires data-dialog-open for dialog.js)
+  Disabled (bool), DialogTarget (dialog id; wires data-dialog-open for dialog.js),
+  HxTarget (Href links only: htmx outerHTML swap of that CSS target with
+  hx-push-url, for navigational pagination links; plain link without JS)
 */}}
 {{ define "ui/button" }}
 {{- $variant := "primary" }}{{ if .Variant }}{{ $variant = .Variant }}{{ end }}
@@ -14,7 +16,7 @@
 {{- end }}
 {{- if eq (or .Size "") "sm" }}{{ $classes = printf "%s %s" $classes "h-8 px-3 text-xs" }}{{ else }}{{ $classes = printf "%s %s" $classes "h-(--control-height) px-4 text-sm" }}{{ end }}
 {{- if .Href }}
-<a class="{{ $classes }}" href="{{ .Href }}">
+<a class="{{ $classes }}" href="{{ .Href }}"{{ if .HxTarget }} hx-get="{{ .Href }}" hx-target="{{ .HxTarget }}" hx-swap="outerHTML" hx-push-url="true"{{ end }}>
   {{- if .Icon }}<svg class="h-4 w-4" aria-hidden="true"><use href="#{{ .Icon }}"></use></svg>{{ end }}
   {{- if .IconOnly }}<span class="sr-only">{{ .Label }}</span>{{ else }}{{ .Label }}{{ end -}}
 </a>

@@ -3,7 +3,7 @@
   Full field: label + hint + control + error. Border uses --color-border-input
   (the only border token that meets WCAG 1.4.11 for form controls).
   dict keys: ID (required), Name (required), Label (required), Type (default text),
-  Value, Placeholder, Autocomplete, Minlength, Hint, Error, Required (bool),
+  Value, Placeholder, Autocomplete, Minlength, Maxlength, Hint, Error, Required (bool),
   Disabled (bool), Autofocus (bool), Mono (bool, monospace value e.g. tokens/branch names)
 */}}
 {{ define "ui/input" }}
@@ -19,6 +19,7 @@
     {{- if .Placeholder }} placeholder="{{ .Placeholder }}"{{ end }}
     {{- if .Autocomplete }} autocomplete="{{ .Autocomplete }}"{{ end }}
     {{- if .Minlength }} minlength="{{ .Minlength }}"{{ end }}
+    {{- if .Maxlength }} maxlength="{{ .Maxlength }}"{{ end }}
     {{- if .Required }} required{{ end }}
     {{- if .Autofocus }} autofocus{{ end }}
     {{- if .Disabled }} disabled{{ end }}

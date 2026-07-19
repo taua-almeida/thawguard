@@ -24,6 +24,7 @@ type freezeOperations interface {
 type freezeLifecycleOperations interface {
 	Get(ctx context.Context, id int64) (domain.BranchFreeze, error)
 	ListScheduled(ctx context.Context, limit int) ([]domain.BranchFreeze, error)
+	ListScheduledPage(ctx context.Context, status domain.BranchFreezeStatus, offset, limit int) ([]domain.BranchFreeze, int, error)
 	CreateScheduled(ctx context.Context, params freeze.ScheduleParams, actor domain.Actor) (domain.BranchFreeze, error)
 	EditScheduled(ctx context.Context, params freeze.EditScheduleParams, actor domain.Actor) (domain.BranchFreeze, error)
 	CancelScheduled(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error)
@@ -136,6 +137,14 @@ func (s *freezeRecomputingStore) ListScheduled(ctx context.Context, limit int) (
 		return nil, err
 	}
 	return lifecycle.ListScheduled(ctx, limit)
+}
+
+func (s *freezeRecomputingStore) ListScheduledPage(ctx context.Context, status domain.BranchFreezeStatus, offset, limit int) ([]domain.BranchFreeze, int, error) {
+	lifecycle, err := s.freezeLifecycle()
+	if err != nil {
+		return nil, 0, err
+	}
+	return lifecycle.ListScheduledPage(ctx, status, offset, limit)
 }
 
 func (s *freezeRecomputingStore) CreateScheduled(ctx context.Context, params freeze.ScheduleParams, actor domain.Actor) (domain.BranchFreeze, error) {

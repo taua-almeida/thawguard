@@ -253,6 +253,62 @@ func TestStoreAllowsMultipleScheduledFreezesForSameBranch(t *testing.T) {
 	}
 }
 
+func TestStoreListsScheduledPageWithFilterAndOffset(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	store := NewStore(database)
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+
+	ids := make([]int64, 0, 3)
+	for i, reason := range []string{"first window", "second window", "third window"} {
+		created, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repo.ID, Branch: "main", Reason: reason, StartsAt: now.Add(time.Duration(i+1) * time.Hour)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, created.ID)
+	}
+	if _, err := store.CancelScheduled(ctx, ids[2]); err != nil {
+		t.Fatal(err)
+	}
+
+	all, total, err := store.ListScheduledPage(ctx, "", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 3 || len(all) != 3 {
+		t.Fatalf("expected all three windows with total 3, got total=%d list=%+v", total, all)
+	}
+	if all[0].ID != ids[0] || all[1].ID != ids[1] || all[2].ID != ids[2] {
+		t.Fatalf("expected pending windows before cancelled, got %+v", all)
+	}
+
+	pending, total, err := store.ListScheduledPage(ctx, domain.BranchFreezeStatusScheduled, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 || len(pending) != 2 {
+		t.Fatalf("expected two pending windows, got total=%d list=%+v", total, pending)
+	}
+
+	page, total, err := store.ListScheduledPage(ctx, "", 2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 3 || len(page) != 1 || page[0].ID != ids[2] {
+		t.Fatalf("expected offset page with cancelled window, got total=%d list=%+v", total, page)
+	}
+
+	cancelled, total, err := store.ListScheduledPage(ctx, domain.BranchFreezeStatusCancelled, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || len(cancelled) != 1 || cancelled[0].ID != ids[2] {
+		t.Fatalf("expected single cancelled window, got total=%d list=%+v", total, cancelled)
+	}
+}
+
 func TestStoreCreatesListsActivatesAndEndsScheduledFreeze(t *testing.T) {
 	ctx := context.Background()
 	database := newTestDB(t, ctx)

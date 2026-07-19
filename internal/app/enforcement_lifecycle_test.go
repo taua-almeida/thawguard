@@ -554,6 +554,10 @@ func (f *fakeScheduledFreezeOperations) ListScheduled(ctx context.Context, limit
 	return nil, nil
 }
 
+func (f *fakeScheduledFreezeOperations) ListScheduledPage(ctx context.Context, status domain.BranchFreezeStatus, offset, limit int) ([]domain.BranchFreeze, int, error) {
+	return nil, 0, nil
+}
+
 func (f *fakeScheduledFreezeOperations) CreateScheduled(ctx context.Context, params freeze.ScheduleParams, actor domain.Actor) (domain.BranchFreeze, error) {
 	f.scheduleCalls++
 	return domain.BranchFreeze{}, nil

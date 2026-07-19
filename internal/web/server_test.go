@@ -1726,7 +1726,7 @@ func TestScheduledFreezesPageShowsFormAndWindows(t *testing.T) {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
 	}
 	body := recorder.Body.String()
-	for _, want := range []string{"Scheduled Freezes", "Create scheduled freeze", "One-time windows only", "taua-almeida/thawguard", "main", "Weekend release freeze", startsAt.Format("2006-01-02 15:04 UTC"), plannedEndsAt.Format("2006-01-02 15:04 UTC"), "upcoming", `action="/scheduled-freezes/edit"`, `action="/scheduled-freezes/start-now"`, `action="/scheduled-freezes/cancel"`, `data-confirm-action="Start Now"`, `data-confirm-action="Cancel schedule"`, "Live enforcement begins immediately", "current open pull requests", "future planned unfreeze remains scheduled", "tg-responsive-table", "tg-mobile-card-list", `data-utc-datetime="` + startsAt.Format(time.RFC3339) + `"`} {
+	for _, want := range []string{"Scheduled Freezes", "Schedule a freeze", "One-time windows only", "How scheduling works", "cooperative enforcement", "taua-almeida/thawguard", "main", "Weekend release freeze", startsAt.Format("2006-01-02 15:04 UTC"), plannedEndsAt.Format("2006-01-02 15:04 UTC"), "upcoming", `action="/scheduled-freezes/edit"`, `action="/scheduled-freezes/start-now"`, `action="/scheduled-freezes/cancel"`, `id="start-scheduled-9"`, `id="cancel-scheduled-9"`, "Live enforcement begins immediately", "current open pull requests", "future planned unfreeze remains scheduled", `datetime="` + startsAt.Format(time.RFC3339) + `"`, "Times shown in UTC.", "data-timezone-note", `<span class="mt-1 block text-xs text-text-muted">Ended <time`, `data-utc-datetime="` + startsAt.Format(time.RFC3339) + `"`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
@@ -1862,7 +1862,7 @@ func TestEditScheduledFreezeValidationReopensCorrectFormWithSafeSubmittedValues(
 			t.Fatalf("expected validation response to contain %q, got %q", want, body)
 		}
 	}
-	if strings.Contains(body, "Operator <note>") || strings.Count(body, `class="tg-schedule-edit" open`) != 2 {
+	if strings.Contains(body, "Operator <note>") || strings.Count(body, `<details class="text-left" open>`) != 2 {
 		t.Fatalf("expected escaped values and only schedule 9 open in desktop/mobile, got %q", body)
 	}
 }
@@ -3629,6 +3629,27 @@ func (s *fakeFreezeStore) ListScheduled(ctx context.Context, limit int) ([]domai
 		return s.scheduled[:limit], nil
 	}
 	return s.scheduled, nil
+}
+
+func (s *fakeFreezeStore) ListScheduledPage(ctx context.Context, status domain.BranchFreezeStatus, offset, limit int) ([]domain.BranchFreeze, int, error) {
+	matched := make([]domain.BranchFreeze, 0, len(s.scheduled))
+	for _, freeze := range s.scheduled {
+		if status == "" || freeze.Status == status {
+			matched = append(matched, freeze)
+		}
+	}
+	total := len(matched)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= total {
+		return []domain.BranchFreeze{}, total, nil
+	}
+	matched = matched[offset:]
+	if limit > 0 && len(matched) > limit {
+		matched = matched[:limit]
+	}
+	return matched, total, nil
 }
 
 func (s *fakeFreezeStore) CreateScheduled(ctx context.Context, params freeze.ScheduleParams, actor domain.Actor) (domain.BranchFreeze, error) {

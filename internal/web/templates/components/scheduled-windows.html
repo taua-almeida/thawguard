@@ -1,0 +1,201 @@
+{{/*
+  components/scheduled-windows — filterable, paginated scheduled-windows
+  section and the #scheduled-windows swap target for edit/start-now/cancel
+  and the filter/pagination links. Table on md+, stacked cards below.
+  Upcoming renders the scheduled badge, Active the frozen badge (it is a live
+  freeze by then), Completed/Cancelled a neutral badge with a muted timestamp
+  sub-line. Server-rendered times are UTC inside <time datetime="…"> elements;
+  datetime.js rewrites them to the browser's local timezone and updates
+  [data-timezone-note] accordingly — without JS the UTC text and note stand.
+  The pending-row edit panel is a plain <details> disclosure (no JS needed);
+  Start Now and Cancel confirm through ui/modal. Mutations and view links
+  carry status/page so the swap returns to the same filter and page.
+*/}}
+{{ define "components/scheduled-windows" }}
+<section id="scheduled-windows" class="rounded-panel border border-border bg-surface shadow-card" aria-label="Scheduled windows">
+  <div class="flex flex-wrap items-center gap-3 border-b border-border px-(--card-spacing) py-4">
+    <h2 class="m-0 text-lg font-bold text-text">Scheduled windows</h2>
+    {{ if eq .Total 1 }}{{ template "ui/badge" dict "Label" "1 window" "Tone" "scheduled" "Icon" "tg-i-schedule" }}{{ else if .Total }}{{ template "ui/badge" dict "Label" (printf "%d windows" .Total) "Tone" "scheduled" "Icon" "tg-i-schedule" }}{{ else }}{{ template "ui/badge" dict "Label" "0 windows" }}{{ end }}
+    {{ if .Windows }}<span class="ml-auto text-xs text-text-muted" data-timezone-note>Times shown in UTC.</span>{{ end }}
+  </div>
+  {{ if or .Total (ne .Filter "all") }}
+  <div class="flex flex-wrap gap-2 border-b border-border px-(--card-spacing) py-3">
+    {{ range .Chips }}{{ template "ui/chip" dict "Label" .Label "Href" .URL "Active" .Active "HxTarget" "#scheduled-windows" }}{{ end }}
+  </div>
+  {{ end }}
+  {{ if .ActionError }}
+  <div role="alert" class="border-b border-border px-(--card-spacing) py-4">
+    {{ template "ui/callout" dict "Tone" "danger" "Body" .ActionError }}
+  </div>
+  {{ end }}
+  {{ if .Windows }}
+  <div class="hidden overflow-x-auto md:block">
+    <table class="w-full border-collapse text-sm">
+      <caption class="sr-only">Scheduled freeze windows with start, planned unfreeze, status, reason, and actions</caption>
+      <thead>
+        <tr class="bg-surface-muted text-left">
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Window</th>
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Starts</th>
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Planned unfreeze</th>
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Status</th>
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Reason</th>
+          <th scope="col" class="px-4 py-3 text-right text-xs font-bold tracking-wide text-text-muted uppercase">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{ range .Windows }}
+        <tr class="border-t border-border align-top">
+          <td class="px-4 py-3">
+            <span class="flex flex-col gap-0.5">
+              <span class="font-bold text-text">{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Freeze.RepositoryID }}{{ end }}</span>
+              <code class="font-mono text-xs text-text-muted">{{ .Freeze.Branch }}</code>
+            </span>
+          </td>
+          <td class="px-4 py-3 text-text">{{ if .StartsAtUTC }}<time datetime="{{ .StartsAtUTC }}">{{ .StartsAt }}</time>{{ else }}<span class="text-text-muted">—</span>{{ end }}</td>
+          <td class="px-4 py-3 text-text">{{ if .PlannedEndsAtUTC }}<time datetime="{{ .PlannedEndsAtUTC }}">{{ .PlannedEndsAt }}</time>{{ else }}<span class="text-text-muted">—</span>{{ end }}</td>
+          <td class="px-4 py-3">
+            {{ template "ui/badge" dict "Label" .StatusText "Tone" .BadgeTone "Icon" .BadgeIcon }}
+            {{ if .SubLineLabel }}<span class="mt-1 block text-xs text-text-muted">{{ .SubLineLabel }} <time datetime="{{ .SubLineUTC }}">{{ .SubLineTime }}</time></span>{{ end }}
+          </td>
+          <td class="px-4 py-3 text-text">{{ .Freeze.Reason }}</td>
+          <td class="px-4 py-3">
+            <div class="flex flex-wrap justify-end gap-2">{{ template "components/scheduled-window-actions" dict "Card" . "Prefix" "t" }}</div>
+            {{ if and .CanManage .StartNowBlockedReason }}<p class="m-0 mt-1 text-right text-xs text-text-muted">{{ .StartNowBlockedReason }}</p>{{ end }}
+          </td>
+        </tr>
+        {{ end }}
+      </tbody>
+    </table>
+  </div>
+  <div class="flex flex-col gap-3 p-(--card-spacing) md:hidden">
+    {{ range .Windows }}
+    <article class="rounded-card border border-border p-4">
+      <div class="flex items-start justify-between gap-3">
+        <div class="flex flex-col gap-0.5">
+          <span class="text-sm font-bold text-text">{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Freeze.RepositoryID }}{{ end }}</span>
+          <code class="font-mono text-xs text-text-muted">{{ .Freeze.Branch }}</code>
+        </div>
+        <div class="flex flex-col items-end gap-0.5">
+          {{ template "ui/badge" dict "Label" .StatusText "Tone" .BadgeTone "Icon" .BadgeIcon }}
+          {{ if .SubLineLabel }}<span class="text-xs text-text-muted">{{ .SubLineLabel }} <time datetime="{{ .SubLineUTC }}">{{ .SubLineTime }}</time></span>{{ end }}
+        </div>
+      </div>
+      <p class="m-0 mt-2 text-sm text-text">{{ .Freeze.Reason }}</p>
+      <p class="m-0 mt-1 text-xs text-text-muted">Starts: {{ if .StartsAtUTC }}<time datetime="{{ .StartsAtUTC }}">{{ .StartsAt }}</time>{{ else }}—{{ end }}</p>
+      <p class="m-0 mt-1 text-xs text-text-muted">Planned unfreeze: {{ if .PlannedEndsAtUTC }}<time datetime="{{ .PlannedEndsAtUTC }}">{{ .PlannedEndsAt }}</time>{{ else }}none — lift manually{{ end }}</p>
+      <div class="mt-3 flex flex-wrap gap-2">{{ template "components/scheduled-window-actions" dict "Card" . "Prefix" "m" }}</div>
+      {{ if and .CanManage .StartNowBlockedReason }}<p class="m-0 mt-1 text-xs text-text-muted">{{ .StartNowBlockedReason }}</p>{{ end }}
+    </article>
+    {{ end }}
+  </div>
+  {{ range .Windows }}
+  {{ if and .CanStartNow .CanManage }}
+  {{ template "ui/modal" dict
+      "ID" (printf "start-scheduled-%d" .Freeze.ID)
+      "Title" "Start this freeze now?"
+      "Body" "Live enforcement begins immediately. Thawguard will synchronize current open pull requests and publish real thawguard/freeze statuses. Any future planned unfreeze remains scheduled."
+      "ConfirmLabel" "Start Now"
+      "ConfirmVariant" "primary"
+      "Action" "/scheduled-freezes/start-now"
+      "HxTarget" "#scheduled-windows"
+      "CSRFField" .CSRFField
+      "CSRFToken" .CSRFToken
+      "Fields" (dict "freeze_id" .Freeze.ID "status" .Query.Filter "page" .Query.Page) }}
+  {{ end }}
+  {{ if and .CanCancel .CanFreeze }}
+  {{ template "ui/modal" dict
+      "ID" (printf "cancel-scheduled-%d" .Freeze.ID)
+      "Title" "Cancel scheduled freeze?"
+      "Body" "This cancels a future scheduled freeze before it activates. The action is auditable and no live statuses are changed."
+      "ConfirmLabel" "Cancel schedule"
+      "ConfirmVariant" "danger"
+      "CancelLabel" "Keep schedule"
+      "Action" "/scheduled-freezes/cancel"
+      "HxTarget" "#scheduled-windows"
+      "CSRFField" .CSRFField
+      "CSRFToken" .CSRFToken
+      "Fields" (dict "freeze_id" .Freeze.ID "status" .Query.Filter "page" .Query.Page) }}
+  {{ end }}
+  {{ end }}
+  {{ if .Pagination }}
+  <div class="flex flex-wrap items-center justify-between gap-3 border-t border-border px-(--card-spacing) py-3">
+    <span class="text-xs text-text-muted">Showing {{ .Pagination.From }}–{{ .Pagination.To }} of {{ .Pagination.Total }}</span>
+    <div class="flex gap-2">
+      {{ if .Pagination.PrevURL }}{{ template "ui/button" dict "Label" "Previous" "Variant" "secondary" "Size" "sm" "Href" .Pagination.PrevURL "HxTarget" "#scheduled-windows" }}{{ else }}{{ template "ui/button" dict "Label" "Previous" "Variant" "secondary" "Size" "sm" "Disabled" true }}{{ end }}
+      {{ if .Pagination.NextURL }}{{ template "ui/button" dict "Label" "Next" "Variant" "secondary" "Size" "sm" "Href" .Pagination.NextURL "HxTarget" "#scheduled-windows" }}{{ else }}{{ template "ui/button" dict "Label" "Next" "Variant" "secondary" "Size" "sm" "Disabled" true }}{{ end }}
+    </div>
+  </div>
+  {{ end }}
+  {{ else }}
+  <div class="p-(--card-spacing)">
+    {{ if eq .Filter "all" }}
+    {{ template "ui/empty-state" dict "Title" "No scheduled freezes yet" "Hint" "Create a one-time window to have Thawguard freeze a branch later." "Icon" "tg-i-schedule" }}
+    {{ else }}
+    {{ template "ui/empty-state" dict "Title" (printf "No %s windows" .Filter) "Hint" "Switch filters or create a new one-time window." "Icon" "tg-i-schedule" }}
+    {{ end }}
+  </div>
+  {{ end }}
+</section>
+{{ end }}
+
+{{/*
+  components/scheduled-window-actions — action cluster for one scheduled
+  window. Data: dict {Card scheduledWindowCard, Prefix "t"|"m"} — Prefix keeps
+  edit-panel control ids unique between the table and mobile renderings of
+  the same row. Start Now and Cancel open the ui/modal confirms defined once
+  per row in components/scheduled-windows; Edit is an inline <details>
+  disclosure so a pending schedule can be adjusted in place. Cancel is
+  freezer-only; Edit and Start Now allow manager-or-freezer. Viewers see
+  "Read only"; a closed window shows a plain dash.
+*/}}
+{{ define "components/scheduled-window-actions" }}
+{{- $c := .Card }}{{- $p := .Prefix }}
+{{- if or $c.CanManage $c.CanFreeze }}
+{{- if or (and $c.CanStartNow $c.CanManage) (and $c.CanEdit $c.CanManage) (and $c.CanCancel $c.CanFreeze) }}
+{{- if and $c.CanStartNow $c.CanManage }}
+{{ template "ui/button" dict "Label" "Start Now" "Variant" "primary" "Size" "sm" "Icon" "tg-i-play" "DialogTarget" (printf "start-scheduled-%d" $c.Freeze.ID) }}
+{{- end }}
+{{- if and $c.CanEdit $c.CanManage }}
+<details class="text-left"{{ if $c.EditOpen }} open{{ end }}>
+  <summary class="inline-flex h-8 cursor-pointer list-none items-center rounded-control border border-border-input bg-surface px-3 text-xs font-semibold text-text hover:bg-surface-muted [&::-webkit-details-marker]:hidden">Edit</summary>
+  <div class="mt-2 w-[min(24rem,100%)] rounded-card border border-border bg-surface-muted p-4 text-left">
+    <h3 class="m-0 text-sm font-bold text-text">Edit pending schedule</h3>
+    <p class="m-0 mt-1 text-xs text-text-muted"><strong>{{ if $c.Repository.ID }}{{ $c.Repository.FullName }}{{ else }}Repository #{{ $c.Freeze.RepositoryID }}{{ end }}</strong> → <code class="font-mono">{{ $c.Freeze.Branch }}</code> cannot be changed.</p>
+    <form method="post" action="/scheduled-freezes/edit" hx-post="/scheduled-freezes/edit" hx-target="#scheduled-windows" hx-swap="outerHTML" hx-push-url="false" class="mt-3 flex flex-col gap-3">
+      <input type="hidden" name="{{ $c.CSRFField }}" value="{{ $c.CSRFToken }}">
+      <input type="hidden" name="freeze_id" value="{{ $c.Freeze.ID }}">
+      <input type="hidden" name="timezone_offset_minutes" value="0" data-timezone-offset-minutes>
+      <input type="hidden" name="status" value="{{ $c.Query.Filter }}">
+      <input type="hidden" name="page" value="{{ $c.Query.Page }}">
+      {{ template "ui/input" dict "ID" (printf "scheduled-edit-%s-reason-%d" $p $c.Freeze.ID) "Name" "reason" "Label" "Reason" "Value" $c.EditReason "Maxlength" "500" "Required" true }}
+      <div class="flex flex-col gap-1.5">
+        <label for="scheduled-edit-{{ $p }}-starts-at-{{ $c.Freeze.ID }}" class="text-sm font-semibold text-text">Starts at<span class="text-danger" aria-hidden="true"> *</span></label>
+        <input id="scheduled-edit-{{ $p }}-starts-at-{{ $c.Freeze.ID }}" type="datetime-local" name="starts_at" value="{{ $c.EditStartsAt }}" required
+          {{- if and (not $c.EditSubmitted) $c.StartsAtUTC }} data-utc-datetime="{{ $c.StartsAtUTC }}"{{ end }}
+          class="h-(--control-height) w-full rounded-control border border-border-input bg-surface px-3 text-sm text-text">
+      </div>
+      <div class="flex flex-col gap-1.5">
+        <label for="scheduled-edit-{{ $p }}-planned-ends-at-{{ $c.Freeze.ID }}" class="text-sm font-semibold text-text">Planned unfreeze</label>
+        <input id="scheduled-edit-{{ $p }}-planned-ends-at-{{ $c.Freeze.ID }}" type="datetime-local" name="planned_ends_at" value="{{ $c.EditPlannedEndsAt }}" aria-describedby="scheduled-edit-{{ $p }}-planned-ends-at-{{ $c.Freeze.ID }}-hint"
+          {{- if and (not $c.EditSubmitted) $c.PlannedEndsAtUTC }} data-utc-datetime="{{ $c.PlannedEndsAtUTC }}"{{ end }}
+          class="h-(--control-height) w-full rounded-control border border-border-input bg-surface px-3 text-sm text-text">
+        <p id="scheduled-edit-{{ $p }}-planned-ends-at-{{ $c.Freeze.ID }}-hint" class="m-0 text-xs text-text-muted">Leave planned unfreeze empty to clear it.</p>
+      </div>
+      <noscript><p class="m-0 text-xs font-semibold text-warning">Without JavaScript, times are interpreted as UTC.</p></noscript>
+      <div class="flex justify-end">
+        {{ template "ui/button" dict "Label" "Save schedule" "Variant" "primary" "Size" "sm" "Type" "submit" }}
+      </div>
+    </form>
+  </div>
+</details>
+{{- end }}
+{{- if and $c.CanCancel $c.CanFreeze }}
+{{ template "ui/button" dict "Label" "Cancel" "Variant" "ghost" "Size" "sm" "DialogTarget" (printf "cancel-scheduled-%d" $c.Freeze.ID) }}
+{{- end }}
+{{- else }}
+<span class="text-xs text-text-muted">—</span>
+{{- end }}
+{{- else }}
+<span class="text-xs text-text-muted">Read only</span>
+{{- end }}
+{{ end }}

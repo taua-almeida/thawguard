@@ -254,6 +254,57 @@ LIMIT ?`, limit)
 	return freezes, nil
 }
 
+func (s *Store) ListScheduledPage(ctx context.Context, status domain.BranchFreezeStatus, offset, limit int) ([]domain.BranchFreeze, int, error) {
+	if s == nil || s.db == nil {
+		return nil, 0, errors.New("freeze store has no database")
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	where := "WHERE scheduled = 1"
+	countArgs := []any{}
+	if status != "" {
+		where += " AND status = ?"
+		countArgs = append(countArgs, status)
+	}
+
+	var total int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM branch_freezes "+where, countArgs...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count scheduled branch freezes: %w", err)
+	}
+
+	args := append(append([]any{}, countArgs...), limit, offset)
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, created_by, created_by_kind, created_at, updated_at
+FROM branch_freezes
+`+where+`
+ORDER BY
+  CASE status WHEN 'scheduled' THEN 0 WHEN 'active' THEN 1 WHEN 'ended' THEN 2 WHEN 'cancelled' THEN 3 ELSE 4 END,
+  starts_at ASC,
+  id ASC
+LIMIT ? OFFSET ?`, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list scheduled branch freezes page: %w", err)
+	}
+	defer rows.Close()
+
+	freezes := make([]domain.BranchFreeze, 0)
+	for rows.Next() {
+		freeze, err := scanBranchFreeze(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		freezes = append(freezes, freeze)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("list scheduled branch freezes page rows: %w", err)
+	}
+	return freezes, total, nil
+}
+
 func (s *Store) ListDueScheduled(ctx context.Context, limit int) ([]domain.BranchFreeze, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("freeze store has no database")

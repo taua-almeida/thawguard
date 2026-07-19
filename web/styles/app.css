@@ -28,6 +28,10 @@
 @source "../../internal/web/templates/components/freeze-workbench.html";
 @source "../../internal/web/templates/components/freeze-impact.html";
 @source "../../internal/web/templates/components/active-freezes.html";
+@source "../../internal/web/templates/pages/scheduled-freezes.html";
+@source "../../internal/web/templates/components/scheduled-live.html";
+@source "../../internal/web/templates/components/scheduled-workbench.html";
+@source "../../internal/web/templates/components/scheduled-windows.html";
 @source "../../internal/web/templates/pages/dashboard.html";
 @source "../../internal/web/templates/pages/login.html";
 @source "../../internal/web/templates/pages/setup.html";

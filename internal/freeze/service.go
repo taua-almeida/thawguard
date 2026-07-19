@@ -44,6 +44,13 @@ func (s *Service) ListScheduled(ctx context.Context, limit int) ([]domain.Branch
 	return NewStore(s.db).ListScheduled(ctx, limit)
 }
 
+func (s *Service) ListScheduledPage(ctx context.Context, status domain.BranchFreezeStatus, offset, limit int) ([]domain.BranchFreeze, int, error) {
+	if s == nil || s.db == nil {
+		return nil, 0, errors.New("freeze service has no database")
+	}
+	return NewStore(s.db).ListScheduledPage(ctx, status, offset, limit)
+}
+
 func (s *Service) ListDueScheduled(ctx context.Context, limit int) ([]domain.BranchFreeze, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("freeze service has no database")
