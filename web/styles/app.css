@@ -48,6 +48,8 @@
 @source "../../internal/web/templates/pages/webhooks.html";
 @source "../../internal/web/templates/components/webhooks-live.html";
 @source "../../internal/web/templates/components/webhooks-table.html";
+@source "../../internal/web/templates/pages/users.html";
+@source "../../internal/web/templates/components/users-live.html";
 @source "../../internal/web/templates/pages/login.html";
 @source "../../internal/web/templates/pages/setup.html";
 @source "../../internal/web/templates/pages/account-password.html";

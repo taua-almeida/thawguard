@@ -14,11 +14,12 @@
 //   any endpoint that returns both a full page and an htmx fragment for the
 //   same URL must send "Vary: HX-Request" so shared caches never serve a
 //   fragment to a full-page navigation or vice versa.
-import { initDialogs } from "./dialog.js";
+import { initDialogs, upgradeOpenDialogs } from "./dialog.js";
 import { applyLocalDatetimes, initLocalDatetimes } from "./datetime.js";
 
 initDialogs();
 initLocalDatetimes();
+upgradeOpenDialogs();
 
 // Freeze-form branch filtering and selection echo. All hooks are declarative
 // data-* attributes and every listener is delegated, so htmx swaps need no
@@ -72,6 +73,7 @@ document.addEventListener("change", (event) => {
 document.addEventListener("htmx:afterSwap", () => {
   applyBranchFilters();
   applyLocalDatetimes();
+  upgradeOpenDialogs();
 });
 
 document.addEventListener("htmx:beforeSwap", (event) => {

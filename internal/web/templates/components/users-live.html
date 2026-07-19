@@ -1,0 +1,270 @@
+{{/*
+  components/users-live — the swappable /users region: admin-invariant callout
+  plus the all-users panel (desktop table / mobile cards) and every dialog that
+  carries mutable state (add-user, per-row reset-password, per-row disable
+  confirm). The whole region swaps as one unit because the last-enabled-admin
+  invariant crosses rows: any mutation can change which row is guarded, so
+  per-row swaps would leave stale guards behind. Dialogs live inside the
+  region so a validation error re-renders them with the `open` attribute and
+  preserved values; dialog.js upgrades those to showModal after each swap.
+  The header "Add user" button lives outside the region and targets the
+  stable dialog id, so it keeps working across swaps.
+*/}}
+{{ define "components/users-live" }}
+<div id="users-live" class="flex flex-col gap-6">
+  {{ if .FormError }}
+  <div role="alert">
+    {{ template "ui/callout" dict "Tone" "danger" "Body" .FormError }}
+  </div>
+  {{ end }}
+  {{ template "ui/callout" dict "Tone" "info" "Body" "Thawguard never commits a state without an enabled admin: the final enabled admin cannot be disabled or lose the admin role. Disabling a user revokes all of their sessions; re-enabling does not restore old sessions. Password resets sign the user out everywhere and force a new password on their next login." }}
+  <section class="rounded-panel border border-border bg-surface shadow-card" aria-label="All users">
+    <div class="border-b border-border px-(--card-spacing) py-4">
+      <div class="flex flex-wrap items-center gap-3">
+        <h2 class="m-0 text-lg font-bold text-text">All users</h2>
+        {{ if eq .UserCount 1 }}{{ template "ui/badge" dict "Label" "1 user" }}{{ else }}{{ template "ui/badge" dict "Label" (printf "%d users" .UserCount) }}{{ end }}
+      </div>
+      {{ if .Users }}
+      <p class="m-0 mt-1 text-sm text-text-muted">Local accounts, their Thawguard roles, and account status.</p>
+      {{ end }}
+    </div>
+    {{ if .Users }}
+    <div class="hidden overflow-x-auto md:block">
+      <table class="w-full border-collapse text-sm">
+        <caption class="sr-only">Local users with status, roles, creation date, and account actions</caption>
+        <thead>
+          <tr class="bg-surface-muted text-left">
+            <th scope="col" class="px-4 py-3 text-left text-xs font-bold tracking-wide text-text-muted uppercase">Name</th>
+            <th scope="col" class="px-4 py-3 text-left text-xs font-bold tracking-wide text-text-muted uppercase">Email</th>
+            <th scope="col" class="px-4 py-3 text-left text-xs font-bold tracking-wide text-text-muted uppercase">Status</th>
+            <th scope="col" class="px-4 py-3 text-left text-xs font-bold tracking-wide text-text-muted uppercase">Roles</th>
+            <th scope="col" class="px-4 py-3 text-left text-xs font-bold tracking-wide text-text-muted uppercase">Created</th>
+            <th scope="col" class="px-4 py-3 text-left text-xs font-bold tracking-wide text-text-muted uppercase">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{ range .Users }}
+          <tr class="border-t border-border align-top">
+            <td class="px-4 py-4"><span class="flex items-center gap-2 font-semibold text-text">{{ .DisplayName }}{{ if .IsSelf }} {{ template "users/you-chip" }}{{ end }}</span></td>
+            <td class="px-4 py-4"><code class="font-mono text-xs text-text">{{ .Email }}</code></td>
+            <td class="px-4 py-4">
+              <span class="flex flex-col items-start gap-1.5">
+                {{ template "users/status-badges" . }}
+              </span>
+            </td>
+            <td class="px-4 py-4">{{ template "users/roles-form" dict "User" . "CSRFField" $.CSRFField "CSRFToken" $.CSRFToken "Prefix" "" }}</td>
+            <td class="px-4 py-4 whitespace-nowrap text-text-muted"><time datetime="{{ .CreatedAtISO }}">{{ .CreatedAt }}</time></td>
+            <td class="px-4 py-4">{{ template "users/actions" dict "User" . "CSRFField" $.CSRFField "CSRFToken" $.CSRFToken }}</td>
+          </tr>
+          {{ end }}
+        </tbody>
+      </table>
+    </div>
+    <div class="flex flex-col gap-3 p-(--card-spacing) md:hidden">
+      {{ range .Users }}
+      <article class="rounded-card border border-border p-4">
+        <div class="flex flex-wrap items-start justify-between gap-2">
+          <h3 class="m-0 flex items-center gap-2 text-sm font-bold text-text">{{ .DisplayName }}{{ if .IsSelf }} {{ template "users/you-chip" }}{{ end }}</h3>
+          <div class="flex flex-wrap gap-1.5">{{ template "users/status-badges" . }}</div>
+        </div>
+        <p class="m-0 mt-1"><code class="font-mono text-xs text-text-muted">{{ .Email }}</code></p>
+        <p class="m-0 mt-2 text-xs font-bold tracking-wide text-text-muted uppercase">Roles</p>
+        <div class="mt-1.5">{{ template "users/roles-form" dict "User" . "CSRFField" $.CSRFField "CSRFToken" $.CSRFToken "Prefix" "m-" }}</div>
+        <p class="m-0 mt-3 text-xs text-text-muted">Created <time datetime="{{ .CreatedAtISO }}">{{ .CreatedAt }}</time></p>
+        <div class="mt-3">{{ template "users/actions" dict "User" . "CSRFField" $.CSRFField "CSRFToken" $.CSRFToken }}</div>
+      </article>
+      {{ end }}
+    </div>
+    {{ else }}
+    <div class="p-(--card-spacing)">
+      {{ template "ui/empty-state" dict "Title" "No users yet" "Hint" "Create the first admin from setup." "Icon" "tg-i-users" }}
+    </div>
+    {{ end }}
+  </section>
+  {{ range .Users }}
+  {{ if and (not .Disabled) (not .IsLastEnabledAdmin) }}
+  {{ if .IsSelf }}
+  {{ template "ui/modal" dict "ID" (printf "users-disable-%d" .ID) "Title" "Disable user?" "Body" "Disabling your own account revokes all of your sessions and signs you out immediately. The final enabled admin cannot be disabled." "ConfirmLabel" "Disable user" "Action" "/users/disable" "CSRFField" $.CSRFField "CSRFToken" $.CSRFToken "Fields" (dict "user_id" .ID) "HxTarget" "#users-live" }}
+  {{ else }}
+  {{ template "ui/modal" dict "ID" (printf "users-disable-%d" .ID) "Title" "Disable user?" "Body" "The user can no longer log in and all of their sessions are revoked. Their password and roles are kept for later re-enabling. The final enabled admin cannot be disabled." "ConfirmLabel" "Disable user" "Action" "/users/disable" "CSRFField" $.CSRFField "CSRFToken" $.CSRFToken "Fields" (dict "user_id" .ID) "HxTarget" "#users-live" }}
+  {{ end }}
+  {{ end }}
+  {{ if not .IsSelf }}
+  {{ template "users/reset-dialog" dict "User" . "CSRFField" $.CSRFField "CSRFToken" $.CSRFToken }}
+  {{ end }}
+  {{ end }}
+  {{ template "users/add-dialog" . }}
+</div>
+{{ end }}
+
+{{/*
+  components/users-live-fragment — htmx swap payload: the live region plus an
+  optional out-of-band toast for the shell's #toasts container.
+*/}}
+{{ define "components/users-live-fragment" }}
+{{ template "components/users-live" .Data }}
+{{ if .Toast }}<div id="toasts" hx-swap-oob="true" class="mb-4 flex flex-col gap-2">{{ template "ui/toast" .Toast }}</div>{{ end }}
+{{ end }}
+
+{{ define "users/you-chip" }}<span class="inline-flex items-center rounded-pill bg-accent-soft px-2 py-0.5 text-xs font-semibold text-accent-strong">you</span>{{ end }}
+
+{{/* users/status-badges — dot is a usersUserView. */}}
+{{ define "users/status-badges" }}
+{{- if .Disabled }}
+{{ template "ui/badge" dict "Label" "Disabled" "Tone" "warning" "Icon" "tg-i-warning" }}
+{{- else }}
+{{ template "ui/badge" dict "Label" "Enabled" "Tone" "success" "Icon" "tg-i-check" }}
+{{- end }}
+{{- if .MustChangePassword }}
+{{ template "ui/badge" dict "Label" "Must change password" "Tone" "scheduled" "Icon" "tg-i-key" }}
+{{- end }}
+{{ end }}
+
+{{/*
+  users/roles-form — dot: dict with User, CSRFField, CSRFToken, Prefix
+  (checkbox-id prefix; "m-" on mobile cards so ids stay unique).
+  The last enabled admin's admin checkbox is checked+disabled, and a hidden
+  roles=admin input keeps the role in the submission (disabled controls do
+  not submit); the server guard stays authoritative either way.
+*/}}
+{{ define "users/roles-form" }}
+{{- $u := .User }}{{ $prefix := .Prefix }}
+<form method="post" action="/users/roles" hx-post="/users/roles" hx-target="#users-live" hx-swap="outerHTML" hx-push-url="false" class="flex flex-col gap-2">
+  <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+  <input type="hidden" name="user_id" value="{{ $u.ID }}">
+  {{- if $u.IsLastEnabledAdmin }}
+  <input type="hidden" name="roles" value="admin">
+  {{- end }}
+  {{- if $u.RoleFormError }}
+  <div role="alert">
+    {{ template "ui/callout" dict "Tone" "danger" "Body" $u.RoleFormError }}
+  </div>
+  {{- end }}
+  <div class="grid grid-cols-2 gap-x-4 gap-y-1.5">
+    {{- range $u.RoleOptions }}
+    {{- $isAdmin := eq .Value "admin" }}
+    {{- $hint := "" }}
+    {{- if and $isAdmin $u.IsLastEnabledAdmin }}{{ $hint = "The final enabled admin must keep the admin role." }}
+    {{- else if and $isAdmin $u.IsSelf .Selected }}{{ $hint = "Removing your own admin role locks you out of this page immediately." }}
+    {{- end }}
+    {{ template "ui/checkbox" dict "ID" (printf "%su%d-role-%s" $prefix $u.ID .Value) "Name" "roles" "Value" .Value "Label" .Label "Checked" (or .Selected (and $isAdmin $u.IsLastEnabledAdmin)) "Disabled" (and $isAdmin $u.IsLastEnabledAdmin) "Hint" $hint }}
+    {{- end }}
+  </div>
+  <div>
+    {{ template "ui/button" dict "Label" "Save roles" "Variant" "secondary" "Size" "sm" "Type" "submit" }}
+  </div>
+</form>
+{{ end }}
+
+{{/*
+  users/actions — dot: dict with User, CSRFField, CSRFToken. Rendered in both
+  the desktop Actions cell and the mobile card footer; the dialog-opening
+  buttons target the shared per-user dialog ids, so this define stays
+  markup-only apart from the inline re-enable form.
+*/}}
+{{ define "users/actions" }}
+{{- $u := .User }}
+<div class="flex flex-col items-start gap-2">
+  {{- if $u.Disabled }}
+  <form method="post" action="/users/enable" hx-post="/users/enable" hx-target="#users-live" hx-swap="outerHTML" hx-push-url="false">
+    <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+    <input type="hidden" name="user_id" value="{{ $u.ID }}">
+    {{ template "ui/button" dict "Label" "Re-enable" "Variant" "secondary" "Size" "sm" "Type" "submit" }}
+  </form>
+  <p class="m-0 text-xs text-text-muted">Re-enabling does not restore old sessions.</p>
+  {{- if not $u.IsSelf }}
+  {{ template "ui/button" dict "Label" "Reset password…" "Variant" "secondary" "Size" "sm" "Icon" "tg-i-key" "DialogTarget" (printf "users-reset-%d" $u.ID) }}
+  {{- end }}
+  {{- else }}
+  {{- if $u.IsLastEnabledAdmin }}
+  {{ template "ui/button" dict "Label" "Disable" "Variant" "secondary" "Size" "sm" "Disabled" true }}
+  <p class="m-0 text-xs text-text-muted">The final enabled admin cannot be disabled.</p>
+  {{- else }}
+  {{ template "ui/button" dict "Label" "Disable" "Variant" "secondary" "Size" "sm" "DialogTarget" (printf "users-disable-%d" $u.ID) }}
+  {{- end }}
+  {{- if $u.IsSelf }}
+  <p class="m-0 text-xs text-text-muted">Use &#8216;Change password&#8217; for your own account.</p>
+  {{- else }}
+  {{ template "ui/button" dict "Label" "Reset password…" "Variant" "secondary" "Size" "sm" "Icon" "tg-i-key" "DialogTarget" (printf "users-reset-%d" $u.ID) }}
+  {{- end }}
+  {{- end }}
+</div>
+{{ end }}
+
+{{/*
+  users/reset-dialog — dot: dict with User, CSRFField, CSRFToken. Admin types
+  the temporary password; it is never generated, echoed back, or logged, so
+  both password inputs always render blank — including after a validation
+  error, when the server re-opens the dialog via the `open` attribute.
+  Not rendered for the admin's own row (self-service goes through
+  "Change password").
+*/}}
+{{ define "users/reset-dialog" }}
+{{- $u := .User }}
+<dialog id="users-reset-{{ $u.ID }}"{{ if $u.ResetFormOpen }} open{{ end }} class="m-auto w-[min(30rem,90vw)] rounded-panel border border-border bg-surface p-6 text-text shadow-card" aria-labelledby="users-reset-{{ $u.ID }}-title">
+  <h2 id="users-reset-{{ $u.ID }}-title" class="m-0 text-base font-bold">Reset password</h2>
+  <p class="mt-1 mb-0"><code class="font-mono text-xs text-text-muted">{{ $u.Email }}</code></p>
+  <p class="mt-2 mb-0 text-sm text-text-muted">This sets an admin-entered temporary password, revokes every session for the user, and forces them to choose a new password on their next login. It does not re-enable a disabled account.</p>
+  {{- if $u.ResetFormError }}
+  <div class="mt-4" role="alert">
+    {{ template "ui/callout" dict "Tone" "danger" "Body" $u.ResetFormError }}
+  </div>
+  {{- end }}
+  <form method="post" action="/users/reset-password" hx-post="/users/reset-password" hx-target="#users-live" hx-swap="outerHTML" hx-push-url="false">
+    <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+    <input type="hidden" name="user_id" value="{{ $u.ID }}">
+    <div class="mt-4 flex flex-col gap-4">
+      {{ template "ui/input" dict "ID" (printf "reset-%d-password" $u.ID) "Name" "temporary_password" "Label" "Temporary password" "Type" "password" "Required" true "Minlength" "12" "Autocomplete" "new-password" "Hint" "At least 12 characters." }}
+      {{ template "ui/input" dict "ID" (printf "reset-%d-password-confirm" $u.ID) "Name" "temporary_password_confirmation" "Label" "Confirm temporary password" "Type" "password" "Required" true "Minlength" "12" "Autocomplete" "new-password" }}
+    </div>
+    {{/* The primary button must precede Cancel in the DOM: Enter-key implicit
+         submission activates the form's first submit button, and that must
+         never be the dismiss button. flex-row-reverse keeps Cancel on the
+         visual left. */}}
+    <div class="mt-5 flex flex-row-reverse gap-2">
+      {{ template "ui/button" dict "Label" "Set temporary password" "Variant" "danger" "Type" "submit" }}
+      {{ template "ui/button" dict "Label" "Cancel" "Variant" "secondary" "Type" "submit" "Dismiss" true }}
+    </div>
+  </form>
+</dialog>
+{{ end }}
+
+{{/*
+  users/add-dialog — dot is the full usersPageData. Re-opens with preserved
+  email/display-name/roles after a validation error (server-rendered `open`
+  attribute, upgraded to showModal by dialog.js); the password input always
+  renders blank. A fresh form preselects Viewer only.
+*/}}
+{{ define "users/add-dialog" }}
+<dialog id="users-create-dialog"{{ if .CreateOpen }} open{{ end }} class="m-auto w-[min(30rem,90vw)] rounded-panel border border-border bg-surface p-6 text-text shadow-card" aria-labelledby="users-create-dialog-title">
+  <h2 id="users-create-dialog-title" class="m-0 text-base font-bold">Add user</h2>
+  <p class="mt-2 mb-0 text-sm text-text-muted">Add action roles explicitly; admin alone does not freeze or approve thaws.</p>
+  {{- if .CreateError }}
+  <div class="mt-4" role="alert">
+    {{ template "ui/callout" dict "Tone" "danger" "Body" .CreateError }}
+  </div>
+  {{- end }}
+  <form method="post" action="/users" hx-post="/users" hx-target="#users-live" hx-swap="outerHTML" hx-push-url="false">
+    <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+    <div class="mt-4 flex flex-col gap-4">
+      {{ template "ui/input" dict "ID" "create-email" "Name" "email" "Label" "Email" "Type" "email" "Value" .CreateEmail "Required" true "Mono" true }}
+      {{ template "ui/input" dict "ID" "create-display-name" "Name" "display_name" "Label" "Display name" "Value" .CreateDisplayName "Required" true }}
+      {{ template "ui/input" dict "ID" "create-password" "Name" "password" "Label" "Password" "Type" "password" "Required" true "Minlength" "12" "Autocomplete" "new-password" "Hint" "At least 12 characters. Not shown again after submit." }}
+    </div>
+    <fieldset class="m-0 mt-4 border-0 p-0">
+      <legend class="p-0 text-sm font-semibold text-text">Roles</legend>
+      <div class="mt-2 flex flex-col gap-2">
+        {{- range .CreateRoleOptions }}
+        {{ template "ui/checkbox" dict "ID" (printf "create-role-%s" .Value) "Name" "roles" "Value" .Value "Label" .Label "Checked" .Selected "Hint" .Hint }}
+        {{- end }}
+      </div>
+    </fieldset>
+    {{/* Primary before Cancel in the DOM for the same implicit-submission
+         reason as the reset dialog. */}}
+    <div class="mt-5 flex flex-row-reverse gap-2">
+      {{ template "ui/button" dict "Label" "Create user" "Variant" "primary" "Type" "submit" }}
+      {{ template "ui/button" dict "Label" "Cancel" "Variant" "secondary" "Type" "submit" "Dismiss" true }}
+    </div>
+  </form>
+</dialog>
+{{ end }}

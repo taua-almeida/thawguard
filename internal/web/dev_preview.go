@@ -7,6 +7,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/taua-almeida/thawguard/internal/auth"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
 	"github.com/taua-almeida/thawguard/internal/statuspublication"
@@ -1191,4 +1192,62 @@ func (s *Server) handleDevPreviewWebhooks(w http.ResponseWriter, r *http.Request
 		return webhooksURL(next)
 	})
 	s.renderPage(w, "layouts/webhooks", data)
+}
+
+// handleDevPreviewUsers renders the users & roles page from fictional
+// fixtures through the real view-model builders (GET /dev/preview/users).
+// Query knobs: ?variant=empty|create-error|role-error|reset-error|form-error,
+// ?role=viewer (the real route's 403 guard response), ?theme=dark|light.
+// The default view holds four users: the signed-in admin — also the final
+// enabled admin, so their row carries both guards — a plain multi-role row,
+// a must-change-password row, and a disabled admin row (which is why the
+// signed-in admin is final). The error variants re-render the matching
+// dialog or row form open with its message, the way a real validation
+// failure would.
+func (s *Server) handleDevPreviewUsers(w http.ResponseWriter, r *http.Request) {
+	if !s.cfg.DevMode {
+		http.NotFound(w, r)
+		return
+	}
+	if r.URL.Query().Get("role") == "viewer" {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	selfID := int64(1)
+	session := sessionState{
+		CSRFToken:   "dev-preview-fictional-token",
+		UserID:      &selfID,
+		Email:       "mira.frost@example.test",
+		DisplayName: "Mira Frost",
+		Roles:       auth.RoleSet{auth.RoleAdmin, auth.RoleFreezer},
+	}
+	disabledAt := time.Date(2026, 7, 2, 16, 30, 0, 0, time.UTC)
+	users := []auth.User{
+		{ID: 1, Email: "mira.frost@example.test", DisplayName: "Mira Frost", Roles: auth.RoleSet{auth.RoleAdmin, auth.RoleFreezer}, CreatedAt: time.Date(2026, 5, 2, 9, 12, 0, 0, time.UTC)},
+		{ID: 2, Email: "kai.merid@example.test", DisplayName: "Kai Merid", Roles: auth.RoleSet{auth.RoleThawApprover, auth.RoleViewer}, CreatedAt: time.Date(2026, 6, 11, 14, 40, 0, 0, time.UTC)},
+		{ID: 3, Email: "sten.hale@example.test", DisplayName: "Sten Hale", Roles: auth.RoleSet{auth.RoleViewer}, MustChangePassword: true, CreatedAt: time.Date(2026, 7, 4, 8, 5, 0, 0, time.UTC)},
+		{ID: 4, Email: "lena.polar@example.test", DisplayName: "Lena Polar", Roles: auth.RoleSet{auth.RoleAdmin, auth.RoleFreezer}, DisabledAt: &disabledAt, CreatedAt: time.Date(2026, 6, 20, 11, 25, 0, 0, time.UTC)},
+	}
+	state := defaultUsersPageState()
+	switch r.URL.Query().Get("variant") {
+	case "empty":
+		users = nil
+	case "create-error":
+		state = usersPageState{
+			FormError:         "a user with this email already exists",
+			CreateOpen:        true,
+			CreateEmail:       "sten.hale@example.test",
+			CreateDisplayName: "Sten Hale",
+			CreateRoles:       auth.RoleSet{auth.RoleFreezer, auth.RoleViewer},
+		}
+	case "role-error":
+		state = usersPageState{FormError: "at least one role is required", RoleFormUserID: 2}
+	case "reset-error":
+		state = usersPageState{FormError: "temporary passwords do not match", ResetFormUserID: 2}
+	case "form-error":
+		state = usersPageState{FormError: "cannot disable the final enabled admin"}
+	}
+	data := usersPageDataFor(s.cfg.AppName, users, state, session)
+	data.Theme = devPreviewTheme(r)
+	s.renderPage(w, "layouts/users", data)
 }

@@ -3,6 +3,9 @@
   dict keys: Label (required), Variant primary|secondary|danger|ghost (default primary),
   Size ""|sm, Type (default button), Href (renders <a>), Icon (sprite id), IconOnly (bool),
   Disabled (bool), DialogTarget (dialog id; wires data-dialog-open for dialog.js),
+  Dismiss (bool: a submit button inside a <dialog> form that closes the dialog
+  without submitting to the server — formmethod="dialog" formnovalidate; with
+  JS, dialog.js closes on click before htmx can intercept the submit event),
   HxTarget (Href links only: htmx outerHTML swap of that CSS target with
   hx-push-url, for navigational pagination links; plain link without JS)
 */}}
@@ -21,7 +24,7 @@
   {{- if .IconOnly }}<span class="sr-only">{{ .Label }}</span>{{ else }}{{ .Label }}{{ end -}}
 </a>
 {{- else }}
-<button type="{{ or .Type "button" }}" class="{{ $classes }}"{{ if .Disabled }} disabled{{ end }}{{ if .DialogTarget }} data-dialog-open aria-controls="{{ .DialogTarget }}" aria-haspopup="dialog"{{ end }}>
+<button type="{{ or .Type "button" }}" class="{{ $classes }}"{{ if .Disabled }} disabled{{ end }}{{ if .Dismiss }} formmethod="dialog" formnovalidate{{ end }}{{ if .DialogTarget }} data-dialog-open aria-controls="{{ .DialogTarget }}" aria-haspopup="dialog"{{ end }}>
   {{- if .Icon }}<svg class="h-4 w-4" aria-hidden="true"><use href="#{{ .Icon }}"></use></svg>{{ end }}
   {{- if .IconOnly }}<span class="sr-only">{{ .Label }}</span>{{ else }}{{ .Label }}{{ end -}}
 </button>

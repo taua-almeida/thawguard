@@ -114,25 +114,29 @@ func TestUsersPageShowsAccountStateAndResponsiveLabels(t *testing.T) {
 		t.Fatalf("expected users page, got %d", recorder.Code)
 	}
 	for _, want := range []string{
-		`<span class="status status-warning">Disabled</span>`,
-		`<span class="status status-ok">Enabled</span>`,
+		`<use href="#tg-i-warning"></use></svg>Disabled</span>`,
+		`<use href="#tg-i-check"></use></svg>Enabled</span>`,
 		`action="/users/enable"`,
-		`action="/users/disable"`,
 		`action="/users/reset-password"`,
 		`Re-enabling does not restore old sessions.`,
 		`the final enabled admin cannot be disabled or lose the admin role`,
-		`data-label="Status"`,
-		`data-label="Roles"`,
-		`data-label="Actions"`,
-		`tg-mobile-card-list`,
+		`The final enabled admin cannot be disabled.`,
+		`<caption class="sr-only">Local users with status, roles, creation date, and account actions</caption>`,
+		`hidden overflow-x-auto md:block`,
+		`md:hidden`,
 		`href="/account/password"`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected users page to contain %q", want)
 		}
 	}
-	if strings.Contains(body, fmt.Sprintf(`id="reset-password-%d"`, admin.User.ID)) {
-		t.Fatal("expected no reset-password form for the signed-in admin's own row")
+	// The final enabled admin is guarded and the only other user is already
+	// disabled, so no row may offer a disable action.
+	if strings.Contains(body, `action="/users/disable"`) {
+		t.Fatal("expected no disable form when every row is guarded or already disabled")
+	}
+	if strings.Contains(body, fmt.Sprintf(`id="users-reset-%d"`, admin.User.ID)) {
+		t.Fatal("expected no reset-password dialog for the signed-in admin's own row")
 	}
 }
 
@@ -154,12 +158,34 @@ func TestRoleEditFormPreservesSubmittedRolesAfterValidationError(t *testing.T) {
 	if recorder.Code != http.StatusBadRequest || !strings.Contains(body, "role is invalid") {
 		t.Fatalf("expected role validation error, status=%d body=%q", recorder.Code, body)
 	}
-	if !strings.Contains(body, fmt.Sprintf(`id="user-roles-%d-freezer" name="roles" value="freezer" checked`, user.ID)) {
+	if !strings.Contains(renderedControlTag(t, body, fmt.Sprintf("u%d-role-freezer", user.ID)), " checked") {
 		t.Fatal("expected submitted freezer role to stay selected after validation error")
 	}
-	if strings.Contains(body, fmt.Sprintf(`id="user-roles-%d-viewer" name="roles" value="viewer" checked`, user.ID)) {
+	if !strings.Contains(renderedControlTag(t, body, fmt.Sprintf("m-u%d-role-freezer", user.ID)), " checked") {
+		t.Fatal("expected submitted freezer role to stay selected on the mobile card after validation error")
+	}
+	if strings.Contains(renderedControlTag(t, body, fmt.Sprintf("u%d-role-viewer", user.ID)), " checked") {
 		t.Fatal("expected unsubmitted viewer role to be unselected after validation error")
 	}
+}
+
+// renderedControlTag returns the markup of the form control carrying the given
+// id, from its id attribute to the tag's closing ">" (users-page attribute
+// values never contain ">"). The id="..." marker includes the closing quote, so
+// label for=, -hint, and -confirm ids cannot match.
+func renderedControlTag(t *testing.T, body, id string) string {
+	t.Helper()
+	marker := fmt.Sprintf("id=%q", id)
+	start := strings.Index(body, marker)
+	if start < 0 {
+		t.Fatalf("expected users page to render a control with id %q", id)
+	}
+	rest := body[start:]
+	end := strings.Index(rest, ">")
+	if end < 0 {
+		t.Fatalf("expected control %q tag to close", id)
+	}
+	return rest[:end]
 }
 
 func TestPasswordResetNeverRendersPasswordValues(t *testing.T) {
@@ -185,11 +211,16 @@ func TestPasswordResetNeverRendersPasswordValues(t *testing.T) {
 	if strings.Contains(recorder.Body.String(), secretValue) {
 		t.Fatal("expected temporary password to never be re-rendered")
 	}
-	if !strings.Contains(recorder.Body.String(), fmt.Sprintf(`<form id="reset-password-%d" method="post"`, user.ID)) {
-		t.Fatal("expected failed reset form to stay expanded on its row")
+	if !strings.Contains(recorder.Body.String(), fmt.Sprintf(`<dialog id="users-reset-%d" open`, user.ID)) {
+		t.Fatal("expected failed reset dialog to re-open on its row")
 	}
-	if !strings.Contains(recorder.Body.String(), `name="temporary_password" data-credential-input minlength="12"`) {
-		t.Fatal("expected expanded reset form inputs to be enabled")
+	passwordTag := renderedControlTag(t, recorder.Body.String(), fmt.Sprintf("reset-%d-password", user.ID))
+	// A bare " disabled" attribute, not the class's disabled: variant prefixes.
+	if !strings.Contains(passwordTag, `minlength="12"`) || strings.Contains(passwordTag, " disabled ") || strings.HasSuffix(passwordTag, " disabled") {
+		t.Fatalf("expected re-opened reset password input to stay enabled, got %q", passwordTag)
+	}
+	if strings.Contains(passwordTag, " value=") {
+		t.Fatalf("expected reset password input to render blank, got %q", passwordTag)
 	}
 
 	form.Set("temporary_password_confirmation", secretValue)

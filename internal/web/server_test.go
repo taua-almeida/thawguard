@@ -332,7 +332,7 @@ func TestUsersPageCreatesUsersAndViewerCannotManageRepositories(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/users", nil)
 	request.AddCookie(adminCookie)
 	server.Routes().ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "Users & Roles") {
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "Users &amp; Roles") {
 		t.Fatalf("expected users page for admin, status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
 	csrfToken := csrfTokenFromBody(t, recorder.Body.String())
@@ -356,7 +356,7 @@ func TestUsersPageCreatesUsersAndViewerCannotManageRepositories(t *testing.T) {
 	request = httptest.NewRequest(http.MethodGet, "/repositories", nil)
 	request.AddCookie(viewerCookie)
 	server.Routes().ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusOK || strings.Contains(recorder.Body.String(), "Users & Roles") {
+	if recorder.Code != http.StatusOK || strings.Contains(recorder.Body.String(), "Users &amp; Roles") {
 		t.Fatalf("expected viewer to read repositories without admin nav, status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
 	if strings.Contains(recorder.Body.String(), "Run readiness checks") {
