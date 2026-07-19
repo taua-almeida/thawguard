@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -108,6 +109,7 @@ type Event struct {
 type database interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
 type Store struct {
@@ -186,6 +188,59 @@ LIMIT ?`, limit)
 		return nil, fmt.Errorf("list audit events rows: %w", err)
 	}
 	return events, nil
+}
+
+// ListPage returns one page of audit events newest first plus the total
+// number of matching events. A non-empty actions list restricts the result
+// to those exact action names; nil or empty means all actions.
+func (s *Store) ListPage(ctx context.Context, actions []string, offset, limit int) ([]Event, int, error) {
+	if s == nil || s.db == nil {
+		return nil, 0, errors.New("audit store has no database")
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	where := ""
+	filterArgs := []any{}
+	if len(actions) > 0 {
+		where = "WHERE action IN (?" + strings.Repeat(", ?", len(actions)-1) + ")"
+		for _, action := range actions {
+			filterArgs = append(filterArgs, action)
+		}
+	}
+
+	var total int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM audit_events "+where, filterArgs...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count audit events: %w", err)
+	}
+
+	args := append(append([]any{}, filterArgs...), limit, offset)
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, actor_user_id, action, subject_type, subject_id, details_json, created_at
+FROM audit_events
+`+where+`
+ORDER BY julianday(created_at) DESC, id DESC
+LIMIT ? OFFSET ?`, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list audit events page: %w", err)
+	}
+	defer rows.Close()
+
+	events := make([]Event, 0)
+	for rows.Next() {
+		event, err := scanEvent(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("list audit events page rows: %w", err)
+	}
+	return events, total, nil
 }
 
 func normalizeEvent(event Event, now time.Time) Event {

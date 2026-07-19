@@ -1,0 +1,91 @@
+{{/*
+  components/activity-table — the paginated audit-history table with filter
+  chips, following the diagnostics-table shape from /decisions. Every cell
+  renders curated, length-clamped text derived from audit events; raw stored
+  JSON and secret values are never rendered. Chips and pager links are plain
+  links enhanced with hx-get swaps of #activity-live.
+*/}}
+{{ define "components/activity-table" }}
+<section class="rounded-panel border border-border bg-surface shadow-card" aria-label="Recent activity">
+  <div class="border-b border-border px-(--card-spacing) py-4">
+    <div class="flex flex-wrap items-center gap-3">
+      <h2 class="m-0 text-lg font-bold text-text">Recent activity</h2>
+      {{ if eq .Total 1 }}
+      {{ template "ui/badge" dict "Label" "1 event" }}
+      {{ else }}
+      {{ template "ui/badge" dict "Label" (printf "%d events" .Total) }}
+      {{ end }}
+      {{ if .Rows }}<span class="ml-auto text-xs text-text-muted" data-timezone-note>Times shown in UTC.</span>{{ end }}
+    </div>
+    <p class="m-0 mt-1 text-sm text-text-muted">Actor, action, affected target, outcome, and curated details from Thawguard audit events. Raw JSON and secret values are never displayed.</p>
+  </div>
+  {{ if or .Total (ne .Filter "all") }}
+  <div class="flex flex-wrap items-center gap-2 border-b border-border px-(--card-spacing) py-3">
+    {{ range .Chips }}
+    {{ template "ui/chip" dict "Label" .Label "Href" .URL "Active" .Active "HxTarget" "#activity-live" }}
+    {{ end }}
+  </div>
+  {{ end }}
+  {{ if .Rows }}
+  <div class="hidden overflow-x-auto md:block">
+    <table class="w-full border-collapse text-sm">
+      <caption class="sr-only">Recent chronological Thawguard activity with time, actor, event, target, and curated details</caption>
+      <thead>
+        <tr class="bg-surface-muted text-left">
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">When</th>
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Actor</th>
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Event</th>
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Target</th>
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Details</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{ range .Rows }}
+        <tr class="border-t border-border align-top">
+          <td class="px-4 py-3 whitespace-nowrap text-text">{{ if .CreatedAtUTC }}<time datetime="{{ .CreatedAtUTC }}">{{ .CreatedAt }}</time>{{ else }}{{ .CreatedAt }}{{ end }}</td>
+          <td class="px-4 py-3 text-text">{{ .Actor }}</td>
+          <td class="px-4 py-3">
+            <span class="flex flex-col items-start gap-1">
+              <span class="font-medium text-text">{{ .ActionLabel }}</span>
+              {{ template "ui/badge" dict "Label" .Outcome "Tone" .BadgeTone "Icon" .BadgeIcon }}
+            </span>
+          </td>
+          <td class="px-4 py-3 text-text">{{ .Target }}</td>
+          <td class="px-4 py-3"><span class="block max-w-prose text-text-muted">{{ .Detail }}</span></td>
+        </tr>
+        {{ end }}
+      </tbody>
+    </table>
+  </div>
+  <div class="flex flex-col gap-3 p-(--card-spacing) md:hidden">
+    {{ range .Rows }}
+    <article class="rounded-card border border-border p-4">
+      <div class="flex items-start justify-between gap-3">
+        <div>
+          <p class="m-0 text-xs text-text-muted">{{ if .CreatedAtUTC }}<time datetime="{{ .CreatedAtUTC }}">{{ .CreatedAt }}</time>{{ else }}{{ .CreatedAt }}{{ end }}</p>
+          <h3 class="m-0 mt-0.5 text-sm font-bold text-text">{{ .ActionLabel }}</h3>
+        </div>
+        {{ template "ui/badge" dict "Label" .Outcome "Tone" .BadgeTone "Icon" .BadgeIcon }}
+      </div>
+      <dl class="m-0 mt-3 grid grid-cols-2 gap-2 text-sm">
+        <div><dt class="text-xs font-bold tracking-wide text-text-muted uppercase">Actor</dt><dd class="m-0 text-text">{{ .Actor }}</dd></div>
+        <div><dt class="text-xs font-bold tracking-wide text-text-muted uppercase">Target</dt><dd class="m-0 text-text">{{ .Target }}</dd></div>
+      </dl>
+      {{ if .Detail }}<p class="m-0 mt-2 text-sm text-text-muted">{{ .Detail }}</p>{{ end }}
+    </article>
+    {{ end }}
+  </div>
+  {{ if .Pagination }}
+  {{ template "ui/pager" dict "Pager" .Pagination "Noun" "events" "HxTarget" "#activity-live" }}
+  {{ end }}
+  {{ else }}
+  <div class="p-(--card-spacing)">
+    {{ if ne .Filter "all" }}
+    {{ template "ui/empty-state" dict "Title" "No matching events" "Hint" "Switch filters to see other recorded activity." "Icon" "tg-i-activity" }}
+    {{ else }}
+    {{ template "ui/empty-state" dict "Title" "No activity yet" "Hint" "Operator and system changes will appear here after the first audited action." "Icon" "tg-i-activity" }}
+    {{ end }}
+  </div>
+  {{ end }}
+</section>
+{{ end }}

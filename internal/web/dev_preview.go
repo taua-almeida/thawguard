@@ -757,3 +757,102 @@ func (s *Server) handleDevPreviewDecisions(w http.ResponseWriter, r *http.Reques
 	data.Theme = devPreviewTheme(r)
 	s.renderPage(w, "layouts/decisions", data)
 }
+
+// devPreviewActivityRow builds one fictional activity-table row, deriving the
+// badge and machine-readable timestamp the same way the real page does. A zero
+// createdAt exercises the "Time unavailable" path without a <time> element.
+func devPreviewActivityRow(createdAt time.Time, actor, label, outcome, outcomeClass, target, detail string) activityRowView {
+	row := activityRowView{activityEventView: activityEventView{
+		CreatedAt:    activityCreatedAt(createdAt),
+		Actor:        actor,
+		ActionLabel:  label,
+		Outcome:      outcome,
+		OutcomeClass: outcomeClass,
+		Target:       target,
+		Detail:       detail,
+	}}
+	if !createdAt.IsZero() {
+		row.CreatedAtUTC = createdAt.UTC().Format(time.RFC3339)
+	}
+	row.BadgeTone, row.BadgeIcon = activityOutcomeBadge(outcome, outcomeClass)
+	return row
+}
+
+// handleDevPreviewActivity renders the activity page from fictional fixtures
+// covering the table state matrix (GET /dev/preview/activity). Query knobs:
+// ?role=viewer, ?variant=empty|filtered|filtered-empty, ?theme=dark|light.
+// The default variant is the last page (2 of 28 events) with one row per
+// badge tone plus the safe fallback row; label/outcome pairs mirror real
+// entries in activityActionDefinitions.
+func (s *Server) handleDevPreviewActivity(w http.ResponseWriter, r *http.Request) {
+	if !s.cfg.DevMode {
+		http.NotFound(w, r)
+		return
+	}
+	user := currentUserView{
+		Email:             "mira.frost@example.test",
+		DisplayName:       "Mira Frost",
+		RoleLabel:         "Admin",
+		CanChangePassword: true,
+		IsAdmin:           true,
+		CanFreeze:         true,
+		CanThaw:           true,
+	}
+	if r.URL.Query().Get("role") == "viewer" {
+		user = currentUserView{
+			Email:             "sten.hale@example.test",
+			DisplayName:       "Sten Hale",
+			RoleLabel:         "Viewer",
+			CanChangePassword: true,
+		}
+	}
+	rows := []activityRowView{
+		devPreviewActivityRow(time.Date(2026, 7, 17, 9, 2, 0, 0, time.UTC), "Mira Frost", "Single-PR thaw", "Approved", "ok", "aurora/ice-station → PR #241", "Production fix needed during release freeze."),
+		devPreviewActivityRow(time.Date(2026, 7, 17, 6, 0, 0, 0, time.UTC), "Scheduler", "Scheduled freeze", "Started", "frozen", "aurora/ice-station main", "Release freeze window opened on schedule."),
+		devPreviewActivityRow(time.Date(2026, 7, 16, 21, 40, 0, 0, time.UTC), "Mira Frost", "Freeze schedule", "Changed", "frozen", "aurora/ice-station main", "Freeze window now ends 2026-07-21 06:00 UTC."),
+		devPreviewActivityRow(time.Date(2026, 7, 16, 18, 25, 0, 0, time.UTC), "Runtime process", "Status-post verification", "Failed", "failed", "borealis/frost-api → PR #214", "The forge rejected the posted commit status."),
+		devPreviewActivityRow(time.Date(2026, 7, 16, 9, 12, 0, 0, time.UTC), "Reconciliation runner", "Setup drift", "Detected", "warning", "borealis/frost-api", "Branch protection no longer requires the Thawguard status context."),
+		devPreviewActivityRow(time.Date(2026, 7, 15, 16, 44, 0, 0, time.UTC), "Mira Frost", "Freeze schedule", "Scheduled", "pending", "borealis/frost-api release/1.8", "Freeze window scheduled for 2026-07-19 06:00 to 2026-07-21 06:00 UTC."),
+		devPreviewActivityRow(time.Date(2026, 7, 15, 11, 3, 0, 0, time.UTC), "Mira Frost", "User roles", "Changed", "frozen", "Sten Hale", "Roles set to viewer."),
+		devPreviewActivityRow(time.Time{}, "Unknown system actor", "Unrecognized activity", "Unknown", "warning", "Repository #12", "Stored audit details could not be displayed safely."),
+	}
+	query := activityQuery{Filter: "all", Page: 2}
+	total := 28
+	switch r.URL.Query().Get("variant") {
+	case "empty":
+		rows = nil
+		total = 0
+		query.Page = 1
+	case "filtered":
+		query = activityQuery{Filter: "failures", Page: 1}
+		rows = []activityRowView{
+			devPreviewActivityRow(time.Date(2026, 7, 16, 18, 25, 0, 0, time.UTC), "Runtime process", "Status-post verification", "Failed", "failed", "borealis/frost-api → PR #214", "The forge rejected the posted commit status."),
+			devPreviewActivityRow(time.Date(2026, 7, 14, 7, 50, 0, 0, time.UTC), "Runtime process", "Enforcement activation", "Failed", "failed", "borealis/frost-api", "Could not reach the forge API to require the status context."),
+		}
+		total = len(rows)
+	case "filtered-empty":
+		query = activityQuery{Filter: "users", Page: 1}
+		rows = nil
+		total = 0
+	}
+	data := activityPageData{
+		AppName:     s.cfg.AppName,
+		PageTitle:   "Activity",
+		Theme:       devPreviewTheme(r),
+		ActivePage:  "activity",
+		CurrentUser: user,
+		Rows:        rows,
+		Total:       total,
+		Filter:      query.Filter,
+		Query:       query,
+		CSRFToken:   "dev-preview-fictional-token",
+		CSRFField:   csrfFormField,
+	}
+	data.Chips = filterChips(query.Filter, activityFilterOptions, func(value string) string {
+		return activityURL(activityQuery{Filter: value, Page: 1})
+	})
+	data.Pagination = paginateTable(total, query.Page, activityPageSize, func(page int) string {
+		return activityURL(activityQuery{Filter: query.Filter, Page: page})
+	})
+	s.renderPage(w, "layouts/activity", data)
+}

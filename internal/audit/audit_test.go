@@ -145,6 +145,110 @@ func TestStoreListHonorsBoundedLimit(t *testing.T) {
 	}
 }
 
+func TestStoreListPageFiltersByExactActionNames(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	base := time.Date(2026, 7, 13, 10, 0, 0, 0, time.UTC)
+
+	insertStoredActionEvent(t, ctx, store, ActionRepositoryCreated, "repo-1", base)
+	insertStoredActionEvent(t, ctx, store, ActionBranchFreezeCreated, "freeze-1", base.Add(time.Second))
+	insertStoredActionEvent(t, ctx, store, ActionUserRolesUpdated, "user-1", base.Add(2*time.Second))
+	insertStoredActionEvent(t, ctx, store, ActionBranchFreezeEnded, "freeze-2", base.Add(3*time.Second))
+	// A prefix-sharing action must not match an exact IN-list filter.
+	insertStoredActionEvent(t, ctx, store, ActionBranchFreezeCreated+".extra", "freeze-3", base.Add(4*time.Second))
+
+	events, total, err := store.ListPage(ctx, []string{ActionBranchFreezeCreated, ActionBranchFreezeEnded}, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 {
+		t.Fatalf("expected total 2, got %d", total)
+	}
+	want := []string{"freeze-2", "freeze-1"}
+	if len(events) != len(want) {
+		t.Fatalf("expected %d events, got %d", len(want), len(events))
+	}
+	for i := range want {
+		if events[i].SubjectID != want[i] {
+			t.Fatalf("event %d: expected subject %q, got %q", i, want[i], events[i].SubjectID)
+		}
+	}
+}
+
+func TestStoreListPageWithoutActionsReturnsAll(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	base := time.Date(2026, 7, 13, 10, 0, 0, 0, time.UTC)
+
+	insertStoredActionEvent(t, ctx, store, ActionRepositoryCreated, "repo-1", base)
+	insertStoredActionEvent(t, ctx, store, ActionUserDisabled, "user-1", base.Add(time.Second))
+
+	events, total, err := store.ListPage(ctx, nil, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 || len(events) != 2 {
+		t.Fatalf("expected all 2 events, got %d of total %d", len(events), total)
+	}
+	if events[0].SubjectID != "user-1" || events[1].SubjectID != "repo-1" {
+		t.Fatalf("expected newest-first ordering, got %+v", events)
+	}
+}
+
+func TestStoreListPagePaginatesWithStableTotal(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	base := time.Date(2026, 7, 13, 10, 0, 0, 0, time.UTC)
+	for i := range 5 {
+		insertStoredEvent(t, ctx, store, strconv.Itoa(i+1), base.Add(time.Duration(i)*time.Second))
+	}
+
+	events, total, err := store.ListPage(ctx, nil, 2, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 5 {
+		t.Fatalf("expected total 5, got %d", total)
+	}
+	if len(events) != 2 || events[0].SubjectID != "3" || events[1].SubjectID != "2" {
+		t.Fatalf("expected middle page (3, 2), got %+v", events)
+	}
+}
+
+func TestStoreListPageClampsOffsetAndLimit(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	base := time.Date(2026, 7, 13, 10, 0, 0, 0, time.UTC)
+	for i := range 3 {
+		insertStoredEvent(t, ctx, store, strconv.Itoa(i+1), base.Add(time.Duration(i)*time.Second))
+	}
+
+	events, total, err := store.ListPage(ctx, nil, -5, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 3 || len(events) != 3 {
+		t.Fatalf("expected clamped query to return all 3 events, got %d of total %d", len(events), total)
+	}
+	if events[0].SubjectID != "3" {
+		t.Fatalf("expected newest event first, got %+v", events)
+	}
+}
+
+func TestStoreListPageReturnsSafeScanFailure(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	if _, err := store.db.ExecContext(ctx, `
+INSERT INTO audit_events(action, subject_type, subject_id, details_json, created_at)
+VALUES (?, ?, ?, ?, ?)`, ActionRepositoryCreated, SubjectTypeRepository, "1", `{}`, "not-a-time"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := store.ListPage(ctx, nil, 0, 10); err == nil {
+		t.Fatal("expected invalid stored timestamp to fail safely")
+	}
+}
+
 func TestStoreListReturnsSafeScanFailure(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t, ctx)
@@ -202,9 +306,14 @@ func newTestStore(t *testing.T, ctx context.Context) *Store {
 
 func insertStoredEvent(t *testing.T, ctx context.Context, store *Store, subjectID string, createdAt time.Time) {
 	t.Helper()
+	insertStoredActionEvent(t, ctx, store, ActionRepositoryCreated, subjectID, createdAt)
+}
+
+func insertStoredActionEvent(t *testing.T, ctx context.Context, store *Store, action, subjectID string, createdAt time.Time) {
+	t.Helper()
 	if _, err := store.db.ExecContext(ctx, `
 INSERT INTO audit_events(action, subject_type, subject_id, details_json, created_at)
-VALUES (?, ?, ?, ?, ?)`, ActionRepositoryCreated, SubjectTypeRepository, subjectID, `{}`, createdAt.Format(time.RFC3339Nano)); err != nil {
+VALUES (?, ?, ?, ?, ?)`, action, SubjectTypeRepository, subjectID, `{}`, createdAt.Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
 }

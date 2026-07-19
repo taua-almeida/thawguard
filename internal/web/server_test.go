@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -2734,10 +2736,10 @@ func TestActivityPageRendersPrimaryChronologicalFeedWithoutDiagnostics(t *testin
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected activity without diagnostic stores, status=%d body=%q", recorder.Code, body)
 	}
-	if auditStore.requestedLimit != 100 {
-		t.Fatalf("expected activity to request a bounded 100 events, got %d", auditStore.requestedLimit)
+	if auditStore.requestedLimit != activityPageSize {
+		t.Fatalf("expected activity to request one page of %d events, got %d", activityPageSize, auditStore.requestedLimit)
 	}
-	for _, want := range []string{"Activity", "Chronological audit history", "Recent activity", "Latest 100 events at most", "Time", "Actor", "Action", "Target", "Outcome", "Details", "Bootstrap admin", "Single-PR thaw", "taua-almeida/thawguard → PR #42", "Approved", "fix &lt;b&gt;now&lt;/b&gt;", "Runtime process", "Repository added", "2026-07-13 12:00 UTC", "tg-responsive-table", "Recent activity mobile cards", "Webhook diagnostics", `href="/webhooks"`, "Status diagnostics", `href="/publications"`, `href="/activity"`, ">Activity</a>"} {
+	for _, want := range []string{"Activity", "Chronological audit history", "Recent activity", "2 events", "Times shown in UTC.", "When", "Actor", "Event", "Target", "Details", "Bootstrap admin", "Single-PR thaw", "taua-almeida/thawguard → PR #42", "Approved", "fix &lt;b&gt;now&lt;/b&gt;", "Runtime process", "Repository added", "2026-07-13 12:00 UTC", `datetime="2026-07-13T12:00:00Z"`, "Freeze control", "collaborators with sufficient forge permissions can still bypass cooperative enforcement", `id="activity-live"`, `href="/activity"`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected activity body to contain %q, got %q", want, body)
 		}
@@ -2745,10 +2747,124 @@ func TestActivityPageRendersPrimaryChronologicalFeedWithoutDiagnostics(t *testin
 	if strings.Index(body, "Single-PR thaw") > strings.Index(body, "Repository added") {
 		t.Fatalf("expected newest event first, got %q", body)
 	}
-	for _, unwanted := range []string{"secret-token", "raw webhook payload", "X-Hub-Signature", "repository.future_secret_action", "fix <b>now</b>"} {
+	for _, unwanted := range []string{"secret-token", "raw webhook payload", "X-Hub-Signature", "repository.future_secret_action", "fix <b>now</b>", "Operational diagnostics"} {
 		if strings.Contains(body, unwanted) {
 			t.Fatalf("activity leaked or rendered unsafe value %q", unwanted)
 		}
+	}
+}
+
+func TestActivityFilterActionsGroupKnownActions(t *testing.T) {
+	if actions := activityFilterActions("all"); actions != nil {
+		t.Fatalf("expected no action filter for all, got %v", actions)
+	}
+	failures := activityFilterActions("failures")
+	if len(failures) == 0 || !sort.StringsAreSorted(failures) {
+		t.Fatalf("expected sorted non-empty failure actions, got %v", failures)
+	}
+	for _, action := range failures {
+		if activityActionDefinitions[action].OutcomeClass != "failed" {
+			t.Fatalf("failures chip includes non-failed action %q", action)
+		}
+	}
+	prefixes := map[string][]string{
+		"freeze":       {"branch_freeze.", "freeze_schedule.", "thaw_exception."},
+		"repositories": {"repository."},
+		"users":        {"user."},
+	}
+	for filter, allowed := range prefixes {
+		actions := activityFilterActions(filter)
+		if len(actions) == 0 {
+			t.Fatalf("expected %s chip to cover known actions", filter)
+		}
+		for _, action := range actions {
+			matched := false
+			for _, prefix := range allowed {
+				if strings.HasPrefix(action, prefix) {
+					matched = true
+				}
+			}
+			if !matched {
+				t.Fatalf("%s chip includes out-of-family action %q", filter, action)
+			}
+		}
+	}
+}
+
+func TestActivityPageFiltersAndPaginates(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard"}
+	events := make([]audit.Event, 0, 25)
+	for i := range 22 {
+		events = append(events, audit.Event{ID: int64(100 - i), Action: audit.ActionRepositoryCreated, SubjectType: audit.SubjectTypeRepository, SubjectID: "1", DetailsJSON: `{"default_branch":"main"}`, CreatedAt: time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC).Add(-time.Duration(i) * time.Minute)})
+	}
+	for i := range 3 {
+		events = append(events, audit.Event{ID: int64(10 - i), Action: audit.ActionBranchFreezeCreated, SubjectType: audit.SubjectTypeBranchFreeze, SubjectID: "1", DetailsJSON: `{"repository_id":"1","branch":"main"}`, CreatedAt: time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC).Add(-time.Duration(i) * time.Minute)})
+	}
+	server := NewServer(Config{
+		AppName:         "Thawguard",
+		RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}},
+		AuditStore:      &fakeAuditStore{events: events},
+	})
+
+	get := func(target string) (int, string) {
+		recorder := httptest.NewRecorder()
+		server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, target, nil))
+		return recorder.Code, recorder.Body.String()
+	}
+
+	code, body := get("/activity?filter=repositories")
+	if code != http.StatusOK || !strings.Contains(body, "22 events") || !strings.Contains(body, "Showing 1–20 of 22 events") {
+		t.Fatalf("expected first repositories page, status=%d body=%q", code, body)
+	}
+	if !strings.Contains(body, `href="/activity?filter=repositories&amp;page=2"`) {
+		t.Fatalf("expected next-page link preserving the filter, got %q", body)
+	}
+	if strings.Contains(body, "Branch freeze") {
+		t.Fatalf("expected repositories filter to hide freeze events, got %q", body)
+	}
+
+	code, body = get("/activity?filter=repositories&page=2")
+	if code != http.StatusOK || !strings.Contains(body, "Showing 21–22 of 22 events") {
+		t.Fatalf("expected second repositories page, status=%d body=%q", code, body)
+	}
+
+	code, body = get("/activity?filter=repositories&page=9")
+	if code != http.StatusOK || !strings.Contains(body, "Showing 21–22 of 22 events") {
+		t.Fatalf("expected out-of-range page to clamp to the last page, status=%d body=%q", code, body)
+	}
+
+	code, body = get("/activity?filter=freeze")
+	if code != http.StatusOK || !strings.Contains(body, "3 events") || strings.Contains(body, "Showing") {
+		t.Fatalf("expected single freeze page without pager, status=%d body=%q", code, body)
+	}
+
+	code, body = get("/activity?filter=users")
+	if code != http.StatusOK || !strings.Contains(body, "No matching events") || !strings.Contains(body, "Switch filters to see other recorded activity.") {
+		t.Fatalf("expected filtered empty state to keep the chips visible, status=%d body=%q", code, body)
+	}
+
+	code, body = get("/activity?filter=nonsense")
+	if code != http.StatusOK || !strings.Contains(body, "25 events") {
+		t.Fatalf("expected unknown filter to fall back to all, status=%d body=%q", code, body)
+	}
+}
+
+func TestActivityPageServesHtmxFragment(t *testing.T) {
+	server := NewServer(Config{AppName: "Thawguard", AuditStore: &fakeAuditStore{}})
+
+	request := httptest.NewRequest(http.MethodGet, "/activity?filter=freeze", nil)
+	request.Header.Set("HX-Request", "true")
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, request)
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusOK || !strings.Contains(body, `id="activity-live"`) {
+		t.Fatalf("expected htmx fragment, status=%d body=%q", recorder.Code, body)
+	}
+	if strings.Contains(body, "shell-nav-item") || strings.Contains(body, "<html") {
+		t.Fatalf("expected fragment without the shell, got %q", body)
+	}
+	if vary := recorder.Header().Values("Vary"); !containsString(vary, "HX-Request") {
+		t.Fatalf("expected Vary: HX-Request on activity responses, got %v", vary)
 	}
 }
 
@@ -3757,6 +3873,31 @@ func (s *fakeAuditStore) List(ctx context.Context, limit int) ([]audit.Event, er
 		return s.events[:limit], nil
 	}
 	return s.events, nil
+}
+
+func (s *fakeAuditStore) ListPage(ctx context.Context, actions []string, offset, limit int) ([]audit.Event, int, error) {
+	s.requestedLimit = limit
+	if s.err != nil {
+		return nil, 0, s.err
+	}
+	matched := make([]audit.Event, 0, len(s.events))
+	for _, event := range s.events {
+		if len(actions) == 0 || slices.Contains(actions, event.Action) {
+			matched = append(matched, event)
+		}
+	}
+	total := len(matched)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > total {
+		offset = total
+	}
+	matched = matched[offset:]
+	if limit > 0 && len(matched) > limit {
+		matched = matched[:limit]
+	}
+	return matched, total, nil
 }
 
 type fakePullRequestStore struct {

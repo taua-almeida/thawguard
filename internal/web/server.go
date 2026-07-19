@@ -144,6 +144,7 @@ type ScheduledFreezeStore interface {
 
 type AuditStore interface {
 	List(ctx context.Context, limit int) ([]audit.Event, error)
+	ListPage(ctx context.Context, actions []string, offset, limit int) ([]audit.Event, int, error)
 }
 
 type ThawExceptionStore interface {
@@ -430,6 +431,7 @@ func (s *Server) routes() {
 		s.mux.HandleFunc("GET /dev/preview/freezes", s.handleDevPreviewFreezes)
 		s.mux.HandleFunc("GET /dev/preview/dashboard", s.handleDevPreviewDashboard)
 		s.mux.HandleFunc("GET /dev/preview/decisions", s.handleDevPreviewDecisions)
+		s.mux.HandleFunc("GET /dev/preview/activity", s.handleDevPreviewActivity)
 	}
 }
 
@@ -781,6 +783,7 @@ func (s *Server) handlePublications(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request) {
+	w.Header().Add("Vary", "HX-Request")
 	if s.cfg.AuditStore == nil {
 		http.Error(w, "audit store is not configured", http.StatusServiceUnavailable)
 		return
@@ -789,12 +792,16 @@ func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	events, repositories, users, err := s.activityPageData(r.Context())
-	if err != nil {
-		internalServerError(w)
+	query := activityQueryFromValues(r.URL.Query())
+	data, ok := s.loadActivityPageData(w, r, query, session)
+	if !ok {
 		return
 	}
-	s.renderActivity(w, activityEventViews(repositories, users, events), session)
+	if isHXRequest(r) {
+		s.renderPage(w, "components/activity-live", data)
+		return
+	}
+	s.renderPage(w, "layouts/activity", data)
 }
 
 func (s *Server) handleWebhooks(w http.ResponseWriter, r *http.Request) {
@@ -2167,25 +2174,6 @@ func (s *Server) webhookDeliveries(ctx context.Context) ([]webhook.Delivery, err
 	return s.cfg.WebhookDeliveryStore.ListRecent(ctx, maxAuditLogLimit)
 }
 
-func (s *Server) activityPageData(ctx context.Context) ([]audit.Event, []domain.Repository, []auth.User, error) {
-	events, err := s.cfg.AuditStore.List(ctx, 100)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	repositories, err := s.repositories(ctx)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	var users []auth.User
-	if s.cfg.AuthService != nil {
-		users, err = s.cfg.AuthService.ListUsers(ctx)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-	}
-	return events, repositories, users, nil
-}
-
 func (s *Server) webhookDeliveryPageData(ctx context.Context) ([]domain.Repository, []webhook.Delivery, error) {
 	repositories, err := s.repositories(ctx)
 	if err != nil {
@@ -3333,16 +3321,6 @@ func (s *Server) renderPublications(w http.ResponseWriter, publications []status
 	})
 }
 
-func (s *Server) renderActivity(w http.ResponseWriter, events []activityEventView, session sessionState) {
-	s.render(w, activityTemplate, map[string]any{
-		"AppName":     s.cfg.AppName,
-		"ActivePage":  "activity",
-		"CurrentUser": currentUserFromSession(session),
-		"CSRFToken":   session.CSRFToken,
-		"Events":      events,
-	})
-}
-
 func (s *Server) renderWebhookDeliveries(w http.ResponseWriter, auditLog auditLogView, session sessionState) {
 	s.render(w, webhookDeliveriesTemplate, map[string]any{
 		"AppName":                 s.cfg.AppName,
@@ -3737,75 +3715,6 @@ const usersTemplate = pageHead + `
       {{ else }}
         <div class="tg-empty-row tg-data-empty"><strong>No users yet</strong><span>Create the first admin from setup.</span></div>
       {{ end }}
-    </section>
-  </main>` + pageFoot
-
-const activityTemplate = pageHead + `
-  <main class="tg-main tg-setup-page tg-activity-page">
-    <header class="tg-header">
-      <div>
-        <p class="eyebrow">Chronological audit history</p>
-        <h1 class="tg-title">Activity</h1>
-        <p class="tg-subtitle">Recent operator and system changes, newest first. This bounded feed shows sanitized metadata only.</p>
-      </div>
-      <span class="tg-badge tg-badge-info"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-activity"></use></svg>Latest 100 events at most</span>
-    </header>
-
-    <section class="tg-warning-callout">
-      <span aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-warning"></use></svg></span>
-      <span>Thawguard provides cooperative enforcement for trusted teams. Activity records auditable changes; it is not a hard security boundary against forge writers who can post statuses.</span>
-    </section>
-
-    <section class="tg-panel tg-data-panel tg-audit-log-panel">
-      <div class="tg-panel-head"><h2>Recent activity</h2><span class="tg-badge tg-badge-info">{{ len .Events }} shown</span></div>
-      <p class="tg-panel-subtitle">Actor, action, affected target, outcome, and curated details from Thawguard audit events. Raw JSON and sensitive values are never displayed.</p>
-      {{ if .Events }}
-      <div class="tg-table-wrap tg-responsive-table">
-        <table class="tg-data-table tg-audit-table">
-          <caption class="tg-sr-only">Recent chronological Thawguard activity</caption>
-          <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Outcome</th><th>Details</th></tr></thead>
-          <tbody>
-          {{ range .Events }}
-            <tr>
-              <td data-label="Time">{{ .CreatedAt }}</td>
-              <td data-label="Actor">{{ .Actor }}</td>
-              <td data-label="Action">{{ .ActionLabel }}</td>
-              <td data-label="Target">{{ .Target }}</td>
-              <td data-label="Outcome"><span class="status status-{{ .OutcomeClass }}">{{ .Outcome }}</span></td>
-              <td data-label="Details">{{ .Detail }}</td>
-            </tr>
-          {{ end }}
-          </tbody>
-        </table>
-      </div>
-      <div class="tg-mobile-card-list" aria-label="Recent activity mobile cards">
-        {{ range .Events }}
-        <article class="tg-mobile-card">
-          <div class="tg-mobile-card-head">
-            <div><span class="tg-mobile-card-kicker">{{ .CreatedAt }}</span><h3>{{ .ActionLabel }}</h3></div>
-            <span class="status status-{{ .OutcomeClass }}">{{ .Outcome }}</span>
-          </div>
-          <dl class="tg-mobile-card-grid">
-            <div><dt>Actor</dt><dd>{{ .Actor }}</dd></div>
-            <div><dt>Target</dt><dd>{{ .Target }}</dd></div>
-          </dl>
-          <p class="tg-mobile-card-detail">{{ .Detail }}</p>
-        </article>
-        {{ end }}
-      </div>
-      {{ else }}
-        <div class="tg-empty-row tg-data-empty"><strong>No activity yet</strong><span>Operator and system changes will appear here after the first audited action.</span></div>
-      {{ end }}
-    </section>
-
-    <section class="tg-panel tg-data-panel">
-      <div class="tg-panel-head tg-panel-head-stacked">
-        <div><h2>Operational diagnostics</h2><p class="tg-panel-subtitle">Use these secondary troubleshooting views for transport and status-publication evidence.</p></div>
-        <div class="tg-header-actions">
-          <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/webhooks">Webhook diagnostics</a>
-          <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/publications">Status diagnostics</a>
-        </div>
-      </div>
     </section>
   </main>` + pageFoot
 

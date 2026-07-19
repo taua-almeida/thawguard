@@ -1,0 +1,9 @@
+{{ define "pages/activity" }}
+<div class="flex flex-col gap-6">
+  <header>
+    <h1 class="m-0 text-page-title font-bold text-text">Activity</h1>
+    <p class="m-0 mt-1 text-sm text-text-muted">Chronological audit history of operator and system changes, newest first.</p>
+  </header>
+  {{ template "components/activity-live" . }}
+</div>
+{{ end }}

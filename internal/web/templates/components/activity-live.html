@@ -1,0 +1,11 @@
+{{/*
+  components/activity-live — the swappable /activity region: the page's
+  cooperative-enforcement callout plus the audit-history table. Filter chips
+  and pager links hx-get swap this whole region.
+*/}}
+{{ define "components/activity-live" }}
+<div id="activity-live" class="flex flex-col gap-6">
+  {{ template "ui/callout" dict "Tone" "warning" "Body" "Thawguard prevents accidental merges for trusted teams; collaborators with sufficient forge permissions can still bypass cooperative enforcement." }}
+  {{ template "components/activity-table" . }}
+</div>
+{{ end }}

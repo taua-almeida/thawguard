@@ -1,0 +1,18 @@
+{{/*
+  ui/pager — table pagination footer: "Showing X–Y of N <noun>" plus
+  Previous/Next buttons (links when a URL is set, disabled otherwise).
+  Pairs with the tablePager view model in diagnostics.go; callers wrap the
+  call in an {{ if }} so a nil pager hides the footer entirely.
+  dict keys: Pager (required: From, To, Total, PrevURL, NextURL),
+  Noun (plural noun after the count, e.g. "events"),
+  HxTarget (optional htmx outerHTML swap target for the nav links)
+*/}}
+{{ define "ui/pager" }}
+<div class="flex flex-wrap items-center justify-between gap-3 border-t border-border px-(--card-spacing) py-3">
+  <span class="text-xs text-text-muted">Showing {{ .Pager.From }}–{{ .Pager.To }} of {{ .Pager.Total }} {{ .Noun }}</span>
+  <div class="flex items-center gap-2">
+    {{ if .Pager.PrevURL }}{{ template "ui/button" dict "Label" "Previous" "Variant" "secondary" "Size" "sm" "Href" .Pager.PrevURL "HxTarget" .HxTarget }}{{ else }}{{ template "ui/button" dict "Label" "Previous" "Variant" "secondary" "Size" "sm" "Disabled" true }}{{ end }}
+    {{ if .Pager.NextURL }}{{ template "ui/button" dict "Label" "Next" "Variant" "secondary" "Size" "sm" "Href" .Pager.NextURL "HxTarget" .HxTarget }}{{ else }}{{ template "ui/button" dict "Label" "Next" "Variant" "secondary" "Size" "sm" "Disabled" true }}{{ end }}
+  </div>
+</div>
+{{ end }}
