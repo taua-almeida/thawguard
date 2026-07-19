@@ -1,0 +1,211 @@
+{{/*
+  components/publications-desired — the latest desired thawguard/freeze status
+  per repository head and status context, following the diagnostics-table shape
+  from /activity. Every cell renders curated text from the publication store;
+  raw forge responses and secret values are never stored or rendered. State
+  chips and pager links are plain links enhanced with hx-get swaps of
+  #publications-live; the page-level repository filter narrows this table too.
+*/}}
+{{ define "components/publications-desired" }}
+<section class="rounded-panel border border-border bg-surface shadow-card" aria-label="Latest desired statuses">
+  <div class="border-b border-border px-(--card-spacing) py-4">
+    <div class="flex flex-wrap items-center gap-3">
+      <h2 class="m-0 text-lg font-bold text-text">Latest desired statuses</h2>
+      {{ if eq .PublicationsTotal 1 }}
+      {{ template "ui/badge" dict "Label" "1 status" }}
+      {{ else }}
+      {{ template "ui/badge" dict "Label" (printf "%d statuses" .PublicationsTotal) }}
+      {{ end }}
+      {{ if .Publications }}<span class="ml-auto text-xs text-text-muted" data-timezone-note>Times shown in UTC.</span>{{ end }}
+    </div>
+    <p class="m-0 mt-1 text-sm text-text-muted">The latest desired status per repository head and status context.</p>
+  </div>
+  {{ if or .PublicationsTotal (ne .Query.DesiredState "all") .Query.RepositoryID }}
+  <div class="flex flex-wrap items-center gap-2 border-b border-border px-(--card-spacing) py-3">
+    {{ range .DesiredChips }}
+    {{ template "ui/chip" dict "Label" .Label "Href" .URL "Active" .Active "HxTarget" "#publications-live" }}
+    {{ end }}
+  </div>
+  {{ end }}
+  {{ if .Publications }}
+  <div class="hidden overflow-x-auto md:block">
+    <table class="w-full border-collapse text-sm">
+      <caption class="sr-only">Latest desired status publications with time, repository, commit, status, and description</caption>
+      <thead>
+        <tr class="bg-surface-muted text-left">
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Updated</th>
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Repository</th>
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Commit</th>
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Status</th>
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Description</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{ range .Publications }}
+        <tr class="border-t border-border align-top">
+          <td class="px-4 py-3 whitespace-nowrap text-text">{{ if .UpdatedAtUTC }}<time datetime="{{ .UpdatedAtUTC }}">{{ .UpdatedAt }}</time>{{ else }}{{ .UpdatedAt }}{{ end }}</td>
+          <td class="px-4 py-3">
+            <span class="flex flex-col gap-0.5">
+              <span class="text-text">{{ .Repository }}</span>
+              <span class="text-xs text-text-muted">PR {{ .PullRequest }} · {{ .TargetBranch }}</span>
+            </span>
+          </td>
+          <td class="px-4 py-3">
+            <span class="flex flex-col gap-0.5">
+              <code class="font-mono text-xs text-text" title="{{ .HeadSHAFull }}">{{ .HeadSHA }}</code>
+              <code class="font-mono text-xs text-text-muted">{{ .Context }}</code>
+            </span>
+          </td>
+          <td class="px-4 py-3">
+            <span class="flex flex-col items-start gap-1">
+              {{ template "ui/badge" dict "Label" .State "Tone" .StateTone "Icon" .StateIcon }}
+              <code class="font-mono text-xs text-text-muted">{{ .Mode }}</code>
+            </span>
+          </td>
+          <td class="px-4 py-3"><span class="block max-w-prose text-text-muted">{{ .Description }}</span></td>
+        </tr>
+        {{ end }}
+      </tbody>
+    </table>
+  </div>
+  <div class="flex flex-col gap-3 p-(--card-spacing) md:hidden">
+    {{ range .Publications }}
+    <article class="rounded-card border border-border p-4">
+      <div class="flex items-start justify-between gap-3">
+        <div>
+          <p class="m-0 text-xs text-text-muted">{{ if .UpdatedAtUTC }}<time datetime="{{ .UpdatedAtUTC }}">{{ .UpdatedAt }}</time>{{ else }}{{ .UpdatedAt }}{{ end }}</p>
+          <h3 class="m-0 mt-0.5 text-sm font-bold text-text">{{ .Repository }}</h3>
+        </div>
+        {{ template "ui/badge" dict "Label" .State "Tone" .StateTone "Icon" .StateIcon }}
+      </div>
+      <p class="m-0 mt-1 text-xs text-text-muted">PR {{ .PullRequest }} · {{ .TargetBranch }} · <code class="font-mono" title="{{ .HeadSHAFull }}">{{ .HeadSHA }}</code></p>
+      <dl class="m-0 mt-3 grid grid-cols-2 gap-2 text-sm">
+        <div><dt class="text-xs font-bold tracking-wide text-text-muted uppercase">Context</dt><dd class="m-0"><code class="font-mono text-xs text-text">{{ .Context }}</code></dd></div>
+        <div><dt class="text-xs font-bold tracking-wide text-text-muted uppercase">Mode</dt><dd class="m-0"><code class="font-mono text-xs text-text">{{ .Mode }}</code></dd></div>
+      </dl>
+      {{ if .Description }}<p class="m-0 mt-2 text-sm text-text-muted">{{ .Description }}</p>{{ end }}
+    </article>
+    {{ end }}
+  </div>
+  {{ if .DesiredPager }}
+  {{ template "ui/pager" dict "Pager" .DesiredPager "Noun" "statuses" "HxTarget" "#publications-live" }}
+  {{ end }}
+  {{ else }}
+  <div class="p-(--card-spacing)">
+    {{ if or (ne .Query.DesiredState "all") .Query.RepositoryID }}
+    {{ template "ui/empty-state" dict "Title" "No matching statuses" "Hint" "Switch filters to see other desired statuses." "Icon" "tg-i-audit" }}
+    {{ else }}
+    {{ template "ui/empty-state" dict "Title" "No desired statuses yet" "Hint" "Desired status records appear after an enforcement-active repository evaluates pull requests." "Icon" "tg-i-audit" }}
+    {{ end }}
+  </div>
+  {{ end }}
+</section>
+{{ end }}
+
+{{/*
+  components/publications-attempts — posted and failed delivery attempts
+  against the forge, newest first. Error text arrives already sanitized from
+  the store; historical records from older databases may still appear and stay
+  reachable through the unfiltered view. Result chips and pager links are
+  plain links enhanced with hx-get swaps of #publications-live; the
+  page-level repository filter narrows this table too.
+*/}}
+{{ define "components/publications-attempts" }}
+<section class="rounded-panel border border-border bg-surface shadow-card" aria-label="Recent publication attempts">
+  <div class="border-b border-border px-(--card-spacing) py-4">
+    <div class="flex flex-wrap items-center gap-3">
+      <h2 class="m-0 text-lg font-bold text-text">Recent publication attempts</h2>
+      {{ if eq .AttemptsTotal 1 }}
+      {{ template "ui/badge" dict "Label" "1 attempt" }}
+      {{ else }}
+      {{ template "ui/badge" dict "Label" (printf "%d attempts" .AttemptsTotal) }}
+      {{ end }}
+    </div>
+    <p class="m-0 mt-1 text-sm text-text-muted">Posted and failed attempts against the forge. Historical records from older databases may still appear here.</p>
+  </div>
+  {{ if or .AttemptsTotal (ne .Query.AttemptResult "all") .Query.RepositoryID }}
+  <div class="flex flex-wrap items-center gap-2 border-b border-border px-(--card-spacing) py-3">
+    {{ range .AttemptChips }}
+    {{ template "ui/chip" dict "Label" .Label "Href" .URL "Active" .Active "HxTarget" "#publications-live" }}
+    {{ end }}
+  </div>
+  {{ end }}
+  {{ if .Attempts }}
+  <div class="hidden overflow-x-auto md:block">
+    <table class="w-full border-collapse text-sm">
+      <caption class="sr-only">Recent status publication attempts with time, repository, commit, result, and description</caption>
+      <thead>
+        <tr class="bg-surface-muted text-left">
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Attempted</th>
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Repository</th>
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Commit</th>
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Result</th>
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Description</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{ range .Attempts }}
+        <tr class="border-t border-border align-top">
+          <td class="px-4 py-3 whitespace-nowrap text-text">{{ if .AttemptedAtUTC }}<time datetime="{{ .AttemptedAtUTC }}">{{ .AttemptedAt }}</time>{{ else }}{{ .AttemptedAt }}{{ end }}</td>
+          <td class="px-4 py-3">
+            <span class="flex flex-col gap-0.5">
+              <span class="text-text">{{ .Repository }}</span>
+              <span class="text-xs text-text-muted">PR {{ .PullRequest }} · {{ .TargetBranch }}</span>
+            </span>
+          </td>
+          <td class="px-4 py-3">
+            <span class="flex flex-col gap-0.5">
+              <code class="font-mono text-xs text-text" title="{{ .HeadSHAFull }}">{{ .HeadSHA }}</code>
+              <code class="font-mono text-xs text-text-muted">{{ .Context }}</code>
+            </span>
+          </td>
+          <td class="px-4 py-3">
+            <span class="flex flex-col items-start gap-1">
+              {{ template "ui/badge" dict "Label" .Result "Tone" .ResultTone "Icon" .ResultIcon }}
+              <code class="font-mono text-xs text-text-muted">{{ .State }} · {{ .Mode }}</code>
+            </span>
+          </td>
+          <td class="px-4 py-3">
+            <span class="block max-w-prose text-text-muted">{{ .Description }}</span>
+            {{ if .Error }}<span class="mt-1 block max-w-prose text-xs text-danger">{{ .Error }}</span>{{ end }}
+          </td>
+        </tr>
+        {{ end }}
+      </tbody>
+    </table>
+  </div>
+  <div class="flex flex-col gap-3 p-(--card-spacing) md:hidden">
+    {{ range .Attempts }}
+    <article class="rounded-card border border-border p-4">
+      <div class="flex items-start justify-between gap-3">
+        <div>
+          <p class="m-0 text-xs text-text-muted">{{ if .AttemptedAtUTC }}<time datetime="{{ .AttemptedAtUTC }}">{{ .AttemptedAt }}</time>{{ else }}{{ .AttemptedAt }}{{ end }}</p>
+          <h3 class="m-0 mt-0.5 text-sm font-bold text-text">{{ .Repository }}</h3>
+        </div>
+        {{ template "ui/badge" dict "Label" .Result "Tone" .ResultTone "Icon" .ResultIcon }}
+      </div>
+      <p class="m-0 mt-1 text-xs text-text-muted">PR {{ .PullRequest }} · {{ .TargetBranch }} · <code class="font-mono" title="{{ .HeadSHAFull }}">{{ .HeadSHA }}</code></p>
+      <dl class="m-0 mt-3 grid grid-cols-2 gap-2 text-sm">
+        <div><dt class="text-xs font-bold tracking-wide text-text-muted uppercase">Context</dt><dd class="m-0"><code class="font-mono text-xs text-text">{{ .Context }}</code></dd></div>
+        <div><dt class="text-xs font-bold tracking-wide text-text-muted uppercase">State</dt><dd class="m-0 text-text">{{ .State }}</dd></div>
+        <div><dt class="text-xs font-bold tracking-wide text-text-muted uppercase">Mode</dt><dd class="m-0"><code class="font-mono text-xs text-text">{{ .Mode }}</code></dd></div>
+      </dl>
+      {{ if .Description }}<p class="m-0 mt-2 text-sm text-text-muted">{{ .Description }}</p>{{ end }}
+      {{ if .Error }}<p class="m-0 mt-1 text-xs text-danger">{{ .Error }}</p>{{ end }}
+    </article>
+    {{ end }}
+  </div>
+  {{ if .AttemptPager }}
+  {{ template "ui/pager" dict "Pager" .AttemptPager "Noun" "attempts" "HxTarget" "#publications-live" }}
+  {{ end }}
+  {{ else }}
+  <div class="p-(--card-spacing)">
+    {{ if or (ne .Query.AttemptResult "all") .Query.RepositoryID }}
+    {{ template "ui/empty-state" dict "Title" "No matching attempts" "Hint" "Switch filters to see other delivery attempts." "Icon" "tg-i-audit" }}
+    {{ else }}
+    {{ template "ui/empty-state" dict "Title" "No publication attempts yet" "Hint" "Posted or failed forge deliveries will appear here after status publication begins." "Icon" "tg-i-audit" }}
+    {{ end }}
+  </div>
+  {{ end }}
+</section>
+{{ end }}

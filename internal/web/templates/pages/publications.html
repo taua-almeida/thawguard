@@ -1,0 +1,9 @@
+{{ define "pages/publications" }}
+<div class="flex flex-col gap-6">
+  <header>
+    <h1 class="m-0 text-page-title font-bold text-text">Status diagnostics</h1>
+    <p class="m-0 mt-1 text-sm text-text-muted">Thawguard publishes a <code class="font-mono text-xs">thawguard/freeze</code> commit status to your forge for each open pull request. This page shows the latest status it wants set on each head, and the delivery attempts against the forge.</p>
+  </header>
+  {{ template "components/publications-live" . }}
+</div>
+{{ end }}

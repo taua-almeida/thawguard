@@ -2494,15 +2494,66 @@ func TestPublicationsPageShowsRecentPublicationIntents(t *testing.T) {
 		t.Fatal("expected session cookie value")
 	}
 	body := recorder.Body.String()
-	for _, want := range []string{"Status diagnostics", "Latest desired statuses", "Recent publication attempts", "Back to activity", `href="/activity"`, "tg-responsive-table", "tg-mobile-card-list", "taua-almeida/thawguard", "#42", "main", "abc123", "thawguard/freeze", "failure", "forgejo_status", "failed", "permission denied", "Branch is frozen", "2026-06-29 17:30 UTC", "2026-06-29 17:31 UTC"} {
+	for _, want := range []string{"Status diagnostics", "Status publishing", "Latest desired statuses", "Recent publication attempts", "taua-almeida/thawguard", "#42", "main", "abc123", "thawguard/freeze", "failure", "forgejo_status", "failed", "permission denied", "Branch is frozen", "2026-06-29 17:30 UTC", "2026-06-29 17:31 UTC", `datetime="2026-06-29T17:30:00Z"`, `datetime="2026-06-29T17:31:00Z"`, "data-timezone-note", "Publication errors are sanitized before storage", "bypass cooperative enforcement", "publications-repo-filter", `hx-target="#publications-live"`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
 	}
-	for _, stale := range []string{"dry-run", "dry_run", "shadow", "Shadow", "would be posted", "what would publish"} {
+	for _, stale := range []string{"dry-run", "dry_run", "shadow mode", "Shadow", "would be posted", "what would publish", "Back to activity", "tg-responsive-table", "tg-mobile-card-list"} {
 		if strings.Contains(body, stale) {
 			t.Fatalf("expected publications page not to mention %q, got %q", stale, body)
 		}
+	}
+}
+
+func TestPublicationsPageShowsEmptyStatesPerTable(t *testing.T) {
+	server := NewServer(Config{
+		AppName:                "Thawguard",
+		RepositoryStore:        &fakeRepositoryStore{},
+		StatusPublicationStore: &fakeStatusPublicationStore{},
+	})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/publications", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{"No desired statuses yet", "enforcement-active repository evaluates pull requests", "No publication attempts yet", "after status publication begins", "0 statuses", "0 attempts"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected body to contain %q, got %q", want, body)
+		}
+	}
+	if strings.Contains(body, "data-timezone-note") {
+		t.Fatalf("expected no timezone note without rows, got %q", body)
+	}
+}
+
+func TestPublicationsPageShowsAttemptsEmptyStateAlone(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	createdAt := time.Date(2026, 6, 29, 17, 30, 0, 0, time.UTC)
+	publication := statuspublication.Publication{ID: 1, StatusResultID: 7, RepositoryID: repo.ID, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: domain.CommitStatusPending, Description: "Thawguard is evaluating the freeze state for this head", DeliveryMode: statuspublication.DeliveryModeForgejoStatus, CreatedAt: createdAt}
+	server := NewServer(Config{
+		AppName:                "Thawguard",
+		RepositoryStore:        &fakeRepositoryStore{repositories: []domain.Repository{repo}},
+		StatusPublicationStore: &fakeStatusPublicationStore{publications: []statuspublication.Publication{publication}},
+	})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/publications", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{"taua-almeida/thawguard", "pending", "No publication attempts yet", "2026-06-29 17:30 UTC"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected body to contain %q, got %q", want, body)
+		}
+	}
+	if strings.Contains(body, "No desired statuses yet") {
+		t.Fatalf("expected desired-statuses table to render rows, got %q", body)
 	}
 }
 
@@ -2514,6 +2565,113 @@ func TestPublicationsPageRequiresStatusPublicationStore(t *testing.T) {
 
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected service unavailable status, got %d", recorder.Code)
+	}
+}
+
+func TestPublicationsPageFiltersAndPaginates(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	repo2 := domain.Repository{ID: 2, Owner: "taua-almeida", Name: "ice-station", Forge: "forgejo", DefaultBranch: "main"}
+	createdAt := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	publications := make([]statuspublication.Publication, 0, 25)
+	for i := range 22 {
+		publications = append(publications, statuspublication.Publication{ID: int64(100 - i), RepositoryID: repo.ID, PullRequestIndex: 100 - i, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "Branch is frozen; merge is blocked by Thawguard", DeliveryMode: statuspublication.DeliveryModeForgejoStatus, CreatedAt: createdAt, UpdatedAt: createdAt.Add(-time.Duration(i) * time.Minute)})
+	}
+	for i := range 3 {
+		publications = append(publications, statuspublication.Publication{ID: int64(10 - i), RepositoryID: repo2.ID, PullRequestIndex: 10 - i, TargetBranch: "main", HeadSHA: "def456", Context: domain.RequiredStatusContext, State: domain.CommitStatusSuccess, Description: "No active freeze applies to this pull request", DeliveryMode: statuspublication.DeliveryModeForgejoStatus, CreatedAt: createdAt, UpdatedAt: createdAt.Add(-time.Duration(22+i) * time.Minute)})
+	}
+	attempts := []statuspublication.Attempt{
+		{ID: 4, RepositoryID: repo.ID, PullRequestIndex: 100, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Mode: statuspublication.AttemptModeForgejoStatus, Result: statuspublication.AttemptResultPosted, AttemptedAt: createdAt},
+		{ID: 3, RepositoryID: repo.ID, PullRequestIndex: 99, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Mode: statuspublication.AttemptModeForgejoStatus, Result: statuspublication.AttemptResultFailed, Error: "permission denied", AttemptedAt: createdAt.Add(-time.Minute)},
+		{ID: 2, RepositoryID: repo2.ID, PullRequestIndex: 10, TargetBranch: "main", HeadSHA: "def456", Context: domain.RequiredStatusContext, State: domain.CommitStatusSuccess, Mode: statuspublication.AttemptModeForgejoStatus, Result: statuspublication.AttemptResultPosted, AttemptedAt: createdAt.Add(-2 * time.Minute)},
+		{ID: 1, RepositoryID: repo2.ID, PullRequestIndex: 9, TargetBranch: "main", HeadSHA: "def456", Context: domain.RequiredStatusContext, State: domain.CommitStatusSuccess, Mode: statuspublication.AttemptModeForgejoStatus, Result: statuspublication.AttemptResultFailed, Error: "forge returned 500", AttemptedAt: createdAt.Add(-3 * time.Minute)},
+	}
+	server := NewServer(Config{
+		AppName:                "Thawguard",
+		RepositoryStore:        &fakeRepositoryStore{repositories: []domain.Repository{repo, repo2}},
+		StatusPublicationStore: &fakeStatusPublicationStore{publications: publications, attempts: attempts},
+	})
+
+	get := func(target string) (int, string) {
+		recorder := httptest.NewRecorder()
+		server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, target, nil))
+		return recorder.Code, recorder.Body.String()
+	}
+
+	code, body := get("/publications")
+	if code != http.StatusOK || !strings.Contains(body, "25 statuses") || !strings.Contains(body, "Showing 1–20 of 25 statuses") {
+		t.Fatalf("expected first desired-statuses page, status=%d body=%q", code, body)
+	}
+	if !strings.Contains(body, `href="/publications?dpage=2"`) {
+		t.Fatalf("expected next-page link for the desired table, got %q", body)
+	}
+	if !strings.Contains(body, "4 attempts") || strings.Contains(body, "of 4 attempts") {
+		t.Fatalf("expected single attempts page without pager, got %q", body)
+	}
+
+	code, body = get("/publications?dpage=2")
+	if code != http.StatusOK || !strings.Contains(body, "Showing 21–25 of 25 statuses") {
+		t.Fatalf("expected second desired-statuses page, status=%d body=%q", code, body)
+	}
+	if !strings.Contains(body, `href="/publications?dstate=failure"`) {
+		t.Fatalf("expected state chip link to reset the desired page, got %q", body)
+	}
+
+	code, body = get("/publications?dpage=9")
+	if code != http.StatusOK || !strings.Contains(body, "Showing 21–25 of 25 statuses") {
+		t.Fatalf("expected out-of-range desired page to clamp to the last page, status=%d body=%q", code, body)
+	}
+
+	code, body = get("/publications?dstate=success")
+	if code != http.StatusOK || !strings.Contains(body, "3 statuses") || !strings.Contains(body, "4 attempts") {
+		t.Fatalf("expected desired filter to leave the attempts table alone, status=%d body=%q", code, body)
+	}
+	if !strings.Contains(body, `href="/publications?aresult=failed&amp;dstate=success"`) {
+		t.Fatalf("expected attempt chip links to preserve the desired filter, got %q", body)
+	}
+
+	code, body = get("/publications?aresult=failed")
+	if code != http.StatusOK || !strings.Contains(body, "2 attempts") || !strings.Contains(body, "25 statuses") {
+		t.Fatalf("expected attempt filter to leave the desired table alone, status=%d body=%q", code, body)
+	}
+
+	code, body = get("/publications?repo=2")
+	if code != http.StatusOK || !strings.Contains(body, "3 statuses") || !strings.Contains(body, "2 attempts") {
+		t.Fatalf("expected repository filter to narrow both tables, status=%d body=%q", code, body)
+	}
+	if !strings.Contains(body, `<option value="2" selected>taua-almeida/ice-station</option>`) {
+		t.Fatalf("expected repository select to mark the active repository, got %q", body)
+	}
+	if strings.Contains(body, "taua-almeida/thawguard</span>") {
+		t.Fatalf("expected repository filter to hide other repositories' rows, got %q", body)
+	}
+
+	code, body = get("/publications?dstate=pending")
+	if code != http.StatusOK || !strings.Contains(body, "No matching statuses") || !strings.Contains(body, "Switch filters to see other desired statuses.") {
+		t.Fatalf("expected filtered empty state to keep the chips visible, status=%d body=%q", code, body)
+	}
+
+	code, body = get("/publications?dstate=bogus&aresult=bogus")
+	if code != http.StatusOK || !strings.Contains(body, "25 statuses") || !strings.Contains(body, "4 attempts") {
+		t.Fatalf("expected unknown filters to fall back to all, status=%d body=%q", code, body)
+	}
+}
+
+func TestPublicationsPageServesHtmxFragment(t *testing.T) {
+	server := NewServer(Config{AppName: "Thawguard", StatusPublicationStore: &fakeStatusPublicationStore{}})
+
+	request := httptest.NewRequest(http.MethodGet, "/publications?dstate=failure", nil)
+	request.Header.Set("HX-Request", "true")
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, request)
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusOK || !strings.Contains(body, `id="publications-live"`) {
+		t.Fatalf("expected htmx fragment, status=%d body=%q", recorder.Code, body)
+	}
+	if strings.Contains(body, "shell-nav-item") || strings.Contains(body, "<html") {
+		t.Fatalf("expected fragment without the shell, got %q", body)
+	}
+	if vary := recorder.Header().Values("Vary"); !containsString(vary, "HX-Request") {
+		t.Fatalf("expected Vary: HX-Request on publications responses, got %v", vary)
 	}
 }
 
@@ -3835,27 +3993,57 @@ type fakeStatusPublicationStore struct {
 	attemptErr   error
 }
 
-func (s *fakeStatusPublicationStore) ListRecent(ctx context.Context, limit int) ([]statuspublication.Publication, error) {
+func (s *fakeStatusPublicationStore) ListPage(ctx context.Context, state string, repositoryID int64, offset, limit int) ([]statuspublication.Publication, int, error) {
 	if s.err != nil {
-		return nil, s.err
+		return nil, 0, s.err
 	}
-	if limit > 0 && len(s.publications) > limit {
-		return s.publications[:limit], nil
+	filtered := make([]statuspublication.Publication, 0, len(s.publications))
+	for _, publication := range s.publications {
+		if state != "" && string(publication.State) != state {
+			continue
+		}
+		if repositoryID > 0 && publication.RepositoryID != repositoryID {
+			continue
+		}
+		filtered = append(filtered, publication)
 	}
-	return s.publications, nil
+	return pageSlice(filtered, offset, limit), len(filtered), nil
 }
 
-func (s *fakeStatusPublicationStore) ListRecentAttempts(ctx context.Context, limit int) ([]statuspublication.Attempt, error) {
+func (s *fakeStatusPublicationStore) ListAttemptsPage(ctx context.Context, result string, repositoryID int64, offset, limit int) ([]statuspublication.Attempt, int, error) {
 	if s.attemptErr != nil {
-		return nil, s.attemptErr
+		return nil, 0, s.attemptErr
 	}
 	if s.err != nil {
-		return nil, s.err
+		return nil, 0, s.err
 	}
-	if limit > 0 && len(s.attempts) > limit {
-		return s.attempts[:limit], nil
+	filtered := make([]statuspublication.Attempt, 0, len(s.attempts))
+	for _, attempt := range s.attempts {
+		if result != "" && attempt.Result != result {
+			continue
+		}
+		if repositoryID > 0 && attempt.RepositoryID != repositoryID {
+			continue
+		}
+		filtered = append(filtered, attempt)
 	}
-	return s.attempts, nil
+	return pageSlice(filtered, offset, limit), len(filtered), nil
+}
+
+// pageSlice windows a filtered fake-store result the way the real stores'
+// LIMIT/OFFSET queries do.
+func pageSlice[T any](items []T, offset, limit int) []T {
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(items) {
+		return nil
+	}
+	items = items[offset:]
+	if limit > 0 && len(items) > limit {
+		return items[:limit]
+	}
+	return items
 }
 
 type fakeAuditStore struct {

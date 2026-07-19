@@ -1,12 +1,14 @@
 package web
 
 import (
+	"fmt"
 	"html/template"
 	"net/http"
 	"time"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
+	"github.com/taua-almeida/thawguard/internal/statuspublication"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
 )
 
@@ -855,4 +857,173 @@ func (s *Server) handleDevPreviewActivity(w http.ResponseWriter, r *http.Request
 		return activityURL(activityQuery{Filter: query.Filter, Page: page})
 	})
 	s.renderPage(w, "layouts/activity", data)
+}
+
+// devPreviewPageWindow clamps a 1-based page to the filtered fixture set and
+// returns that page's slice plus the clamped page, mirroring the real
+// loader's last-page clamp.
+func devPreviewPageWindow[T any](items []T, page, size int) ([]T, int) {
+	lastPage := max((len(items)+size-1)/size, 1)
+	if page > lastPage {
+		page = lastPage
+	}
+	start := (page - 1) * size
+	if start >= len(items) {
+		return nil, page
+	}
+	end := min(start+size, len(items))
+	return items[start:end], page
+}
+
+// handleDevPreviewPublications renders the status-diagnostics page from
+// fictional fixtures through the real view-model builders
+// (GET /dev/preview/publications). Query knobs: ?role=viewer,
+// ?variant=empty|no-attempts, ?theme=dark|light, plus the page's real
+// dstate/aresult/repo/dpage/apage parameters, which filter and window the
+// fixtures the way the store queries would. The default view holds 23
+// desired rows (all four states, the unknown-repository / zero-time fallback
+// last) so the pager renders, and 3 attempts covering both results and a
+// sanitized error.
+func (s *Server) handleDevPreviewPublications(w http.ResponseWriter, r *http.Request) {
+	if !s.cfg.DevMode {
+		http.NotFound(w, r)
+		return
+	}
+	user := currentUserView{
+		Email:             "mira.frost@example.test",
+		DisplayName:       "Mira Frost",
+		RoleLabel:         "Admin",
+		CanChangePassword: true,
+		IsAdmin:           true,
+		CanFreeze:         true,
+		CanThaw:           true,
+	}
+	if r.URL.Query().Get("role") == "viewer" {
+		user = currentUserView{
+			Email:             "sten.hale@example.test",
+			DisplayName:       "Sten Hale",
+			RoleLabel:         "Viewer",
+			CanChangePassword: true,
+		}
+	}
+	repositories := []domain.Repository{
+		{ID: 46, Forge: "forgejo", BaseURL: "https://forge.example.test", Owner: "aurora", Name: "ice-station", DefaultBranch: "main", EnforcementState: domain.EnforcementActive},
+		{ID: 47, Forge: "codeberg", BaseURL: "https://codeberg.org", Owner: "borealis", Name: "frost-api", DefaultBranch: "main", EnforcementState: domain.EnforcementActive},
+	}
+	publications := []statuspublication.Publication{
+		{ID: 601, RepositoryID: 46, PullRequestIndex: 241, TargetBranch: "main", HeadSHA: "9c41f2ab77d3e0b6512fe8a1c4d90b3a7e6f5d21", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "Branch is frozen; merge is blocked by Thawguard", DeliveryMode: statuspublication.DeliveryModeForgejoStatus, CreatedAt: time.Date(2026, 7, 17, 6, 0, 0, 0, time.UTC), UpdatedAt: time.Date(2026, 7, 17, 9, 2, 0, 0, time.UTC)},
+		{ID: 600, RepositoryID: 46, PullRequestIndex: 238, TargetBranch: "release/1.8", HeadSHA: "aa11bb22cc33dd44ee55ff667788990011223344", Context: domain.RequiredStatusContext, State: domain.CommitStatusSuccess, Description: "No active freeze applies to this PR", DeliveryMode: statuspublication.DeliveryModeForgejoStatus, CreatedAt: time.Date(2026, 7, 16, 18, 25, 0, 0, time.UTC)},
+		{ID: 598, RepositoryID: 47, PullRequestIndex: 214, TargetBranch: "main", HeadSHA: "bb22cc33dd44ee55ff667788990011223344aa11", Context: domain.RequiredStatusContext, State: domain.CommitStatusPending, Description: "Thawguard is evaluating the freeze state for this head", DeliveryMode: statuspublication.DeliveryModeForgejoStatus, CreatedAt: time.Date(2026, 7, 16, 9, 12, 0, 0, time.UTC), UpdatedAt: time.Date(2026, 7, 16, 9, 12, 0, 0, time.UTC)},
+		{ID: 597, RepositoryID: 47, PullRequestIndex: 209, TargetBranch: "release/1.8", HeadSHA: "cc33dd44ee55ff667788990011223344aa11bb22", Context: domain.RequiredStatusContext, State: domain.CommitStatusError, Description: "Status publication failed; the forge rejected the request", DeliveryMode: statuspublication.DeliveryModeForgejoStatus, CreatedAt: time.Date(2026, 7, 15, 16, 44, 0, 0, time.UTC), UpdatedAt: time.Date(2026, 7, 15, 16, 44, 0, 0, time.UTC)},
+	}
+	// Older filler heads push the desired table past one page (23 rows total)
+	// so the pager renders; states rotate so every chip filter has matches.
+	for i := range 18 {
+		state := domain.CommitStatusSuccess
+		description := "No active freeze applies to this PR"
+		switch i % 3 {
+		case 1:
+			state = domain.CommitStatusFailure
+			description = "Branch is frozen; merge is blocked by Thawguard"
+		case 2:
+			state = domain.CommitStatusPending
+			description = "Thawguard is evaluating the freeze state for this head"
+		}
+		repositoryID, branch := int64(46), "main"
+		if i%2 == 1 {
+			repositoryID, branch = 47, "release/1.8"
+		}
+		at := time.Date(2026, 7, 15, 14, 0, 0, 0, time.UTC).Add(-time.Duration(i*3) * time.Hour)
+		publications = append(publications, statuspublication.Publication{
+			ID:               int64(590 - i),
+			RepositoryID:     repositoryID,
+			PullRequestIndex: 205 - i,
+			TargetBranch:     branch,
+			HeadSHA:          fmt.Sprintf("ee%02d1122334455667788990011223344556677%02d", i, i),
+			Context:          domain.RequiredStatusContext,
+			State:            state,
+			Description:      description,
+			DeliveryMode:     statuspublication.DeliveryModeForgejoStatus,
+			CreatedAt:        at,
+			UpdatedAt:        at,
+		})
+	}
+	publications = append(publications, statuspublication.Publication{ID: 402, RepositoryID: 12, PullRequestIndex: 77, TargetBranch: "main", HeadSHA: "dd44ee55ff667788990011223344aa11bb22cc33", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "Branch is frozen; merge is blocked by Thawguard", DeliveryMode: statuspublication.DeliveryModeForgejoStatus})
+	attempts := []statuspublication.Attempt{
+		{ID: 901, PublicationID: 601, RepositoryID: 46, PullRequestIndex: 241, TargetBranch: "main", HeadSHA: "9c41f2ab77d3e0b6512fe8a1c4d90b3a7e6f5d21", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "Branch is frozen; merge is blocked by Thawguard", Mode: statuspublication.AttemptModeForgejoStatus, Result: statuspublication.AttemptResultPosted, AttemptedAt: time.Date(2026, 7, 17, 9, 2, 30, 0, time.UTC)},
+		{ID: 899, PublicationID: 600, RepositoryID: 46, PullRequestIndex: 238, TargetBranch: "release/1.8", HeadSHA: "aa11bb22cc33dd44ee55ff667788990011223344", Context: domain.RequiredStatusContext, State: domain.CommitStatusSuccess, Description: "No active freeze applies to this PR", Mode: statuspublication.AttemptModeForgejoStatus, Result: statuspublication.AttemptResultPosted, AttemptedAt: time.Date(2026, 7, 16, 18, 25, 40, 0, time.UTC)},
+		{ID: 900, PublicationID: 597, RepositoryID: 47, PullRequestIndex: 209, TargetBranch: "release/1.8", HeadSHA: "cc33dd44ee55ff667788990011223344aa11bb22", Context: domain.RequiredStatusContext, State: domain.CommitStatusError, Description: "Status publication failed; the forge rejected the request", Mode: statuspublication.AttemptModeForgejoStatus, Result: statuspublication.AttemptResultFailed, Error: "forge returned status 403", AttemptedAt: time.Date(2026, 7, 15, 16, 44, 12, 0, time.UTC)},
+	}
+	switch r.URL.Query().Get("variant") {
+	case "empty":
+		publications = nil
+		attempts = nil
+	case "no-attempts":
+		attempts = nil
+	}
+	query := publicationsQueryFromValues(r.URL.Query())
+	desiredFilter := publicationStoreFilter(query.DesiredState)
+	filteredPublications := make([]statuspublication.Publication, 0, len(publications))
+	for _, publication := range publications {
+		if desiredFilter != "" && string(publication.State) != desiredFilter {
+			continue
+		}
+		if query.RepositoryID > 0 && publication.RepositoryID != query.RepositoryID {
+			continue
+		}
+		filteredPublications = append(filteredPublications, publication)
+	}
+	attemptFilter := publicationStoreFilter(query.AttemptResult)
+	filteredAttempts := make([]statuspublication.Attempt, 0, len(attempts))
+	for _, attempt := range attempts {
+		if attemptFilter != "" && string(attempt.Result) != attemptFilter {
+			continue
+		}
+		if query.RepositoryID > 0 && attempt.RepositoryID != query.RepositoryID {
+			continue
+		}
+		filteredAttempts = append(filteredAttempts, attempt)
+	}
+	pagePublications, desiredPage := devPreviewPageWindow(filteredPublications, query.DesiredPage, publicationsPageSize)
+	query.DesiredPage = desiredPage
+	pageAttempts, attemptPage := devPreviewPageWindow(filteredAttempts, query.AttemptPage, publicationsPageSize)
+	query.AttemptPage = attemptPage
+	data := publicationsPageData{
+		AppName:            s.cfg.AppName,
+		PageTitle:          "Status diagnostics",
+		Theme:              devPreviewTheme(r),
+		ActivePage:         "publications",
+		CurrentUser:        user,
+		Publications:       publicationRowViews(repositories, pagePublications),
+		Attempts:           publicationAttemptRowViews(repositories, pageAttempts),
+		PublicationsTotal:  len(filteredPublications),
+		AttemptsTotal:      len(filteredAttempts),
+		Query:              query,
+		FilterRepositories: repositories,
+		CSRFToken:          "dev-preview-fictional-token",
+		CSRFField:          csrfFormField,
+	}
+	data.DesiredChips = filterChips(query.DesiredState, publicationDesiredFilterOptions, func(value string) string {
+		next := query
+		next.DesiredState = value
+		next.DesiredPage = 1
+		return publicationsURL(next)
+	})
+	data.AttemptChips = filterChips(query.AttemptResult, publicationAttemptFilterOptions, func(value string) string {
+		next := query
+		next.AttemptResult = value
+		next.AttemptPage = 1
+		return publicationsURL(next)
+	})
+	data.DesiredPager = paginateTable(len(filteredPublications), query.DesiredPage, publicationsPageSize, func(page int) string {
+		next := query
+		next.DesiredPage = page
+		return publicationsURL(next)
+	})
+	data.AttemptPager = paginateTable(len(filteredAttempts), query.AttemptPage, publicationsPageSize, func(page int) string {
+		next := query
+		next.AttemptPage = page
+		return publicationsURL(next)
+	})
+	s.renderPage(w, "layouts/publications", data)
 }

@@ -3,6 +3,7 @@ package statuspublication
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -180,6 +181,210 @@ func TestStoreRejectsInvalidPublicationResult(t *testing.T) {
 	}
 	if _, err := store.PublishForgejoStatus(ctx, statusresult.Result{ID: 1, RepositoryID: 1, PullRequestIndex: 1, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: "invalid", Description: "ok"}); !IsValidationError(err) {
 		t.Fatalf("expected invalid state validation error, got %v", err)
+	}
+}
+
+func TestStoreListPageFiltersAndPaginates(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	repo2, err := repository.NewStore(database).Create(ctx, repository.CreateParams{Owner: "example-owner", Name: "second-repo", DefaultBranch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(database)
+
+	seed := []struct {
+		repositoryID int64
+		index        int
+		state        domain.CommitStatusState
+	}{
+		{repo.ID, 1, domain.CommitStatusFailure},
+		{repo.ID, 2, domain.CommitStatusSuccess},
+		{repo2.ID, 3, domain.CommitStatusFailure},
+		{repo.ID, 4, domain.CommitStatusPending},
+		{repo2.ID, 5, domain.CommitStatusSuccess},
+	}
+	for _, entry := range seed {
+		result := createStatusResultWithParams(t, ctx, database, entry.repositoryID, entry.index, "main", fmt.Sprintf("abc%03d", entry.index), entry.state, "seeded")
+		if _, err := store.PublishForgejoStatus(ctx, result); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	assertPageIndexes := func(label string, publications []Publication, want ...int) {
+		t.Helper()
+		got := make([]int, 0, len(publications))
+		for _, publication := range publications {
+			got = append(got, publication.PullRequestIndex)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("%s: expected indexes %v, got %v", label, want, got)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("%s: expected indexes %v, got %v", label, want, got)
+			}
+		}
+	}
+
+	page, total, err := store.ListPage(ctx, "", 0, 0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 5 {
+		t.Fatalf("expected total 5, got %d", total)
+	}
+	assertPageIndexes("first page", page, 5, 4)
+
+	page, total, err = store.ListPage(ctx, "", 0, 2, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 5 {
+		t.Fatalf("expected stable total 5, got %d", total)
+	}
+	assertPageIndexes("second page", page, 3, 2)
+
+	page, _, err = store.ListPage(ctx, string(domain.CommitStatusFailure), 0, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPageIndexes("state filter", page, 3, 1)
+
+	page, _, err = store.ListPage(ctx, "", repo2.ID, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPageIndexes("repository filter", page, 5, 3)
+
+	page, total, err = store.ListPage(ctx, string(domain.CommitStatusFailure), repo2.ID, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 {
+		t.Fatalf("expected combined-filter total 1, got %d", total)
+	}
+	assertPageIndexes("combined filter", page, 3)
+
+	page, total, err = store.ListPage(ctx, "bogus", 0, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 0 || len(page) != 0 {
+		t.Fatalf("expected unknown state to match nothing, got total %d rows %v", total, page)
+	}
+
+	page, total, err = store.ListPage(ctx, "", 0, -5, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 5 || len(page) != 5 {
+		t.Fatalf("expected clamped page to return everything, got total %d rows %d", total, len(page))
+	}
+}
+
+func TestStoreListAttemptsPageFiltersAndPaginates(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	repo2, err := repository.NewStore(database).Create(ctx, repository.CreateParams{Owner: "example-owner", Name: "second-repo", DefaultBranch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(database)
+
+	result1 := createStatusResultWithParams(t, ctx, database, repo.ID, 1, "main", "abc001", domain.CommitStatusFailure, "seeded")
+	publication1, err := store.PublishForgejoStatus(ctx, result1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result2 := createStatusResultWithParams(t, ctx, database, repo2.ID, 2, "main", "abc002", domain.CommitStatusSuccess, "seeded")
+	publication2, err := store.PublishForgejoStatus(ctx, result2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	seed := []struct {
+		publication Publication
+		result      string
+		message     string
+	}{
+		{publication1, AttemptResultPosted, ""},
+		{publication1, AttemptResultFailed, "forge returned 500"},
+		{publication2, AttemptResultPosted, ""},
+		{publication2, AttemptResultFailed, "forge returned 403"},
+	}
+	ids := make([]int64, 0, len(seed))
+	for _, entry := range seed {
+		attempt, err := store.RecordForgejoStatusAttempt(ctx, entry.publication, entry.result, entry.message)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, attempt.ID)
+	}
+
+	assertAttemptIDs := func(label string, attempts []Attempt, want ...int64) {
+		t.Helper()
+		got := make([]int64, 0, len(attempts))
+		for _, attempt := range attempts {
+			got = append(got, attempt.ID)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("%s: expected ids %v, got %v", label, want, got)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("%s: expected ids %v, got %v", label, want, got)
+			}
+		}
+	}
+
+	page, total, err := store.ListAttemptsPage(ctx, "", 0, 0, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 4 {
+		t.Fatalf("expected total 4, got %d", total)
+	}
+	assertAttemptIDs("first page", page, ids[3], ids[2], ids[1])
+
+	page, total, err = store.ListAttemptsPage(ctx, "", 0, 3, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 4 {
+		t.Fatalf("expected stable total 4, got %d", total)
+	}
+	assertAttemptIDs("second page", page, ids[0])
+
+	page, _, err = store.ListAttemptsPage(ctx, AttemptResultFailed, 0, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertAttemptIDs("result filter", page, ids[3], ids[1])
+
+	page, _, err = store.ListAttemptsPage(ctx, "", repo2.ID, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertAttemptIDs("repository filter", page, ids[3], ids[2])
+
+	page, total, err = store.ListAttemptsPage(ctx, AttemptResultPosted, repo2.ID, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 {
+		t.Fatalf("expected combined-filter total 1, got %d", total)
+	}
+	assertAttemptIDs("combined filter", page, ids[2])
+
+	page, total, err = store.ListAttemptsPage(ctx, "", 0, -1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 4 || len(page) != 4 {
+		t.Fatalf("expected clamped page to return everything, got total %d rows %d", total, len(page))
 	}
 }
 

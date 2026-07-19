@@ -158,8 +158,8 @@ type StatusDecisionStore interface {
 }
 
 type StatusPublicationStore interface {
-	ListRecent(ctx context.Context, limit int) ([]statuspublication.Publication, error)
-	ListRecentAttempts(ctx context.Context, limit int) ([]statuspublication.Attempt, error)
+	ListPage(ctx context.Context, state string, repositoryID int64, offset, limit int) ([]statuspublication.Publication, int, error)
+	ListAttemptsPage(ctx context.Context, result string, repositoryID int64, offset, limit int) ([]statuspublication.Attempt, int, error)
 }
 
 type WebhookRepositoryStore interface {
@@ -232,19 +232,6 @@ type scheduledFreezePageState struct {
 	EditReason        string
 	EditStartsAt      string
 	EditPlannedEndsAt string
-}
-
-type statusPublicationView struct {
-	Publication statuspublication.Publication
-	Repository  domain.Repository
-	CreatedAt   string
-	UpdatedAt   string
-}
-
-type statusPublicationAttemptView struct {
-	Attempt     statuspublication.Attempt
-	Repository  domain.Repository
-	AttemptedAt string
 }
 
 type webhookDeliveryView struct {
@@ -432,6 +419,7 @@ func (s *Server) routes() {
 		s.mux.HandleFunc("GET /dev/preview/dashboard", s.handleDevPreviewDashboard)
 		s.mux.HandleFunc("GET /dev/preview/decisions", s.handleDevPreviewDecisions)
 		s.mux.HandleFunc("GET /dev/preview/activity", s.handleDevPreviewActivity)
+		s.mux.HandleFunc("GET /dev/preview/publications", s.handleDevPreviewPublications)
 	}
 }
 
@@ -766,6 +754,7 @@ func shortHeadSHA(sha string) string {
 }
 
 func (s *Server) handlePublications(w http.ResponseWriter, r *http.Request) {
+	w.Header().Add("Vary", "HX-Request")
 	if s.cfg.StatusPublicationStore == nil {
 		http.Error(w, "status publication store is not configured", http.StatusServiceUnavailable)
 		return
@@ -774,12 +763,16 @@ func (s *Server) handlePublications(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	repositories, publications, attempts, err := s.publicationPageData(r.Context())
-	if err != nil {
-		internalServerError(w)
+	query := publicationsQueryFromValues(r.URL.Query())
+	data, ok := s.loadPublicationsPageData(w, r, query, session)
+	if !ok {
 		return
 	}
-	s.renderPublications(w, s.statusPublicationViews(repositories, publications), statusPublicationAttemptViews(repositories, attempts), session)
+	if isHXRequest(r) {
+		s.renderPage(w, "components/publications-live", data)
+		return
+	}
+	s.renderPage(w, "layouts/publications", data)
 }
 
 func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request) {
@@ -2153,20 +2146,6 @@ func (s *Server) repositories(ctx context.Context) ([]domain.Repository, error) 
 	return s.cfg.RepositoryStore.List(ctx)
 }
 
-func (s *Server) statusPublications(ctx context.Context) ([]statuspublication.Publication, error) {
-	if s.cfg.StatusPublicationStore == nil {
-		return nil, nil
-	}
-	return s.cfg.StatusPublicationStore.ListRecent(ctx, 25)
-}
-
-func (s *Server) statusPublicationAttempts(ctx context.Context) ([]statuspublication.Attempt, error) {
-	if s.cfg.StatusPublicationStore == nil {
-		return nil, nil
-	}
-	return s.cfg.StatusPublicationStore.ListRecentAttempts(ctx, 25)
-}
-
 func (s *Server) webhookDeliveries(ctx context.Context) ([]webhook.Delivery, error) {
 	if s.cfg.WebhookDeliveryStore == nil {
 		return nil, nil
@@ -2441,44 +2420,6 @@ func auditLogSortIndicator(controls auditLogControls, field string) string {
 		return "↑"
 	}
 	return "↓"
-}
-
-func (s *Server) publicationPageData(ctx context.Context) ([]domain.Repository, []statuspublication.Publication, []statuspublication.Attempt, error) {
-	repositories, err := s.repositories(ctx)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	publications, err := s.statusPublications(ctx)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	attempts, err := s.statusPublicationAttempts(ctx)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	return repositories, publications, attempts, nil
-}
-
-func (s *Server) statusPublicationViews(repositories []domain.Repository, publications []statuspublication.Publication) []statusPublicationView {
-	repositoriesByID := repositoriesByID(repositories)
-	views := make([]statusPublicationView, 0, len(publications))
-	for _, publication := range publications {
-		updatedAt := publication.UpdatedAt
-		if updatedAt.IsZero() {
-			updatedAt = publication.CreatedAt
-		}
-		views = append(views, statusPublicationView{Publication: publication, Repository: repositoriesByID[publication.RepositoryID], CreatedAt: publication.CreatedAt.UTC().Format("2006-01-02 15:04 UTC"), UpdatedAt: updatedAt.UTC().Format("2006-01-02 15:04 UTC")})
-	}
-	return views
-}
-
-func statusPublicationAttemptViews(repositories []domain.Repository, attempts []statuspublication.Attempt) []statusPublicationAttemptView {
-	repositoriesByID := repositoriesByID(repositories)
-	views := make([]statusPublicationAttemptView, 0, len(attempts))
-	for _, attempt := range attempts {
-		views = append(views, statusPublicationAttemptView{Attempt: attempt, Repository: repositoriesByID[attempt.RepositoryID], AttemptedAt: attempt.AttemptedAt.UTC().Format("2006-01-02 15:04 UTC")})
-	}
-	return views
 }
 
 func webhookDeliveryViews(repositories []domain.Repository, deliveries []webhook.Delivery) []webhookDeliveryView {
@@ -3310,17 +3251,6 @@ func (s *Server) renderUsers(w http.ResponseWriter, users []auth.User, state use
 	})
 }
 
-func (s *Server) renderPublications(w http.ResponseWriter, publications []statusPublicationView, attempts []statusPublicationAttemptView, session sessionState) {
-	s.render(w, publicationsTemplate, map[string]any{
-		"AppName":      s.cfg.AppName,
-		"ActivePage":   "",
-		"CurrentUser":  currentUserFromSession(session),
-		"CSRFToken":    session.CSRFToken,
-		"Publications": publications,
-		"Attempts":     attempts,
-	})
-}
-
 func (s *Server) renderWebhookDeliveries(w http.ResponseWriter, auditLog auditLogView, session sessionState) {
 	s.render(w, webhookDeliveriesTemplate, map[string]any{
 		"AppName":                 s.cfg.AppName,
@@ -3863,114 +3793,6 @@ const webhookDeliveriesTemplate = pageHead + `
           <span>Send a signed pull request webhook to see sanitized delivery metadata here.</span>
           {{ end }}
         </div>
-      {{ end }}
-    </section>
-  </main>` + pageFoot
-
-const publicationsTemplate = pageHead + `
-  <main class="tg-main tg-setup-page tg-diagnostics-page">
-    <header class="tg-header">
-      <div>
-        <p class="eyebrow">Secondary operational diagnostics</p>
-        <h1 class="tg-title">Status diagnostics</h1>
-        <p class="tg-subtitle">Inspect the latest desired <code>thawguard/freeze</code> statuses and recent sanitized publication attempts.</p>
-      </div>
-      <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/activity">Back to activity</a>
-    </header>
-
-    <section class="tg-warning-callout">
-      <span aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-warning"></use></svg></span>
-      <span>Publication errors are sanitized before storage. Raw forge response bodies, tokens, passwords, and session IDs are not rendered.</span>
-    </section>
-
-    <section class="tg-panel tg-data-panel">
-      <div class="tg-panel-head"><h2>Latest desired statuses</h2><span class="tg-badge tg-badge-info">{{ len .Publications }} shown</span></div>
-      <p class="tg-panel-subtitle">The latest desired status per repository head and status context.</p>
-      {{ if .Publications }}
-      <div class="tg-table-wrap tg-responsive-table">
-        <table class="tg-data-table tg-audit-table">
-          <caption class="tg-sr-only">Latest desired status publications</caption>
-          <thead><tr><th>Last updated</th><th>Repository</th><th>PR / branch</th><th>Head SHA</th><th>Context</th><th>State</th><th>Mode</th><th>Description</th></tr></thead>
-          <tbody>
-          {{ range .Publications }}
-            <tr>
-              <td data-label="Last updated">{{ .UpdatedAt }}</td>
-              <td data-label="Repository">{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Publication.RepositoryID }}{{ end }}</td>
-              <td data-label="PR / branch">#{{ .Publication.PullRequestIndex }}<small class="tg-muted">{{ .Publication.TargetBranch }}</small></td>
-              <td data-label="Head SHA"><code>{{ .Publication.HeadSHA }}</code></td>
-              <td data-label="Context"><code>{{ .Publication.Context }}</code></td>
-              <td data-label="State"><span class="status status-{{ .Publication.State }}">{{ .Publication.State }}</span></td>
-              <td data-label="Mode"><code>{{ .Publication.DeliveryMode }}</code></td>
-              <td data-label="Description">{{ .Publication.Description }}</td>
-            </tr>
-          {{ end }}
-          </tbody>
-        </table>
-      </div>
-      <div class="tg-mobile-card-list" aria-label="Latest desired statuses mobile cards">
-        {{ range .Publications }}
-        <article class="tg-mobile-card">
-          <div class="tg-mobile-card-head">
-            <div><span class="tg-mobile-card-kicker">Updated {{ .UpdatedAt }}</span><h3>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Publication.RepositoryID }}{{ end }}</h3></div>
-            <span class="status status-{{ .Publication.State }}">{{ .Publication.State }}</span>
-          </div>
-          <p class="tg-mobile-card-meta">PR #{{ .Publication.PullRequestIndex }}<span class="tg-dot">·</span>{{ .Publication.TargetBranch }}<span class="tg-dot">·</span><code>{{ .Publication.HeadSHA }}</code></p>
-          <dl class="tg-mobile-card-grid">
-            <div><dt>Context</dt><dd><code>{{ .Publication.Context }}</code></dd></div>
-            <div><dt>Mode</dt><dd><code>{{ .Publication.DeliveryMode }}</code></dd></div>
-          </dl>
-          <p class="tg-mobile-card-detail">{{ .Publication.Description }}</p>
-        </article>
-        {{ end }}
-      </div>
-      {{ else }}
-        <div class="tg-empty-row tg-data-empty"><strong>No desired statuses yet</strong><span>Desired status records appear after an enforcement-active repository evaluates pull requests.</span></div>
-      {{ end }}
-    </section>
-
-    <section class="tg-panel tg-data-panel">
-      <div class="tg-panel-head"><h2>Recent publication attempts</h2><span class="tg-badge tg-badge-info">{{ len .Attempts }} shown</span></div>
-      <p class="tg-panel-subtitle">Posted and failed attempts against the forge. Historical records from older databases may still appear here.</p>
-      {{ if .Attempts }}
-      <div class="tg-table-wrap tg-responsive-table">
-        <table class="tg-data-table tg-audit-table">
-          <caption class="tg-sr-only">Recent status publication attempts</caption>
-          <thead><tr><th>Attempted</th><th>Repository</th><th>PR / branch</th><th>Head SHA</th><th>State</th><th>Mode</th><th>Result</th><th>Description / error</th></tr></thead>
-          <tbody>
-          {{ range .Attempts }}
-            <tr>
-              <td data-label="Attempted">{{ .AttemptedAt }}</td>
-              <td data-label="Repository">{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Attempt.RepositoryID }}{{ end }}</td>
-              <td data-label="PR / branch">#{{ .Attempt.PullRequestIndex }}<small class="tg-muted">{{ .Attempt.TargetBranch }}</small></td>
-              <td data-label="Head SHA"><code>{{ .Attempt.HeadSHA }}</code><small class="tg-muted">{{ .Attempt.Context }}</small></td>
-              <td data-label="State"><span class="status status-{{ .Attempt.State }}">{{ .Attempt.State }}</span></td>
-              <td data-label="Mode"><code>{{ .Attempt.Mode }}</code></td>
-              <td data-label="Result"><span class="status status-{{ if eq .Attempt.Result "posted" }}ok{{ else }}failed{{ end }}">{{ .Attempt.Result }}</span></td>
-              <td data-label="Description / error">{{ .Attempt.Description }}{{ if .Attempt.Error }}<small class="tg-muted">{{ .Attempt.Error }}</small>{{ end }}</td>
-            </tr>
-          {{ end }}
-          </tbody>
-        </table>
-      </div>
-      <div class="tg-mobile-card-list" aria-label="Recent publication attempts mobile cards">
-        {{ range .Attempts }}
-        <article class="tg-mobile-card">
-          <div class="tg-mobile-card-head">
-            <div><span class="tg-mobile-card-kicker">{{ .AttemptedAt }}</span><h3>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Attempt.RepositoryID }}{{ end }}</h3></div>
-            <span class="status status-{{ if eq .Attempt.Result "posted" }}ok{{ else }}failed{{ end }}">{{ .Attempt.Result }}</span>
-          </div>
-          <p class="tg-mobile-card-meta">PR #{{ .Attempt.PullRequestIndex }}<span class="tg-dot">·</span>{{ .Attempt.TargetBranch }}<span class="tg-dot">·</span><code>{{ .Attempt.HeadSHA }}</code></p>
-          <dl class="tg-mobile-card-grid">
-            <div><dt>Context</dt><dd><code>{{ .Attempt.Context }}</code></dd></div>
-            <div><dt>State</dt><dd>{{ .Attempt.State }}</dd></div>
-            <div><dt>Mode</dt><dd><code>{{ .Attempt.Mode }}</code></dd></div>
-          </dl>
-          <p class="tg-mobile-card-detail">{{ .Attempt.Description }}{{ if .Attempt.Error }} — {{ .Attempt.Error }}{{ end }}</p>
-        </article>
-        {{ end }}
-      </div>
-      {{ else }}
-        <div class="tg-empty-row tg-data-empty"><strong>No publication attempts yet</strong><span>Posted or failed forge deliveries will appear here after status publication begins.</span></div>
       {{ end }}
     </section>
   </main>` + pageFoot

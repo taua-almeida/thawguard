@@ -1,0 +1,28 @@
+{{/*
+  components/publications-live — the swappable /publications region: both
+  page callouts, the shared repository filter, and the two diagnostics
+  tables. Filter chips, pager links, and the repository select hx-get swap
+  this whole region; the repository filter applies to both tables at once
+  and resets both pages.
+*/}}
+{{ define "components/publications-live" }}
+<div id="publications-live" class="flex flex-col gap-6">
+  {{ template "ui/callout" dict "Tone" "warning" "Body" "Thawguard prevents accidental merges for trusted teams; collaborators with sufficient forge permissions can still bypass cooperative enforcement." }}
+  {{ template "ui/callout" dict "Tone" "info" "Body" "Publication errors are sanitized before storage. Raw forge response bodies, tokens, passwords, and session IDs are not rendered." }}
+  {{ if .FilterRepositories }}
+  <form method="get" action="/publications" class="flex flex-wrap items-center gap-2" aria-label="Filter both tables by repository">
+    <input type="hidden" name="dstate" value="{{ .Query.DesiredState }}">
+    <input type="hidden" name="aresult" value="{{ .Query.AttemptResult }}">
+    <label for="publications-repo-filter" class="text-sm text-text-muted">Repository</label>
+    <select id="publications-repo-filter" name="repo" hx-get="/publications" hx-trigger="change" hx-target="#publications-live" hx-swap="outerHTML" hx-push-url="true" hx-include="closest form"
+      class="h-8 rounded-control border border-border-input bg-surface px-2 text-xs text-text">
+      <option value="0">All repositories</option>
+      {{ range .FilterRepositories }}<option value="{{ .ID }}"{{ if eq .ID $.Query.RepositoryID }} selected{{ end }}>{{ .FullName }}</option>{{ end }}
+    </select>
+    <noscript>{{ template "ui/button" dict "Label" "Filter" "Variant" "secondary" "Size" "sm" "Type" "submit" }}</noscript>
+  </form>
+  {{ end }}
+  {{ template "components/publications-desired" . }}
+  {{ template "components/publications-attempts" . }}
+</div>
+{{ end }}

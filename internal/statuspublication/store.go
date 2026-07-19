@@ -165,6 +165,72 @@ LIMIT ?`, limit)
 	return publications, nil
 }
 
+// ListPage returns one newest-first page of publication intents plus the total
+// count matching the same filters. An empty state or zero repositoryID leaves
+// that filter off; an unknown state simply matches nothing.
+func (s *Store) ListPage(ctx context.Context, state string, repositoryID int64, offset, limit int) ([]Publication, int, error) {
+	if s == nil || s.db == nil {
+		return nil, 0, errors.New("status publication store has no database")
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	where, filterArgs := publicationPageFilter("state", state, repositoryID)
+
+	var total int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM status_publication_intents "+where, filterArgs...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count status publication intents: %w", err)
+	}
+
+	args := append(append([]any{}, filterArgs...), limit, offset)
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, status_result_id, repository_id, pull_request_index, target_branch, head_sha, context, state, description, target_url, delivery_mode, created_at, updated_at
+FROM status_publication_intents
+`+where+`
+ORDER BY updated_at DESC, id DESC
+LIMIT ? OFFSET ?`, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list status publication intents page: %w", err)
+	}
+	defer rows.Close()
+
+	publications := make([]Publication, 0)
+	for rows.Next() {
+		publication, err := scanPublication(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		publications = append(publications, publication)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("list status publication intents page rows: %w", err)
+	}
+	return publications, total, nil
+}
+
+// publicationPageFilter builds the shared WHERE clause for the paged list
+// queries: an optional exact match on one text column plus an optional
+// repository scope.
+func publicationPageFilter(column, value string, repositoryID int64) (string, []any) {
+	conditions := make([]string, 0, 2)
+	args := make([]any, 0, 2)
+	if value != "" {
+		conditions = append(conditions, column+" = ?")
+		args = append(args, value)
+	}
+	if repositoryID > 0 {
+		conditions = append(conditions, "repository_id = ?")
+		args = append(args, repositoryID)
+	}
+	if len(conditions) == 0 {
+		return "", nil
+	}
+	return "WHERE " + strings.Join(conditions, " AND "), args
+}
+
 func (s *Store) RecordForgejoStatusAttempt(ctx context.Context, publication Publication, result string, errorMessage string) (Attempt, error) {
 	return s.recordAttempt(ctx, publication, AttemptModeForgejoStatus, result, errorMessage)
 }
@@ -236,6 +302,53 @@ LIMIT ?`, limit)
 		return nil, fmt.Errorf("list status publication attempts rows: %w", err)
 	}
 	return attempts, nil
+}
+
+// ListAttemptsPage returns one newest-first page of delivery attempts plus the
+// total count matching the same filters. An empty result or zero repositoryID
+// leaves that filter off; historical results from removed modes stay reachable
+// through the unfiltered view.
+func (s *Store) ListAttemptsPage(ctx context.Context, result string, repositoryID int64, offset, limit int) ([]Attempt, int, error) {
+	if s == nil || s.db == nil {
+		return nil, 0, errors.New("status publication store has no database")
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	where, filterArgs := publicationPageFilter("result", result, repositoryID)
+
+	var total int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM status_publication_attempts "+where, filterArgs...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count status publication attempts: %w", err)
+	}
+
+	args := append(append([]any{}, filterArgs...), limit, offset)
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, publication_id, status_result_id, repository_id, pull_request_index, target_branch, head_sha, context, state, description, target_url, mode, result, error, attempted_at
+FROM status_publication_attempts
+`+where+`
+ORDER BY attempted_at DESC, id DESC
+LIMIT ? OFFSET ?`, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list status publication attempts page: %w", err)
+	}
+	defer rows.Close()
+
+	attempts := make([]Attempt, 0)
+	for rows.Next() {
+		attempt, err := scanAttempt(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		attempts = append(attempts, attempt)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("list status publication attempts page rows: %w", err)
+	}
+	return attempts, total, nil
 }
 
 func (s *Store) getByIdempotencyKey(ctx context.Context, publication Publication) (Publication, error) {
