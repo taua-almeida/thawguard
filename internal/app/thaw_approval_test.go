@@ -474,6 +474,10 @@ func (r *thawApprovalTestStatusRunner) ListRecent(context.Context, int) ([]statu
 	return nil, nil
 }
 
+func (r *thawApprovalTestStatusRunner) ListDecisionsPage(context.Context, domain.CommitStatusState, int64, int, int) ([]statusresult.Result, int, error) {
+	return nil, 0, nil
+}
+
 func (r *thawApprovalTestStatusRunner) RunForSharedHead(_ context.Context, prs []domain.PullRequest, preferredIndex int) (statusresult.Result, error) {
 	r.calls++
 	if r.order != nil {

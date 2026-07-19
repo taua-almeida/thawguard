@@ -1,0 +1,50 @@
+{{/*
+  components/thaw-eligibility — the #thaw-eligibility swap region in the
+  decisions aside, mirroring components/freeze-impact. Dot is a
+  *thawEligibilityView (nil renders the prompt). Reads only the
+  webhook-synced cache; the caveat line says so on every state because
+  approval always re-checks the forge.
+*/}}
+{{ define "components/thaw-eligibility" }}
+<div id="thaw-eligibility" class="flex flex-col gap-3">
+  {{ if or (not .) (eq .State "prompt") }}
+  <p class="m-0 text-sm text-text-muted">Pick a repository and enter a pull request number to preview what an approval would affect.</p>
+  {{ else if eq .State "found" }}
+  <p class="m-0 flex flex-wrap items-center gap-2 font-mono text-xs text-text">
+    <svg class="h-4 w-4 flex-none text-text-muted" aria-hidden="true"><use href="#tg-i-git-branch"></use></svg>
+    <code data-preview-repository>{{ .RepositoryLabel }}</code>
+    <span class="text-text-muted" aria-hidden="true">·</span>
+    <code>#{{ .PullRequestIndex }}</code>
+  </p>
+  <p class="m-0 flex min-w-0 items-center gap-2 text-sm text-text">
+    <span class="min-w-0 flex-1 truncate" title="{{ .Title }}">{{ .Title }}</span>
+    {{ if .URL }}<a href="{{ .URL }}" target="_blank" rel="noopener noreferrer" class="flex-none text-text-muted transition-colors hover:text-accent-strong" aria-label="Open pull request #{{ .PullRequestIndex }} on the forge (new tab)"><svg class="h-3.5 w-3.5" aria-hidden="true"><use href="#tg-i-external-link"></use></svg></a>{{ end }}
+  </p>
+  {{ if .TargetFrozen }}
+  <div>{{ template "ui/badge" dict "Label" (printf "%s is frozen — thaw required" .TargetBranch) "Tone" "frozen" "Icon" "tg-i-lock" }}</div>
+  {{ else }}
+  <p class="m-0 text-xs text-text-muted"><code class="font-mono">{{ .TargetBranch }}</code> is not frozen — approval would be rejected (no thaw needed).</p>
+  {{ end }}
+  {{ if .Companions }}
+  <div class="flex flex-col gap-2">
+    <p class="m-0 text-sm font-semibold text-warning">Shares head <code class="font-mono text-xs">{{ .ShortHeadSHA }}</code> with {{ len .Companions }} other open pull request{{ if ne (len .Companions) 1 }}s{{ end }}:</p>
+    <ul class="m-0 flex list-none flex-col gap-2 p-0">
+      {{ range .Companions }}
+      <li class="flex min-w-0 items-center gap-2 text-sm">
+        <code class="flex-none font-mono text-xs text-text-muted">#{{ .Index }}</code>
+        <span class="min-w-0 flex-1 truncate text-text" title="{{ .Title }}">{{ .Title }}</span>
+        {{ if .URL }}<a href="{{ .URL }}" target="_blank" rel="noopener noreferrer" class="flex-none text-text-muted transition-colors hover:text-accent-strong" aria-label="Open pull request #{{ .Index }} on the forge (new tab)"><svg class="h-3.5 w-3.5" aria-hidden="true"><use href="#tg-i-external-link"></use></svg></a>{{ end }}
+      </li>
+      {{ end }}
+    </ul>
+    <p class="m-0 text-xs text-text-muted">Approval will pause for an explicit all-PRs confirmation.</p>
+  </div>
+  {{ else }}
+  <p class="m-0 text-xs text-text-muted">No other open pull request shares this head commit.</p>
+  {{ end }}
+  {{ else }}
+  <p class="m-0 text-sm text-text">#{{ .PullRequestIndex }} isn't in the webhook-synced cache yet. Approval fetches the live pull request from the forge, so it may simply be newer than the last sync.</p>
+  {{ end }}
+  <p class="m-0 text-xs text-text-muted">From webhook sync, not a live forge lookup. Approval always re-checks the forge.</p>
+</div>
+{{ end }}

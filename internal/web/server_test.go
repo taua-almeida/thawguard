@@ -1985,7 +1985,7 @@ func TestDecisionsPageShowsFormAndRecentResults(t *testing.T) {
 	if token := csrfTokenFromBody(t, body); token == "" {
 		t.Fatal("expected CSRF token in decision form")
 	}
-	for _, want := range []string{"Thaw Requests", "Approve a thaw exception", "Auditable exceptions", "current forge head SHA", "taua-almeida/thawguard", "Target branch", "main", "thawguard/freeze", "Blocked", "Branch is frozen", "2026-06-29 16:30 UTC"} {
+	for _, want := range []string{"Thaw Requests", "Approve a thaw exception", "Approve auditable exceptions", "current forge head commit", "taua-almeida/thawguard", "Target branch", "main", "thawguard/freeze", "Freeze decisions", "Eligibility preview", "Blocked", "Branch is frozen", "2026-06-29 16:30 UTC"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
@@ -2000,6 +2000,199 @@ func TestDecisionsPageRequiresStatusDecisionStore(t *testing.T) {
 
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected service unavailable status, got %d", recorder.Code)
+	}
+}
+
+func newThawEligibilityTestServer(pullRequests []domain.PullRequest, freezes []domain.BranchFreeze) *Server {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
+	return NewServer(Config{
+		AppName:          "Thawguard",
+		RepositoryStore:  &fakeRepositoryStore{repositories: []domain.Repository{repo}},
+		FreezeStore:      &fakeFreezeStore{freezes: freezes},
+		PullRequestStore: &fakePullRequestStore{pullRequests: pullRequests},
+	})
+}
+
+func TestThawEligibilityFragmentShowsFrozenTargetAndCompanions(t *testing.T) {
+	sharedHead := "f00dfeed00c0ffee1122334455667788990011aa"
+	server := newThawEligibilityTestServer(
+		[]domain.PullRequest{
+			{ID: 100, RepositoryID: 1, Index: 241, State: "open", TargetBranch: "main", HeadSHA: sharedHead, Title: "Fix retry backoff for status publication", URL: "https://forge.example.test/taua-almeida/thawguard/pulls/241"},
+			{ID: 101, RepositoryID: 1, Index: 238, State: "open", TargetBranch: "release/1.8", HeadSHA: sharedHead, Title: "Backport retry backoff fix", URL: "https://forge.example.test/taua-almeida/thawguard/pulls/238"},
+		},
+		[]domain.BranchFreeze{{ID: 5, RepositoryID: 1, Branch: "main", Status: domain.BranchFreezeStatusActive, Active: true}},
+	)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/decisions/eligibility?repository_id=1&pull_request_index=241", nil)
+	request.Header.Set("HX-Request", "true")
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	if vary := recorder.Header().Get("Vary"); !strings.Contains(vary, "HX-Request") {
+		t.Fatalf("expected Vary to include HX-Request, got %q", vary)
+	}
+	body := recorder.Body.String()
+	if strings.Contains(body, "<!doctype html>") {
+		t.Fatalf("expected fragment without page shell, got %q", body)
+	}
+	for _, want := range []string{
+		`id="thaw-eligibility"`,
+		"taua-almeida/thawguard",
+		"#241",
+		"Fix retry backoff for status publication",
+		"main is frozen — thaw required",
+		"Shares head",
+		"f00dfeed00",
+		"#238",
+		"Backport retry backoff fix",
+		"Approval will pause for an explicit all-PRs confirmation.",
+		"From webhook sync, not a live forge lookup.",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected eligibility fragment to contain %q, got %q", want, body)
+		}
+	}
+}
+
+func TestThawEligibilityFragmentShowsNotFrozenWithoutCompanions(t *testing.T) {
+	server := newThawEligibilityTestServer(
+		[]domain.PullRequest{{ID: 100, RepositoryID: 1, Index: 241, State: "open", TargetBranch: "main", HeadSHA: "f00dfeed00c0ffee1122334455667788990011aa", Title: "Fix retry backoff for status publication"}},
+		nil,
+	)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/decisions/eligibility?repository_id=1&pull_request_index=241", nil)
+	request.Header.Set("HX-Request", "true")
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{
+		"is not frozen — approval would be rejected (no thaw needed).",
+		"No other open pull request shares this head commit.",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected eligibility fragment to contain %q, got %q", want, body)
+		}
+	}
+	if strings.Contains(body, "thaw required") {
+		t.Fatalf("expected no frozen badge for unfrozen branch, got %q", body)
+	}
+}
+
+func TestThawEligibilityFragmentShowsCacheMissForUnknownIndex(t *testing.T) {
+	server := newThawEligibilityTestServer(nil, nil)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/decisions/eligibility?repository_id=1&pull_request_index=977", nil)
+	request.Header.Set("HX-Request", "true")
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{"#977", "in the webhook-synced cache yet", "Approval fetches the live pull request from the forge"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected cache-miss fragment to contain %q, got %q", want, body)
+		}
+	}
+}
+
+func TestThawEligibilityFragmentPromptsWhenIncomplete(t *testing.T) {
+	server := newThawEligibilityTestServer(nil, nil)
+
+	for _, query := range []string{"", "?repository_id=1", "?pull_request_index=241", "?repository_id=99&pull_request_index=241", "?repository_id=abc&pull_request_index=-3"} {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/decisions/eligibility"+query, nil)
+		request.Header.Set("HX-Request", "true")
+		server.Routes().ServeHTTP(recorder, request)
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("expected status 200 for query %q, got %d", query, recorder.Code)
+		}
+		if body := recorder.Body.String(); !strings.Contains(body, "Pick a repository and enter a pull request number") {
+			t.Fatalf("expected prompt state for query %q, got %q", query, body)
+		}
+	}
+}
+
+func TestDecisionsTableFiltersAndPaginates(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
+	other := domain.Repository{ID: 2, Owner: "taua-almeida", Name: "frost-api", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
+	createdAt := time.Date(2026, 6, 29, 16, 30, 0, 0, time.UTC)
+	var results []statusresult.Result
+	for i := range 25 {
+		results = append(results, statusresult.Result{ID: int64(i + 1), RepositoryID: repo.ID, PullRequestIndex: 101 + i, TargetBranch: "main", HeadSHA: "abc123", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "Branch is frozen; merge is blocked by Thawguard", CreatedAt: createdAt})
+	}
+	results = append(results, statusresult.Result{ID: 90, RepositoryID: other.ID, PullRequestIndex: 900, TargetBranch: "main", HeadSHA: "def456", Context: domain.RequiredStatusContext, State: domain.CommitStatusSuccess, CreatedAt: createdAt})
+	server := NewServer(Config{
+		AppName:             "Thawguard",
+		RepositoryStore:     &fakeRepositoryStore{repositories: []domain.Repository{repo, other}},
+		StatusDecisionStore: &fakeStatusDecisionStore{results: results},
+	})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/decisions?state=blocked&repo=1&page=2", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{"Showing 21–25 of 25 decisions", "#121", "#125", `hx-push-url="true"`, "25 decisions"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected filtered page 2 to contain %q, got %q", want, body)
+		}
+	}
+	for _, unwanted := range []string{"#101", "#900"} {
+		if strings.Contains(body, unwanted) {
+			t.Fatalf("expected filtered page 2 to omit %q", unwanted)
+		}
+	}
+
+	recorder = httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/decisions?state=blocked&repo=1&page=99", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200 for out-of-range page, got %d", recorder.Code)
+	}
+	if body := recorder.Body.String(); !strings.Contains(body, "Showing 21–25 of 25 decisions") {
+		t.Fatalf("expected out-of-range page to clamp to the last page, got %q", body)
+	}
+
+	recorder = httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/decisions?state=blocked&repo=1&page=2", nil)
+	request.Header.Set("HX-Request", "true")
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200 for HX request, got %d", recorder.Code)
+	}
+	fragment := recorder.Body.String()
+	if strings.Contains(fragment, "<!doctype html>") {
+		t.Fatalf("expected fragment without page shell, got %q", fragment)
+	}
+	if !strings.Contains(fragment, `id="decisions-live"`) || !strings.Contains(fragment, "#121") {
+		t.Fatalf("expected fragment to swap #decisions-live with the filtered rows, got %q", fragment)
+	}
+}
+
+func TestThawEligibilityRedirectsNonHXRequestsToDecisions(t *testing.T) {
+	server := newThawEligibilityTestServer(nil, nil)
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/decisions/eligibility?repository_id=1&pull_request_index=241", nil))
+
+	if recorder.Code != http.StatusSeeOther {
+		t.Fatalf("expected status 303, got %d", recorder.Code)
+	}
+	if location := recorder.Header().Get("Location"); location != "/decisions" {
+		t.Fatalf("expected redirect to /decisions, got %q", location)
+	}
+	if vary := recorder.Header().Get("Vary"); !strings.Contains(vary, "HX-Request") {
+		t.Fatalf("expected Vary to include HX-Request, got %q", vary)
 	}
 }
 
@@ -2191,24 +2384,6 @@ func TestCreateDecisionSharedHeadConfirmationEscapesTitles(t *testing.T) {
 	}
 	if !strings.Contains(body, "&lt;script&gt;") {
 		t.Fatalf("expected escaped PR title in body, got %q", body)
-	}
-}
-
-func TestRenderDecisionsSharedHeadReadOnlyUserGetsNoConfirmationForm(t *testing.T) {
-	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
-	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, StatusDecisionStore: &fakeStatusDecisionStore{}})
-	confirmation := sharedHeadConfirmationViewFrom(sharedHeadOutcome("Release fix", "Other fix"), repo.ID, 42, "main", "production fix")
-	session := sessionState{CSRFToken: "viewer-token", Roles: auth.RoleSet{auth.RoleAdmin}}
-
-	recorder := httptest.NewRecorder()
-	server.renderDecisions(recorder, []domain.Repository{repo}, nil, "", session, confirmation)
-
-	body := recorder.Body.String()
-	if !strings.Contains(body, "These pull requests share one commit SHA") {
-		t.Fatalf("expected read-only user to still see the shared-head warning, got %q", body)
-	}
-	if strings.Contains(body, `name="confirm_shared_head"`) || strings.Contains(body, "Approve thaw for all") {
-		t.Fatal("expected no actionable confirmation form for read-only thaw access")
 	}
 }
 
@@ -3494,6 +3669,31 @@ func (s *fakeStatusDecisionStore) ListRecent(ctx context.Context, limit int) ([]
 	return s.results, nil
 }
 
+func (s *fakeStatusDecisionStore) ListDecisionsPage(ctx context.Context, state domain.CommitStatusState, repositoryID int64, offset, limit int) ([]statusresult.Result, int, error) {
+	if s.listErr != nil {
+		return nil, 0, s.listErr
+	}
+	var matched []statusresult.Result
+	for _, result := range s.results {
+		if state != "" && result.State != state {
+			continue
+		}
+		if repositoryID > 0 && result.RepositoryID != repositoryID {
+			continue
+		}
+		matched = append(matched, result)
+	}
+	total := len(matched)
+	if offset >= total {
+		return []statusresult.Result{}, total, nil
+	}
+	matched = matched[offset:]
+	if limit > 0 && len(matched) > limit {
+		matched = matched[:limit]
+	}
+	return matched, total, nil
+}
+
 func (s *fakeStatusDecisionStore) ApproveThaw(ctx context.Context, params statusresult.ThawApprovalParams, actor domain.Actor) (statusresult.ThawApprovalOutcome, error) {
 	if s.err != nil {
 		return statusresult.ThawApprovalOutcome{}, s.err
@@ -3571,6 +3771,32 @@ func (s *fakePullRequestStore) ListOpenByTargetBranch(ctx context.Context, repos
 	var matched []domain.PullRequest
 	for _, pr := range s.pullRequests {
 		if pr.RepositoryID == repositoryID && pr.TargetBranch == targetBranch && pr.IsOpen() {
+			matched = append(matched, pr)
+		}
+	}
+	return matched, nil
+}
+
+func (s *fakePullRequestStore) Get(ctx context.Context, repositoryID int64, index int) (domain.PullRequest, error) {
+	if s.err != nil {
+		return domain.PullRequest{}, s.err
+	}
+	for _, pr := range s.pullRequests {
+		if pr.RepositoryID == repositoryID && pr.Index == index {
+			return pr, nil
+		}
+	}
+	return domain.PullRequest{}, fmt.Errorf("scan pull request cache: %w", sql.ErrNoRows)
+}
+
+func (s *fakePullRequestStore) ListOpenByHead(ctx context.Context, repositoryID int64, headSHA string) ([]domain.PullRequest, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	headSHA = strings.ToLower(strings.TrimSpace(headSHA))
+	var matched []domain.PullRequest
+	for _, pr := range s.pullRequests {
+		if pr.RepositoryID == repositoryID && strings.ToLower(pr.HeadSHA) == headSHA && pr.IsOpen() {
 			matched = append(matched, pr)
 		}
 	}

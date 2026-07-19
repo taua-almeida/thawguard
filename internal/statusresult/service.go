@@ -239,6 +239,13 @@ func (s *Service) ListRecent(ctx context.Context, limit int) ([]Result, error) {
 	return s.store.ListRecent(ctx, limit)
 }
 
+func (s *Service) ListDecisionsPage(ctx context.Context, state domain.CommitStatusState, repositoryID int64, offset, limit int) ([]Result, int, error) {
+	if s == nil || s.store == nil {
+		return nil, 0, errors.New("status result service has no store")
+	}
+	return s.store.ListDecisionsPage(ctx, state, repositoryID, offset, limit)
+}
+
 func (s *Service) activeFreeze(ctx context.Context, repositoryID int64, targetBranch string) (*domain.BranchFreeze, error) {
 	if s.freezes == nil {
 		return nil, nil

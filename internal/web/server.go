@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"html/template"
 	"io"
 	"net/http"
@@ -119,6 +120,10 @@ type SetupCheckRunner interface {
 // freeze-impact preview. It is a local lookup, never a live forge call.
 type PullRequestStore interface {
 	ListOpenByTargetBranch(ctx context.Context, repositoryID int64, targetBranch string) ([]domain.PullRequest, error)
+	// Get and ListOpenByHead read the webhook-synced local cache, never the
+	// live forge; the eligibility preview depends on that.
+	Get(ctx context.Context, repositoryID int64, index int) (domain.PullRequest, error)
+	ListOpenByHead(ctx context.Context, repositoryID int64, headSHA string) ([]domain.PullRequest, error)
 }
 
 type FreezeStore interface {
@@ -147,6 +152,7 @@ type ThawExceptionStore interface {
 
 type StatusDecisionStore interface {
 	ListRecent(ctx context.Context, limit int) ([]statusresult.Result, error)
+	ListDecisionsPage(ctx context.Context, state domain.CommitStatusState, repositoryID int64, offset, limit int) ([]statusresult.Result, int, error)
 	ApproveThaw(ctx context.Context, params statusresult.ThawApprovalParams, actor domain.Actor) (statusresult.ThawApprovalOutcome, error)
 }
 
@@ -225,12 +231,6 @@ type scheduledFreezePageState struct {
 	EditReason        string
 	EditStartsAt      string
 	EditPlannedEndsAt string
-}
-
-type statusResultView struct {
-	Result     statusresult.Result
-	Repository domain.Repository
-	CreatedAt  string
 }
 
 type statusPublicationView struct {
@@ -408,6 +408,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /scheduled-freezes/start-now", s.handleStartScheduledFreezeNow)
 	s.mux.HandleFunc("POST /scheduled-freezes/cancel", s.handleCancelScheduledFreeze)
 	s.mux.HandleFunc("GET /decisions", s.handleDecisions)
+	s.mux.HandleFunc("GET /decisions/eligibility", s.handleThawEligibility)
 	s.mux.HandleFunc("POST /decisions", s.handleCreateDecision)
 	s.mux.HandleFunc("GET /activity", s.handleActivity)
 	s.mux.HandleFunc("GET /publications", s.handlePublications)
@@ -428,6 +429,7 @@ func (s *Server) routes() {
 		s.mux.HandleFunc("GET /dev/preview/repositories", s.handleDevPreviewRepositories)
 		s.mux.HandleFunc("GET /dev/preview/freezes", s.handleDevPreviewFreezes)
 		s.mux.HandleFunc("GET /dev/preview/dashboard", s.handleDevPreviewDashboard)
+		s.mux.HandleFunc("GET /dev/preview/decisions", s.handleDevPreviewDecisions)
 	}
 }
 
@@ -592,6 +594,8 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDecisions(w http.ResponseWriter, r *http.Request) {
+	// The same URL serves the full page and the #decisions-live fragment.
+	w.Header().Add("Vary", "HX-Request")
 	if s.cfg.StatusDecisionStore == nil {
 		http.Error(w, "status decision store is not configured", http.StatusServiceUnavailable)
 		return
@@ -600,15 +604,24 @@ func (s *Server) handleDecisions(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	repositories, results, err := s.decisionPageData(r.Context())
-	if err != nil {
-		internalServerError(w)
+	state := decisionsPageState{Query: decisionsQueryFromValues(r.URL.Query())}
+	switch r.URL.Query().Get("notice") {
+	case "thaw-approved":
+		state.Notice = "Thaw approved."
+	case "thaw-approved-shared":
+		state.Notice = "Thaw approved for all pull requests sharing the confirmed head commit."
+	}
+	if isHXRequest(r) {
+		// Filter chips, the repository filter, and pagination links enhance to
+		// hx-get swaps of the live region; the full page handles everything else.
+		s.renderDecisionsFragment(w, r, http.StatusOK, state, session, nil)
 		return
 	}
-	s.renderDecisions(w, repositories, s.statusResultViews(repositories, results), "", session)
+	s.renderDecisionsPage(w, r, http.StatusOK, state, session)
 }
 
 func (s *Server) handleCreateDecision(w http.ResponseWriter, r *http.Request) {
+	w.Header().Add("Vary", "HX-Request")
 	if s.cfg.StatusDecisionStore == nil {
 		http.Error(w, "status decision store is not configured", http.StatusServiceUnavailable)
 		return
@@ -617,50 +630,80 @@ func (s *Server) handleCreateDecision(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	repositoryID, err := strconv.ParseInt(strings.TrimSpace(r.PostFormValue("repository_id")), 10, 64)
-	if err != nil {
-		repositoryID = 0
-	}
-	pullRequestIndex, err := strconv.Atoi(strings.TrimSpace(r.PostFormValue("pull_request_index")))
+	query := decisionsQueryFromValues(r.PostForm)
+	form := decisionFormStateFromRequest(r)
+	pullRequestIndex, err := strconv.Atoi(form.PullRequestIndex)
 	if err != nil {
 		pullRequestIndex = 0
 	}
+	confirmation := thawApprovalConfirmationFromForm(r)
 	outcome, err := s.cfg.StatusDecisionStore.ApproveThaw(r.Context(), statusresult.ThawApprovalParams{
-		RepositoryID:     repositoryID,
+		RepositoryID:     form.RepositoryID,
 		PullRequestIndex: pullRequestIndex,
 		TargetBranch:     r.PostFormValue("target_branch"),
 		HeadSHA:          r.PostFormValue("head_sha"),
 		Reason:           r.PostFormValue("reason"),
-		Confirmation:     thawApprovalConfirmationFromForm(r),
+		Confirmation:     confirmation,
 	}, session.auditActor())
 	if err != nil {
 		if !statusresult.IsValidationError(err) {
 			internalServerError(w)
 			return
 		}
-		repositories, results, dataErr := s.decisionPageData(r.Context())
-		if dataErr != nil {
-			internalServerError(w)
+		state := decisionsPageState{FormError: err.Error(), DecisionForm: form, Query: query}
+		if isHXRequest(r) {
+			// main.js only swaps 2xx/5xx (plus the shared-head 409), so validation
+			// errors come back as 200 fragments re-rendering the live region with
+			// the error and the submitted values preserved.
+			s.renderDecisionsFragment(w, r, http.StatusOK, state, session, nil)
 			return
 		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusBadRequest)
-		s.renderDecisions(w, repositories, s.statusResultViews(repositories, results), err.Error(), session)
+		s.renderDecisionsPage(w, r, http.StatusBadRequest, state, session)
 		return
 	}
 	if outcome.ConfirmationRequired {
-		repositories, results, dataErr := s.decisionPageData(r.Context())
-		if dataErr != nil {
-			internalServerError(w)
+		view := sharedHeadConfirmationViewFrom(outcome, form.RepositoryID, pullRequestIndex, strings.TrimSpace(r.PostFormValue("target_branch")), strings.TrimSpace(r.PostFormValue("reason")))
+		// ApproveThaw re-checks the shared head on every attempt and never
+		// trusts a stale confirmation, so a posted confirmation landing back
+		// here means the forge state changed since the approver last saw the
+		// affected set.
+		view.Stale = confirmation != nil
+		state := decisionsPageState{DecisionForm: form, Query: query, Confirmation: &view}
+		if isHXRequest(r) {
+			s.renderDecisionsFragment(w, r, http.StatusConflict, state, session, nil)
 			return
 		}
-		confirmation := sharedHeadConfirmationViewFrom(outcome, repositoryID, pullRequestIndex, strings.TrimSpace(r.PostFormValue("target_branch")), strings.TrimSpace(r.PostFormValue("reason")))
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusConflict)
-		s.renderDecisions(w, repositories, s.statusResultViews(repositories, results), "", session, confirmation)
+		s.renderDecisionsPage(w, r, http.StatusConflict, state, session)
 		return
 	}
-	http.Redirect(w, r, "/decisions", http.StatusSeeOther)
+	if isHXRequest(r) {
+		toast := s.decisionApprovalToast(r.Context(), form.RepositoryID, pullRequestIndex, confirmation)
+		s.renderDecisionsFragment(w, r, http.StatusOK, decisionsPageState{Query: query}, session, &toast)
+		return
+	}
+	notice := "thaw-approved"
+	if confirmation != nil {
+		notice = "thaw-approved-shared"
+	}
+	http.Redirect(w, r, decisionsNoticeURL(query, notice), http.StatusSeeOther)
+}
+
+// decisionApprovalToast phrases the success toast. Approval defers status
+// publication to convergence, so the copy never claims a status was published.
+// On a confirmed shared-head approval the affected count is recomputed from
+// the webhook cache ApproveThaw just re-synced; if that lookup is unavailable
+// the toast falls back to a countless phrasing rather than guessing.
+func (s *Server) decisionApprovalToast(ctx context.Context, repositoryID int64, pullRequestIndex int, confirmation *statusresult.ThawApprovalConfirmation) toastView {
+	if confirmation == nil {
+		return toastView{Message: fmt.Sprintf("Thaw approved for pull request #%d.", pullRequestIndex)}
+	}
+	short := shortHeadSHA(confirmation.HeadSHA)
+	if s.cfg.PullRequestStore != nil {
+		if prs, err := s.cfg.PullRequestStore.ListOpenByHead(ctx, repositoryID, confirmation.HeadSHA); err == nil && len(prs) > 1 {
+			return toastView{Message: fmt.Sprintf("Thaw approved for all %d pull requests sharing %s.", len(prs), short)}
+		}
+	}
+	return toastView{Message: fmt.Sprintf("Thaw approved for all pull requests sharing %s.", short)}
 }
 
 func thawApprovalConfirmationFromForm(r *http.Request) *statusresult.ThawApprovalConfirmation {
@@ -675,6 +718,7 @@ type sharedHeadAffectedPullRequestView struct {
 	Title        string
 	TargetBranch string
 	ShortHeadSHA string
+	URL          string
 }
 
 type sharedHeadConfirmationView struct {
@@ -687,6 +731,10 @@ type sharedHeadConfirmationView struct {
 	AffectedSignature    string
 	AffectedCount        int
 	AffectedPullRequests []sharedHeadAffectedPullRequestView
+	// Stale is true when this confirmation replaced one the approver already
+	// posted: the fail-closed re-check found the forge state changed, so the
+	// interstitial flags that the affected set below was refreshed.
+	Stale bool
 }
 
 func sharedHeadConfirmationViewFrom(outcome statusresult.ThawApprovalOutcome, repositoryID int64, pullRequestIndex int, targetBranch, reason string) sharedHeadConfirmationView {
@@ -703,7 +751,7 @@ func sharedHeadConfirmationViewFrom(outcome statusresult.ThawApprovalOutcome, re
 	}
 	view.ShortHeadSHA = shortHeadSHA(view.HeadSHA)
 	for _, pr := range outcome.AffectedPullRequests {
-		view.AffectedPullRequests = append(view.AffectedPullRequests, sharedHeadAffectedPullRequestView{Index: pr.Index, Title: pr.Title, TargetBranch: pr.TargetBranch, ShortHeadSHA: shortHeadSHA(pr.HeadSHA)})
+		view.AffectedPullRequests = append(view.AffectedPullRequests, sharedHeadAffectedPullRequestView{Index: pr.Index, Title: pr.Title, TargetBranch: pr.TargetBranch, ShortHeadSHA: shortHeadSHA(pr.HeadSHA), URL: pr.URL})
 	}
 	return view
 }
@@ -2098,13 +2146,6 @@ func (s *Server) repositories(ctx context.Context) ([]domain.Repository, error) 
 	return s.cfg.RepositoryStore.List(ctx)
 }
 
-func (s *Server) statusResults(ctx context.Context) ([]statusresult.Result, error) {
-	if s.cfg.StatusDecisionStore == nil {
-		return nil, nil
-	}
-	return s.cfg.StatusDecisionStore.ListRecent(ctx, 25)
-}
-
 func (s *Server) statusPublications(ctx context.Context) ([]statuspublication.Publication, error) {
 	if s.cfg.StatusPublicationStore == nil {
 		return nil, nil
@@ -2428,27 +2469,6 @@ func (s *Server) publicationPageData(ctx context.Context) ([]domain.Repository, 
 		return nil, nil, nil, err
 	}
 	return repositories, publications, attempts, nil
-}
-
-func (s *Server) decisionPageData(ctx context.Context) ([]domain.Repository, []statusresult.Result, error) {
-	repositories, err := s.repositories(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	results, err := s.statusResults(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	return repositories, results, nil
-}
-
-func (s *Server) statusResultViews(repositories []domain.Repository, results []statusresult.Result) []statusResultView {
-	repositoriesByID := repositoriesByID(repositories)
-	views := make([]statusResultView, 0, len(results))
-	for _, result := range results {
-		views = append(views, statusResultView{Result: result, Repository: repositoriesByID[result.RepositoryID], CreatedAt: result.CreatedAt.UTC().Format("2006-01-02 15:04 UTC")})
-	}
-	return views
 }
 
 func (s *Server) statusPublicationViews(repositories []domain.Repository, publications []statuspublication.Publication) []statusPublicationView {
@@ -3289,23 +3309,6 @@ func enforcementActiveRepositories(repositories []domain.Repository) []domain.Re
 	return enforceable
 }
 
-func (s *Server) renderDecisions(w http.ResponseWriter, repositories []domain.Repository, results []statusResultView, formError string, session sessionState, confirmations ...sharedHeadConfirmationView) {
-	data := map[string]any{
-		"AppName":                 s.cfg.AppName,
-		"ActivePage":              "thaws",
-		"CurrentUser":             currentUserFromSession(session),
-		"EnforceableRepositories": enforcementActiveRepositories(repositories),
-		"Results":                 results,
-		"FormError":               formError,
-		"CSRFToken":               session.CSRFToken,
-		"RequiredContext":         domain.RequiredStatusContext,
-	}
-	if len(confirmations) > 0 {
-		data["SharedHeadConfirmation"] = confirmations[0]
-	}
-	s.render(w, decisionsTemplate, data)
-}
-
 func (s *Server) renderUsers(w http.ResponseWriter, users []auth.User, state usersPageState, session sessionState) {
 	s.render(w, usersTemplate, map[string]any{
 		"AppName":     s.cfg.AppName,
@@ -4062,211 +4065,3 @@ const publicationsTemplate = pageHead + `
       {{ end }}
     </section>
   </main>` + pageFoot
-
-// branchFilterScript keeps the managed-branch select scoped to the selected
-// repository. Server-side (repository_id, branch) validation stays
-// authoritative when JavaScript is unavailable.
-const branchFilterScript = `
-      const filterBranchOptions = (repo, branch) => {
-        if (!repo || !branch) return;
-        let first = null;
-        for (const option of branch.options) {
-          const match = option.dataset.repository === repo.value;
-          option.hidden = !match;
-          option.disabled = !match;
-          if (match && first === null) first = option;
-        }
-        const selected = branch.options[branch.selectedIndex];
-        if ((!selected || selected.disabled) && first !== null) branch.value = first.value;
-      };`
-
-const decisionsTemplate = pageHead + `
-  <main class="tg-main tg-setup-page tg-thaws-page">
-    <header class="tg-header">
-      <div>
-        <h1 class="tg-title">Thaw Requests</h1>
-        <p class="tg-subtitle">Review exceptions for PRs that need to land during an active branch freeze. Every decision should be auditable — this is cooperative workflow for trusted teams, not a hard security gate.</p>
-      </div>
-      <span class="tg-badge tg-badge-info"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-icy-shield"></use></svg>Auditable exceptions — not a hard security gate</span>
-    </header>
-
-    {{ if .FormError }}<p class="error">{{ .FormError }}</p>{{ end }}
-
-    {{ with .SharedHeadConfirmation }}
-    <section class="tg-panel tg-shared-head-panel" aria-labelledby="tg-shared-head-heading">
-      <div class="tg-panel-head tg-panel-head-stacked">
-        <div class="tg-thaw-panel-title">
-          <span class="tg-thaw-panel-icon tg-shared-head-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-warning"></use></svg></span>
-          <div>
-            <h2 id="tg-shared-head-heading">These pull requests share one commit SHA</h2>
-            <p class="tg-panel-subtitle">Forgejo applies commit statuses to the shared SHA, so approving this thaw will affect every pull request listed below.</p>
-          </div>
-        </div>
-      </div>
-      <p class="tg-warning-callout tg-shared-head-callout"><span aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-warning"></use></svg></span><span>Nothing has been approved yet. Thawguard paused this request before recording any exception or publishing any status for shared head <code>{{ .ShortHeadSHA }}</code>.</span></p>
-      {{ $selected := .PullRequestIndex }}
-      <div class="tg-table-wrap">
-        <table class="tg-data-table tg-shared-head-table">
-          <thead><tr><th>Pull request</th><th>Title</th><th>Target branch</th><th>Head SHA</th></tr></thead>
-          <tbody>
-          {{ range .AffectedPullRequests }}
-            <tr>
-              <td class="tg-shared-head-index">#{{ .Index }}{{ if eq .Index $selected }} <span class="tg-badge tg-badge-info">your selection</span>{{ end }}</td>
-              <td class="tg-shared-head-title">{{ .Title }}</td>
-              <td><code class="tg-branch">{{ .TargetBranch }}</code></td>
-              <td><code>{{ .ShortHeadSHA }}</code></td>
-            </tr>
-          {{ end }}
-          </tbody>
-        </table>
-      </div>
-      {{ if $.CurrentUser.CanThaw }}
-      <form method="post" action="/decisions" class="tg-shared-head-confirm-form">
-        <input type="hidden" name="` + csrfFormField + `" value="{{ $.CSRFToken }}">
-        <input type="hidden" name="repository_id" value="{{ .RepositoryID }}">
-        <input type="hidden" name="pull_request_index" value="{{ .PullRequestIndex }}">
-        <input type="hidden" name="target_branch" value="{{ .TargetBranch }}">
-        <input type="hidden" name="reason" value="{{ .Reason }}">
-        <input type="hidden" name="confirm_shared_head" value="true">
-        <input type="hidden" name="confirmed_head_sha" value="{{ .HeadSHA }}">
-        <input type="hidden" name="confirmed_affected_signature" value="{{ .AffectedSignature }}">
-        <p class="tg-muted">Approving publishes one SHA-scoped <code>{{ $.RequiredContext }}</code> status that applies to all {{ .AffectedCount }} pull requests above. Thawguard refreshes the forge state first; if the head SHA or affected set changed, it asks for confirmation again.</p>
-        <div class="tg-form-actions">
-          <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/decisions">Cancel</a>
-          <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg>Approve thaw for all {{ .AffectedCount }} PRs</button>
-        </div>
-      </form>
-      {{ else }}
-      <div class="tg-empty-row">
-        <strong>Read-only thaw access</strong>
-        <span>Explicit thaw approver role is required to confirm a shared-head thaw.</span>
-      </div>
-      {{ end }}
-    </section>
-    {{ end }}
-
-    <section class="tg-thaw-workbench" aria-label="Approve a thaw exception">
-      <section class="tg-panel tg-thaw-form-panel">
-        <div class="tg-panel-head tg-panel-head-stacked">
-          <div class="tg-thaw-panel-title">
-            <span class="tg-thaw-panel-icon" aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg></span>
-            <div>
-              <h2>Approve a thaw exception</h2>
-              <p class="tg-panel-subtitle">Approve one open PR for its current forge head SHA. Thawguard records the exception, recomputes <code>{{ .RequiredContext }}</code>, and publishes only that status context.</p>
-            </div>
-          </div>
-        </div>
-        {{ if not .CurrentUser.CanThaw }}
-        <div class="tg-empty-row">
-          <strong>Read-only thaw access</strong>
-          <span>Your role can view thaw decisions. Explicit thaw approver role is required to approve exceptions.</span>
-        </div>
-        {{ else if .EnforceableRepositories }}
-        <form method="post" action="/decisions" class="tg-setup-form tg-thaw-form" data-thaw-form>
-          <input type="hidden" name="` + csrfFormField + `" value="{{ .CSRFToken }}">
-          <label>Repository
-            <select name="repository_id" required data-thaw-repository>
-            {{ range .EnforceableRepositories }}<option value="{{ .ID }}">{{ .FullName }}</option>{{ end }}
-            </select>
-          </label>
-          <label>Pull request <input name="pull_request_index" inputmode="numeric" placeholder="251" required data-thaw-pr></label>
-          <label>Target branch <input name="target_branch" placeholder="main" value="main" required data-thaw-branch></label>
-          <label class="tg-field-wide">Reason for exception <input name="reason" placeholder="Production fix needed during release freeze" aria-describedby="thaw-alpha-note" required></label>
-          <label>Exception expires
-            <select name="expires_after" disabled>
-              <option>24 hours after approval</option>
-            </select>
-          </label>
-          <label>Notify channel (optional) <input name="notify_channel" placeholder="#releases" disabled></label>
-          <div class="tg-form-footer tg-thaw-form-footer tg-field-wide">
-            <span id="thaw-alpha-note" class="tg-muted"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-audit"></use></svg>The current head SHA is fetched from the forge at approval time, so new commits invalidate this thaw.</span>
-            <div class="tg-form-actions">
-              <button type="reset" class="tg-btn tg-btn-secondary tg-btn-sm">Reset</button>
-              <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm"><svg class="tg-icon"><use href="#tg-i-thaw-drop"></use></svg>Approve thaw</button>
-            </div>
-          </div>
-        </form>
-        {{ else }}
-        <div class="tg-empty-row">
-          <strong>No repository has active enforcement</strong>
-          <span>Repository enforcement is not active. Complete setup and activate enforcement before approving a thaw exception.</span>
-          <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/repositories">Repository setup</a>
-        </div>
-        {{ end }}
-      </section>
-
-      <aside class="tg-panel tg-eligibility-card">
-        <div class="tg-panel-head tg-panel-head-stacked">
-          <div class="tg-impact-title-row">
-            <h2><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-health-check"></use></svg>Eligibility preview</h2>
-            <span class="tg-badge tg-badge-info">head-SHA scoped</span>
-          </div>
-          <p class="tg-panel-subtitle">How the approval is constrained before the forge status is published.</p>
-        </div>
-        <div class="tg-thaw-freeze-card">
-          <div class="tg-thaw-freeze-main"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-freeze-branch"></use></svg><code data-thaw-preview-repository>Selected repository</code><span class="tg-arrow">→</span><code class="tg-branch" data-thaw-preview-branch>main</code><span class="status status-pending">Preview</span></div>
-          <p>After approval, the latest result below shows the actual <code>{{ .RequiredContext }}</code> decision posted for this PR head.</p>
-        </div>
-        <ul class="tg-eligibility-list">
-          <li><span class="tg-event-ok"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-check"></use></svg></span><span>Repository, PR number, target branch, and reason are captured for the approval.</span></li>
-          <li><span class="tg-event-ok"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-check"></use></svg></span><span>The current PR head SHA is fetched from the configured Forgejo/Codeberg repository.</span></li>
-          <li><span class="tg-event-ok"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-check"></use></svg></span><span>A unique head SHA scopes the approval to this one PR.</span></li>
-          <li><span class="tg-event-fail"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-warning"></use></svg></span><span>If other open PRs share the head SHA, Thawguard pauses and requires explicit confirmation for every affected PR.</span></li>
-        </ul>
-        <div class="tg-review-actions">
-          <span class="tg-caps">Reviewer decision</span>
-          <div>
-            <button type="button" class="tg-btn tg-btn-secondary tg-btn-sm" disabled>Deny</button>
-            <button type="button" class="tg-btn tg-btn-primary tg-btn-sm" disabled><svg class="tg-icon"><use href="#tg-i-check"></use></svg>Approved by form</button>
-          </div>
-        </div>
-      </aside>
-    </section>
-
-    <section class="tg-panel tg-open-thaws-panel">
-      <div class="tg-panel-head"><h2>Thaw approval results</h2><span class="tg-badge tg-badge-info">{{ len .Results }} status results</span></div>
-      {{ if .Results }}
-      <div class="tg-table-wrap">
-        <table class="tg-data-table tg-thaws-table">
-          <thead><tr><th>Request candidate</th><th>Policy result</th><th>Status context</th><th>Expiry</th><th>Status</th><th>Workflow</th></tr></thead>
-          <tbody>
-          {{ range .Results }}
-            <tr>
-              <td><div class="tg-thaw-request-main"><a href="#">#{{ .Result.PullRequestIndex }}</a><span><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-git-branch"></use></svg><code>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else }}Repository #{{ .Result.RepositoryID }}{{ end }}</code><span class="tg-arrow">→</span><code class="tg-branch">{{ .Result.TargetBranch }}</code></span><small><code>{{ .Result.HeadSHA }}</code> · {{ .CreatedAt }}</small></div></td>
-              <td>{{ .Result.Description }}</td>
-              <td><span class="tg-table-repo"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-freeze-branch"></use></svg><code>{{ .Result.Context }}</code></span><small class="tg-muted">{{ if eq .Result.State "failure" }}freeze · failing{{ else }}freeze · passing{{ end }}</small></td>
-              <td><span class="tg-muted">Head SHA scoped</span></td>
-              <td><span class="status status-{{ .Result.State }}">{{ if eq .Result.State "success" }}Eligible{{ else if eq .Result.State "failure" }}Blocked{{ else }}{{ .Result.State }}{{ end }}</span></td>
-              <td class="tg-table-actions"><button type="button" class="tg-btn tg-btn-secondary tg-btn-sm" disabled>Recorded</button></td>
-            </tr>
-          {{ end }}
-          </tbody>
-        </table>
-      </div>
-      {{ else }}
-        <div class="tg-empty-row">
-          <strong>No thaw approvals yet</strong>
-          <span>Approve a PR above to record a head-SHA-scoped thaw and publish the resulting status.</span>
-        </div>
-      {{ end }}
-    </section>
-  </main>
-  <script>
-    (() => {
-      const form = document.querySelector('[data-thaw-form]');
-      if (!form) return;
-      const repo = form.querySelector('[data-thaw-repository]');
-      const branch = form.querySelector('[data-thaw-branch]');
-      const repoOut = document.querySelector('[data-thaw-preview-repository]');
-      const branchOut = document.querySelector('[data-thaw-preview-branch]');
-      const update = () => {
-        if (repoOut && repo) repoOut.textContent = repo.options[repo.selectedIndex]?.textContent?.trim() || 'Selected repository';
-        if (branchOut && branch) branchOut.textContent = branch.value.trim() || 'branch';
-      };
-      repo.addEventListener('change', update);
-      branch.addEventListener('input', update);
-      form.addEventListener('reset', () => window.setTimeout(update, 0));
-      update();
-    })();
-  </script>
-` + pageFoot

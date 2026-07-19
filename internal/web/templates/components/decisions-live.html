@@ -1,0 +1,27 @@
+{{/*
+  components/decisions-live — the swappable /decisions region: approve
+  workbench (or shared-head interstitial) plus the freeze-decisions table.
+  Every htmx mutation and filter/pagination link swaps this whole region, so
+  a state chip clicked while the interstitial is open swaps it away — an
+  implicit cancel; nothing was recorded.
+*/}}
+{{ define "components/decisions-live" }}
+<div id="decisions-live" class="flex flex-col gap-6">
+  {{ if .FormError }}
+  <div role="alert">
+    {{ template "ui/callout" dict "Tone" "danger" "Body" .FormError }}
+  </div>
+  {{ end }}
+  {{ template "components/decisions-workbench" . }}
+  {{ template "components/decisions-table" . }}
+</div>
+{{ end }}
+
+{{/*
+  components/decisions-live-fragment — htmx swap payload: the live region
+  plus an optional out-of-band toast for the shell's #toasts container.
+*/}}
+{{ define "components/decisions-live-fragment" }}
+{{ template "components/decisions-live" .Data }}
+{{ if .Toast }}<div id="toasts" hx-swap-oob="true" class="mb-4 flex flex-col gap-2">{{ template "ui/toast" .Toast }}</div>{{ end }}
+{{ end }}

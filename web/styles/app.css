@@ -32,6 +32,12 @@
 @source "../../internal/web/templates/components/scheduled-live.html";
 @source "../../internal/web/templates/components/scheduled-workbench.html";
 @source "../../internal/web/templates/components/scheduled-windows.html";
+@source "../../internal/web/templates/pages/decisions.html";
+@source "../../internal/web/templates/components/decisions-live.html";
+@source "../../internal/web/templates/components/decisions-workbench.html";
+@source "../../internal/web/templates/components/decisions-shared-head.html";
+@source "../../internal/web/templates/components/decisions-table.html";
+@source "../../internal/web/templates/components/thaw-eligibility.html";
 @source "../../internal/web/templates/pages/dashboard.html";
 @source "../../internal/web/templates/pages/login.html";
 @source "../../internal/web/templates/pages/setup.html";

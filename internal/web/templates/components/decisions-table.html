@@ -1,0 +1,109 @@
+{{/*
+  components/decisions-table — the "Freeze decisions" results table with
+  state chips, a repository filter, and pagination, mirroring
+  components/scheduled-windows. Chips and pager links are plain links
+  enhanced with hx-get swaps of #decisions-live (hx-push-url keeps the URL
+  shareable); the repository select auto-applies on change and falls back to
+  a noscript submit. Badge labels describe merge eligibility under
+  cooperative enforcement, never a hard security guarantee.
+*/}}
+{{ define "components/decisions-table" }}
+<section class="rounded-panel border border-border bg-surface shadow-card" aria-label="Freeze decisions">
+  <div class="border-b border-border px-(--card-spacing) py-4">
+    <div class="flex flex-wrap items-center gap-3">
+      <h2 class="m-0 text-lg font-bold text-text">Freeze decisions</h2>
+      {{ if eq .Total 1 }}{{ template "ui/badge" dict "Label" "1 decision" }}{{ else }}{{ template "ui/badge" dict "Label" (printf "%d decisions" .Total) }}{{ end }}
+      {{ if .Rows }}<span class="ml-auto text-xs text-text-muted" data-timezone-note>Times shown in UTC.</span>{{ end }}
+    </div>
+    <p class="m-0 mt-1 text-sm text-text-muted">Every recorded decision — from webhooks, freeze changes, and thaw approvals — for the <code class="font-mono">{{ .RequiredContext }}</code> context.</p>
+  </div>
+  {{ if or .Total (ne .Filter "all") .Query.RepositoryID }}
+  <div class="flex flex-wrap items-center gap-2 border-b border-border px-(--card-spacing) py-3">
+    {{ range .Chips }}{{ template "ui/chip" dict "Label" .Label "Href" .URL "Active" .Active "HxTarget" "#decisions-live" }}{{ end }}
+    {{ if .FilterRepositories }}
+    <form method="get" action="/decisions" class="ml-auto flex items-center gap-2">
+      <input type="hidden" name="state" value="{{ .Query.State }}">
+      <label for="decisions-repo-filter" class="sr-only">Filter by repository</label>
+      <select id="decisions-repo-filter" name="repo" hx-get="/decisions" hx-trigger="change" hx-target="#decisions-live" hx-swap="outerHTML" hx-push-url="true" hx-include="closest form"
+        class="h-8 rounded-control border border-border-input bg-surface px-2 text-xs text-text">
+        <option value="0">All repositories</option>
+        {{ range .FilterRepositories }}<option value="{{ .ID }}"{{ if eq .ID $.Query.RepositoryID }} selected{{ end }}>{{ .FullName }}</option>{{ end }}
+      </select>
+      <noscript>{{ template "ui/button" dict "Label" "Filter" "Variant" "secondary" "Size" "sm" "Type" "submit" }}</noscript>
+    </form>
+    {{ end }}
+  </div>
+  {{ end }}
+  {{ if .Rows }}
+  <div class="hidden overflow-x-auto md:block">
+    <table class="w-full border-collapse text-sm">
+      <caption class="sr-only">Recorded freeze decisions with pull request, decision, head commit, and recorded time</caption>
+      <thead>
+        <tr class="bg-surface-muted text-left">
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Pull request</th>
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Decision</th>
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Head</th>
+          <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Recorded</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{ range .Rows }}
+        <tr class="border-t border-border align-top">
+          <td class="px-4 py-3">
+            <span class="flex flex-col gap-0.5">
+              <span class="flex items-center gap-1.5">
+                <code class="font-mono text-sm font-bold text-text">#{{ .Result.PullRequestIndex }}</code>
+                {{ if .PullRequestURL }}<a href="{{ .PullRequestURL }}" target="_blank" rel="noopener noreferrer" class="text-text-muted transition-colors hover:text-accent-strong" aria-label="Open pull request #{{ .Result.PullRequestIndex }} on the forge (new tab)"><svg class="h-3.5 w-3.5" aria-hidden="true"><use href="#tg-i-external-link"></use></svg></a>{{ end }}
+              </span>
+              <span class="text-xs text-text-muted">{{ .RepositoryLabel }} <span aria-hidden="true">→</span> <code class="font-mono">{{ .Result.TargetBranch }}</code></span>
+            </span>
+          </td>
+          <td class="px-4 py-3">
+            {{ template "ui/badge" dict "Label" .StateLabel "Tone" .BadgeTone "Icon" .BadgeIcon }}
+            {{ if .Result.Error }}<span class="mt-1 block max-w-prose text-xs text-text-muted">{{ .Result.Error }}</span>{{ else if .Result.Description }}<span class="mt-1 block max-w-prose text-xs text-text-muted">{{ .Result.Description }}</span>{{ end }}
+          </td>
+          <td class="px-4 py-3"><code class="font-mono text-xs text-text-muted" title="{{ .Result.HeadSHA }}">{{ .ShortHeadSHA }}</code></td>
+          <td class="px-4 py-3 text-text"><time datetime="{{ .CreatedAtUTC }}">{{ .CreatedAt }}</time></td>
+        </tr>
+        {{ end }}
+      </tbody>
+    </table>
+  </div>
+  <div class="flex flex-col gap-3 p-(--card-spacing) md:hidden">
+    {{ range .Rows }}
+    <article class="rounded-card border border-border p-4">
+      <div class="flex items-start justify-between gap-3">
+        <span class="flex items-center gap-1.5">
+          <code class="font-mono text-sm font-bold text-text">#{{ .Result.PullRequestIndex }}</code>
+          {{ if .PullRequestURL }}<a href="{{ .PullRequestURL }}" target="_blank" rel="noopener noreferrer" class="text-text-muted transition-colors hover:text-accent-strong" aria-label="Open pull request #{{ .Result.PullRequestIndex }} on the forge (new tab)"><svg class="h-3.5 w-3.5" aria-hidden="true"><use href="#tg-i-external-link"></use></svg></a>{{ end }}
+        </span>
+        {{ template "ui/badge" dict "Label" .StateLabel "Tone" .BadgeTone "Icon" .BadgeIcon }}
+      </div>
+      <p class="m-0 mt-1 text-xs text-text-muted">{{ .RepositoryLabel }} <span aria-hidden="true">→</span> <code class="font-mono">{{ .Result.TargetBranch }}</code></p>
+      {{ if .Result.Error }}<p class="m-0 mt-2 text-sm text-text">{{ .Result.Error }}</p>{{ else if .Result.Description }}<p class="m-0 mt-2 text-sm text-text">{{ .Result.Description }}</p>{{ end }}
+      <p class="m-0 mt-2 text-xs text-text-muted"><code class="font-mono">{{ .ShortHeadSHA }}</code> · <time datetime="{{ .CreatedAtUTC }}">{{ .CreatedAt }}</time></p>
+    </article>
+    {{ end }}
+  </div>
+  {{ if .Pagination }}
+  <div class="flex flex-wrap items-center justify-between gap-3 border-t border-border px-(--card-spacing) py-3">
+    <span class="text-xs text-text-muted">Showing {{ .Pagination.From }}–{{ .Pagination.To }} of {{ .Pagination.Total }} decisions</span>
+    <div class="flex items-center gap-2">
+      {{ if .Pagination.PrevURL }}{{ template "ui/button" dict "Label" "Previous" "Variant" "secondary" "Size" "sm" "Href" .Pagination.PrevURL "HxTarget" "#decisions-live" }}{{ else }}{{ template "ui/button" dict "Label" "Previous" "Variant" "secondary" "Size" "sm" "Disabled" true }}{{ end }}
+      {{ if .Pagination.NextURL }}{{ template "ui/button" dict "Label" "Next" "Variant" "secondary" "Size" "sm" "Href" .Pagination.NextURL "HxTarget" "#decisions-live" }}{{ else }}{{ template "ui/button" dict "Label" "Next" "Variant" "secondary" "Size" "sm" "Disabled" true }}{{ end }}
+    </div>
+  </div>
+  {{ end }}
+  {{ else }}
+  <div class="p-(--card-spacing)">
+    {{ if and (eq .Filter "all") (not .Query.RepositoryID) }}
+    {{ template "ui/empty-state" dict "Title" "No freeze decisions yet" "Hint" "Decisions appear when webhooks, freeze changes, or thaw approvals cause Thawguard to evaluate a pull request." "Icon" "tg-i-thaw-drop" }}
+    {{ else if ne .Filter "all" }}
+    {{ template "ui/empty-state" dict "Title" (printf "No %s decisions" .Filter) "Hint" "Switch filters or pick another repository to see other recorded decisions." "Icon" "tg-i-thaw-drop" }}
+    {{ else }}
+    {{ template "ui/empty-state" dict "Title" "No decisions for this repository" "Hint" "Switch filters or pick another repository to see other recorded decisions." "Icon" "tg-i-thaw-drop" }}
+    {{ end }}
+  </div>
+  {{ end }}
+</section>
+{{ end }}

@@ -75,7 +75,12 @@ document.addEventListener("htmx:afterSwap", () => {
 });
 
 document.addEventListener("htmx:beforeSwap", (event) => {
-  if (event.detail.xhr && event.detail.xhr.status >= 500) {
+  // 409 carries a renderable fragment: the thaw shared-head confirmation
+  // interstitial is an honest Conflict response, not an error page.
+  if (
+    event.detail.xhr &&
+    (event.detail.xhr.status >= 500 || event.detail.xhr.status === 409)
+  ) {
     event.detail.shouldSwap = true;
   }
 });

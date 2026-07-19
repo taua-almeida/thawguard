@@ -3,9 +3,11 @@ package web
 import (
 	"html/template"
 	"net/http"
+	"time"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
+	"github.com/taua-almeida/thawguard/internal/statusresult"
 )
 
 // Dev-only component gallery (GET /dev/preview, GET /dev/preview/auth).
@@ -636,4 +638,122 @@ func (s *Server) handleDevPreviewFreezes(w http.ResponseWriter, r *http.Request)
 	data.Impact = impact
 	data.Theme = devPreviewTheme(r)
 	s.renderPage(w, "layouts/freezes", data)
+}
+
+// handleDevPreviewDecisions renders the thaw requests page from fictional
+// fixtures covering the full state matrix (GET /dev/preview/decisions).
+// Query knobs: ?role=viewer, ?variant=empty|no-repos|form-error|
+// eligibility-found|eligibility-unfrozen|eligibility-missing|shared-head|
+// stale, ?theme=dark|light. The default variant is the approve form with the
+// eligibility prompt and one table row per badge tone (plus a deleted-repo
+// fallback row).
+func (s *Server) handleDevPreviewDecisions(w http.ResponseWriter, r *http.Request) {
+	if !s.cfg.DevMode {
+		http.NotFound(w, r)
+		return
+	}
+	user := currentUserView{
+		Email:             "mira.frost@example.test",
+		DisplayName:       "Mira Frost",
+		RoleLabel:         "Admin",
+		CanChangePassword: true,
+		IsAdmin:           true,
+		CanFreeze:         true,
+		CanThaw:           true,
+	}
+	if r.URL.Query().Get("role") == "viewer" {
+		user = currentUserView{
+			Email:             "sten.hale@example.test",
+			DisplayName:       "Sten Hale",
+			RoleLabel:         "Viewer",
+			CanChangePassword: true,
+		}
+	}
+	repositories := []domain.Repository{
+		{ID: 46, Forge: "forgejo", BaseURL: "https://forge.example.test", Owner: "aurora", Name: "ice-station", DefaultBranch: "main", EnforcementState: domain.EnforcementActive},
+		{ID: 47, Forge: "codeberg", BaseURL: "https://codeberg.org", Owner: "borealis", Name: "frost-api", DefaultBranch: "main", EnforcementState: domain.EnforcementActive},
+	}
+	branchOptions := []managedBranchOption{
+		{RepositoryID: 46, Name: "main"},
+		{RepositoryID: 46, Name: "release/1.8"},
+		{RepositoryID: 47, Name: "main"},
+	}
+	sharedHead := "f00dfeed00c0ffee1122334455667788990011aa"
+	// One row per badge tone plus a deleted-repository fallback row.
+	results := []statusresult.Result{
+		{ID: 501, RepositoryID: 46, PullRequestIndex: 241, TargetBranch: "main", HeadSHA: sharedHead, Context: domain.RequiredStatusContext, State: domain.CommitStatusSuccess, Description: "PR is explicitly thawed during an active freeze", CreatedAt: time.Date(2026, 7, 17, 9, 2, 0, 0, time.UTC)},
+		{ID: 502, RepositoryID: 46, PullRequestIndex: 238, TargetBranch: "main", HeadSHA: "aa11bb22cc33dd44ee55ff667788990011223344", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "Branch is frozen; merge is blocked by Thawguard", CreatedAt: time.Date(2026, 7, 16, 21, 40, 0, 0, time.UTC)},
+		{ID: 503, RepositoryID: 47, PullRequestIndex: 229, TargetBranch: "main", HeadSHA: "bb22cc33dd44ee55ff6677889900112233445566", Context: domain.RequiredStatusContext, State: domain.CommitStatusPending, Description: "Thawguard is evaluating this pull request", CreatedAt: time.Date(2026, 7, 16, 18, 0, 0, 0, time.UTC)},
+		{ID: 504, RepositoryID: 47, PullRequestIndex: 214, TargetBranch: "main", HeadSHA: "cc33dd44ee55ff667788990011223344556677aa", Context: domain.RequiredStatusContext, State: domain.CommitStatusError, Error: "status publication failed: the forge rejected the status token", CreatedAt: time.Date(2026, 7, 16, 9, 12, 0, 0, time.UTC)},
+		{ID: 505, RepositoryID: 17, PullRequestIndex: 77, TargetBranch: "release/0.9", HeadSHA: "dd44ee55ff667788990011223344556677aabb00", Context: domain.RequiredStatusContext, State: domain.CommitStatusFailure, Description: "Branch is frozen; merge is blocked by Thawguard", CreatedAt: time.Date(2026, 7, 12, 11, 30, 0, 0, time.UTC)},
+	}
+	eligibilityFound := &thawEligibilityView{
+		State:            "found",
+		RepositoryLabel:  "aurora/ice-station",
+		PullRequestIndex: 241,
+		Title:            "Fix retry backoff for status publication",
+		URL:              "https://forge.example.test/aurora/ice-station/pulls/241",
+		TargetBranch:     "main",
+		TargetFrozen:     true,
+		ShortHeadSHA:     shortHeadSHA(sharedHead),
+		Companions: []thawEligibilityCompanionView{
+			{Index: 238, Title: "Backport retry backoff fix to release/1.8", URL: "https://forge.example.test/aurora/ice-station/pulls/238"},
+		},
+	}
+	confirmation := &sharedHeadConfirmationView{
+		RepositoryID:      46,
+		PullRequestIndex:  241,
+		TargetBranch:      "main",
+		Reason:            "Production fix needed during release freeze",
+		HeadSHA:           sharedHead,
+		ShortHeadSHA:      shortHeadSHA(sharedHead),
+		AffectedSignature: "9c1f2b7e4d8a5c3e6f0b1d2a4c5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f70",
+		AffectedCount:     3,
+		AffectedPullRequests: []sharedHeadAffectedPullRequestView{
+			{Index: 241, Title: "Fix retry backoff for status publication", TargetBranch: "main", ShortHeadSHA: shortHeadSHA(sharedHead), URL: "https://forge.example.test/aurora/ice-station/pulls/241"},
+			{Index: 238, Title: "Backport retry backoff fix to release/1.8", TargetBranch: "release/1.8", ShortHeadSHA: shortHeadSHA(sharedHead), URL: "https://forge.example.test/aurora/ice-station/pulls/238"},
+			{Index: 229, Title: "Docs: webhook rotation runbook", TargetBranch: "main", ShortHeadSHA: shortHeadSHA(sharedHead), URL: "https://forge.example.test/aurora/ice-station/pulls/229"},
+		},
+	}
+	state := decisionsPageState{Query: decisionsQuery{State: "all", Page: 1}}
+	var eligibility *thawEligibilityView
+	switch r.URL.Query().Get("variant") {
+	case "empty":
+		results = nil
+	case "no-repos":
+		repositories = nil
+		branchOptions = nil
+		results = nil
+	case "form-error":
+		state.FormError = "target branch is invalid"
+		state.DecisionForm = decisionFormState{
+			Submitted:        true,
+			RepositoryID:     46,
+			TargetBranch:     "release/1.8",
+			PullRequestIndex: "241",
+			Reason:           "Production fix needed during release freeze",
+		}
+		eligibility = eligibilityFound
+	case "eligibility-found":
+		state.DecisionForm = decisionFormState{Submitted: true, RepositoryID: 46, TargetBranch: "main", PullRequestIndex: "241"}
+		eligibility = eligibilityFound
+	case "eligibility-unfrozen":
+		state.DecisionForm = decisionFormState{Submitted: true, RepositoryID: 46, TargetBranch: "main", PullRequestIndex: "241"}
+		unfrozen := *eligibilityFound
+		unfrozen.TargetFrozen = false
+		unfrozen.Companions = nil
+		eligibility = &unfrozen
+	case "eligibility-missing":
+		state.DecisionForm = decisionFormState{Submitted: true, RepositoryID: 46, TargetBranch: "main", PullRequestIndex: "977"}
+		eligibility = &thawEligibilityView{State: "missing", RepositoryLabel: "aurora/ice-station", PullRequestIndex: 977}
+	case "shared-head":
+		state.Confirmation = confirmation
+	case "stale":
+		stale := *confirmation
+		stale.Stale = true
+		state.Confirmation = &stale
+	}
+	data := s.decisionsPageData(repositories, results, branchOptions, len(results), state, eligibility, "dev-preview-fictional-token", user)
+	data.Theme = devPreviewTheme(r)
+	s.renderPage(w, "layouts/decisions", data)
 }

@@ -3,6 +3,7 @@ package pullrequest
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -32,6 +33,32 @@ func TestStoreUpsertsAndReadsPullRequestCache(t *testing.T) {
 	}
 	if updated.ID != created.ID || updated.State != "closed" || updated.TargetBranch != "dev" || updated.HeadSHA != "def456" {
 		t.Fatalf("unexpected updated pull request: %+v", updated)
+	}
+}
+
+func TestStoreGetsPullRequestByRepositoryAndIndex(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	store := NewStore(database)
+
+	if _, err := store.Upsert(ctx, domain.PullRequest{RepositoryID: repo.ID, Index: 42, State: "open", TargetBranch: "main", HeadSHA: "abc123", Title: "Example fix", URL: "https://codeberg.org/example-owner/example-repo/pulls/42"}); err != nil {
+		t.Fatal(err)
+	}
+
+	pr, err := store.Get(ctx, repo.ID, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pr.Index != 42 || pr.TargetBranch != "main" || pr.HeadSHA != "abc123" || pr.Title != "Example fix" || pr.URL == "" {
+		t.Fatalf("unexpected pull request: %+v", pr)
+	}
+
+	if _, err := store.Get(ctx, repo.ID, 999); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected sql.ErrNoRows for uncached index, got %v", err)
+	}
+	if _, err := store.Get(ctx, repo.ID+1, 42); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected sql.ErrNoRows for other repository, got %v", err)
 	}
 }
 

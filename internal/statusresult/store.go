@@ -157,6 +157,62 @@ LIMIT ?`, limit)
 	return results, nil
 }
 
+func (s *Store) ListDecisionsPage(ctx context.Context, state domain.CommitStatusState, repositoryID int64, offset, limit int) ([]Result, int, error) {
+	if s == nil || s.db == nil {
+		return nil, 0, errors.New("status result store has no database")
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	where := ""
+	countArgs := []any{}
+	if state != "" {
+		where = "WHERE state = ?"
+		countArgs = append(countArgs, state)
+	}
+	if repositoryID > 0 {
+		if where == "" {
+			where = "WHERE repository_id = ?"
+		} else {
+			where += " AND repository_id = ?"
+		}
+		countArgs = append(countArgs, repositoryID)
+	}
+
+	var total int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM status_results "+where, countArgs...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count status results: %w", err)
+	}
+
+	args := append(append([]any{}, countArgs...), limit, offset)
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, repository_id, pull_request_index, target_branch, head_sha, context, state, description, target_url, posted_at, error, created_at
+FROM status_results
+`+where+`
+ORDER BY id DESC
+LIMIT ? OFFSET ?`, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list status results page: %w", err)
+	}
+	defer rows.Close()
+
+	results := make([]Result, 0)
+	for rows.Next() {
+		result, err := scanResult(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		results = append(results, result)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("list status results page rows: %w", err)
+	}
+	return results, total, nil
+}
+
 func (s *Store) requireRepository(ctx context.Context, repositoryID int64) error {
 	var existing int64
 	err := s.db.QueryRowContext(ctx, `SELECT id FROM repositories WHERE id = ? AND active = 1`, repositoryID).Scan(&existing)

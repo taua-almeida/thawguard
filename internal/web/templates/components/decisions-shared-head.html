@@ -1,0 +1,85 @@
+{{/*
+  components/decisions-shared-head — step 2 of thaw approval: the shared-head
+  confirmation interstitial that replaces the approve form card when the forge
+  reports more than one open pull request on the submitted head commit. The
+  confirm re-POST carries the confirmed head SHA and affected-set signature,
+  but the server re-runs the shared-head check on every attempt and never
+  trusts a stale confirmation; a re-409 renders this card again with
+  .Confirmation.Stale set.
+*/}}
+{{ define "components/decisions-shared-head" }}
+{{ $c := .Confirmation }}
+<section class="rounded-panel border border-border bg-surface p-(--card-spacing) shadow-card" aria-labelledby="shared-head-heading">
+  <div class="flex flex-col gap-2">
+    <div>{{ template "ui/badge" dict "Label" "Confirmation required" "Tone" "warning" "Icon" "tg-i-warning" }}</div>
+    <h2 id="shared-head-heading" class="m-0 text-lg font-bold text-text">These pull requests share one commit SHA</h2>
+    <p class="m-0 text-sm text-text-muted">Forgejo applies commit statuses to the shared SHA, so approving this thaw will affect every pull request listed below.</p>
+  </div>
+  <div class="mt-4 flex flex-col gap-4">
+    {{ if $c.Stale }}
+    <div role="status">
+      {{ template "ui/callout" dict "Tone" "info" "Body" "The forge state changed since your last confirmation — the list below was refreshed. Review it again before approving." }}
+    </div>
+    {{ end }}
+    <div class="flex items-start gap-3 rounded-card border-l-4 p-3.5 border-warning bg-warning-soft text-warning">
+      <svg class="mt-0.5 h-4 w-4 flex-none" aria-hidden="true"><use href="#tg-i-warning"></use></svg>
+      <p class="m-0 text-sm text-text">Nothing has been approved yet. Thawguard paused this request before recording any exception or publishing any status for shared head <code class="font-mono text-xs">{{ $c.ShortHeadSHA }}</code>.</p>
+    </div>
+    <div class="hidden overflow-x-auto rounded-card border border-border md:block">
+      <table class="w-full border-collapse text-sm">
+        <caption class="sr-only">Open pull requests sharing head commit {{ $c.ShortHeadSHA }}</caption>
+        <thead>
+          <tr class="bg-surface-muted text-left">
+            <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">#</th>
+            <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Title</th>
+            <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Target branch</th>
+            <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Head SHA</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{ range $c.AffectedPullRequests }}
+          <tr class="border-t border-border align-top">
+            <td class="px-4 py-3"><span class="flex items-center gap-2"><code class="font-mono text-xs font-bold text-text">#{{ .Index }}</code>{{ if eq .Index $c.PullRequestIndex }}{{ template "ui/badge" dict "Label" "your selection" "Tone" "info" }}{{ end }}</span></td>
+            <td class="px-4 py-3"><span class="flex min-w-0 items-center gap-2"><span class="min-w-0 flex-1 text-text">{{ .Title }}</span>{{ if .URL }}<a href="{{ .URL }}" target="_blank" rel="noopener noreferrer" class="flex-none text-text-muted transition-colors hover:text-accent-strong" aria-label="Open pull request #{{ .Index }} on the forge (new tab)"><svg class="h-3.5 w-3.5" aria-hidden="true"><use href="#tg-i-external-link"></use></svg></a>{{ end }}</span></td>
+            <td class="px-4 py-3"><code class="font-mono text-xs text-text-muted">{{ .TargetBranch }}</code></td>
+            <td class="px-4 py-3"><code class="font-mono text-xs text-text-muted">{{ .ShortHeadSHA }}</code></td>
+          </tr>
+          {{ end }}
+        </tbody>
+      </table>
+    </div>
+    <ul class="m-0 flex list-none flex-col gap-2 p-0 md:hidden">
+      {{ range $c.AffectedPullRequests }}
+      <li class="rounded-card border border-border p-3">
+        <span class="flex min-w-0 items-center gap-2 text-sm">
+          <code class="flex-none font-mono text-xs font-bold text-text">#{{ .Index }}</code>
+          <span class="min-w-0 flex-1 truncate text-text" title="{{ .Title }}">{{ .Title }}</span>
+          {{ if eq .Index $c.PullRequestIndex }}{{ template "ui/badge" dict "Label" "your selection" "Tone" "info" }}{{ end }}
+          {{ if .URL }}<a href="{{ .URL }}" target="_blank" rel="noopener noreferrer" class="flex-none text-text-muted transition-colors hover:text-accent-strong" aria-label="Open pull request #{{ .Index }} on the forge (new tab)"><svg class="h-3.5 w-3.5" aria-hidden="true"><use href="#tg-i-external-link"></use></svg></a>{{ end }}
+        </span>
+        <p class="m-0 mt-1 text-xs text-text-muted"><code class="font-mono">{{ .TargetBranch }}</code> · <code class="font-mono">{{ .ShortHeadSHA }}</code></p>
+      </li>
+      {{ end }}
+    </ul>
+    <p class="m-0 text-sm text-text-muted">Reason: <span class="text-text">{{ $c.Reason }}</span></p>
+    <form method="post" action="/decisions" hx-post="/decisions" hx-target="#decisions-live" hx-swap="outerHTML" hx-push-url="false" class="flex flex-col gap-4">
+      <input type="hidden" name="{{ $.CSRFField }}" value="{{ $.CSRFToken }}">
+      <input type="hidden" name="state" value="{{ $.Query.State }}">
+      <input type="hidden" name="repo" value="{{ $.Query.RepositoryID }}">
+      <input type="hidden" name="page" value="{{ $.Query.Page }}">
+      <input type="hidden" name="repository_id" value="{{ $c.RepositoryID }}">
+      <input type="hidden" name="pull_request_index" value="{{ $c.PullRequestIndex }}">
+      <input type="hidden" name="target_branch" value="{{ $c.TargetBranch }}">
+      <input type="hidden" name="reason" value="{{ $c.Reason }}">
+      <input type="hidden" name="confirm_shared_head" value="true">
+      <input type="hidden" name="confirmed_head_sha" value="{{ $c.HeadSHA }}">
+      <input type="hidden" name="confirmed_affected_signature" value="{{ $c.AffectedSignature }}">
+      <p class="m-0 text-xs text-text-muted">Approving publishes one SHA-scoped <code class="font-mono">{{ $.RequiredContext }}</code> status that applies to all {{ $c.AffectedCount }} pull requests above. Thawguard refreshes the forge state first; if the head SHA or affected set changed, it asks for confirmation again.</p>
+      <div class="flex flex-wrap items-center justify-end gap-2 border-t border-border pt-4">
+        {{ template "ui/button" dict "Label" "Cancel" "Variant" "secondary" "Href" "/decisions" }}
+        {{ template "ui/button" dict "Label" (printf "Approve thaw for all %d PRs" $c.AffectedCount) "Variant" "primary" "Type" "submit" "Icon" "tg-i-thaw-drop" }}
+      </div>
+    </form>
+  </div>
+</section>
+{{ end }}

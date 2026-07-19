@@ -1,0 +1,9 @@
+{{ define "pages/decisions" }}
+<div class="flex flex-col gap-6">
+  <header>
+    <h1 class="m-0 text-page-title font-bold text-text">Thaw Requests</h1>
+    <p class="m-0 mt-1 text-sm text-text-muted">Approve auditable exceptions so specific pull requests can merge while a branch is frozen.</p>
+  </header>
+  {{ template "components/decisions-live" . }}
+</div>
+{{ end }}

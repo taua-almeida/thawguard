@@ -49,6 +49,83 @@ func TestStoreCreatesAndListsStatusResults(t *testing.T) {
 	}
 }
 
+func TestStoreListsDecisionsPage(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repoA := createTestRepository(t, ctx, database)
+	repoB, err := repository.NewStore(database).Create(ctx, repository.CreateParams{Owner: "taua-almeida", Name: "frost-api", DefaultBranch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(database)
+
+	seed := []struct {
+		repositoryID int64
+		state        domain.CommitStatusState
+	}{
+		{repoA.ID, domain.CommitStatusSuccess},
+		{repoA.ID, domain.CommitStatusFailure},
+		{repoA.ID, domain.CommitStatusPending},
+		{repoA.ID, domain.CommitStatusSuccess},
+		{repoB.ID, domain.CommitStatusError},
+		{repoB.ID, domain.CommitStatusSuccess},
+	}
+	ids := make([]int64, 0, len(seed))
+	for i, params := range seed {
+		created, err := store.Create(ctx, CreateParams{
+			RepositoryID:     params.repositoryID,
+			PullRequestIndex: 100 + i,
+			TargetBranch:     "main",
+			HeadSHA:          "abc123",
+			Context:          domain.RequiredStatusContext,
+			State:            params.state,
+			Description:      "seeded decision",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, created.ID)
+	}
+
+	assertPage := func(t *testing.T, state domain.CommitStatusState, repositoryID int64, offset, limit int, wantTotal int, wantIDs []int64) {
+		t.Helper()
+		rows, total, err := store.ListDecisionsPage(ctx, state, repositoryID, offset, limit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if total != wantTotal {
+			t.Fatalf("expected total %d, got %d", wantTotal, total)
+		}
+		if len(rows) != len(wantIDs) {
+			t.Fatalf("expected %d rows, got %+v", len(wantIDs), rows)
+		}
+		for i, row := range rows {
+			if row.ID != wantIDs[i] {
+				t.Fatalf("row %d: expected id %d, got %d", i, wantIDs[i], row.ID)
+			}
+		}
+	}
+
+	assertPage(t, "", 0, 0, 4, 6, []int64{ids[5], ids[4], ids[3], ids[2]})
+	assertPage(t, "", 0, 4, 4, 6, []int64{ids[1], ids[0]})
+	assertPage(t, domain.CommitStatusSuccess, 0, 0, 10, 3, []int64{ids[5], ids[3], ids[0]})
+	assertPage(t, "", repoB.ID, 0, 10, 2, []int64{ids[5], ids[4]})
+	assertPage(t, domain.CommitStatusSuccess, repoA.ID, 0, 10, 2, []int64{ids[3], ids[0]})
+	assertPage(t, domain.CommitStatusSuccess, repoB.ID, 0, 10, 1, []int64{ids[5]})
+	assertPage(t, domain.CommitStatusPending, repoB.ID, 0, 10, 0, nil)
+	assertPage(t, "", 0, 10, 4, 6, nil)
+	assertPage(t, "", 0, 0, 0, 6, []int64{ids[5], ids[4], ids[3], ids[2], ids[1], ids[0]})
+	assertPage(t, "", 0, -3, 4, 6, []int64{ids[5], ids[4], ids[3], ids[2]})
+
+	rows, _, err := store.ListDecisionsPage(ctx, domain.CommitStatusError, 0, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].RepositoryID != repoB.ID || rows[0].Description != "seeded decision" || rows[0].State != domain.CommitStatusError {
+		t.Fatalf("expected hydrated error row, got %+v", rows)
+	}
+}
+
 func TestStoreRejectsInvalidStatusResultParams(t *testing.T) {
 	ctx := context.Background()
 	database := newTestDB(t, ctx)

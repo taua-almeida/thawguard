@@ -1,0 +1,106 @@
+{{/*
+  components/decisions-workbench — the /decisions approve card plus the
+  eligibility aside. When a shared-head confirmation is pending the
+  interstitial replaces the form card (never stacks under it) and the aside
+  drops the live preview so the confirmation is the only actionable thing on
+  screen. The field pair pulls /decisions/eligibility into #thaw-eligibility;
+  [data-branch-filter] + [data-branch-options] narrow branches to the chosen
+  repository (main.js re-runs both after every swap).
+*/}}
+{{ define "components/decisions-workbench" }}
+<div class="grid grid-cols-1 items-start gap-6 lg:grid-cols-[minmax(0,1fr)_22rem]">
+  {{ if .Confirmation }}
+  {{ template "components/decisions-shared-head" . }}
+  {{ else }}
+  <section class="rounded-panel border border-border bg-surface p-(--card-spacing) shadow-card" aria-label="Approve a thaw exception">
+    <h2 class="m-0 text-lg font-bold text-text">Approve a thaw exception</h2>
+    <p class="m-0 mt-1 text-sm text-text-muted">The exception is scoped to the pull request's current forge head commit; any new push invalidates it.</p>
+    {{ if not .CurrentUser.CanThaw }}
+    <div class="mt-4">
+      {{ template "ui/callout" dict "Tone" "warning" "Title" "Read-only thaw access" "Body" "Your role can view thaw decisions. Explicit thaw approver role is required to approve exceptions." }}
+    </div>
+    {{ else if .EnforceableRepositories }}
+    <form method="post" action="/decisions" hx-post="/decisions" hx-target="#decisions-live" hx-swap="outerHTML" hx-push-url="false" class="mt-4 flex flex-col gap-4">
+      <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+      <input type="hidden" name="state" value="{{ .Query.State }}">
+      <input type="hidden" name="repo" value="{{ .Query.RepositoryID }}">
+      <input type="hidden" name="page" value="{{ .Query.Page }}">
+      <div class="grid gap-4 sm:grid-cols-2" hx-get="/decisions/eligibility" hx-trigger="change delay:150ms from:#decision-repository, keyup changed delay:300ms from:#decision-pr" hx-target="#thaw-eligibility" hx-swap="outerHTML" hx-push-url="false" hx-include="#decision-repository,#decision-pr" hx-params="repository_id,pull_request_index">
+        <div class="flex flex-col gap-1.5">
+          <label for="decision-repository" class="text-sm font-semibold text-text">Repository<span class="text-danger" aria-hidden="true"> *</span></label>
+          <select id="decision-repository" name="repository_id" required data-branch-filter
+            class="h-(--control-height) w-full rounded-control border border-border-input bg-surface px-3 text-sm text-text">
+            {{ range .EnforceableRepositories }}<option value="{{ .ID }}"{{ if and $.DecisionForm.Submitted (eq .ID $.DecisionForm.RepositoryID) }} selected{{ end }}>{{ .FullName }}</option>{{ end }}
+          </select>
+        </div>
+        <div class="flex flex-col gap-1.5">
+          <label for="decision-branch" class="text-sm font-semibold text-text">Target branch<span class="text-danger" aria-hidden="true"> *</span></label>
+          <select id="decision-branch" name="target_branch" required data-branch-options
+            class="h-(--control-height) w-full rounded-control border border-border-input bg-surface px-3 font-mono text-sm text-text">
+            {{ range .BranchOptions }}<option value="{{ .Name }}" data-repository="{{ .RepositoryID }}"{{ if and $.DecisionForm.Submitted (eq .RepositoryID $.DecisionForm.RepositoryID) (eq .Name $.DecisionForm.TargetBranch) }} selected{{ end }}>{{ .Name }}</option>{{ end }}
+          </select>
+        </div>
+        <div class="flex flex-col gap-1.5">
+          <label for="decision-pr" class="text-sm font-semibold text-text">Pull request number<span class="text-danger" aria-hidden="true"> *</span></label>
+          <input id="decision-pr" type="text" name="pull_request_index" value="{{ .DecisionForm.PullRequestIndex }}" inputmode="numeric" pattern="[0-9]*" placeholder="241" required
+            class="h-(--control-height) w-full rounded-control border border-border-input bg-surface px-3 text-sm text-text placeholder:text-text-muted">
+        </div>
+        {{ template "ui/input" dict "ID" "decision-reason" "Name" "reason" "Label" "Reason" "Value" .DecisionForm.Reason "Placeholder" "Production fix needed during release freeze" "Maxlength" "500" "Required" true }}
+      </div>
+      <div class="flex flex-wrap items-center justify-between gap-3 border-t border-border pt-4">
+        <span class="flex items-center gap-1.5 text-xs text-text-muted"><svg class="h-4 w-4" aria-hidden="true"><use href="#tg-i-audit"></use></svg><span>Approvals are recorded as audit events. Thawguard publishes only the <code class="font-mono">{{ .RequiredContext }}</code> status context.</span></span>
+        <div class="flex items-center gap-2">
+          {{ template "ui/button" dict "Label" "Reset" "Variant" "secondary" "Type" "reset" }}
+          {{ template "ui/button" dict "Label" "Approve thaw" "Variant" "primary" "Type" "submit" "Icon" "tg-i-thaw-drop" }}
+        </div>
+      </div>
+    </form>
+    {{ else }}
+    <div class="mt-4">
+      {{ template "ui/empty-state" dict "Title" "No repository has active enforcement" "Hint" "Repository enforcement is not active. Complete setup and activate enforcement before approving a thaw exception." "Icon" "tg-i-repositories" "ActionLabel" "Repository setup" "ActionHref" "/repositories" }}
+    </div>
+    {{ end }}
+  </section>
+  {{ end }}
+
+  {{ if and .CurrentUser.CanThaw .EnforceableRepositories (not .Confirmation) }}
+  <aside class="flex flex-col gap-4 rounded-panel border border-border bg-surface p-(--card-spacing) shadow-card" aria-label="Eligibility preview">
+    <h2 class="m-0 text-lg font-bold text-text">Eligibility preview</h2>
+    {{ template "components/thaw-eligibility" .Eligibility }}
+    <details class="border-t border-border pt-3">
+      <summary class="cursor-pointer text-sm font-semibold text-text">How thaw approval works</summary>
+      <div class="mt-3">{{ template "components/decisions-approval-steps" . }}</div>
+    </details>
+    {{ template "ui/callout" dict "Tone" "warning" "Body" "Thawguard prevents accidental merges for trusted teams; collaborators with sufficient forge permissions can still bypass cooperative enforcement." }}
+  </aside>
+  {{ else }}
+  <aside class="flex flex-col gap-4 rounded-panel border border-border bg-surface p-(--card-spacing) shadow-card" aria-label="How thaw approval works">
+    <h2 class="m-0 text-lg font-bold text-text">How thaw approval works</h2>
+    {{ template "components/decisions-approval-steps" . }}
+    {{ template "ui/callout" dict "Tone" "warning" "Body" "Thawguard prevents accidental merges for trusted teams; collaborators with sufficient forge permissions can still bypass cooperative enforcement." }}
+  </aside>
+  {{ end }}
+</div>
+{{ end }}
+
+{{/*
+  components/decisions-approval-steps — the thaw policy explainer, shared by
+  the aside's collapsed and expanded variants. Copy stays honest about what
+  approval does: live forge re-check, head-SHA scope, one status context.
+*/}}
+{{ define "components/decisions-approval-steps" }}
+<ol class="m-0 flex list-none flex-col gap-3 p-0">
+  <li class="flex items-start gap-3">
+    <span class="flex size-7 flex-none items-center justify-center rounded-pill bg-accent-soft font-mono text-xs font-bold text-accent-strong">1</span>
+    <div class="text-sm"><strong class="text-text">Live head fetch</strong><p class="m-0 mt-0.5 text-text-muted">Approval fetches the pull request's current head commit from the forge and re-syncs open pull requests; the eligibility preview is only the webhook cache.</p></div>
+  </li>
+  <li class="flex items-start gap-3">
+    <span class="flex size-7 flex-none items-center justify-center rounded-pill bg-accent-soft font-mono text-xs font-bold text-accent-strong">2</span>
+    <div class="text-sm"><strong class="text-text">Head-commit-scoped exception</strong><p class="m-0 mt-0.5 text-text-muted">The exception is recorded for that exact commit and never expires on its own; any new push invalidates it. If other open pull requests share the commit, approval pauses for an explicit all-PRs confirmation.</p></div>
+  </li>
+  <li class="flex items-start gap-3">
+    <span class="flex size-7 flex-none items-center justify-center rounded-pill bg-accent-soft font-mono text-xs font-bold text-accent-strong">3</span>
+    <div class="text-sm"><strong class="text-text">One status context</strong><p class="m-0 mt-0.5 text-text-muted">Thawguard recomputes and publishes only the <code class="font-mono">{{ .RequiredContext }}</code> commit status; merge blocking still depends on the forge requiring that context.</p></div>
+  </li>
+</ol>
+{{ end }}
