@@ -2716,12 +2716,12 @@ func TestWebhooksPageShowsRecentDeliveries(t *testing.T) {
 		t.Fatal("expected session cookie value")
 	}
 	body := recorder.Body.String()
-	for _, want := range []string{"Webhook diagnostics", "Signed webhook deliveries", "Back to activity", `href="/activity"`, "Sanitized delivery metadata", "tg-table-toolbar", "tg-responsive-table", "tg-mobile-card-list", "Rows per page", "Filter webhook deliveries", "aria-sort=\"descending\"", "Showing 3 of 3 matching rows", "3 total rows loaded", "taua-almeida/thawguard", "delivery-processed", "pull_request", "opened", "verified", "processed", "delivery-retry", "synchronized", "retryable failure", "webhook processing failed", "delivery-processing", "processing", "2026-06-30 12:00 UTC"} {
+	for _, want := range []string{"Webhook deliveries", "Signed webhook deliveries", "3 deliveries", "Times shown in UTC.", "taua-almeida/thawguard", `title="delivery-processed"`, "pull_request · opened", "Verified", "Processed", `title="delivery-retry"`, "pull_request · synchronized", "Retryable failure", "webhook processing failed", `title="delivery-processing"`, "Processing", `aria-sort="descending"`, "2026-06-30 12:00 UTC", "cooperative enforcement", "does not store or render raw webhook payloads"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
 	}
-	for _, unwanted := range []string{"Latest 25", "Local records", ">Details</a>", "Clear controls", "Processed <span class=\"tg-sort-indicator\"", ">Sort by\n", ">Direction\n"} {
+	for _, unwanted := range []string{"Webhook diagnostics", "Rows per page", "tg-table-toolbar", "tg-responsive-table"} {
 		if strings.Contains(body, unwanted) {
 			t.Fatalf("expected body not to contain %q, got %q", unwanted, body)
 		}
@@ -2753,11 +2753,11 @@ func TestWebhooksPageExcludesActivityAndStatusAttempts(t *testing.T) {
 	body := recorder.Body.String()
 	for _, unwanted := range []string{"System activity", "Status publication attempts", "activity-only-marker", "PR is explicitly thawed during an active freeze", "forgejo_status"} {
 		if strings.Contains(body, unwanted) {
-			t.Fatalf("expected webhook diagnostics not to contain %q, got %q", unwanted, body)
+			t.Fatalf("expected webhook delivery page not to contain %q, got %q", unwanted, body)
 		}
 	}
-	if !strings.Contains(body, "Webhook diagnostics") || !strings.Contains(body, `href="/activity"`) {
-		t.Fatalf("expected dedicated webhook diagnostics with activity link, got %q", body)
+	if !strings.Contains(body, "Webhook deliveries") || !strings.Contains(body, "No webhook deliveries yet") {
+		t.Fatalf("expected dedicated webhook delivery page with empty state, got %q", body)
 	}
 }
 
@@ -3081,7 +3081,7 @@ func TestActivityPageAllowsViewer(t *testing.T) {
 	}
 }
 
-func TestWebhooksPageFiltersSortsAndLimitsDeliveries(t *testing.T) {
+func TestWebhooksPageFiltersAndSortsDeliveries(t *testing.T) {
 	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
 	receivedAt := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
 	processedAt := receivedAt.Add(time.Minute)
@@ -3096,18 +3096,18 @@ func TestWebhooksPageFiltersSortsAndLimitsDeliveries(t *testing.T) {
 	})
 
 	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/webhooks?processing=retryable_failure&sort=processed&direction=asc&limit=50", nil))
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/webhooks?processing=retryable_failure&sort=processed&dir=asc", nil))
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
 	}
 	body := recorder.Body.String()
-	for _, want := range []string{"Filters active", "selected>50", "aria-sort=\"ascending\"", "Showing 1 of 1 matching rows", "2 total rows loaded", "delivery-retry", "retryable failure", "webhook processing failed"} {
+	for _, want := range []string{`aria-sort="ascending"`, "1 delivery", `title="delivery-retry"`, "Retryable failure", "webhook processing failed"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected body to contain %q, got %q", want, body)
 		}
 	}
-	if strings.Contains(body, "delivery-processed") {
+	if strings.Contains(body, `title="delivery-processed"`) {
 		t.Fatalf("expected processed delivery to be filtered out, got %q", body)
 	}
 }
@@ -3135,6 +3135,159 @@ func TestWebhooksPageHidesInternalErrorDetails(t *testing.T) {
 	}
 	if strings.Contains(recorder.Body.String(), "secret-token") {
 		t.Fatalf("expected generic error body, got %q", recorder.Body.String())
+	}
+}
+
+func TestWebhooksPageServesHtmxFragment(t *testing.T) {
+	server := NewServer(Config{AppName: "Thawguard", WebhookDeliveryStore: &fakeWebhookDeliveryStore{}})
+
+	request := httptest.NewRequest(http.MethodGet, "/webhooks?processing=received", nil)
+	request.Header.Set("HX-Request", "true")
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, request)
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusOK || !strings.Contains(body, `id="webhooks-live"`) {
+		t.Fatalf("expected htmx fragment, status=%d body=%q", recorder.Code, body)
+	}
+	if strings.Contains(body, "shell-nav-item") || strings.Contains(body, "<html") {
+		t.Fatalf("expected fragment without the shell, got %q", body)
+	}
+	if vary := recorder.Header().Values("Vary"); !containsString(vary, "HX-Request") {
+		t.Fatalf("expected Vary: HX-Request on webhooks responses, got %v", vary)
+	}
+}
+
+func TestWebhooksPageQueryMapsToStoreArguments(t *testing.T) {
+	cases := []struct {
+		name string
+		url  string
+		want fakeWebhookListCall
+	}{
+		{
+			name: "defaults",
+			url:  "/webhooks",
+			want: fakeWebhookListCall{order: webhook.DeliveryOrderReceivedDesc, limit: webhooksPageSize},
+		},
+		{
+			name: "filters sort and page",
+			url:  "/webhooks?processing=processed_with_error&repo=7&sort=processed&dir=asc&page=3",
+			want: fakeWebhookListCall{processing: webhook.DeliveryProcessingProcessedWithError, repositoryID: 7, order: webhook.DeliveryOrderProcessedAsc, offset: 2 * webhooksPageSize, limit: webhooksPageSize},
+		},
+		{
+			name: "invalid values fall back to defaults",
+			url:  "/webhooks?processing=bogus&repo=-4&sort=bogus&dir=down&page=0",
+			want: fakeWebhookListCall{order: webhook.DeliveryOrderReceivedDesc, limit: webhooksPageSize},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeWebhookDeliveryStore{}
+			server := NewServer(Config{AppName: "Thawguard", WebhookDeliveryStore: store})
+			recorder := httptest.NewRecorder()
+			server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, tc.url, nil))
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("expected status 200, got %d", recorder.Code)
+			}
+			if len(store.listCalls) != 1 || store.listCalls[0] != tc.want {
+				t.Fatalf("expected one list call %+v, got %+v", tc.want, store.listCalls)
+			}
+		})
+	}
+}
+
+func TestWebhooksPageClampsOutOfRangePageToLastPage(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	receivedAt := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	deliveries := make([]webhook.Delivery, 0, 25)
+	for i := range 25 {
+		deliveries = append(deliveries, webhook.Delivery{
+			ID:           int64(i + 1),
+			RepositoryID: repo.ID,
+			DeliveryID:   fmt.Sprintf("delivery-%02d", i+1),
+			Event:        "pull_request",
+			Action:       "opened",
+			ReceivedAt:   receivedAt.Add(time.Duration(i) * time.Minute),
+			Verified:     true,
+		})
+	}
+	server := NewServer(Config{
+		AppName:              "Thawguard",
+		RepositoryStore:      &fakeRepositoryStore{repositories: []domain.Repository{repo}},
+		WebhookDeliveryStore: &fakeWebhookDeliveryStore{listed: deliveries},
+	})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/webhooks?page=9", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{"25 deliveries", `title="delivery-01"`, `title="delivery-05"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected clamped last page to contain %q, got %q", want, body)
+		}
+	}
+	if strings.Contains(body, `title="delivery-25"`) {
+		t.Fatalf("expected newest delivery to stay off the clamped last page, got %q", body)
+	}
+}
+
+func TestWebhooksPageRepositoryFilterFormPreservesSort(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}
+	server := NewServer(Config{
+		AppName:              "Thawguard",
+		RepositoryStore:      &fakeRepositoryStore{repositories: []domain.Repository{repo}},
+		WebhookDeliveryStore: &fakeWebhookDeliveryStore{},
+	})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/webhooks?processing=processed&sort=processed&dir=asc", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{
+		`<input type="hidden" name="processing" value="processed">`,
+		`<input type="hidden" name="sort" value="processed">`,
+		`<input type="hidden" name="dir" value="asc">`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected repository filter form to carry %q, got %q", want, body)
+		}
+	}
+
+	recorder = httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/webhooks", nil))
+	body = recorder.Body.String()
+	if strings.Contains(body, `name="sort"`) || strings.Contains(body, `name="dir"`) {
+		t.Fatalf("expected default sort to stay out of the repository filter form, got %q", body)
+	}
+}
+
+func TestWebhooksPageRedirectsAnonymousToLogin(t *testing.T) {
+	ctx := context.Background()
+	database := newWebTestDB(t, ctx)
+	authService := auth.NewService(database)
+	if _, err := authService.CreateFirstAdmin(ctx, auth.CreateFirstAdminParams{Email: "admin@example.test", DisplayName: "Admin", Password: "correct horse battery staple"}); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(Config{AppName: "Thawguard", AuthService: authService, WebhookDeliveryStore: &fakeWebhookDeliveryStore{}})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/webhooks", nil))
+	if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != "/login" {
+		t.Fatalf("expected unauthenticated redirect to login, status=%d location=%q", recorder.Code, recorder.Header().Get("Location"))
+	}
+
+	// The missing-store guard answers before authentication so operators see
+	// the configuration problem instead of a login page.
+	noStore := NewServer(Config{AppName: "Thawguard", AuthService: authService})
+	recorder = httptest.NewRecorder()
+	noStore.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/webhooks", nil))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected missing-store 503 before the auth redirect, got %d", recorder.Code)
 	}
 }
 
@@ -3224,7 +3377,7 @@ func TestForgejoWebhookSmokeWithSQLiteStoresPostsLiveStatus(t *testing.T) {
 	if recorder.Code != http.StatusAccepted || recorder.Body.String() != "accepted\n" {
 		t.Fatalf("expected generic accepted response, got status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
-	deliveries, err := deliveryStore.ListRecent(ctx, 10)
+	deliveries, _, err := deliveryStore.ListPage(ctx, "", 0, webhook.DeliveryOrderReceivedDesc, 0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3325,7 +3478,7 @@ func TestForgejoWebhookForSetupIncompleteRepositoryRecordsEvidenceWithoutPublish
 	if recorder.Code != http.StatusAccepted || recorder.Body.String() != "accepted\n" {
 		t.Fatalf("expected generic accepted response, got status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
-	deliveries, err := deliveryStore.ListRecent(ctx, 10)
+	deliveries, _, err := deliveryStore.ListPage(ctx, "", 0, webhook.DeliveryOrderReceivedDesc, 0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3788,8 +3941,17 @@ type fakeWebhookDeliveryStore struct {
 	failed       []fakeWebhookFailedDelivery
 	listed       []webhook.Delivery
 	listErr      error
+	listCalls    []fakeWebhookListCall
 	deliveries   map[int64]webhook.Delivery
 	deliveryByID map[string]int64
+}
+
+type fakeWebhookListCall struct {
+	processing   string
+	repositoryID int64
+	order        webhook.DeliveryOrder
+	offset       int
+	limit        int
 }
 
 type fakeWebhookProcessedDelivery struct {
@@ -3806,14 +3968,76 @@ func newFakeWebhookDeliveryStore() *fakeWebhookDeliveryStore {
 	return &fakeWebhookDeliveryStore{deliveries: make(map[int64]webhook.Delivery), deliveryByID: make(map[string]int64)}
 }
 
-func (s *fakeWebhookDeliveryStore) ListRecent(ctx context.Context, limit int) ([]webhook.Delivery, error) {
+// fakeWebhookDeliveryProcessing mirrors the store's derived-state partition
+// so handler tests can exercise the ?processing= filter against listed rows.
+func fakeWebhookDeliveryProcessing(delivery webhook.Delivery) string {
+	switch {
+	case delivery.ProcessedAt != nil && delivery.Error == "":
+		return webhook.DeliveryProcessingProcessed
+	case delivery.ProcessedAt != nil:
+		return webhook.DeliveryProcessingProcessedWithError
+	case delivery.ProcessingStartedAt != nil:
+		return webhook.DeliveryProcessingProcessing
+	case delivery.Error != "":
+		return webhook.DeliveryProcessingRetryableFailure
+	default:
+		return webhook.DeliveryProcessingReceived
+	}
+}
+
+func (s *fakeWebhookDeliveryStore) ListPage(ctx context.Context, processing string, repositoryID int64, order webhook.DeliveryOrder, offset, limit int) ([]webhook.Delivery, int, error) {
+	s.listCalls = append(s.listCalls, fakeWebhookListCall{processing: processing, repositoryID: repositoryID, order: order, offset: offset, limit: limit})
 	if s.listErr != nil {
-		return nil, s.listErr
+		return nil, 0, s.listErr
 	}
-	if limit > 0 && len(s.listed) > limit {
-		return s.listed[:limit], nil
+	matches := make([]webhook.Delivery, 0, len(s.listed))
+	for _, delivery := range s.listed {
+		if repositoryID > 0 && delivery.RepositoryID != repositoryID {
+			continue
+		}
+		if processing != "" && fakeWebhookDeliveryProcessing(delivery) != processing {
+			continue
+		}
+		matches = append(matches, delivery)
 	}
-	return s.listed, nil
+	sort.SliceStable(matches, func(i, j int) bool {
+		a, b := matches[i], matches[j]
+		switch order {
+		case webhook.DeliveryOrderReceivedAsc:
+			if !a.ReceivedAt.Equal(b.ReceivedAt) {
+				return a.ReceivedAt.Before(b.ReceivedAt)
+			}
+			return a.ID < b.ID
+		case webhook.DeliveryOrderProcessedAsc, webhook.DeliveryOrderProcessedDesc:
+			if (a.ProcessedAt == nil) != (b.ProcessedAt == nil) {
+				return b.ProcessedAt == nil
+			}
+			if a.ProcessedAt != nil && !a.ProcessedAt.Equal(*b.ProcessedAt) {
+				if order == webhook.DeliveryOrderProcessedAsc {
+					return a.ProcessedAt.Before(*b.ProcessedAt)
+				}
+				return b.ProcessedAt.Before(*a.ProcessedAt)
+			}
+			if order == webhook.DeliveryOrderProcessedAsc {
+				return a.ID < b.ID
+			}
+			return a.ID > b.ID
+		default:
+			if !a.ReceivedAt.Equal(b.ReceivedAt) {
+				return b.ReceivedAt.Before(a.ReceivedAt)
+			}
+			return a.ID > b.ID
+		}
+	})
+	total := len(matches)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= total {
+		return nil, total, nil
+	}
+	end := min(offset+limit, total)
+	return matches[offset:end], total, nil
 }
 
 func (s *fakeWebhookDeliveryStore) Record(ctx context.Context, params webhook.DeliveryRecordParams) (webhook.Delivery, error) {
@@ -4371,5 +4595,62 @@ func TestDevPreviewDashboardRequiresDevMode(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected empty dev preview dashboard to contain %q", want)
 		}
+	}
+}
+
+func TestDevPreviewWebhooksRequiresDevMode(t *testing.T) {
+	// Without DevMode the route is never registered and the handler re-checks
+	// the flag, mirroring the other preview pages.
+	prod := NewServer(Config{AppName: "Thawguard"})
+	recorder := httptest.NewRecorder()
+	prod.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dev/preview/webhooks", nil))
+	for _, leaked := range []string{"mira.frost@example.test", "f47ac10b", "dev-preview-fictional-token"} {
+		if strings.Contains(recorder.Body.String(), leaked) {
+			t.Fatalf("expected non-dev server not to serve preview fixture %q", leaked)
+		}
+	}
+	recorder = httptest.NewRecorder()
+	prod.handleDevPreviewWebhooks(recorder, httptest.NewRequest(http.MethodGet, "/dev/preview/webhooks", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("expected dev preview webhooks handler to 404 without dev mode, got %d", recorder.Code)
+	}
+
+	dev := NewServer(Config{AppName: "Thawguard", DevMode: true})
+	recorder = httptest.NewRecorder()
+	dev.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dev/preview/webhooks", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected /dev/preview/webhooks to render in dev mode, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{"Webhook deliveries", "Webhook Log", "aurora/ice-station", "borealis/frost-api", "f47ac10b…", "26 deliveries", "Processed with error", "Retryable failure", `aria-sort="descending"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected dev preview webhooks to contain %q", want)
+		}
+	}
+
+	// The two oldest fixtures - the historical unverified receipt and the
+	// unknown-repository fallback - land on the second page.
+	recorder = httptest.NewRecorder()
+	dev.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dev/preview/webhooks?page=2", nil))
+	body = recorder.Body.String()
+	for _, want := range []string{"Not verified", "Repository #12"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected dev preview webhooks page 2 to contain %q", want)
+		}
+	}
+
+	recorder = httptest.NewRecorder()
+	dev.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dev/preview/webhooks?variant=empty&role=viewer", nil))
+	body = recorder.Body.String()
+	for _, want := range []string{"No webhook deliveries yet", "sten.hale@example.test"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected empty dev preview webhooks to contain %q", want)
+		}
+	}
+
+	recorder = httptest.NewRecorder()
+	dev.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dev/preview/webhooks?variant=empty&processing=processed", nil))
+	if !strings.Contains(recorder.Body.String(), "No matching deliveries") {
+		t.Fatalf("expected filtered empty dev preview webhooks to show the filtered empty state, got %q", recorder.Body.String())
 	}
 }

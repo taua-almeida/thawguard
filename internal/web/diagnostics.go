@@ -1,9 +1,10 @@
 package web
 
 // Shared view-model helpers for the diagnostics-table pages (/activity,
-// /webhooks, /publications). Only the pagination window and filter-chip
-// shapes are shared; each page keeps its own query struct, URL builder,
-// column markup, and badge mapping. The template side is ui/pager.
+// /webhooks, /publications). Only the pagination window, filter-chip, and
+// sortable-header shapes are shared; each page keeps its own query struct,
+// URL builder, column markup, and badge mapping. The template side is
+// ui/pager and ui/sort-th.
 
 // tablePager is the "Showing From–To of Total" footer with optional
 // previous/next URLs. A nil pager means everything fits on one page and the
@@ -36,6 +37,45 @@ func paginateTable(total, page, size int, urlFor func(page int) string) *tablePa
 		pager.NextURL = urlFor(page + 1)
 	}
 	return pager
+}
+
+// tableSort is a diagnostics table's applied ordering.
+type tableSort struct {
+	Field string
+	Dir   string // "asc" | "desc"
+}
+
+// tableSortHeader is one sortable column header's render state; the template
+// side is ui/sort-th. Unsortable columns keep their plain <th> markup.
+type tableSortHeader struct {
+	Label     string
+	URL       string // toggle target
+	Aria      string // "ascending" | "descending" | "none"
+	Indicator string // "↑" | "↓" | "" (inactive)
+	Active    bool
+}
+
+// sortHeader builds one sortable header: clicking an inactive column takes it
+// over at desc (newest-first is the useful default for time columns), clicking
+// the active column flips direction. urlFor rebuilds the page URL for the
+// toggled sort with the page reset to 1.
+func sortHeader(current tableSort, field, label string, urlFor func(tableSort) string) tableSortHeader {
+	header := tableSortHeader{Label: label, Aria: "none"}
+	if current.Field != field {
+		header.URL = urlFor(tableSort{Field: field, Dir: "desc"})
+		return header
+	}
+	header.Active = true
+	if current.Dir == "asc" {
+		header.Aria = "ascending"
+		header.Indicator = "↑"
+		header.URL = urlFor(tableSort{Field: field, Dir: "desc"})
+	} else {
+		header.Aria = "descending"
+		header.Indicator = "↓"
+		header.URL = urlFor(tableSort{Field: field, Dir: "asc"})
+	}
+	return header
 }
 
 // filterChip is one entry in a diagnostics table's filter-chip row.

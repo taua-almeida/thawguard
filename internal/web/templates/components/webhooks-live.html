@@ -1,0 +1,28 @@
+{{/*
+  components/webhooks-live — the swappable /webhooks region: both page
+  callouts, the repository filter, and the delivery table. Filter chips,
+  sortable headers, pager links, and the repository select hx-get swap this
+  whole region; the repository filter keeps the processing filter and sort
+  but resets the page.
+*/}}
+{{ define "components/webhooks-live" }}
+<div id="webhooks-live" class="flex flex-col gap-6">
+  {{ template "ui/callout" dict "Tone" "warning" "Body" "Thawguard prevents accidental merges for trusted teams; collaborators with sufficient forge permissions can still bypass cooperative enforcement." }}
+  {{ template "ui/callout" dict "Tone" "info" "Body" "This troubleshooting page does not store or render raw webhook payloads, request headers, signatures, webhook secrets, status tokens, or session IDs." }}
+  {{ if .FilterRepositories }}
+  <form method="get" action="/webhooks" class="flex flex-wrap items-center gap-2" aria-label="Filter deliveries by repository">
+    <input type="hidden" name="processing" value="{{ .Query.Processing }}">
+    {{ if eq .Query.Sort.Field "processed" }}<input type="hidden" name="sort" value="processed">{{ end }}
+    {{ if eq .Query.Sort.Dir "asc" }}<input type="hidden" name="dir" value="asc">{{ end }}
+    <label for="webhooks-repo-filter" class="text-sm text-text-muted">Repository</label>
+    <select id="webhooks-repo-filter" name="repo" hx-get="/webhooks" hx-trigger="change" hx-target="#webhooks-live" hx-swap="outerHTML" hx-push-url="true" hx-include="closest form"
+      class="h-8 rounded-control border border-border-input bg-surface px-2 text-xs text-text">
+      <option value="0">All repositories</option>
+      {{ range .FilterRepositories }}<option value="{{ .ID }}"{{ if eq .ID $.Query.RepositoryID }} selected{{ end }}>{{ .FullName }}</option>{{ end }}
+    </select>
+    <noscript>{{ template "ui/button" dict "Label" "Filter" "Variant" "secondary" "Size" "sm" "Type" "submit" }}</noscript>
+  </form>
+  {{ end }}
+  {{ template "components/webhooks-table" . }}
+</div>
+{{ end }}

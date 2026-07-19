@@ -1,0 +1,13 @@
+{{/*
+  ui/sort-th — one sortable diagnostics-table column header. The whole label
+  is a toggle link (desc-first takeover, flip when active) with a trailing
+  direction indicator; inactive sortable columns show a faint ↕ affordance.
+  Pairs with the tableSortHeader view model in diagnostics.go.
+  dict keys: Header (required: Label, URL, Aria, Indicator, Active),
+  HxTarget (optional htmx outerHTML swap target for the toggle link)
+*/}}
+{{ define "ui/sort-th" }}
+<th scope="col" aria-sort="{{ .Header.Aria }}" class="px-4 py-3 text-xs font-bold tracking-wide uppercase">
+  <a class="inline-flex items-center gap-1 {{ if .Header.Active }}text-text no-underline hover:text-accent-strong{{ else }}text-text-muted no-underline hover:text-text{{ end }}" href="{{ .Header.URL }}"{{ if .HxTarget }} hx-get="{{ .Header.URL }}" hx-target="{{ .HxTarget }}" hx-swap="outerHTML" hx-push-url="true"{{ end }}>{{ .Header.Label }} {{ if .Header.Active }}<span aria-hidden="true">{{ .Header.Indicator }}</span>{{ else }}<span class="opacity-40" aria-hidden="true">↕</span>{{ end }}</a>
+</th>
+{{ end }}

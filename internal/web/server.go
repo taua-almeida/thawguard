@@ -10,8 +10,6 @@ import (
 	"html/template"
 	"io"
 	"net/http"
-	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -31,8 +29,6 @@ import (
 )
 
 const defaultWebhookMaxBodyBytes int64 = 1 << 20
-const defaultAuditLogLimit = 25
-const maxAuditLogLimit = 500
 const scheduledFreezeReasonMaxLength = 500
 
 type Config struct {
@@ -168,7 +164,7 @@ type WebhookRepositoryStore interface {
 }
 
 type WebhookDeliveryStore interface {
-	ListRecent(ctx context.Context, limit int) ([]webhook.Delivery, error)
+	ListPage(ctx context.Context, processing string, repositoryID int64, order webhook.DeliveryOrder, offset, limit int) ([]webhook.Delivery, int, error)
 	Record(ctx context.Context, params webhook.DeliveryRecordParams) (webhook.Delivery, error)
 	ClaimForProcessing(ctx context.Context, id int64) (webhook.Delivery, bool, error)
 	MarkProcessed(ctx context.Context, id int64, params webhook.DeliveryProcessParams) (webhook.Delivery, error)
@@ -234,18 +230,6 @@ type scheduledFreezePageState struct {
 	EditPlannedEndsAt string
 }
 
-type webhookDeliveryView struct {
-	Delivery               webhook.Delivery
-	Repository             domain.Repository
-	ReceivedAt             string
-	ProcessingStartedAt    string
-	ProcessedAt            string
-	ProcessingState        string
-	ProcessingStateClass   string
-	VerificationState      string
-	VerificationStateClass string
-}
-
 type activityEventView struct {
 	CreatedAt    string
 	Actor        string
@@ -290,57 +274,6 @@ type usersPageState struct {
 
 type roleOption struct {
 	Value    string
-	Label    string
-	Selected bool
-}
-
-type auditLogControls struct {
-	Limit           int
-	Sort            string
-	Direction       string
-	RepositoryID    int64
-	ProcessingState string
-	Event           string
-}
-
-type auditLogView struct {
-	Deliveries              []webhookDeliveryView
-	Filters                 auditLogFilterView
-	RepositoryFilterOptions []auditLogOption
-	EventFilterOptions      []auditLogOption
-	ProcessingFilterOptions []auditLogOption
-	SortOptions             []auditLogOption
-	DirectionOptions        []auditLogOption
-	LimitOptions            []auditLogLimitOption
-}
-
-type auditLogFilterView struct {
-	Limit                  int
-	Sort                   string
-	Direction              string
-	RepositoryID           int64
-	ProcessingState        string
-	Event                  string
-	TotalRows              int
-	FilteredRows           int
-	ShowingRows            int
-	HasActiveFilters       bool
-	SortReceivedURL        string
-	SortProcessedURL       string
-	SortReceivedAria       string
-	SortProcessedAria      string
-	SortReceivedIndicator  string
-	SortProcessedIndicator string
-}
-
-type auditLogOption struct {
-	Value    string
-	Label    string
-	Selected bool
-}
-
-type auditLogLimitOption struct {
-	Value    int
 	Label    string
 	Selected bool
 }
@@ -420,6 +353,7 @@ func (s *Server) routes() {
 		s.mux.HandleFunc("GET /dev/preview/decisions", s.handleDevPreviewDecisions)
 		s.mux.HandleFunc("GET /dev/preview/activity", s.handleDevPreviewActivity)
 		s.mux.HandleFunc("GET /dev/preview/publications", s.handleDevPreviewPublications)
+		s.mux.HandleFunc("GET /dev/preview/webhooks", s.handleDevPreviewWebhooks)
 	}
 }
 
@@ -798,6 +732,7 @@ func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleWebhooks(w http.ResponseWriter, r *http.Request) {
+	w.Header().Add("Vary", "HX-Request")
 	if s.cfg.WebhookDeliveryStore == nil {
 		http.Error(w, "webhook delivery store is not configured", http.StatusServiceUnavailable)
 		return
@@ -806,13 +741,16 @@ func (s *Server) handleWebhooks(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	controls := parseAuditLogControls(r)
-	repositories, deliveries, err := s.webhookDeliveryPageData(r.Context())
-	if err != nil {
-		internalServerError(w)
+	query := webhooksQueryFromValues(r.URL.Query())
+	data, ok := s.loadWebhooksPageData(w, r, query, session)
+	if !ok {
 		return
 	}
-	s.renderWebhookDeliveries(w, auditLogViewData(controls, repositories, deliveries), session)
+	if isHXRequest(r) {
+		s.renderPage(w, "components/webhooks-live", data)
+		return
+	}
+	s.renderPage(w, "layouts/webhooks", data)
 }
 
 func (s *Server) handleForgejoWebhook(w http.ResponseWriter, r *http.Request) {
@@ -2146,303 +2084,6 @@ func (s *Server) repositories(ctx context.Context) ([]domain.Repository, error) 
 	return s.cfg.RepositoryStore.List(ctx)
 }
 
-func (s *Server) webhookDeliveries(ctx context.Context) ([]webhook.Delivery, error) {
-	if s.cfg.WebhookDeliveryStore == nil {
-		return nil, nil
-	}
-	return s.cfg.WebhookDeliveryStore.ListRecent(ctx, maxAuditLogLimit)
-}
-
-func (s *Server) webhookDeliveryPageData(ctx context.Context) ([]domain.Repository, []webhook.Delivery, error) {
-	repositories, err := s.repositories(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	deliveries, err := s.webhookDeliveries(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	return repositories, deliveries, nil
-}
-
-func parseAuditLogControls(r *http.Request) auditLogControls {
-	values := r.URL.Query()
-	controls := auditLogControls{
-		Limit:     defaultAuditLogLimit,
-		Sort:      "received",
-		Direction: "desc",
-		Event:     strings.TrimSpace(values.Get("event")),
-	}
-	if limit, err := strconv.Atoi(strings.TrimSpace(values.Get("limit"))); err == nil {
-		switch limit {
-		case 25, 50, 100:
-			controls.Limit = limit
-		}
-	}
-	if sortField := strings.TrimSpace(values.Get("sort")); sortField == "processed" || sortField == "received" {
-		controls.Sort = sortField
-	}
-	if direction := strings.TrimSpace(values.Get("direction")); direction == "asc" || direction == "desc" {
-		controls.Direction = direction
-	}
-	if repositoryID, err := strconv.ParseInt(strings.TrimSpace(values.Get("repository_id")), 10, 64); err == nil && repositoryID > 0 {
-		controls.RepositoryID = repositoryID
-	}
-	if state := strings.TrimSpace(values.Get("processing")); isAuditLogProcessingFilter(state) {
-		controls.ProcessingState = state
-	}
-	return controls
-}
-
-func auditLogViewData(controls auditLogControls, repositories []domain.Repository, deliveries []webhook.Delivery) auditLogView {
-	filtered := filterAuditLogDeliveries(deliveries, controls)
-	sortAuditLogDeliveries(filtered, controls)
-	limited := filtered
-	if len(limited) > controls.Limit {
-		limited = limited[:controls.Limit]
-	}
-	filterView := auditLogFilterView{
-		Limit:                  controls.Limit,
-		Sort:                   controls.Sort,
-		Direction:              controls.Direction,
-		RepositoryID:           controls.RepositoryID,
-		ProcessingState:        controls.ProcessingState,
-		Event:                  controls.Event,
-		TotalRows:              len(deliveries),
-		FilteredRows:           len(filtered),
-		ShowingRows:            len(limited),
-		HasActiveFilters:       controls.RepositoryID > 0 || controls.ProcessingState != "" || controls.Event != "",
-		SortReceivedURL:        auditLogSortURL(controls, "received"),
-		SortProcessedURL:       auditLogSortURL(controls, "processed"),
-		SortReceivedAria:       auditLogSortAria(controls, "received"),
-		SortProcessedAria:      auditLogSortAria(controls, "processed"),
-		SortReceivedIndicator:  auditLogSortIndicator(controls, "received"),
-		SortProcessedIndicator: auditLogSortIndicator(controls, "processed"),
-	}
-	return auditLogView{
-		Deliveries:              webhookDeliveryViews(repositories, limited),
-		Filters:                 filterView,
-		RepositoryFilterOptions: auditLogRepositoryOptions(repositories, controls.RepositoryID),
-		EventFilterOptions:      auditLogEventOptions(deliveries, controls.Event),
-		ProcessingFilterOptions: auditLogProcessingOptions(controls.ProcessingState),
-		SortOptions:             auditLogSortOptions(controls.Sort),
-		DirectionOptions:        auditLogDirectionOptions(controls.Direction),
-		LimitOptions:            auditLogLimitOptions(controls.Limit),
-	}
-}
-
-func filterAuditLogDeliveries(deliveries []webhook.Delivery, controls auditLogControls) []webhook.Delivery {
-	filtered := make([]webhook.Delivery, 0, len(deliveries))
-	for _, delivery := range deliveries {
-		if controls.RepositoryID > 0 && delivery.RepositoryID != controls.RepositoryID {
-			continue
-		}
-		if controls.Event != "" && delivery.Event != controls.Event {
-			continue
-		}
-		if controls.ProcessingState != "" && webhookDeliveryProcessingFilterState(delivery) != controls.ProcessingState {
-			continue
-		}
-		filtered = append(filtered, delivery)
-	}
-	return filtered
-}
-
-func sortAuditLogDeliveries(deliveries []webhook.Delivery, controls auditLogControls) {
-	sort.SliceStable(deliveries, func(i, j int) bool {
-		left := deliveries[i]
-		right := deliveries[j]
-		if controls.Sort == "processed" {
-			return compareOptionalAuditLogTimes(left.ProcessedAt, right.ProcessedAt, controls.Direction)
-		}
-		if left.ReceivedAt.Equal(right.ReceivedAt) {
-			if controls.Direction == "asc" {
-				return left.ID < right.ID
-			}
-			return left.ID > right.ID
-		}
-		if controls.Direction == "asc" {
-			return left.ReceivedAt.Before(right.ReceivedAt)
-		}
-		return left.ReceivedAt.After(right.ReceivedAt)
-	})
-}
-
-func compareOptionalAuditLogTimes(left *time.Time, right *time.Time, direction string) bool {
-	if left == nil && right == nil {
-		return false
-	}
-	if left == nil {
-		return false
-	}
-	if right == nil {
-		return true
-	}
-	if left.Equal(*right) {
-		return false
-	}
-	if direction == "asc" {
-		return left.Before(*right)
-	}
-	return left.After(*right)
-}
-
-func webhookDeliveryProcessingFilterState(delivery webhook.Delivery) string {
-	if delivery.ProcessedAt != nil {
-		if delivery.Error != "" {
-			return "processed_with_error"
-		}
-		return "processed"
-	}
-	if delivery.ProcessingStartedAt != nil {
-		return "processing"
-	}
-	if delivery.Error != "" {
-		return "retryable_failure"
-	}
-	return "received"
-}
-
-func isAuditLogProcessingFilter(state string) bool {
-	switch state {
-	case "", "received", "processing", "processed", "processed_with_error", "retryable_failure":
-		return true
-	default:
-		return false
-	}
-}
-
-func auditLogRepositoryOptions(repositories []domain.Repository, selectedID int64) []auditLogOption {
-	options := []auditLogOption{{Label: "All repositories", Selected: selectedID == 0}}
-	for _, repo := range repositories {
-		options = append(options, auditLogOption{Value: strconv.FormatInt(repo.ID, 10), Label: repo.FullName(), Selected: repo.ID == selectedID})
-	}
-	return options
-}
-
-func auditLogEventOptions(deliveries []webhook.Delivery, selected string) []auditLogOption {
-	events := make(map[string]bool)
-	for _, delivery := range deliveries {
-		if delivery.Event != "" {
-			events[delivery.Event] = true
-		}
-	}
-	if selected != "" {
-		events[selected] = true
-	}
-	labels := make([]string, 0, len(events))
-	for event := range events {
-		labels = append(labels, event)
-	}
-	sort.Strings(labels)
-	options := []auditLogOption{{Label: "All events", Selected: selected == ""}}
-	for _, event := range labels {
-		options = append(options, auditLogOption{Value: event, Label: event, Selected: event == selected})
-	}
-	return options
-}
-
-func auditLogProcessingOptions(selected string) []auditLogOption {
-	return []auditLogOption{
-		{Label: "All processing states", Selected: selected == ""},
-		{Value: "received", Label: "Received", Selected: selected == "received"},
-		{Value: "processing", Label: "Processing", Selected: selected == "processing"},
-		{Value: "processed", Label: "Processed", Selected: selected == "processed"},
-		{Value: "processed_with_error", Label: "Processed with error", Selected: selected == "processed_with_error"},
-		{Value: "retryable_failure", Label: "Retryable failure", Selected: selected == "retryable_failure"},
-	}
-}
-
-func auditLogSortOptions(selected string) []auditLogOption {
-	return []auditLogOption{
-		{Value: "received", Label: "Received time", Selected: selected == "received"},
-		{Value: "processed", Label: "Processed time", Selected: selected == "processed"},
-	}
-}
-
-func auditLogDirectionOptions(selected string) []auditLogOption {
-	return []auditLogOption{
-		{Value: "desc", Label: "Newest first", Selected: selected == "desc"},
-		{Value: "asc", Label: "Oldest first", Selected: selected == "asc"},
-	}
-}
-
-func auditLogLimitOptions(selected int) []auditLogLimitOption {
-	return []auditLogLimitOption{
-		{Value: 25, Label: "25", Selected: selected == 25},
-		{Value: 50, Label: "50", Selected: selected == 50},
-		{Value: 100, Label: "100", Selected: selected == 100},
-	}
-}
-
-func auditLogSortURL(controls auditLogControls, field string) string {
-	next := controls
-	next.Sort = field
-	next.Direction = "desc"
-	if controls.Sort == field && controls.Direction == "desc" {
-		next.Direction = "asc"
-	}
-	return auditLogURL(next)
-}
-
-func auditLogURL(controls auditLogControls) string {
-	values := url.Values{}
-	values.Set("limit", strconv.Itoa(controls.Limit))
-	values.Set("sort", controls.Sort)
-	values.Set("direction", controls.Direction)
-	if controls.RepositoryID > 0 {
-		values.Set("repository_id", strconv.FormatInt(controls.RepositoryID, 10))
-	}
-	if controls.ProcessingState != "" {
-		values.Set("processing", controls.ProcessingState)
-	}
-	if controls.Event != "" {
-		values.Set("event", controls.Event)
-	}
-	return "/webhooks?" + values.Encode()
-}
-
-func auditLogSortAria(controls auditLogControls, field string) string {
-	if controls.Sort != field {
-		return "none"
-	}
-	if controls.Direction == "asc" {
-		return "ascending"
-	}
-	return "descending"
-}
-
-func auditLogSortIndicator(controls auditLogControls, field string) string {
-	if controls.Sort != field {
-		return ""
-	}
-	if controls.Direction == "asc" {
-		return "↑"
-	}
-	return "↓"
-}
-
-func webhookDeliveryViews(repositories []domain.Repository, deliveries []webhook.Delivery) []webhookDeliveryView {
-	repositoriesByID := repositoriesByID(repositories)
-	views := make([]webhookDeliveryView, 0, len(deliveries))
-	for _, delivery := range deliveries {
-		state, stateClass := webhookDeliveryProcessingState(delivery)
-		verified, verifiedClass := webhookDeliveryVerificationState(delivery)
-		views = append(views, webhookDeliveryView{
-			Delivery:               delivery,
-			Repository:             repositoriesByID[delivery.RepositoryID],
-			ReceivedAt:             delivery.ReceivedAt.UTC().Format("2006-01-02 15:04 UTC"),
-			ProcessingStartedAt:    optionalWebhookDeliveryTime(delivery.ProcessingStartedAt),
-			ProcessedAt:            optionalWebhookDeliveryTime(delivery.ProcessedAt),
-			ProcessingState:        state,
-			ProcessingStateClass:   stateClass,
-			VerificationState:      verified,
-			VerificationStateClass: verifiedClass,
-		})
-	}
-	return views
-}
-
 type activityDetails map[string]json.RawMessage
 
 type activityActionDefinition struct {
@@ -2988,36 +2629,6 @@ func activityRolesOrUnavailable(details activityDetails, key string) string {
 	return roles.Label()
 }
 
-func webhookDeliveryProcessingState(delivery webhook.Delivery) (string, string) {
-	if delivery.ProcessedAt != nil {
-		if delivery.Error != "" {
-			return "processed with error", "warning"
-		}
-		return "processed", "ok"
-	}
-	if delivery.ProcessingStartedAt != nil {
-		return "processing", "pending"
-	}
-	if delivery.Error != "" {
-		return "retryable failure", "failed"
-	}
-	return "received", "warning"
-}
-
-func webhookDeliveryVerificationState(delivery webhook.Delivery) (string, string) {
-	if delivery.Verified {
-		return "verified", "ok"
-	}
-	return "not verified", "warning"
-}
-
-func optionalWebhookDeliveryTime(value *time.Time) string {
-	if value == nil || value.IsZero() {
-		return "—"
-	}
-	return value.UTC().Format("2006-01-02 15:04 UTC")
-}
-
 func (s *Server) activeFreezes(ctx context.Context) ([]domain.BranchFreeze, error) {
 	if s.cfg.FreezeStore == nil {
 		return nil, nil
@@ -3248,23 +2859,6 @@ func (s *Server) renderUsers(w http.ResponseWriter, users []auth.User, state use
 		"UserCount":   len(users),
 		"FormError":   state.FormError,
 		"RoleOptions": roleOptionsFor(state.CreateRoles),
-	})
-}
-
-func (s *Server) renderWebhookDeliveries(w http.ResponseWriter, auditLog auditLogView, session sessionState) {
-	s.render(w, webhookDeliveriesTemplate, map[string]any{
-		"AppName":                 s.cfg.AppName,
-		"ActivePage":              "",
-		"CurrentUser":             currentUserFromSession(session),
-		"CSRFToken":               session.CSRFToken,
-		"Deliveries":              auditLog.Deliveries,
-		"Filters":                 auditLog.Filters,
-		"RepositoryFilterOptions": auditLog.RepositoryFilterOptions,
-		"EventFilterOptions":      auditLog.EventFilterOptions,
-		"ProcessingFilterOptions": auditLog.ProcessingFilterOptions,
-		"SortOptions":             auditLog.SortOptions,
-		"DirectionOptions":        auditLog.DirectionOptions,
-		"LimitOptions":            auditLog.LimitOptions,
 	})
 }
 
@@ -3644,155 +3238,6 @@ const usersTemplate = pageHead + `
       </div>
       {{ else }}
         <div class="tg-empty-row tg-data-empty"><strong>No users yet</strong><span>Create the first admin from setup.</span></div>
-      {{ end }}
-    </section>
-  </main>` + pageFoot
-
-const webhookDeliveriesTemplate = pageHead + `
-  <main class="tg-main tg-setup-page tg-audit-page">
-    <header class="tg-header">
-      <div>
-        <p class="eyebrow">Secondary operational diagnostics</p>
-        <h1 class="tg-title">Webhook diagnostics</h1>
-        <p class="tg-subtitle">Inspect recent signed webhook deliveries, verification state, and sanitized local processing outcomes.</p>
-      </div>
-      <div class="tg-header-actions">
-        <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/activity">Back to activity</a>
-        <span class="tg-badge tg-badge-info"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-audit"></use></svg>Sanitized delivery metadata</span>
-      </div>
-    </header>
-
-    <section class="tg-warning-callout">
-      <span aria-hidden="true"><svg class="tg-icon"><use href="#tg-i-warning"></use></svg></span>
-      <span>This troubleshooting page does not store or render raw webhook payloads, request headers, signatures, webhook secrets, status tokens, or session IDs.</span>
-    </section>
-
-    <section class="tg-panel tg-data-panel tg-audit-log-panel">
-      <div class="tg-table-toolbar" aria-label="Webhook diagnostic controls">
-        <div class="tg-toolbar-main">
-          <h2>Signed webhook deliveries</h2>
-          <p>Latest signed pull request webhook receipts and local recomputation processing states.</p>
-        </div>
-        <div class="tg-toolbar-controls" aria-label="Webhook delivery table controls">
-          <a class="tg-btn tg-btn-secondary tg-btn-sm" href="#audit-filters">Filters{{ if .Filters.HasActiveFilters }} active{{ end }}</a>
-        </div>
-      </div>
-
-      <section id="audit-filters" class="tg-modal tg-filter-modal" aria-labelledby="audit-filters-title">
-        <a class="tg-modal-backdrop" href="#" aria-label="Close audit filters"></a>
-        <div class="tg-modal-card" role="dialog" aria-modal="true">
-          <div class="tg-modal-head">
-            <h2 id="audit-filters-title">Filter webhook deliveries</h2>
-            <a href="#" class="tg-modal-close" aria-label="Close"><svg class="tg-icon"><use href="#tg-i-close"></use></svg></a>
-          </div>
-          <form class="tg-setup-form tg-filter-form" method="get" action="/webhooks">
-            <input type="hidden" name="sort" value="{{ .Filters.Sort }}">
-            <input type="hidden" name="direction" value="{{ .Filters.Direction }}">
-            <input type="hidden" name="limit" value="{{ .Filters.Limit }}">
-            <label>Repository
-              <select name="repository_id">
-                {{ range .RepositoryFilterOptions }}<option value="{{ .Value }}"{{ if .Selected }} selected{{ end }}>{{ .Label }}</option>{{ end }}
-              </select>
-            </label>
-            <label>Processing status
-              <select name="processing">
-                {{ range .ProcessingFilterOptions }}<option value="{{ .Value }}"{{ if .Selected }} selected{{ end }}>{{ .Label }}</option>{{ end }}
-              </select>
-            </label>
-            <label>Event
-              <select name="event">
-                {{ range .EventFilterOptions }}<option value="{{ .Value }}"{{ if .Selected }} selected{{ end }}>{{ .Label }}</option>{{ end }}
-              </select>
-            </label>
-            <div class="tg-form-actions tg-field-wide">
-              <a class="tg-btn tg-btn-secondary tg-btn-sm" href="/webhooks">Reset filters</a>
-              <button type="submit" class="tg-btn tg-btn-primary tg-btn-sm">Apply filters</button>
-            </div>
-          </form>
-        </div>
-      </section>
-
-      {{ if .Deliveries }}
-      <div class="tg-table-wrap tg-responsive-table">
-        <table class="tg-data-table tg-audit-table">
-          <caption class="tg-sr-only">Recent webhook deliveries</caption>
-          <thead>
-            <tr>
-              <th scope="col" aria-sort="{{ .Filters.SortReceivedAria }}"><a class="tg-sort-link{{ if eq .Filters.Sort "received" }} is-sorted{{ end }}" href="{{ .Filters.SortReceivedURL }}">Received{{ if .Filters.SortReceivedIndicator }} <span class="tg-sort-indicator" aria-hidden="true">{{ .Filters.SortReceivedIndicator }}</span>{{ end }}</a></th>
-              <th scope="col">Repository</th>
-              <th scope="col">Delivery ID</th>
-              <th scope="col">Event</th>
-              <th scope="col">Verification</th>
-              <th scope="col">Processing</th>
-              <th scope="col" aria-sort="{{ .Filters.SortProcessedAria }}"><a class="tg-sort-link{{ if eq .Filters.Sort "processed" }} is-sorted{{ end }}" href="{{ .Filters.SortProcessedURL }}">Processed{{ if .Filters.SortProcessedIndicator }} <span class="tg-sort-indicator" aria-hidden="true">{{ .Filters.SortProcessedIndicator }}</span>{{ end }}</a></th>
-              <th scope="col">Details</th>
-            </tr>
-          </thead>
-          <tbody>
-          {{ range .Deliveries }}
-            <tr id="delivery-{{ .Delivery.ID }}">
-              <td data-label="Received">{{ .ReceivedAt }}</td>
-              <td data-label="Repository"><span class="tg-table-repo"><svg class="tg-icon" aria-hidden="true"><use href="#tg-i-repositories"></use></svg><code>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else if .Delivery.RepositoryID }}Repository #{{ .Delivery.RepositoryID }}{{ else }}Unknown repository{{ end }}</code></span></td>
-              <td data-label="Delivery ID"><code class="tg-truncate">{{ .Delivery.DeliveryID }}</code></td>
-              <td data-label="Event"><code>{{ .Delivery.Event }}</code>{{ if .Delivery.Action }}<small class="tg-muted">{{ .Delivery.Action }}</small>{{ else }}<small class="tg-muted">no action</small>{{ end }}</td>
-              <td data-label="Verification"><span class="status status-{{ .VerificationStateClass }}">{{ .VerificationState }}</span></td>
-              <td data-label="Processing"><span class="status status-{{ .ProcessingStateClass }}">{{ .ProcessingState }}</span><small class="tg-muted">Claimed {{ .ProcessingStartedAt }}</small></td>
-              <td data-label="Processed">{{ .ProcessedAt }}</td>
-              <td data-label="Details">{{ if .Delivery.Error }}{{ .Delivery.Error }}{{ else }}No processing error{{ end }}</td>
-            </tr>
-          {{ end }}
-          </tbody>
-        </table>
-      </div>
-
-      <div class="tg-mobile-card-list" aria-label="Recent webhook deliveries mobile cards">
-        {{ range .Deliveries }}
-        <article class="tg-mobile-card">
-          <div class="tg-mobile-card-head">
-            <div>
-              <span class="tg-mobile-card-kicker">{{ .ReceivedAt }}</span>
-              <h3>{{ if .Repository.ID }}{{ .Repository.FullName }}{{ else if .Delivery.RepositoryID }}Repository #{{ .Delivery.RepositoryID }}{{ else }}Unknown repository{{ end }}</h3>
-            </div>
-            <span class="status status-{{ .ProcessingStateClass }}">{{ .ProcessingState }}</span>
-          </div>
-          <p class="tg-mobile-card-meta"><code>{{ .Delivery.Event }}</code>{{ if .Delivery.Action }}<span class="tg-dot">·</span><code>{{ .Delivery.Action }}</code>{{ end }}<span class="tg-dot">·</span><span class="status status-{{ .VerificationStateClass }}">{{ .VerificationState }}</span></p>
-          <dl class="tg-mobile-card-grid">
-            <div><dt>Delivery ID</dt><dd><code>{{ .Delivery.DeliveryID }}</code></dd></div>
-            <div><dt>Claimed</dt><dd>{{ .ProcessingStartedAt }}</dd></div>
-            <div><dt>Processed</dt><dd>{{ .ProcessedAt }}</dd></div>
-          </dl>
-          <p class="tg-mobile-card-detail">{{ if .Delivery.Error }}{{ .Delivery.Error }}{{ else }}No processing error recorded for this delivery.{{ end }}</p>
-        </article>
-        {{ end }}
-      </div>
-
-      <footer class="tg-pagination" aria-label="Webhook diagnostic pagination">
-        <span class="tg-pagination-summary">Showing {{ .Filters.ShowingRows }} of {{ .Filters.FilteredRows }} matching rows</span>
-        <form class="tg-page-size-form" method="get" action="/webhooks">
-          <input type="hidden" name="sort" value="{{ .Filters.Sort }}">
-          <input type="hidden" name="direction" value="{{ .Filters.Direction }}">
-          {{ if .Filters.RepositoryID }}<input type="hidden" name="repository_id" value="{{ .Filters.RepositoryID }}">{{ end }}
-          {{ if .Filters.ProcessingState }}<input type="hidden" name="processing" value="{{ .Filters.ProcessingState }}">{{ end }}
-          {{ if .Filters.Event }}<input type="hidden" name="event" value="{{ .Filters.Event }}">{{ end }}
-          <span class="tg-page-size">{{ .Filters.TotalRows }} total rows loaded</span>
-          <label class="tg-compact-field">Rows per page
-            <select name="limit">
-              {{ range .LimitOptions }}<option value="{{ .Value }}"{{ if .Selected }} selected{{ end }}>{{ .Label }}</option>{{ end }}
-            </select>
-          </label>
-          <button type="submit" class="tg-btn tg-btn-secondary tg-btn-sm">Apply</button>
-        </form>
-      </footer>
-      {{ else }}
-        <div class="tg-empty-row tg-data-empty">
-          {{ if and .Filters.TotalRows .Filters.HasActiveFilters }}
-          <strong>No webhook deliveries match these filters</strong>
-          <span>Adjust filters or reset controls to return to all loaded deliveries.</span>
-          {{ else }}
-          <strong>No webhook deliveries recorded yet</strong>
-          <span>Send a signed pull request webhook to see sanitized delivery metadata here.</span>
-          {{ end }}
-        </div>
       {{ end }}
     </section>
   </main>` + pageFoot

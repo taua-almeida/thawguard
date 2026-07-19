@@ -28,7 +28,7 @@
         <p class="shell-nav-group-title">Observability</p>
         {{ template "shell/nav-item" dict "Href" "/activity" "Icon" "tg-i-activity" "Label" "Activity" "Key" "activity" "Active" .ActivePage }}
         {{ template "shell/nav-item" dict "Href" "/publications" "Icon" "tg-i-audit" "Label" "Status publishing" "Key" "publications" "Active" .ActivePage }}
-        {{ template "shell/nav-item" dict "Href" "/webhooks" "Icon" "tg-i-health-check" "Label" "System Log" "Key" "webhooks" "Active" .ActivePage }}
+        {{ template "shell/nav-item" dict "Href" "/webhooks" "Icon" "tg-i-health-check" "Label" "Webhook Log" "Key" "webhooks" "Active" .ActivePage }}
         {{ if .CurrentUser.IsAdmin }}
         <p class="shell-nav-group-title">Admin</p>
         {{ template "shell/nav-item" dict "Href" "/users" "Icon" "tg-i-users" "Label" "Users & Roles" "Key" "users" "Active" .ActivePage }}
@@ -97,7 +97,7 @@
         {{ template "shell/chip-item" dict "Href" "/repositories" "Label" "Repositories" "Key" "repositories" "Active" .ActivePage }}
         {{ template "shell/chip-item" dict "Href" "/activity" "Label" "Activity" "Key" "activity" "Active" .ActivePage }}
         {{ template "shell/chip-item" dict "Href" "/publications" "Label" "Status publishing" "Key" "publications" "Active" .ActivePage }}
-        {{ template "shell/chip-item" dict "Href" "/webhooks" "Label" "System Log" "Key" "webhooks" "Active" .ActivePage }}
+        {{ template "shell/chip-item" dict "Href" "/webhooks" "Label" "Webhook Log" "Key" "webhooks" "Active" .ActivePage }}
         {{ if .CurrentUser.IsAdmin }}{{ template "shell/chip-item" dict "Href" "/users" "Label" "Users" "Key" "users" "Active" .ActivePage }}{{ end }}
       </nav>
       <main id="main" class="shell-main">

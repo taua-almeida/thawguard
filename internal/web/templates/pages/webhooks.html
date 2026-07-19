@@ -1,0 +1,9 @@
+{{ define "pages/webhooks" }}
+<div class="flex flex-col gap-6">
+  <header>
+    <h1 class="m-0 text-page-title font-bold text-text">Webhook deliveries</h1>
+    <p class="m-0 mt-1 text-sm text-text-muted">Sanitized receipts of signed pull request webhooks from your forge, and what Thawguard's local processing did with each one.</p>
+  </header>
+  {{ template "components/webhooks-live" . }}
+</div>
+{{ end }}

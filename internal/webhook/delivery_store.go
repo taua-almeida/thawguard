@@ -253,20 +253,107 @@ LIMIT 1`, repositoryID)
 	return delivery, true, nil
 }
 
-func (s *DeliveryStore) ListRecent(ctx context.Context, limit int) ([]Delivery, error) {
+// DeliveryOrder selects one fixed ordering for paged delivery lists. It is a
+// closed set: every value maps to a constant ORDER BY clause and nothing
+// user-supplied reaches the SQL.
+type DeliveryOrder string
+
+const (
+	DeliveryOrderReceivedDesc  DeliveryOrder = "received_desc"
+	DeliveryOrderReceivedAsc   DeliveryOrder = "received_asc"
+	DeliveryOrderProcessedDesc DeliveryOrder = "processed_desc"
+	DeliveryOrderProcessedAsc  DeliveryOrder = "processed_asc"
+)
+
+// Derived processing states accepted by ListPage's processing filter. They
+// partition all rows with the same precedence as the UI badge derivation.
+const (
+	DeliveryProcessingReceived           = "received"
+	DeliveryProcessingProcessing         = "processing"
+	DeliveryProcessingProcessed          = "processed"
+	DeliveryProcessingProcessedWithError = "processed_with_error"
+	DeliveryProcessingRetryableFailure   = "retryable_failure"
+)
+
+// deliveryProcessingConditions maps each derived processing state to its WHERE
+// fragment. The error column stores NULL for "no error", so comparisons go
+// through COALESCE to match the Go-side Error == "" derivation.
+var deliveryProcessingConditions = map[string]string{
+	DeliveryProcessingProcessed:          "processed_at IS NOT NULL AND COALESCE(error, '') = ''",
+	DeliveryProcessingProcessedWithError: "processed_at IS NOT NULL AND COALESCE(error, '') != ''",
+	DeliveryProcessingProcessing:         "processed_at IS NULL AND processing_started_at IS NOT NULL",
+	DeliveryProcessingRetryableFailure:   "processed_at IS NULL AND processing_started_at IS NULL AND COALESCE(error, '') != ''",
+	DeliveryProcessingReceived:           "processed_at IS NULL AND processing_started_at IS NULL AND COALESCE(error, '') = ''",
+}
+
+// deliveryOrderClause maps a DeliveryOrder to its fixed ORDER BY clause;
+// unknown orders fall back to newest received first. Processed orders sort
+// missing processed_at last in both directions.
+func deliveryOrderClause(order DeliveryOrder) string {
+	switch order {
+	case DeliveryOrderReceivedAsc:
+		return "ORDER BY received_at ASC, id ASC"
+	case DeliveryOrderProcessedDesc:
+		return "ORDER BY processed_at IS NULL, processed_at DESC, id DESC"
+	case DeliveryOrderProcessedAsc:
+		return "ORDER BY processed_at IS NULL, processed_at ASC, id ASC"
+	default:
+		return "ORDER BY received_at DESC, id DESC"
+	}
+}
+
+// deliveryPageFilter builds the shared WHERE clause for the paged list
+// queries: an optional derived processing-state partition plus an optional
+// repository scope. An unknown processing value matches nothing.
+func deliveryPageFilter(processing string, repositoryID int64) (string, []any) {
+	conditions := make([]string, 0, 2)
+	args := make([]any, 0, 1)
+	if processing != "" {
+		condition, known := deliveryProcessingConditions[processing]
+		if !known {
+			condition = "1 = 0"
+		}
+		conditions = append(conditions, condition)
+	}
+	if repositoryID > 0 {
+		conditions = append(conditions, "repository_id = ?")
+		args = append(args, repositoryID)
+	}
+	if len(conditions) == 0 {
+		return "", nil
+	}
+	return "WHERE " + strings.Join(conditions, " AND "), args
+}
+
+// ListPage returns one page of deliveries plus the total count matching the
+// same filters. An empty processing value or zero repositoryID leaves that
+// filter off.
+func (s *DeliveryStore) ListPage(ctx context.Context, processing string, repositoryID int64, order DeliveryOrder, offset, limit int) ([]Delivery, int, error) {
 	if s == nil || s.db == nil {
-		return nil, errors.New("webhook delivery store has no database")
+		return nil, 0, errors.New("webhook delivery store has no database")
 	}
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
+	if offset < 0 {
+		offset = 0
+	}
+	where, filterArgs := deliveryPageFilter(processing, repositoryID)
+
+	var total int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM webhook_deliveries "+where, filterArgs...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count webhook deliveries: %w", err)
+	}
+
+	args := append(append([]any{}, filterArgs...), limit, offset)
 	rows, err := s.db.QueryContext(ctx, `
 SELECT id, repository_id, delivery_id, event, action, received_at, verified, processing_started_at, processed_at, error
 FROM webhook_deliveries
-ORDER BY received_at DESC, id DESC
-LIMIT ?`, limit)
+`+where+`
+`+deliveryOrderClause(order)+`
+LIMIT ? OFFSET ?`, args...)
 	if err != nil {
-		return nil, fmt.Errorf("list webhook deliveries: %w", err)
+		return nil, 0, fmt.Errorf("list webhook deliveries page: %w", err)
 	}
 	defer rows.Close()
 
@@ -274,14 +361,14 @@ LIMIT ?`, limit)
 	for rows.Next() {
 		delivery, err := scanDelivery(rows)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		deliveries = append(deliveries, delivery)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list webhook deliveries rows: %w", err)
+		return nil, 0, fmt.Errorf("list webhook deliveries page rows: %w", err)
 	}
-	return deliveries, nil
+	return deliveries, total, nil
 }
 
 func recordDeliveryError(err error) error {

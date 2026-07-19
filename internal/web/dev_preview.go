@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
 	"github.com/taua-almeida/thawguard/internal/statuspublication"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
+	"github.com/taua-almeida/thawguard/internal/webhook"
 )
 
 // Dev-only component gallery (GET /dev/preview, GET /dev/preview/auth).
@@ -1026,4 +1028,167 @@ func (s *Server) handleDevPreviewPublications(w http.ResponseWriter, r *http.Req
 		return publicationsURL(next)
 	})
 	s.renderPage(w, "layouts/publications", data)
+}
+
+// handleDevPreviewWebhooks renders the webhook-deliveries page from fictional
+// fixtures through the real view-model builders
+// (GET /dev/preview/webhooks). Query knobs: ?role=viewer, ?variant=empty,
+// ?theme=dark|light, plus the page's real processing/repo/sort/dir/page
+// parameters, which filter, order, and window the fixtures the way the store
+// query would. The default view holds 26 deliveries: heads covering all five
+// processing states, one historical not-verified row, one unknown-repository
+// fallback, and rotating filler so every chip has matches and the pager
+// renders. Combine ?variant=empty with any filter to see the filtered empty
+// state.
+func (s *Server) handleDevPreviewWebhooks(w http.ResponseWriter, r *http.Request) {
+	if !s.cfg.DevMode {
+		http.NotFound(w, r)
+		return
+	}
+	user := currentUserView{
+		Email:             "mira.frost@example.test",
+		DisplayName:       "Mira Frost",
+		RoleLabel:         "Admin",
+		CanChangePassword: true,
+		IsAdmin:           true,
+		CanFreeze:         true,
+		CanThaw:           true,
+	}
+	if r.URL.Query().Get("role") == "viewer" {
+		user = currentUserView{
+			Email:             "sten.hale@example.test",
+			DisplayName:       "Sten Hale",
+			RoleLabel:         "Viewer",
+			CanChangePassword: true,
+		}
+	}
+	repositories := []domain.Repository{
+		{ID: 46, Forge: "forgejo", BaseURL: "https://forge.example.test", Owner: "aurora", Name: "ice-station", DefaultBranch: "main", EnforcementState: domain.EnforcementActive},
+		{ID: 47, Forge: "codeberg", BaseURL: "https://codeberg.org", Owner: "borealis", Name: "frost-api", DefaultBranch: "main", EnforcementState: domain.EnforcementActive},
+	}
+	at := func(t time.Time) *time.Time { return &t }
+	deliveries := []webhook.Delivery{
+		{ID: 720, RepositoryID: 46, DeliveryID: "f47ac10b-58cc-4372-a567-0e02b2c3d479", Event: "pull_request", Action: "opened", ReceivedAt: time.Date(2026, 7, 17, 9, 2, 0, 0, time.UTC), Verified: true, ProcessingStartedAt: at(time.Date(2026, 7, 17, 9, 2, 5, 0, time.UTC)), ProcessedAt: at(time.Date(2026, 7, 17, 9, 2, 6, 0, time.UTC))},
+		{ID: 719, RepositoryID: 47, DeliveryID: "9b2f8c44-1d2e-4f6a-8c3b-5a7d9e0f1a2b", Event: "pull_request", Action: "synchronized", ReceivedAt: time.Date(2026, 7, 17, 8, 41, 0, 0, time.UTC), Verified: true, ProcessingStartedAt: at(time.Date(2026, 7, 17, 8, 41, 2, 0, time.UTC)), ProcessedAt: at(time.Date(2026, 7, 17, 8, 41, 4, 0, time.UTC)), Error: "webhook processing failed: forge API returned status 502"},
+		{ID: 718, RepositoryID: 46, DeliveryID: "3c9d2e71-6b5f-4a8e-9d0c-2f4b6a8e0c1d", Event: "pull_request", Action: "synchronized", ReceivedAt: time.Date(2026, 7, 17, 8, 15, 0, 0, time.UTC), Verified: true, ProcessingStartedAt: at(time.Date(2026, 7, 17, 8, 15, 1, 0, time.UTC))},
+		{ID: 717, RepositoryID: 47, DeliveryID: "d81e5f30-2a4c-4b7d-8e9f-0a1b2c3d4e5f", Event: "pull_request", Action: "closed", ReceivedAt: time.Date(2026, 7, 17, 7, 58, 0, 0, time.UTC), Verified: true, Error: "webhook processing failed: delivery store was busy; retry scheduled"},
+		{ID: 716, RepositoryID: 46, DeliveryID: "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d", Event: "pull_request", Action: "opened", ReceivedAt: time.Date(2026, 7, 17, 7, 31, 0, 0, time.UTC), Verified: true},
+	}
+	// Older filler receipts push the table past one page (26 rows total) so
+	// the pager renders; outcomes rotate so every chip filter has matches.
+	for i := range 19 {
+		received := time.Date(2026, 7, 16, 22, 0, 0, 0, time.UTC).Add(-time.Duration(i*3) * time.Hour)
+		delivery := webhook.Delivery{
+			ID:           int64(700 - i),
+			RepositoryID: 46,
+			DeliveryID:   fmt.Sprintf("%08x-77aa-4c3e-9b1d-45f0c61122aa", 0x9e0c4a00+i),
+			Event:        "pull_request",
+			Action:       "synchronized",
+			ReceivedAt:   received,
+			Verified:     true,
+		}
+		if i%2 == 1 {
+			delivery.RepositoryID = 47
+			delivery.Action = "opened"
+		}
+		switch i % 3 {
+		case 0:
+			delivery.ProcessingStartedAt = at(received.Add(2 * time.Second))
+			delivery.ProcessedAt = at(received.Add(4 * time.Second))
+		case 1:
+			delivery.ProcessingStartedAt = at(received.Add(2 * time.Second))
+			delivery.ProcessedAt = at(received.Add(4 * time.Second))
+			delivery.Error = "webhook processing failed: forge API returned status 502"
+		default:
+			delivery.Error = "webhook processing failed: delivery store was busy; retry scheduled"
+		}
+		deliveries = append(deliveries, delivery)
+	}
+	// Historical row from before signature enforcement (the only source of a
+	// "Not verified" badge) and the unknown-repository fallback.
+	deliveries = append(deliveries,
+		webhook.Delivery{ID: 512, RepositoryID: 47, DeliveryID: "1f2e3d4c-5b6a-4978-8f0e-9d8c7b6a5f4e", Event: "pull_request", Action: "opened", ReceivedAt: time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC), ProcessingStartedAt: at(time.Date(2026, 6, 30, 12, 0, 1, 0, time.UTC)), ProcessedAt: at(time.Date(2026, 6, 30, 12, 0, 3, 0, time.UTC))},
+		webhook.Delivery{ID: 402, RepositoryID: 12, DeliveryID: "7e8f9a0b-1c2d-4e3f-8a4b-5c6d7e8f9a0b", Event: "pull_request", Action: "opened", ReceivedAt: time.Date(2026, 6, 28, 9, 15, 0, 0, time.UTC), Verified: true, ProcessingStartedAt: at(time.Date(2026, 6, 28, 9, 15, 2, 0, time.UTC)), ProcessedAt: at(time.Date(2026, 6, 28, 9, 15, 4, 0, time.UTC))},
+	)
+	if r.URL.Query().Get("variant") == "empty" {
+		deliveries = nil
+	}
+	query := webhooksQueryFromValues(r.URL.Query())
+	processing := publicationStoreFilter(query.Processing)
+	filtered := make([]webhook.Delivery, 0, len(deliveries))
+	for _, delivery := range deliveries {
+		if processing != "" && webhookDeliveryProcessing(delivery) != processing {
+			continue
+		}
+		if query.RepositoryID > 0 && delivery.RepositoryID != query.RepositoryID {
+			continue
+		}
+		filtered = append(filtered, delivery)
+	}
+	order := webhookDeliveryOrder(query.Sort)
+	sort.SliceStable(filtered, func(i, j int) bool {
+		a, b := filtered[i], filtered[j]
+		switch order {
+		case webhook.DeliveryOrderReceivedAsc:
+			if !a.ReceivedAt.Equal(b.ReceivedAt) {
+				return a.ReceivedAt.Before(b.ReceivedAt)
+			}
+			return a.ID < b.ID
+		case webhook.DeliveryOrderProcessedAsc, webhook.DeliveryOrderProcessedDesc:
+			if (a.ProcessedAt == nil) != (b.ProcessedAt == nil) {
+				return b.ProcessedAt == nil // nulls last in both directions
+			}
+			if a.ProcessedAt != nil && !a.ProcessedAt.Equal(*b.ProcessedAt) {
+				if order == webhook.DeliveryOrderProcessedAsc {
+					return a.ProcessedAt.Before(*b.ProcessedAt)
+				}
+				return b.ProcessedAt.Before(*a.ProcessedAt)
+			}
+			if order == webhook.DeliveryOrderProcessedAsc {
+				return a.ID < b.ID
+			}
+			return a.ID > b.ID
+		default:
+			if !a.ReceivedAt.Equal(b.ReceivedAt) {
+				return b.ReceivedAt.Before(a.ReceivedAt)
+			}
+			return a.ID > b.ID
+		}
+	})
+	pageDeliveries, page := devPreviewPageWindow(filtered, query.Page, webhooksPageSize)
+	query.Page = page
+	data := webhooksPageData{
+		AppName:            s.cfg.AppName,
+		PageTitle:          "Webhook deliveries",
+		Theme:              devPreviewTheme(r),
+		ActivePage:         "webhooks",
+		CurrentUser:        user,
+		Rows:               webhookRowViews(repositories, pageDeliveries),
+		Total:              len(filtered),
+		Query:              query,
+		HasFilters:         query.Processing != "all" || query.RepositoryID > 0,
+		FilterRepositories: repositories,
+		CSRFToken:          "dev-preview-fictional-token",
+		CSRFField:          csrfFormField,
+	}
+	data.Chips = filterChips(query.Processing, webhookProcessingFilterOptions, func(value string) string {
+		next := query
+		next.Processing = value
+		next.Page = 1
+		return webhooksURL(next)
+	})
+	sortLink := func(sortState tableSort) string {
+		next := query
+		next.Sort = sortState
+		next.Page = 1
+		return webhooksURL(next)
+	}
+	data.SortReceived = sortHeader(query.Sort, "received", "Received", sortLink)
+	data.SortProcessed = sortHeader(query.Sort, "processed", "Processed", sortLink)
+	data.Pager = paginateTable(len(filtered), query.Page, webhooksPageSize, func(page int) string {
+		next := query
+		next.Page = page
+		return webhooksURL(next)
+	})
+	s.renderPage(w, "layouts/webhooks", data)
 }
