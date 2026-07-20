@@ -277,7 +277,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /login", s.handleLogin)
 	s.mux.HandleFunc("POST /login", s.handleLoginPost)
 	s.mux.HandleFunc("POST /logout", s.handleLogout)
-	s.mux.HandleFunc("GET /", s.handleDashboard)
+	// "/{$}" matches exactly "/"; the bare "GET /" pattern is the catch-all
+	// for every unmatched GET path, which must 404 instead of rendering the
+	// dashboard.
+	s.mux.HandleFunc("GET /{$}", s.handleDashboard)
+	s.mux.HandleFunc("GET /", s.handleUnknownPath)
 	s.mux.HandleFunc("GET /repositories", s.handleRepositories)
 	s.mux.HandleFunc("POST /repositories", s.handleCreateRepository)
 	s.mux.HandleFunc("POST /repositories/branches", s.handleAddRepositoryBranch)
@@ -475,6 +479,19 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	}
 	clearSessionCookie(w, r)
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
+}
+
+// handleUnknownPath serves the styled 404 card for GET paths no route claims.
+// It runs before any auth redirect on purpose: the path doesn't exist, so
+// there is nothing to sign in for; the card's single action still switches to
+// "Sign in" when the visitor has no viewing session.
+func (s *Server) handleUnknownPath(w http.ResponseWriter, r *http.Request) {
+	signedOut := false
+	if s.cfg.AuthService != nil {
+		session, ok, err := s.currentSession(r)
+		signedOut = err != nil || !ok || !session.Roles.CanView()
+	}
+	s.renderErrorPage(w, http.StatusNotFound, signedOut)
 }
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {

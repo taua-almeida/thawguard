@@ -13,10 +13,14 @@ import (
 )
 
 type freezeView struct {
-	Freeze          domain.BranchFreeze
-	Repository      domain.Repository
-	PlannedEndsAt   string
-	HasPlannedEndAt bool
+	Freeze     domain.BranchFreeze
+	Repository domain.Repository
+	// PlannedEndsAt is the UTC display text ("2006-01-02 15:04 UTC");
+	// PlannedEndsAtUTC is the RFC3339 value for <time datetime>, empty when
+	// there is no planned end.
+	PlannedEndsAt    string
+	PlannedEndsAtUTC string
+	HasPlannedEndAt  bool
 	// StartedLabel is the StartsAt date (UTC, date only); StartedTitle holds
 	// the full timestamp for the title attribute. CreatedByLabel resolves the
 	// creator to an email or a role description, or stays empty when the
@@ -161,11 +165,12 @@ func (s *Server) freezeViews(repositories []domain.Repository, freezes []domain.
 			startedAt = *freeze.StartsAt
 		}
 		view := freezeView{
-			Freeze:          freeze,
-			Repository:      repositoriesByID[freeze.RepositoryID],
-			PlannedEndsAt:   optionalScheduleTime(freeze.PlannedEndsAt),
-			HasPlannedEndAt: freeze.PlannedEndsAt != nil && !freeze.PlannedEndsAt.IsZero(),
-			CreatedByLabel:  freezeCreatedByLabel(freeze, usersByID),
+			Freeze:           freeze,
+			Repository:       repositoriesByID[freeze.RepositoryID],
+			PlannedEndsAt:    optionalScheduleTime(freeze.PlannedEndsAt),
+			PlannedEndsAtUTC: optionalScheduleRFC3339(freeze.PlannedEndsAt),
+			HasPlannedEndAt:  freeze.PlannedEndsAt != nil && !freeze.PlannedEndsAt.IsZero(),
+			CreatedByLabel:   freezeCreatedByLabel(freeze, usersByID),
 		}
 		if !startedAt.IsZero() {
 			view.StartedLabel = startedAt.UTC().Format("2006-01-02")

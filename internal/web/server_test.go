@@ -3036,6 +3036,52 @@ func TestPrimaryNavigationAndDashboardLinkToActivity(t *testing.T) {
 	}
 }
 
+func TestUnknownPathsRenderStyled404InsteadOfDashboard(t *testing.T) {
+	server := NewServer(Config{AppName: "Thawguard", FreezeStore: &fakeFreezeStore{}})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `aria-label="Dashboard summary"`) {
+		t.Fatalf("expected the root path to keep rendering the dashboard, status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+
+	recorder = httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/freezes", nil))
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "Start a freeze") {
+		t.Fatalf("expected known routes to keep working, status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+
+	for _, path := range []string{"/nope", "/freezes/"} {
+		recorder = httptest.NewRecorder()
+		server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		body := recorder.Body.String()
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("expected GET %s to return 404, got %d", path, recorder.Code)
+		}
+		if !strings.Contains(body, "Page not found") || !strings.Contains(body, "HTTP 404") || !strings.Contains(body, "Back to dashboard") {
+			t.Fatalf("expected the styled 404 card for %s, got %q", path, body)
+		}
+		if strings.Contains(body, `aria-label="Dashboard summary"`) {
+			t.Fatalf("expected %s not to render the dashboard, got %q", path, body)
+		}
+	}
+}
+
+func TestUnknownPathsReturn404WithSignInActionWhenSignedOut(t *testing.T) {
+	ctx := context.Background()
+	server := NewServer(Config{AppName: "Thawguard", AuthService: auth.NewService(newWebTestDB(t, ctx))})
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/nope", nil))
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("expected a signed-out unknown path to 404 rather than redirect, status=%d location=%q", recorder.Code, recorder.Header().Get("Location"))
+	}
+	if !strings.Contains(body, "Page not found") || !strings.Contains(body, `href="/login"`) || !strings.Contains(body, "Sign in") {
+		t.Fatalf("expected the styled 404 card with a sign-in action, got %q", body)
+	}
+}
+
 func TestActivityPageRequiresAuditStoreAndHandlesEmptyAndFailureStates(t *testing.T) {
 	server := NewServer(Config{AppName: "Thawguard"})
 	recorder := httptest.NewRecorder()

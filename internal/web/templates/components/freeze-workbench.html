@@ -18,7 +18,7 @@
   visibly labeled by its own echo line.
 */}}
 {{ define "components/freeze-workbench" }}
-<section class="grid items-start gap-4 lg:grid-cols-[minmax(0,1fr)_22rem]" aria-label="Start a freeze and review its impact">
+<section class="grid grid-cols-1 items-start gap-4 lg:grid-cols-[minmax(0,1fr)_22rem]" aria-label="Start a freeze and review its impact">
   <section class="rounded-panel border border-border bg-surface p-(--card-spacing) shadow-card">
     <h2 class="m-0 text-lg font-bold text-text">Start a freeze</h2>
     <p class="m-0 mt-1 text-sm text-text-muted">Open pull requests on the frozen branch receive a failing <code>{{ .RequiredContext }}</code> status check.</p>

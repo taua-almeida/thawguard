@@ -551,13 +551,14 @@ func (s *Server) handleDevPreviewFreezes(w http.ResponseWriter, r *http.Request)
 	// blank (no "by …" part at all).
 	freezes := []freezeView{
 		{
-			Freeze:          domain.BranchFreeze{ID: 301, RepositoryID: 46, Branch: "main", Reason: "Release cut 2026-07 — QA verification in progress"},
-			Repository:      repositories[0],
-			PlannedEndsAt:   "2026-07-21 09:00 UTC",
-			HasPlannedEndAt: true,
-			StartedLabel:    "2026-07-16",
-			StartedTitle:    "2026-07-16T14:05:00Z",
-			CreatedByLabel:  "rana.kall@example.test",
+			Freeze:           domain.BranchFreeze{ID: 301, RepositoryID: 46, Branch: "main", Reason: "Release cut 2026-07 — QA verification in progress"},
+			Repository:       repositories[0],
+			PlannedEndsAt:    "2026-07-21 09:00 UTC",
+			PlannedEndsAtUTC: "2026-07-21T09:00:00Z",
+			HasPlannedEndAt:  true,
+			StartedLabel:     "2026-07-16",
+			StartedTitle:     "2026-07-16T14:05:00Z",
+			CreatedByLabel:   "rana.kall@example.test",
 		},
 		{
 			Freeze:         domain.BranchFreeze{ID: 302, RepositoryID: 47, Branch: "main", Reason: "Incident 4821 — hold deploys until the postmortem lands"},

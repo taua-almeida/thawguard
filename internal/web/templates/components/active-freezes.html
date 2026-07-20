@@ -6,13 +6,17 @@
   with deliberately different copy: lift completes the freeze and records it
   as ended; cancel removes it without recording an end. A freeze whose
   repository row was deleted keeps rendering as "Repository #<id>" so the
-  freeze stays visible and liftable.
+  freeze stays visible and liftable. Server-rendered times are UTC inside
+  <time datetime="…"> elements; datetime.js rewrites them to the viewer's
+  local timezone and updates [data-timezone-note] accordingly — without JS
+  the UTC text and note stand.
 */}}
 {{ define "components/active-freezes" }}
 <section id="active-freezes" class="rounded-panel border border-border bg-surface shadow-card" aria-label="Active freezes">
   <div class="flex flex-wrap items-center gap-3 border-b border-border px-(--card-spacing) py-4">
     <h2 class="m-0 text-lg font-bold text-text">Active freezes</h2>
     {{ if .ActiveFreezes }}{{ template "ui/badge" dict "Label" (printf "%d active" (len .ActiveFreezes)) "Tone" "frozen" "Icon" "tg-i-lock" }}{{ else }}{{ template "ui/badge" dict "Label" "0 active" }}{{ end }}
+    {{ if .ActiveFreezes }}<span class="ml-auto text-xs text-text-muted" data-timezone-note>Times shown in UTC.</span>{{ end }}
   </div>
   {{ if .ActionError }}
   <div role="alert" class="border-b border-border px-(--card-spacing) py-4">
@@ -43,9 +47,9 @@
           </td>
           <td class="px-4 py-3 text-text">
             {{ .Freeze.Reason }}
-            {{ if .StartedLabel }}<span class="mt-0.5 block text-xs text-text-muted">Started <span title="{{ .StartedTitle }}">{{ .StartedLabel }}</span>{{ if .CreatedByLabel }} by {{ .CreatedByLabel }}{{ end }}</span>{{ end }}
+            {{ if .StartedLabel }}<span class="mt-0.5 block text-xs text-text-muted">Started <time datetime="{{ .StartedTitle }}" title="{{ .StartedTitle }}">{{ .StartedLabel }}</time>{{ if .CreatedByLabel }} by {{ .CreatedByLabel }}{{ end }}</span>{{ end }}
           </td>
-          <td class="px-4 py-3 text-text">{{ if .HasPlannedEndAt }}{{ .PlannedEndsAt }}{{ else }}<span class="text-text-muted">No planned unfreeze</span>{{ end }}</td>
+          <td class="px-4 py-3 text-text">{{ if .HasPlannedEndAt }}<time datetime="{{ .PlannedEndsAtUTC }}">{{ .PlannedEndsAt }}</time>{{ else }}<span class="text-text-muted">No planned unfreeze</span>{{ end }}</td>
           <td class="px-4 py-3">{{ template "ui/badge" dict "Label" "Frozen" "Tone" "frozen" "Icon" "tg-i-lock" }}</td>
           <td class="px-4 py-3"><div class="flex flex-wrap justify-end gap-2">{{ template "components/active-freeze-actions" . }}</div></td>
         </tr>
@@ -64,8 +68,8 @@
         {{ template "ui/badge" dict "Label" "Frozen" "Tone" "frozen" "Icon" "tg-i-lock" }}
       </div>
       <p class="m-0 mt-2 text-sm text-text">{{ .Freeze.Reason }}</p>
-      {{ if .StartedLabel }}<p class="m-0 mt-1 text-xs text-text-muted">Started <span title="{{ .StartedTitle }}">{{ .StartedLabel }}</span>{{ if .CreatedByLabel }} by {{ .CreatedByLabel }}{{ end }}</p>{{ end }}
-      <p class="m-0 mt-1 text-xs text-text-muted">Planned unfreeze: {{ if .HasPlannedEndAt }}{{ .PlannedEndsAt }}{{ else }}none — lift manually{{ end }}</p>
+      {{ if .StartedLabel }}<p class="m-0 mt-1 text-xs text-text-muted">Started <time datetime="{{ .StartedTitle }}" title="{{ .StartedTitle }}">{{ .StartedLabel }}</time>{{ if .CreatedByLabel }} by {{ .CreatedByLabel }}{{ end }}</p>{{ end }}
+      <p class="m-0 mt-1 text-xs text-text-muted">Planned unfreeze: {{ if .HasPlannedEndAt }}<time datetime="{{ .PlannedEndsAtUTC }}">{{ .PlannedEndsAt }}</time>{{ else }}none — lift manually{{ end }}</p>
       <div class="mt-3 flex flex-wrap gap-2">{{ template "components/active-freeze-actions" . }}</div>
     </article>
     {{ end }}
