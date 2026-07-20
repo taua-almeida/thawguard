@@ -207,9 +207,8 @@ type terminalReadOnlySnapshot struct {
 }
 
 type webhookPageSummary struct {
-	showing  int
-	matching int
-	total    int
+	showing int
+	total   int
 }
 
 func TestLocalForgejoFreezeLifecycle(t *testing.T) {
@@ -234,14 +233,14 @@ func TestLocalForgejoFreezeLifecycle(t *testing.T) {
 	pr := createForgejoPullRequest(t, ctx, forgejo, fixtureFeatureBranch, "main", fixturePrimaryPRTitle)
 
 	waitFor(t, 30*time.Second, "verified Forgejo webhook delivery", func() (bool, error) {
-		page, err := browser.get(ctx, "/webhooks?processing=processed&event=pull_request")
+		page, err := browser.get(ctx, "/webhooks?processing=processed")
 		if err != nil {
 			return false, err
 		}
 		return strings.Contains(page, fixtureOwner+"/"+fixtureRepository) &&
-			strings.Contains(page, "opened") &&
-			strings.Contains(page, "verified") &&
-			nonzeroMatchingRows.MatchString(page), nil
+			strings.Contains(page, "pull_request · opened") &&
+			strings.Contains(page, ">Verified</span>") &&
+			nonzeroDeliveryCountPattern.MatchString(page), nil
 	})
 
 	requireUnprotectedReleaseReadinessFailure(t, ctx, browser, repositoryID)
@@ -318,7 +317,7 @@ func proveActiveFreezeCancellation(t *testing.T, ctx context.Context, forgejo *f
 
 	requireNoActiveFreezeEvidence(t, requirePage(t, ctx, browser, "/freezes"), firstFreeze)
 	firstLiftRow := requireLatestActivityRow(t, requirePage(t, ctx, browser, "/activity"), "Branch freeze")
-	requireBranchFreezeActivityEvidence(t, firstLiftRow, firstFreeze, "Lifted", "ok")
+	requireBranchFreezeActivityEvidence(t, firstLiftRow, firstFreeze, "Lifted")
 
 	secondFreeze := createFreeze(t, ctx, browser, repositoryID, cancellationReason)
 	if secondFreeze.id == firstFreeze.id {
@@ -336,7 +335,7 @@ func proveActiveFreezeCancellation(t *testing.T, ctx context.Context, forgejo *f
 	}
 	activityBefore := requirePage(t, ctx, browser, "/activity")
 	createdRow := requireLatestActivityRow(t, activityBefore, "Branch freeze")
-	requireBranchFreezeActivityEvidence(t, createdRow, secondFreeze, "Frozen", "frozen")
+	requireBranchFreezeActivityEvidence(t, createdRow, secondFreeze, "Frozen")
 	before := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, headSHA)
 	if len(before.freezeStatuses) == 0 {
 		t.Fatal("second active freeze is missing its pre-cancel Forgejo status")
@@ -353,7 +352,7 @@ func proveActiveFreezeCancellation(t *testing.T, ctx context.Context, forgejo *f
 
 	activityAfter := requirePage(t, ctx, browser, "/activity")
 	cancelledRow := requireLatestActivityRow(t, activityAfter, "Branch freeze")
-	requireBranchFreezeActivityEvidence(t, cancelledRow, secondFreeze, "Cancelled", "warning")
+	requireBranchFreezeActivityEvidence(t, cancelledRow, secondFreeze, "Cancelled")
 	if strings.Contains(cancelledRow, ">Lifted</span>") || strings.Contains(cancelledRow, firstFreeze.reason) {
 		t.Fatal("cancelled branch-freeze activity was confused with the earlier lifted freeze")
 	}
@@ -412,16 +411,10 @@ func proveImmediatePerPullRequestThaw(t *testing.T, ctx context.Context, forgejo
 	openPullRequestSyncsBefore := countOpenPullRequestSyncEvents(requirePage(t, ctx, browser, "/activity"))
 
 	decisionsPage := requirePage(t, ctx, browser, "/decisions")
-	thawFormMarker := `<form method="post" action="/decisions" class="tg-setup-form tg-thaw-form" data-thaw-form>`
-	thawFormStart := strings.Index(decisionsPage, thawFormMarker)
-	if thawFormStart < 0 {
+	renderedThawForm := requireRenderedForm(t, decisionsPage, `<form method="post" action="/decisions"`, "immediate thaw")
+	if !strings.Contains(renderedThawForm, `name="pull_request_index"`) {
 		t.Fatal("decisions page is missing the immediate thaw form")
 	}
-	thawFormEnd := strings.Index(decisionsPage[thawFormStart:], "</form>")
-	if thawFormEnd < 0 {
-		t.Fatal("immediate thaw form is incomplete")
-	}
-	renderedThawForm := decisionsPage[thawFormStart : thawFormStart+thawFormEnd+len("</form>")]
 	if strings.Contains(renderedThawForm, `name="head_sha"`) {
 		t.Fatal("immediate thaw form must not submit a client-provided head SHA")
 	}
@@ -485,15 +478,18 @@ func proveImmediatePerPullRequestThaw(t *testing.T, ctx context.Context, forgejo
 		t.Fatalf("unexpected post-thaw required status: id=%d context=%q state=%q description=%q", latestAfter.ID, latestAfter.Context, latestAfter.Status, latestAfter.Description)
 	}
 
-	decisionRow := requireLatestDecisionResultRow(t, requirePage(t, ctx, browser, "/decisions"))
+	decisionsAfter := requirePage(t, ctx, browser, "/decisions")
+	if !strings.Contains(decisionsAfter, `>`+requiredContext+`</code>`) {
+		t.Fatalf("decisions page no longer displays the required context %q", requiredContext)
+	}
+	decisionRow := requireLatestDecisionResultRow(t, decisionsAfter)
 	for _, want := range []string{
-		`<a href="#">#` + strconv.Itoa(pullRequestIndex) + `</a>`,
-		`<code>` + fixtureOwner + `/` + fixtureRepository + `</code>`,
-		`<code class="tg-branch">main</code>`,
-		`<code>` + headSHA + `</code>`,
+		`>#` + strconv.Itoa(pullRequestIndex) + `</code>`,
+		fixtureOwner + `/` + fixtureRepository,
+		`>main</code>`,
+		`title="` + headSHA + `"`,
 		explicitThaw,
-		`<code>` + requiredContext + `</code>`,
-		`<span class="status status-success">Eligible</span>`,
+		`>Eligible</span>`,
 	} {
 		if !strings.Contains(decisionRow, want) {
 			t.Fatalf("latest immediate-thaw decision row is missing %q", want)
@@ -502,10 +498,10 @@ func proveImmediatePerPullRequestThaw(t *testing.T, ctx context.Context, forgejo
 
 	thawActivityRow := requireLatestActivityRow(t, activityPage, "Single-PR thaw")
 	for _, want := range []string{
-		`<td data-label="Actor">E2E Admin</td>`,
-		`<td data-label="Target">` + fixtureOwner + `/` + fixtureRepository + ` → PR #` + strconv.Itoa(pullRequestIndex) + `</td>`,
-		`<td data-label="Outcome"><span class="status status-ok">Approved</span></td>`,
-		`<td data-label="Details">Branch main; head ` + strings.ToLower(headSHA[:12]) + `. Reason: ` + thawReason + `.</td>`,
+		`>E2E Admin</td>`,
+		`>` + fixtureOwner + `/` + fixtureRepository + ` → PR #` + strconv.Itoa(pullRequestIndex) + `</td>`,
+		`>Approved</span>`,
+		`Branch main; head ` + strings.ToLower(headSHA[:12]) + `. Reason: ` + thawReason + `.`,
 	} {
 		if !strings.Contains(thawActivityRow, want) {
 			t.Fatalf("latest Single-PR thaw activity row is missing %q", want)
@@ -543,13 +539,12 @@ func proveStaleHeadThawReevaluation(t *testing.T, ctx context.Context, forgejo *
 	decisionsBefore := requirePage(t, ctx, browser, "/decisions")
 	oldDecisionRow := requireLatestDecisionResultRow(t, decisionsBefore)
 	for _, want := range []string{
-		`<a href="#">#` + strconv.Itoa(pullRequestIndex) + `</a>`,
-		`<code>` + fixtureOwner + `/` + fixtureRepository + `</code>`,
-		`<code class="tg-branch">main</code>`,
-		`<code>` + oldHeadSHA + `</code>`,
+		`>#` + strconv.Itoa(pullRequestIndex) + `</code>`,
+		fixtureOwner + `/` + fixtureRepository,
+		`>main</code>`,
+		`title="` + oldHeadSHA + `"`,
 		explicitThaw,
-		`<code>` + requiredContext + `</code>`,
-		`<span class="status status-success">Eligible</span>`,
+		`>Eligible</span>`,
 	} {
 		if !strings.Contains(oldDecisionRow, want) {
 			t.Fatalf("old exact-head decision row is missing %q", want)
@@ -563,7 +558,7 @@ func proveStaleHeadThawReevaluation(t *testing.T, ctx context.Context, forgejo *
 	}
 
 	thirdFreeze := requireActiveFreezeEvidence(t, requirePage(t, ctx, browser, "/freezes"))
-	if thirdFreeze.branch != "main" || thirdFreeze.reason != freezeReason || thirdFreeze.status != "active" {
+	if thirdFreeze.branch != "main" || thirdFreeze.reason != freezeReason || thirdFreeze.status != "Frozen" {
 		t.Fatalf("unexpected third-freeze evidence before head advance: id=%d branch=%q reason=%q status=%q", thirdFreeze.id, thirdFreeze.branch, thirdFreeze.reason, thirdFreeze.status)
 	}
 
@@ -625,13 +620,12 @@ func proveStaleHeadThawReevaluation(t *testing.T, ctx context.Context, forgejo *
 	}
 	newDecisionRow := requireLatestDecisionResultRow(t, decisionsAfter)
 	for _, want := range []string{
-		`<a href="#">#` + strconv.Itoa(pullRequestIndex) + `</a>`,
-		`<code>` + fixtureOwner + `/` + fixtureRepository + `</code>`,
-		`<code class="tg-branch">main</code>`,
-		`<code>` + newHeadSHA + `</code>`,
+		`>#` + strconv.Itoa(pullRequestIndex) + `</code>`,
+		fixtureOwner + `/` + fixtureRepository,
+		`>main</code>`,
+		`title="` + newHeadSHA + `"`,
 		frozenReason,
-		`<code>` + requiredContext + `</code>`,
-		`<span class="status status-failure">Blocked</span>`,
+		`>Blocked</span>`,
 	} {
 		if !strings.Contains(newDecisionRow, want) {
 			t.Fatalf("latest stale-head decision row is missing %q", want)
@@ -655,10 +649,9 @@ func proveStaleHeadThawReevaluation(t *testing.T, ctx context.Context, forgejo *
 	} {
 		for _, want := range []string{
 			fixtureOwner + `/` + fixtureRepository,
-			`#` + strconv.Itoa(pullRequestIndex) + `<small class="tg-muted">main</small>`,
-			`<code>` + newHeadSHA + `</code>`,
-			`<span class="status status-failure">failure</span>`,
-			`<code>forgejo_status</code>`,
+			`PR #` + strconv.Itoa(pullRequestIndex) + ` · main`,
+			`title="` + newHeadSHA + `"`,
+			`>` + requiredContext + `</code>`,
 			frozenReason,
 		} {
 			if !strings.Contains(row, want) {
@@ -666,13 +659,12 @@ func proveStaleHeadThawReevaluation(t *testing.T, ctx context.Context, forgejo *
 			}
 		}
 	}
-	if !strings.Contains(newIntentRow, `<td data-label="Context"><code>`+requiredContext+`</code></td>`) {
-		t.Fatalf("latest stale-head publication intent is missing %q", requiredContext)
+	for _, want := range []string{`>failure</span>`, `>forgejo_status</code>`} {
+		if !strings.Contains(newIntentRow, want) {
+			t.Fatalf("latest stale-head publication intent is missing %q", want)
+		}
 	}
-	for _, want := range []string{
-		`<small class="tg-muted">` + requiredContext + `</small>`,
-		`<td data-label="Result"><span class="status status-ok">posted</span></td>`,
-	} {
+	for _, want := range []string{`>posted</span>`, `>failure · forgejo_status</code>`} {
 		if !strings.Contains(newAttemptRow, want) {
 			t.Fatalf("latest stale-head publication attempt is missing %q", want)
 		}
@@ -698,7 +690,7 @@ func proveSharedHeadConfirmation(t *testing.T, ctx context.Context, forgejo *for
 	}
 
 	activeFreeze := requireActiveFreezeEvidence(t, requirePage(t, ctx, browser, "/freezes"))
-	if activeFreeze.branch != "main" || activeFreeze.status != "active" {
+	if activeFreeze.branch != "main" || activeFreeze.status != "Frozen" {
 		t.Fatalf("shared-head confirmation started without the expected active main freeze: %+v", activeFreeze)
 	}
 	historicalStatuses, err := listForgejoFreezeStatuses(ctx, forgejo, historicalThawedHeadSHA)
@@ -718,7 +710,7 @@ func proveSharedHeadConfirmation(t *testing.T, ctx context.Context, forgejo *for
 		t.Fatalf("historical Single-PR thaw row is missing head %q", historicalThawedHeadSHA[:12])
 	}
 	historicalDecisionRow := requireDecisionResultRowForHead(t, requirePage(t, ctx, browser, "/decisions"), historicalThawedHeadSHA)
-	for _, want := range []string{explicitThaw, `<span class="status status-success">Eligible</span>`} {
+	for _, want := range []string{explicitThaw, `>Eligible</span>`} {
 		if !strings.Contains(historicalDecisionRow, want) {
 			t.Fatalf("historical thawed-SHA decision row is missing %q", want)
 		}
@@ -779,7 +771,7 @@ func proveSharedHeadConfirmation(t *testing.T, ctx context.Context, forgejo *for
 	}
 
 	decisionsPage := requirePage(t, ctx, browser, "/decisions")
-	ordinaryForm := requireRenderedForm(t, decisionsPage, `<form method="post" action="/decisions" class="tg-setup-form tg-thaw-form" data-thaw-form>`, "ordinary thaw")
+	ordinaryForm := requireRenderedForm(t, decisionsPage, `<form method="post" action="/decisions"`, "ordinary thaw")
 	if strings.Contains(ordinaryForm, `name="head_sha"`) || strings.Contains(ordinaryForm, `name="confirm_shared_head"`) {
 		t.Fatal("ordinary thaw form unexpectedly contains head or confirmation fields")
 	}
@@ -808,12 +800,16 @@ func proveSharedHeadConfirmation(t *testing.T, ctx context.Context, forgejo *for
 		t.Fatalf("ordinary shared-head thaw returned HTTP %d, want 409", conflictResponse.statusCode)
 	}
 	conflictBody := string(conflictResponse.body)
-	confirmationForm := requireRenderedForm(t, conflictBody, `<form method="post" action="/decisions" class="tg-shared-head-confirm-form">`, "shared-head confirmation")
+	confirmationForm := requireRenderedForm(t, conflictBody, `<form method="post" action="/decisions"`, "shared-head confirmation")
+	if !strings.Contains(confirmationForm, `name="confirm_shared_head"`) {
+		t.Fatal("409 response rendered the ordinary thaw form instead of the shared-head confirmation form")
+	}
 	shortSharedHead := sharedHeadSHA[:10]
 	for _, want := range []string{
 		"These pull requests share one commit SHA",
 		"Nothing has been approved yet.",
-		"shared head <code>" + shortSharedHead + "</code>",
+		"for shared head ",
+		">" + shortSharedHead + "</code>",
 		"Approve thaw for all 2 PRs",
 	} {
 		if !strings.Contains(conflictBody, want) {
@@ -822,12 +818,12 @@ func proveSharedHeadConfirmation(t *testing.T, ctx context.Context, forgejo *for
 	}
 	primaryRow := requireSharedHeadConfirmationRow(t, conflictBody, primaryPullRequestIndex)
 	secondaryRow := requireSharedHeadConfirmationRow(t, conflictBody, secondaryPR.Number)
-	for _, want := range []string{fixturePrimaryPRTitle, `<code class="tg-branch">main</code>`, `<code>` + shortSharedHead + `</code>`, `>your selection</span>`} {
+	for _, want := range []string{fixturePrimaryPRTitle, `>main</code>`, `>` + shortSharedHead + `</code>`, `>your selection</span>`} {
 		if !strings.Contains(primaryRow, want) {
 			t.Fatalf("selected shared-head confirmation row is missing %q", want)
 		}
 	}
-	for _, want := range []string{fixtureSharedHeadPRTitle, `<code class="tg-branch">main</code>`, `<code>` + shortSharedHead + `</code>`} {
+	for _, want := range []string{fixtureSharedHeadPRTitle, `>main</code>`, `>` + shortSharedHead + `</code>`} {
 		if !strings.Contains(secondaryRow, want) {
 			t.Fatalf("second shared-head confirmation row is missing %q", want)
 		}
@@ -838,6 +834,9 @@ func proveSharedHeadConfirmation(t *testing.T, ctx context.Context, forgejo *for
 
 	confirmationFieldNames := []string{
 		"csrf_token",
+		"state",
+		"repo",
+		"page",
 		"repository_id",
 		"pull_request_index",
 		"target_branch",
@@ -866,7 +865,7 @@ func proveSharedHeadConfirmation(t *testing.T, ctx context.Context, forgejo *for
 	if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(affectedFingerprint) {
 		t.Fatalf("shared-head affected-set fingerprint has invalid shape %q", affectedFingerprint)
 	}
-	if strings.Contains(conflictBody, `<code>`+affectedFingerprint+`</code>`) || strings.Contains(conflictBody, affectedFingerprint+`</`) {
+	if strings.Contains(conflictBody, `>`+affectedFingerprint+`<`) || strings.Contains(conflictBody, affectedFingerprint+`</`) {
 		t.Fatal("shared-head affected-set fingerprint leaked into visible confirmation content")
 	}
 
@@ -970,13 +969,12 @@ func proveSharedHeadConfirmation(t *testing.T, ctx context.Context, forgejo *for
 	decisionsAfterConfirmation := requirePage(t, ctx, browser, "/decisions")
 	decisionRow := requireLatestDecisionResultRow(t, decisionsAfterConfirmation)
 	for _, want := range []string{
-		`<a href="#">#` + strconv.Itoa(primaryPullRequestIndex) + `</a>`,
-		`<code>` + fixtureOwner + `/` + fixtureRepository + `</code>`,
-		`<code class="tg-branch">main</code>`,
-		`<code>` + sharedHeadSHA + `</code>`,
+		`>#` + strconv.Itoa(primaryPullRequestIndex) + `</code>`,
+		fixtureOwner + `/` + fixtureRepository,
+		`>main</code>`,
+		`title="` + sharedHeadSHA + `"`,
 		explicitThaw,
-		`<code>` + requiredContext + `</code>`,
-		`<span class="status status-success">Eligible</span>`,
+		`>Eligible</span>`,
 	} {
 		if !strings.Contains(decisionRow, want) {
 			t.Fatalf("latest shared-head status result is missing %q", want)
@@ -989,10 +987,9 @@ func proveSharedHeadConfirmation(t *testing.T, ctx context.Context, forgejo *for
 	for label, row := range map[string]string{"intent": intentRow, "attempt": attemptRow} {
 		for _, want := range []string{
 			fixtureOwner + `/` + fixtureRepository,
-			`#` + strconv.Itoa(primaryPullRequestIndex) + `<small class="tg-muted">main</small>`,
-			`<code>` + sharedHeadSHA + `</code>`,
-			`<span class="status status-success">success</span>`,
-			`<code>forgejo_status</code>`,
+			`PR #` + strconv.Itoa(primaryPullRequestIndex) + ` · main`,
+			`title="` + sharedHeadSHA + `"`,
+			`>` + requiredContext + `</code>`,
 			explicitThaw,
 		} {
 			if !strings.Contains(row, want) {
@@ -1000,13 +997,12 @@ func proveSharedHeadConfirmation(t *testing.T, ctx context.Context, forgejo *for
 			}
 		}
 	}
-	if !strings.Contains(intentRow, `<td data-label="Context"><code>`+requiredContext+`</code></td>`) {
-		t.Fatalf("latest shared-head publication intent is missing %q", requiredContext)
+	for _, want := range []string{`>success</span>`, `>forgejo_status</code>`} {
+		if !strings.Contains(intentRow, want) {
+			t.Fatalf("latest shared-head publication intent is missing %q", want)
+		}
 	}
-	for _, want := range []string{
-		`<small class="tg-muted">` + requiredContext + `</small>`,
-		`<td data-label="Result"><span class="status status-ok">posted</span></td>`,
-	} {
+	for _, want := range []string{`>posted</span>`, `>success · forgejo_status</code>`} {
 		if !strings.Contains(attemptRow, want) {
 			t.Fatalf("latest shared-head publication attempt is missing %q", want)
 		}
@@ -1014,10 +1010,10 @@ func proveSharedHeadConfirmation(t *testing.T, ctx context.Context, forgejo *for
 
 	sharedThawRow := requireLatestActivityRow(t, activityAfterConfirmation, "Shared-head thaw")
 	for _, want := range []string{
-		`<td data-label="Actor">E2E Admin</td>`,
-		`<td data-label="Target">` + fixtureOwner + `/` + fixtureRepository + ` → shared head ` + sharedHeadSHA[:12] + `</td>`,
-		`<td data-label="Outcome"><span class="status status-ok">Approved</span></td>`,
-		`<td data-label="Details">New exceptions: #` + strconv.Itoa(primaryPullRequestIndex) + `, #` + strconv.Itoa(secondaryPR.Number) + `; already covered: none. Confirmation reason: ` + thawReason + `.</td>`,
+		`>E2E Admin</td>`,
+		`>` + fixtureOwner + `/` + fixtureRepository + ` → shared head ` + sharedHeadSHA[:12] + `</td>`,
+		`>Approved</span>`,
+		`New exceptions: #` + strconv.Itoa(primaryPullRequestIndex) + `, #` + strconv.Itoa(secondaryPR.Number) + `; already covered: none. Confirmation reason: ` + thawReason + `.`,
 	} {
 		if !strings.Contains(sharedThawRow, want) {
 			t.Fatalf("latest Shared-head thaw activity is missing %q", want)
@@ -1136,12 +1132,11 @@ func proveScheduledFreezeLifecycle(t *testing.T, ctx context.Context, forgejo *f
 	waitForLatestPostedPublicationAttempt(t, ctx, browser, releaseHeadSHA, "success", noFreezeReason)
 	openedDecisionRow := requireLatestDecisionResultRow(t, requirePage(t, ctx, browser, "/decisions"))
 	for _, want := range []string{
-		`<a href="#">#` + strconv.Itoa(releasePR.Number) + `</a>`,
-		`<code>` + fixtureOwner + `/` + fixtureRepository + `</code>`,
-		`<code class="tg-branch">` + fixtureReleaseBranch + `</code>`,
-		`<code>` + releaseHeadSHA + `</code>`,
-		`<code>` + requiredContext + `</code>`,
-		`<span class="status status-success">Eligible</span>`,
+		`>#` + strconv.Itoa(releasePR.Number) + `</code>`,
+		fixtureOwner + `/` + fixtureRepository,
+		`>` + fixtureReleaseBranch + `</code>`,
+		`title="` + releaseHeadSHA + `"`,
+		`>Eligible</span>`,
 		noFreezeReason,
 	} {
 		if !strings.Contains(openedDecisionRow, want) {
@@ -1154,10 +1149,9 @@ func proveScheduledFreezeLifecycle(t *testing.T, ctx context.Context, forgejo *f
 	for label, row := range map[string]string{"intent": openedIntentRow, "attempt": openedAttemptRow} {
 		for _, want := range []string{
 			fixtureOwner + `/` + fixtureRepository,
-			`#` + strconv.Itoa(releasePR.Number) + `<small class="tg-muted">` + fixtureReleaseBranch + `</small>`,
-			`<code>` + releaseHeadSHA + `</code>`,
-			`<span class="status status-success">success</span>`,
-			`<code>forgejo_status</code>`,
+			`PR #` + strconv.Itoa(releasePR.Number) + ` · ` + fixtureReleaseBranch,
+			`title="` + releaseHeadSHA + `"`,
+			`>` + requiredContext + `</code>`,
 			noFreezeReason,
 		} {
 			if !strings.Contains(row, want) {
@@ -1165,11 +1159,12 @@ func proveScheduledFreezeLifecycle(t *testing.T, ctx context.Context, forgejo *f
 			}
 		}
 	}
-	openedIntentContext := `<td data-label="Context"><code>` + requiredContext + `</code></td>`
-	if !strings.Contains(openedIntentRow, openedIntentContext) {
-		t.Fatalf("scheduled release opened publication intent is missing %q", openedIntentContext)
+	for _, want := range []string{`>success</span>`, `>forgejo_status</code>`} {
+		if !strings.Contains(openedIntentRow, want) {
+			t.Fatalf("scheduled release opened publication intent is missing %q", want)
+		}
 	}
-	for _, want := range []string{`<small class="tg-muted">` + requiredContext + `</small>`, `<td data-label="Result"><span class="status status-ok">posted</span></td>`} {
+	for _, want := range []string{`>posted</span>`, `>success · forgejo_status</code>`} {
 		if !strings.Contains(openedAttemptRow, want) {
 			t.Fatalf("scheduled release opened publication attempt is missing %q", want)
 		}
@@ -1190,12 +1185,12 @@ func proveScheduledFreezeLifecycle(t *testing.T, ctx context.Context, forgejo *f
 	}, "create Schedule A")
 	schedulesPage := requirePage(t, ctx, browser, "/scheduled-freezes")
 	scheduleA := requireScheduledFreezeRow(t, schedulesPage, 0, scheduleAReason)
-	if scheduleA.id <= 0 || scheduleA.branch != fixtureReleaseBranch || scheduleA.status != "upcoming" || scheduleA.startsAt != scheduleTime(scheduleAStartsAt) || scheduleA.plannedEndsAt != scheduleTime(scheduleAPlannedEndsAt) || scheduleA.endedAt != "—" {
+	if scheduleA.id <= 0 || scheduleA.branch != fixtureReleaseBranch || scheduleA.status != "Upcoming" || scheduleA.startsAt != scheduleTime(scheduleAStartsAt) || scheduleA.plannedEndsAt != scheduleTime(scheduleAPlannedEndsAt) || scheduleA.endedAt != "—" {
 		t.Fatalf("Schedule A has unexpected initial rendered evidence: %+v", scheduleA)
 	}
-	requirePendingScheduleActions(t, scheduleA, scheduleAStartsAt, scheduleAPlannedEndsAt)
+	requirePendingScheduleActions(t, schedulesPage, scheduleA, scheduleAStartsAt, scheduleAPlannedEndsAt)
 	scheduleACreatedRow := requireLatestActivityRow(t, requirePage(t, ctx, browser, "/activity"), "Freeze schedule")
-	requireScheduleActivityEvidence(t, scheduleACreatedRow, "Freeze schedule", "Scheduled", "pending", scheduleAReason)
+	requireScheduleActivityEvidence(t, scheduleACreatedRow, "Freeze schedule", "Scheduled", scheduleAReason)
 	for _, want := range []string{"Starts " + scheduleTime(scheduleAStartsAt), "planned unfreeze " + scheduleTime(scheduleAPlannedEndsAt)} {
 		if !strings.Contains(scheduleACreatedRow, want) {
 			t.Fatalf("Schedule A creation activity is missing %q", want)
@@ -1218,20 +1213,20 @@ func proveScheduledFreezeLifecycle(t *testing.T, ctx context.Context, forgejo *f
 	}, "create Schedule B")
 	schedulesPage = requirePage(t, ctx, browser, "/scheduled-freezes")
 	scheduleB := requireScheduledFreezeRow(t, schedulesPage, 0, scheduleBReason)
-	if scheduleB.id <= 0 || scheduleB.id == scheduleA.id || scheduleB.branch != fixtureReleaseBranch || scheduleB.status != "upcoming" || scheduleB.startsAt != scheduleTime(scheduleBStartsAt) || scheduleB.plannedEndsAt != scheduleTime(scheduleBPlannedEndsAt) || scheduleB.endedAt != "—" {
+	if scheduleB.id <= 0 || scheduleB.id == scheduleA.id || scheduleB.branch != fixtureReleaseBranch || scheduleB.status != "Upcoming" || scheduleB.startsAt != scheduleTime(scheduleBStartsAt) || scheduleB.plannedEndsAt != scheduleTime(scheduleBPlannedEndsAt) || scheduleB.endedAt != "—" {
 		t.Fatalf("Schedule B has unexpected initial rendered evidence: %+v", scheduleB)
 	}
-	requirePendingScheduleActions(t, scheduleB, scheduleBStartsAt, scheduleBPlannedEndsAt)
+	requirePendingScheduleActions(t, schedulesPage, scheduleB, scheduleBStartsAt, scheduleBPlannedEndsAt)
 	scheduleAAfterBCreate := requireScheduledFreezeRow(t, schedulesPage, scheduleA.id, scheduleAReason)
 	requireUnchangedPendingSchedule(t, scheduleA, scheduleAAfterBCreate, "Schedule B creation")
 	scheduleBCreatedRow := requireLatestActivityRow(t, requirePage(t, ctx, browser, "/activity"), "Freeze schedule")
-	requireScheduleActivityEvidence(t, scheduleBCreatedRow, "Freeze schedule", "Scheduled", "pending", scheduleBReason)
+	requireScheduleActivityEvidence(t, scheduleBCreatedRow, "Freeze schedule", "Scheduled", scheduleBReason)
 	afterScheduleB := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, releaseHeadSHA)
 	requireScheduleOnlyActivityDelta(t, beforeScheduleB, afterScheduleB, 1, "Schedule B creation")
 	requireMainSharedStateUnchanged(t, ctx, forgejo, browser, mainFreezeBefore, sharedHeadSHA, mainSharedStatuses, "Schedule B creation")
 
 	beforeScheduleBCancel := afterScheduleB
-	if !strings.Contains(scheduleB.row, `action="/scheduled-freezes/cancel"`) || strings.Contains(scheduleB.row, `action="/freezes/cancel"`) {
+	if !strings.Contains(scheduleB.row, `aria-controls="cancel-scheduled-`+strconv.FormatInt(scheduleB.id, 10)+`"`) || strings.Contains(scheduleB.row, `action="/freezes/end"`) {
 		t.Fatal("Schedule B pending row confused scheduled cancellation with active-freeze cancellation")
 	}
 	requireRawScheduledFreezeMutation(t, ctx, browser, "/scheduled-freezes/cancel", url.Values{
@@ -1239,15 +1234,15 @@ func proveScheduledFreezeLifecycle(t *testing.T, ctx context.Context, forgejo *f
 	}, "cancel pending Schedule B")
 	schedulesPage = requirePage(t, ctx, browser, "/scheduled-freezes")
 	cancelledScheduleB := requireScheduledFreezeRow(t, schedulesPage, 0, scheduleBReason)
-	if cancelledScheduleB.branch != fixtureReleaseBranch || cancelledScheduleB.status != "cancelled" || cancelledScheduleB.endedAt == "—" || cancelledScheduleB.endedAt == "" {
+	if cancelledScheduleB.branch != fixtureReleaseBranch || cancelledScheduleB.status != "Cancelled" || cancelledScheduleB.endedAt == "—" || cancelledScheduleB.endedAt == "" {
 		t.Fatalf("Schedule B has unexpected cancelled evidence: %+v", cancelledScheduleB)
 	}
 	requireNoPendingScheduleActions(t, cancelledScheduleB)
 	scheduleAAfterBCancel := requireScheduledFreezeRow(t, schedulesPage, scheduleA.id, scheduleAReason)
 	requireUnchangedPendingSchedule(t, scheduleAAfterBCreate, scheduleAAfterBCancel, "Schedule B cancellation")
 	scheduleBCancelledRow := requireLatestActivityRow(t, requirePage(t, ctx, browser, "/activity"), "Freeze schedule")
-	requireScheduleActivityEvidence(t, scheduleBCancelledRow, "Freeze schedule", "Cancelled", "warning", scheduleBReason)
-	if strings.Contains(scheduleBCancelledRow, `<td data-label="Action">Branch freeze</td>`) {
+	requireScheduleActivityEvidence(t, scheduleBCancelledRow, "Freeze schedule", "Cancelled", scheduleBReason)
+	if strings.Contains(scheduleBCancelledRow, `>Branch freeze</span>`) {
 		t.Fatal("pending Schedule B cancellation was rendered as an active branch-freeze cancellation")
 	}
 	afterScheduleBCancel := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, releaseHeadSHA)
@@ -1267,12 +1262,12 @@ func proveScheduledFreezeLifecycle(t *testing.T, ctx context.Context, forgejo *f
 	}, "edit Schedule A")
 	schedulesPage = requirePage(t, ctx, browser, "/scheduled-freezes")
 	editedScheduleA := requireScheduledFreezeRow(t, schedulesPage, scheduleA.id, scheduleAEditedReason)
-	if editedScheduleA.id != scheduleA.id || editedScheduleA.branch != fixtureReleaseBranch || editedScheduleA.status != "upcoming" || editedScheduleA.startsAt != scheduleTime(editedStartsAt) || editedScheduleA.plannedEndsAt != scheduleTime(editedPlannedEndsAt) || editedScheduleA.endedAt != "—" {
+	if editedScheduleA.id != scheduleA.id || editedScheduleA.branch != fixtureReleaseBranch || editedScheduleA.status != "Upcoming" || editedScheduleA.startsAt != scheduleTime(editedStartsAt) || editedScheduleA.plannedEndsAt != scheduleTime(editedPlannedEndsAt) || editedScheduleA.endedAt != "—" {
 		t.Fatalf("Schedule A has unexpected edited evidence: before=%+v after=%+v", scheduleA, editedScheduleA)
 	}
-	requirePendingScheduleActions(t, editedScheduleA, editedStartsAt, editedPlannedEndsAt)
+	requirePendingScheduleActions(t, schedulesPage, editedScheduleA, editedStartsAt, editedPlannedEndsAt)
 	scheduleAUpdatedRow := requireLatestActivityRow(t, requirePage(t, ctx, browser, "/activity"), "Freeze schedule")
-	requireScheduleActivityEvidence(t, scheduleAUpdatedRow, "Freeze schedule", "Changed", "frozen", scheduleAEditedReason)
+	requireScheduleActivityEvidence(t, scheduleAUpdatedRow, "Freeze schedule", "Changed", scheduleAEditedReason)
 	wantUpdateDetail := "Reason " + scheduleAReason + " → " + scheduleAEditedReason + "; starts " + scheduleTime(scheduleAStartsAt) + " → " + scheduleTime(editedStartsAt) + "; planned unfreeze " + scheduleTime(scheduleAPlannedEndsAt) + " → " + scheduleTime(editedPlannedEndsAt) + "."
 	if !strings.Contains(scheduleAUpdatedRow, wantUpdateDetail) {
 		t.Fatalf("Schedule A update activity is missing truthful before/after detail %q", wantUpdateDetail)
@@ -1322,7 +1317,7 @@ func proveScheduledFreezeLifecycle(t *testing.T, ctx context.Context, forgejo *f
 		t.Fatal("Schedule A Start Now did not add exactly one Start Now event and one open-PR sync event")
 	}
 	startNowRow := requireLatestActivityRow(t, activityAfterStart, "Scheduled freeze Start Now")
-	requireScheduleActivityEvidence(t, startNowRow, "Scheduled freeze Start Now", "Started", "frozen", scheduleAEditedReason)
+	requireScheduleActivityEvidence(t, startNowRow, "Scheduled freeze Start Now", "Started", scheduleAEditedReason)
 	if !strings.Contains(startNowRow, "planned unfreeze "+scheduleTime(editedPlannedEndsAt)) {
 		t.Fatalf("Schedule A Start Now activity is missing retained planned unfreeze %q", scheduleTime(editedPlannedEndsAt))
 	}
@@ -1334,10 +1329,9 @@ func proveScheduledFreezeLifecycle(t *testing.T, ctx context.Context, forgejo *f
 	for label, row := range map[string]string{"intent": startIntentRow, "attempt": startAttemptRow} {
 		for _, want := range []string{
 			fixtureOwner + `/` + fixtureRepository,
-			`#` + strconv.Itoa(releasePR.Number) + `<small class="tg-muted">` + fixtureReleaseBranch + `</small>`,
-			`<code>` + releaseHeadSHA + `</code>`,
-			`<span class="status status-failure">failure</span>`,
-			`<code>forgejo_status</code>`,
+			`PR #` + strconv.Itoa(releasePR.Number) + ` · ` + fixtureReleaseBranch,
+			`title="` + releaseHeadSHA + `"`,
+			`>` + requiredContext + `</code>`,
 			frozenReason,
 		} {
 			if !strings.Contains(row, want) {
@@ -1345,21 +1339,26 @@ func proveScheduledFreezeLifecycle(t *testing.T, ctx context.Context, forgejo *f
 			}
 		}
 	}
-	if !strings.Contains(startIntentRow, `<td data-label="Context"><code>`+requiredContext+`</code></td>`) {
-		t.Fatalf("Schedule A reused publication intent is missing %q", requiredContext)
+	for _, want := range []string{`>failure</span>`, `>forgejo_status</code>`} {
+		if !strings.Contains(startIntentRow, want) {
+			t.Fatalf("Schedule A reused publication intent is missing %q", want)
+		}
 	}
-	for _, want := range []string{`<small class="tg-muted">` + requiredContext + `</small>`, `<td data-label="Result"><span class="status status-ok">posted</span></td>`} {
+	for _, want := range []string{`>posted</span>`, `>failure · forgejo_status</code>`} {
 		if !strings.Contains(startAttemptRow, want) {
 			t.Fatalf("Schedule A newest publication attempt is missing %q", want)
 		}
 	}
-	startDecisionRow := requireLatestDecisionResultRow(t, requirePage(t, ctx, browser, "/decisions"))
+	decisionsAfterStart := requirePage(t, ctx, browser, "/decisions")
+	if !strings.Contains(decisionsAfterStart, `>`+requiredContext+`</code>`) {
+		t.Fatalf("decisions page no longer displays the required context %q", requiredContext)
+	}
+	startDecisionRow := requireLatestDecisionResultRow(t, decisionsAfterStart)
 	for _, want := range []string{
-		`<a href="#">#` + strconv.Itoa(releasePR.Number) + `</a>`,
-		`<code class="tg-branch">` + fixtureReleaseBranch + `</code>`,
-		`<code>` + releaseHeadSHA + `</code>`,
-		`<code>` + requiredContext + `</code>`,
-		`<span class="status status-failure">Blocked</span>`,
+		`>#` + strconv.Itoa(releasePR.Number) + `</code>`,
+		`>` + fixtureReleaseBranch + `</code>`,
+		`title="` + releaseHeadSHA + `"`,
+		`>Blocked</span>`,
 		frozenReason,
 	} {
 		if !strings.Contains(startDecisionRow, want) {
@@ -1369,21 +1368,21 @@ func proveScheduledFreezeLifecycle(t *testing.T, ctx context.Context, forgejo *f
 
 	schedulesPage = requirePage(t, ctx, browser, "/scheduled-freezes")
 	activeScheduleA := requireScheduledFreezeRow(t, schedulesPage, 0, scheduleAEditedReason)
-	if activeScheduleA.branch != fixtureReleaseBranch || activeScheduleA.status != "active" || activeScheduleA.plannedEndsAt != scheduleTime(editedPlannedEndsAt) || activeScheduleA.endedAt != "—" {
+	if activeScheduleA.branch != fixtureReleaseBranch || activeScheduleA.status != "Active" || activeScheduleA.plannedEndsAt != scheduleTime(editedPlannedEndsAt) || activeScheduleA.endedAt != "—" {
 		t.Fatalf("Schedule A has unexpected active rendered evidence: %+v", activeScheduleA)
 	}
 	requireNoPendingScheduleActions(t, activeScheduleA)
 	cancelledScheduleBAfterStart := requireScheduledFreezeRow(t, schedulesPage, 0, scheduleBReason)
-	if cancelledScheduleBAfterStart.status != "cancelled" || cancelledScheduleBAfterStart.endedAt == "—" {
+	if cancelledScheduleBAfterStart.status != "Cancelled" || cancelledScheduleBAfterStart.endedAt == "—" {
 		t.Fatalf("Schedule B cancelled history changed after Schedule A Start Now: %+v", cancelledScheduleBAfterStart)
 	}
 	requireNoPendingScheduleActions(t, cancelledScheduleBAfterStart)
-	if strings.Contains(schedulesPage, `<span class="status status-pending">upcoming</span>`) || strings.Contains(schedulesPage, `action="/scheduled-freezes/edit"`) || strings.Contains(schedulesPage, `action="/scheduled-freezes/start-now"`) || strings.Contains(schedulesPage, `action="/scheduled-freezes/cancel"`) {
+	if strings.Contains(schedulesPage, `>Upcoming</span>`) || strings.Contains(schedulesPage, `action="/scheduled-freezes/edit"`) || strings.Contains(schedulesPage, `action="/scheduled-freezes/start-now"`) || strings.Contains(schedulesPage, `action="/scheduled-freezes/cancel"`) {
 		t.Fatal("scheduled lifecycle left a pending schedule or pending-only action")
 	}
 
 	freezesAfter := requirePage(t, ctx, browser, "/freezes")
-	if !strings.Contains(freezesAfter, `<span class="tg-badge">2 active</span>`) {
+	if !strings.Contains(freezesAfter, `>2 active</span>`) {
 		t.Fatal("freezes page does not show both active main and scheduled release freezes")
 	}
 	mainFreezeAfter, _ := requireActiveFreezeEvidenceForBranch(t, freezesAfter, "main")
@@ -1391,7 +1390,7 @@ func proveScheduledFreezeLifecycle(t *testing.T, ctx context.Context, forgejo *f
 		t.Fatalf("original main freeze changed during scheduled lifecycle: before=%+v after=%+v", mainFreezeBefore, mainFreezeAfter)
 	}
 	activeReleaseFreeze, activeReleaseRow := requireActiveFreezeEvidenceForBranch(t, freezesAfter, fixtureReleaseBranch)
-	if activeReleaseFreeze.id != scheduleA.id || activeReleaseFreeze.branch != fixtureReleaseBranch || activeReleaseFreeze.reason != scheduleAEditedReason || activeReleaseFreeze.status != "active" || activeReleaseFreeze.id == mainFreezeAfter.id {
+	if activeReleaseFreeze.id != scheduleA.id || activeReleaseFreeze.branch != fixtureReleaseBranch || activeReleaseFreeze.reason != scheduleAEditedReason || activeReleaseFreeze.status != "Frozen" || activeReleaseFreeze.id == mainFreezeAfter.id {
 		t.Fatalf("active scheduled release freeze has unexpected evidence: schedule=%+v active=%+v", activeScheduleA, activeReleaseFreeze)
 	}
 	if !strings.Contains(activeReleaseRow, scheduleTime(editedPlannedEndsAt)) {
@@ -1399,7 +1398,7 @@ func proveScheduledFreezeLifecycle(t *testing.T, ctx context.Context, forgejo *f
 	}
 
 	repositoriesPage := requirePage(t, ctx, browser, "/repositories")
-	if !strings.Contains(repositoriesPage, `<span class="tg-badge status-ok">enforcement active</span>`) || strings.Contains(repositoriesPage, "Enforcement is unhealthy") || strings.Contains(repositoriesPage, "Automatic recovery is pending") || strings.Contains(repositoriesPage, "Recovery in progress") || strings.Contains(repositoriesPage, `action="/repositories/recover"`) {
+	if !strings.Contains(repositoriesPage, `>enforcement active</span>`) || strings.Contains(repositoriesPage, "Enforcement is unhealthy") || strings.Contains(repositoriesPage, "Automatic recovery is pending") || strings.Contains(repositoriesPage, "Recovery in progress") || strings.Contains(repositoriesPage, `action="/repositories/recover"`) {
 		t.Fatal("repository did not remain enforcement-active and healthy after Schedule A Start Now convergence")
 	}
 	requireOpenForgejoPullRequest(t, ctx, forgejo, releasePR.Number, fixtureReleaseBranch, fixtureScheduledPRTitle, releaseHeadSHA)
@@ -1494,12 +1493,12 @@ func provePlannedUnfreezeAcrossRestart(t *testing.T, ctx context.Context, forgej
 
 	schedulesBefore := requirePage(t, ctx, browser, "/scheduled-freezes")
 	scheduleABefore := requireScheduledFreezeRow(t, schedulesBefore, 0, fixture.activeScheduleA.reason)
-	if scheduleABefore != fixture.activeScheduleA || scheduleABefore.id != 0 || scheduleABefore.branch != fixtureReleaseBranch || scheduleABefore.status != "active" || scheduleABefore.plannedEndsAt != scheduleTime(plannedEndsAt) || scheduleABefore.endedAt != "—" {
+	if scheduleABefore != fixture.activeScheduleA || scheduleABefore.id != 0 || scheduleABefore.branch != fixtureReleaseBranch || scheduleABefore.status != "Active" || scheduleABefore.plannedEndsAt != scheduleTime(plannedEndsAt) || scheduleABefore.endedAt != "—" {
 		t.Fatalf("Schedule A changed before planned-unfreeze downtime: retained=%+v rendered=%+v", fixture.activeScheduleA, scheduleABefore)
 	}
 	requireNoPendingScheduleActions(t, scheduleABefore)
 	scheduleBBefore := requireScheduledFreezeRow(t, schedulesBefore, 0, fixture.cancelledScheduleB.reason)
-	if scheduleBBefore != fixture.cancelledScheduleB || scheduleBBefore.status != "cancelled" || scheduleBBefore.endedAt == "" || scheduleBBefore.endedAt == "—" {
+	if scheduleBBefore != fixture.cancelledScheduleB || scheduleBBefore.status != "Cancelled" || scheduleBBefore.endedAt == "" || scheduleBBefore.endedAt == "—" {
 		t.Fatalf("cancelled Schedule B changed before planned-unfreeze downtime: retained=%+v rendered=%+v", fixture.cancelledScheduleB, scheduleBBefore)
 	}
 	requireNoPendingScheduleActions(t, scheduleBBefore)
@@ -1517,13 +1516,15 @@ func provePlannedUnfreezeAcrossRestart(t *testing.T, ctx context.Context, forgej
 	requireRetainedPlannedUnfreezeFixtureState(t, ctx, forgejo, browser, fixture, "planned-unfreeze pre-stop baseline")
 
 	decisionsBefore := requirePage(t, ctx, browser, "/decisions")
+	if !strings.Contains(decisionsBefore, `>`+requiredContext+`</code>`) {
+		t.Fatalf("decisions page no longer displays the required context %q", requiredContext)
+	}
 	failureDecisionRow := requireDecisionResultRowForHead(t, decisionsBefore, fixture.releaseHeadSHA)
 	for _, want := range []string{
-		`<a href="#">#` + strconv.Itoa(fixture.releasePullRequestIndex) + `</a>`,
-		`<code class="tg-branch">` + fixtureReleaseBranch + `</code>`,
-		`<code>` + fixture.releaseHeadSHA + `</code>`,
-		`<code>` + requiredContext + `</code>`,
-		`<span class="status status-failure">Blocked</span>`,
+		`>#` + strconv.Itoa(fixture.releasePullRequestIndex) + `</code>`,
+		`>` + fixtureReleaseBranch + `</code>`,
+		`title="` + fixture.releaseHeadSHA + `"`,
+		`>Blocked</span>`,
 		frozenDescription,
 	} {
 		if !strings.Contains(failureDecisionRow, want) {
@@ -1534,11 +1535,11 @@ func provePlannedUnfreezeAcrossRestart(t *testing.T, ctx context.Context, forgej
 	failureIntentRow := requirePublicationIntentRowForHead(t, publicationsBefore, fixture.releaseHeadSHA)
 	for _, want := range []string{
 		fixtureOwner + `/` + fixtureRepository,
-		`#` + strconv.Itoa(fixture.releasePullRequestIndex) + `<small class="tg-muted">` + fixtureReleaseBranch + `</small>`,
-		`<code>` + fixture.releaseHeadSHA + `</code>`,
-		`<td data-label="Context"><code>` + requiredContext + `</code></td>`,
-		`<span class="status status-failure">failure</span>`,
-		`<code>forgejo_status</code>`,
+		`PR #` + strconv.Itoa(fixture.releasePullRequestIndex) + ` · ` + fixtureReleaseBranch,
+		`title="` + fixture.releaseHeadSHA + `"`,
+		`>` + requiredContext + `</code>`,
+		`>failure</span>`,
+		`>forgejo_status</code>`,
 		frozenDescription,
 	} {
 		if !strings.Contains(failureIntentRow, want) {
@@ -1637,11 +1638,10 @@ func provePlannedUnfreezeAcrossRestart(t *testing.T, ctx context.Context, forgej
 	}
 	successDecisionRow := requireDecisionResultRowForHead(t, decisionsAfter, fixture.releaseHeadSHA)
 	for _, want := range []string{
-		`<a href="#">#` + strconv.Itoa(fixture.releasePullRequestIndex) + `</a>`,
-		`<code class="tg-branch">` + fixtureReleaseBranch + `</code>`,
-		`<code>` + fixture.releaseHeadSHA + `</code>`,
-		`<code>` + requiredContext + `</code>`,
-		`<span class="status status-success">Eligible</span>`,
+		`>#` + strconv.Itoa(fixture.releasePullRequestIndex) + `</code>`,
+		`>` + fixtureReleaseBranch + `</code>`,
+		`title="` + fixture.releaseHeadSHA + `"`,
+		`>Eligible</span>`,
 		thawedDescription,
 	} {
 		if !strings.Contains(successDecisionRow, want) {
@@ -1652,11 +1652,11 @@ func provePlannedUnfreezeAcrossRestart(t *testing.T, ctx context.Context, forgej
 	successIntentRow := requirePublicationIntentRowForHead(t, publicationsAfter, fixture.releaseHeadSHA)
 	for _, want := range []string{
 		fixtureOwner + `/` + fixtureRepository,
-		`#` + strconv.Itoa(fixture.releasePullRequestIndex) + `<small class="tg-muted">` + fixtureReleaseBranch + `</small>`,
-		`<code>` + fixture.releaseHeadSHA + `</code>`,
-		`<td data-label="Context"><code>` + requiredContext + `</code></td>`,
-		`<span class="status status-success">success</span>`,
-		`<code>forgejo_status</code>`,
+		`PR #` + strconv.Itoa(fixture.releasePullRequestIndex) + ` · ` + fixtureReleaseBranch,
+		`title="` + fixture.releaseHeadSHA + `"`,
+		`>` + requiredContext + `</code>`,
+		`>success</span>`,
+		`>forgejo_status</code>`,
 		thawedDescription,
 	} {
 		if !strings.Contains(successIntentRow, want) {
@@ -1669,12 +1669,11 @@ func provePlannedUnfreezeAcrossRestart(t *testing.T, ctx context.Context, forgej
 	startupAttemptRow := requireLatestPublicationAttemptRow(t, publicationsAfter)
 	for _, want := range []string{
 		fixtureOwner + `/` + fixtureRepository,
-		`#` + strconv.Itoa(fixture.releasePullRequestIndex) + `<small class="tg-muted">` + fixtureReleaseBranch + `</small>`,
-		`<code>` + fixture.releaseHeadSHA + `</code>`,
-		`<small class="tg-muted">` + requiredContext + `</small>`,
-		`<td data-label="State"><span class="status status-success">success</span></td>`,
-		`<td data-label="Mode"><code>forgejo_status</code></td>`,
-		`<td data-label="Result"><span class="status status-ok">posted</span></td>`,
+		`PR #` + strconv.Itoa(fixture.releasePullRequestIndex) + ` · ` + fixtureReleaseBranch,
+		`title="` + fixture.releaseHeadSHA + `"`,
+		`>` + requiredContext + `</code>`,
+		`>posted</span>`,
+		`>success · forgejo_status</code>`,
 		thawedDescription,
 	} {
 		if !strings.Contains(startupAttemptRow, want) {
@@ -1691,10 +1690,10 @@ func provePlannedUnfreezeAcrossRestart(t *testing.T, ctx context.Context, forgej
 	}
 	plannedUnfreezeRow := requireLatestActivityRow(t, activityAfter, "Scheduled planned unfreeze")
 	for _, want := range []string{
-		`<td data-label="Actor">Scheduler</td>`,
-		`<td data-label="Action">Scheduled planned unfreeze</td>`,
-		`<td data-label="Target">` + fixtureOwner + `/` + fixtureRepository + ` → ` + fixtureReleaseBranch + `</td>`,
-		`<td data-label="Outcome"><span class="status status-ok">Completed</span></td>`,
+		`>Scheduler</td>`,
+		`<span class="font-medium text-text">Scheduled planned unfreeze</span>`,
+		`>` + fixtureOwner + `/` + fixtureRepository + ` → ` + fixtureReleaseBranch + `</td>`,
+		`>Completed</span>`,
 		`Planned unfreeze ` + scheduleTime(plannedEndsAt) + `. Reason: ` + html.EscapeString(fixture.activeScheduleA.reason) + `.`,
 	} {
 		if !strings.Contains(plannedUnfreezeRow, want) {
@@ -1703,10 +1702,10 @@ func provePlannedUnfreezeAcrossRestart(t *testing.T, ctx context.Context, forgej
 	}
 	startupSyncRow := requireLatestActivityRow(t, activityAfter, "Open pull request sync")
 	for _, want := range []string{
-		`<td data-label="Actor">Unknown system actor</td>`,
-		`<td data-label="Action">Open pull request sync</td>`,
-		`<td data-label="Target">` + fixtureOwner + `/` + fixtureRepository + ` → all managed branches</td>`,
-		`<td data-label="Outcome"><span class="status status-ok">Succeeded</span></td>`,
+		`>Unknown system actor</td>`,
+		`<span class="font-medium text-text">Open pull request sync</span>`,
+		`>` + fixtureOwner + `/` + fixtureRepository + ` → all managed branches</td>`,
+		`>Succeeded</span>`,
 		`3 open PRs synchronized; 0 cached PRs marked closed.`,
 	} {
 		if !strings.Contains(startupSyncRow, want) {
@@ -1716,7 +1715,7 @@ func provePlannedUnfreezeAcrossRestart(t *testing.T, ctx context.Context, forgej
 
 	schedulesAfter := requirePage(t, ctx, browser, "/scheduled-freezes")
 	completedScheduleA := requireScheduledFreezeRow(t, schedulesAfter, 0, fixture.activeScheduleA.reason)
-	if completedScheduleA.id != 0 || completedScheduleA.branch != fixture.activeScheduleA.branch || completedScheduleA.reason != fixture.activeScheduleA.reason || completedScheduleA.startsAt != fixture.activeScheduleA.startsAt || completedScheduleA.plannedEndsAt != fixture.activeScheduleA.plannedEndsAt || completedScheduleA.status != "completed" || completedScheduleA.endedAt == "" || completedScheduleA.endedAt == "—" {
+	if completedScheduleA.id != 0 || completedScheduleA.branch != fixture.activeScheduleA.branch || completedScheduleA.reason != fixture.activeScheduleA.reason || completedScheduleA.startsAt != fixture.activeScheduleA.startsAt || completedScheduleA.plannedEndsAt != fixture.activeScheduleA.plannedEndsAt || completedScheduleA.status != "Completed" || completedScheduleA.endedAt == "" || completedScheduleA.endedAt == "—" {
 		t.Fatalf("Schedule A has unexpected completed evidence after startup planned unfreeze: before=%+v after=%+v", fixture.activeScheduleA, completedScheduleA)
 	}
 	requireNoPendingScheduleActions(t, completedScheduleA)
@@ -1814,11 +1813,11 @@ func provePlannedUnfreezeAcrossRestart(t *testing.T, ctx context.Context, forgej
 	}
 	latestDelivery := requireLatestWebhookDeliveryRow(t, afterMerge.webhookPage)
 	for _, want := range []string{
-		`<code>` + fixtureOwner + `/` + fixtureRepository + `</code>`,
-		`<td data-label="Event"><code>pull_request</code><small class="tg-muted">closed</small></td>`,
-		`>verified</span>`,
-		`>processed</span>`,
-		`<td data-label="Details">No processing error</td>`,
+		`>` + fixtureOwner + `/` + fixtureRepository + `</span>`,
+		`>pull_request · closed</span>`,
+		`>Verified</span>`,
+		`>Processed</span>`,
+		`>No processing error</span>`,
 	} {
 		if !strings.Contains(latestDelivery, want) {
 			t.Fatalf("terminal release merge webhook is missing %q", want)
@@ -1867,11 +1866,11 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 	}
 
 	completedScheduleA := requireScheduledFreezeRow(t, requirePage(t, ctx, allRoleBrowser, "/scheduled-freezes"), 0, fixture.activeScheduleA.reason)
-	if completedScheduleA.branch != fixtureReleaseBranch || completedScheduleA.status != "completed" || completedScheduleA.endedAt == "" || completedScheduleA.endedAt == "—" {
+	if completedScheduleA.branch != fixtureReleaseBranch || completedScheduleA.status != "Completed" || completedScheduleA.endedAt == "" || completedScheduleA.endedAt == "—" {
 		t.Fatalf("role-boundary baseline has unexpected completed Schedule A: %+v", completedScheduleA)
 	}
 	cancelledScheduleB := requireScheduledFreezeRow(t, requirePage(t, ctx, allRoleBrowser, "/scheduled-freezes"), 0, fixture.cancelledScheduleB.reason)
-	if cancelledScheduleB.branch != fixtureReleaseBranch || cancelledScheduleB.status != "cancelled" || cancelledScheduleB.endedAt == "" || cancelledScheduleB.endedAt == "—" {
+	if cancelledScheduleB.branch != fixtureReleaseBranch || cancelledScheduleB.status != "Cancelled" || cancelledScheduleB.endedAt == "" || cancelledScheduleB.endedAt == "—" {
 		t.Fatalf("role-boundary baseline has unexpected cancelled Schedule B: %+v", cancelledScheduleB)
 	}
 	baselineFreezes := requirePage(t, ctx, allRoleBrowser, "/freezes")
@@ -1898,8 +1897,8 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 	activityHistory := requirePage(t, ctx, allRoleBrowser, "/activity")
 	sharedThawHistory := requireLatestActivityRow(t, activityHistory, "Shared-head thaw")
 	plannedUnfreezeHistory := requireLatestActivityRow(t, activityHistory, "Scheduled planned unfreeze")
-	terminalReleaseDelivery := requireLatestWebhookDeliveryRow(t, requirePage(t, ctx, allRoleBrowser, "/webhooks?event=pull_request&limit=100"))
-	if !strings.Contains(terminalReleaseDelivery, `<small class="tg-muted">closed</small>`) {
+	terminalReleaseDelivery := requireLatestWebhookDeliveryRow(t, requirePage(t, ctx, allRoleBrowser, "/webhooks"))
+	if !strings.Contains(terminalReleaseDelivery, `>pull_request · closed</span>`) {
 		t.Fatal("role-boundary baseline did not retain the terminal release closed webhook")
 	}
 
@@ -2017,13 +2016,14 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 		"planned_ends_at":         {scheduleCPlannedEndsAt.Format(time.RFC3339)},
 		"timezone_offset_minutes": {"0"},
 	}, "Freezer creates Schedule C")
-	scheduleC := requireScheduledFreezeRow(t, requirePage(t, ctx, freezerSession.browser, "/scheduled-freezes"), 0, scheduleCReason)
-	if scheduleC.id <= 0 || scheduleC.branch != fixtureReleaseBranch || scheduleC.status != "upcoming" || scheduleC.startsAt != scheduleTime(scheduleCStartsAt) || scheduleC.plannedEndsAt != scheduleTime(scheduleCPlannedEndsAt) || scheduleC.endedAt != "—" {
+	scheduleCPage := requirePage(t, ctx, freezerSession.browser, "/scheduled-freezes")
+	scheduleC := requireScheduledFreezeRow(t, scheduleCPage, 0, scheduleCReason)
+	if scheduleC.id <= 0 || scheduleC.branch != fixtureReleaseBranch || scheduleC.status != "Upcoming" || scheduleC.startsAt != scheduleTime(scheduleCStartsAt) || scheduleC.plannedEndsAt != scheduleTime(scheduleCPlannedEndsAt) || scheduleC.endedAt != "—" {
 		t.Fatalf("Schedule C has unexpected creation evidence: %+v", scheduleC)
 	}
-	requirePendingScheduleActions(t, scheduleC, scheduleCStartsAt, scheduleCPlannedEndsAt)
+	requirePendingScheduleActions(t, scheduleCPage, scheduleC, scheduleCStartsAt, scheduleCPlannedEndsAt)
 	scheduleCCreatedActivity := requireLatestActivityRow(t, requirePage(t, ctx, allRoleBrowser, "/activity"), "Freeze schedule")
-	requireRoleBoundaryActivity(t, scheduleCCreatedActivity, "E2E Freezer", "Freeze schedule", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Scheduled", "pending", scheduleCReason, "Starts "+scheduleTime(scheduleCStartsAt), "planned unfreeze "+scheduleTime(scheduleCPlannedEndsAt))
+	requireRoleBoundaryActivity(t, scheduleCCreatedActivity, "E2E Freezer", "Freeze schedule", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Scheduled", scheduleCReason, "Starts "+scheduleTime(scheduleCStartsAt), "planned unfreeze "+scheduleTime(scheduleCPlannedEndsAt))
 	afterScheduleCCreate := collectRoleBoundaryEvidence(t, ctx, forgejo, allRoleBrowser, repositoryID, fixture.sharedHeadSHA, append(scheduleReasons, scheduleCReason), trackedHeads)
 	if afterScheduleCCreate.scheduledCount != beforeScheduleCCreate.scheduledCount+1 || afterScheduleCCreate.activeFreezes != beforeScheduleCCreate.activeFreezes || afterScheduleCCreate.userCount != beforeScheduleCCreate.userCount || afterScheduleCCreate.repositoryCount != beforeScheduleCCreate.repositoryCount || afterScheduleCCreate.mainFreeze != beforeScheduleCCreate.mainFreeze {
 		t.Fatal("Schedule C creation changed non-schedule state or the wrong schedule count")
@@ -2065,13 +2065,13 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 		"timezone_offset_minutes": {"0"},
 	}, "Admin-only edits Schedule C")
 	editedScheduleC := requireScheduledFreezeRow(t, requirePage(t, ctx, adminSession.browser, "/scheduled-freezes"), scheduleC.id, scheduleCEditedReason)
-	if editedScheduleC.id != scheduleC.id || editedScheduleC.branch != fixtureReleaseBranch || editedScheduleC.status != "upcoming" || editedScheduleC.startsAt != scheduleTime(editedScheduleCStartsAt) || editedScheduleC.plannedEndsAt != scheduleTime(editedScheduleCPlannedEndsAt) || editedScheduleC.endedAt != "—" {
+	if editedScheduleC.id != scheduleC.id || editedScheduleC.branch != fixtureReleaseBranch || editedScheduleC.status != "Upcoming" || editedScheduleC.startsAt != scheduleTime(editedScheduleCStartsAt) || editedScheduleC.plannedEndsAt != scheduleTime(editedScheduleCPlannedEndsAt) || editedScheduleC.endedAt != "—" {
 		t.Fatalf("Schedule C has unexpected edit evidence: before=%+v after=%+v", scheduleC, editedScheduleC)
 	}
 	requireScheduleRoleControls(t, ctx, adminSession, scheduleCEditedReason, false, true, true, false)
 	scheduleCEditedActivity := requireLatestActivityRow(t, requirePage(t, ctx, allRoleBrowser, "/activity"), "Freeze schedule")
 	wantScheduleCEdit := "Reason " + scheduleCReason + " → " + scheduleCEditedReason + "; starts " + scheduleTime(scheduleCStartsAt) + " → " + scheduleTime(editedScheduleCStartsAt) + "; planned unfreeze " + scheduleTime(scheduleCPlannedEndsAt) + " → " + scheduleTime(editedScheduleCPlannedEndsAt) + "."
-	requireRoleBoundaryActivity(t, scheduleCEditedActivity, "E2E Admin Only", "Freeze schedule", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Changed", "frozen", scheduleCEditedReason, wantScheduleCEdit)
+	requireRoleBoundaryActivity(t, scheduleCEditedActivity, "E2E Admin Only", "Freeze schedule", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Changed", scheduleCEditedReason, wantScheduleCEdit)
 	afterScheduleCEdit := collectRoleBoundaryEvidence(t, ctx, forgejo, allRoleBrowser, repositoryID, fixture.sharedHeadSHA, []string{completedScheduleA.reason, cancelledScheduleB.reason, scheduleCEditedReason}, trackedHeads)
 	requireScheduleOnlyActivityDelta(t, beforeScheduleCEdit.sideEffects, afterScheduleCEdit.sideEffects, 1, "Schedule C edit")
 	if afterScheduleCEdit.userCount != beforeScheduleCEdit.userCount || afterScheduleCEdit.repositoryCount != beforeScheduleCEdit.repositoryCount || afterScheduleCEdit.activeFreezes != beforeScheduleCEdit.activeFreezes || afterScheduleCEdit.scheduledCount != beforeScheduleCEdit.scheduledCount || afterScheduleCEdit.mainFreeze != beforeScheduleCEdit.mainFreeze {
@@ -2093,12 +2093,12 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 	requireScheduleOnlyActivityDelta(t, beforeStartNow.sideEffects, afterStartNow.sideEffects, 2, "Schedule C Start Now without an open release PR")
 	requireRoleStatusHistoriesUnchanged(t, beforeStartNow.statusHistories, afterStartNow.statusHistories, "Schedule C Start Now")
 	activeScheduleC := afterStartNow.schedules[2]
-	if activeScheduleC.id != 0 || activeScheduleC.branch != fixtureReleaseBranch || activeScheduleC.reason != scheduleCEditedReason || activeScheduleC.status != "active" || activeScheduleC.plannedEndsAt != scheduleTime(editedScheduleCPlannedEndsAt) || activeScheduleC.endedAt != "—" {
+	if activeScheduleC.id != 0 || activeScheduleC.branch != fixtureReleaseBranch || activeScheduleC.reason != scheduleCEditedReason || activeScheduleC.status != "Active" || activeScheduleC.plannedEndsAt != scheduleTime(editedScheduleCPlannedEndsAt) || activeScheduleC.endedAt != "—" {
 		t.Fatalf("Schedule C has unexpected Start Now evidence: %+v", activeScheduleC)
 	}
 	requireNoPendingScheduleActions(t, activeScheduleC)
 	activeReleaseFreeze, _ := requireActiveFreezeEvidenceForBranch(t, requirePage(t, ctx, allRoleBrowser, "/freezes"), fixtureReleaseBranch)
-	if activeReleaseFreeze.id != scheduleC.id || activeReleaseFreeze.reason != scheduleCEditedReason || activeReleaseFreeze.status != "active" {
+	if activeReleaseFreeze.id != scheduleC.id || activeReleaseFreeze.reason != scheduleCEditedReason || activeReleaseFreeze.status != "Frozen" {
 		t.Fatalf("Schedule C Start Now created the wrong active release freeze: schedule=%+v active=%+v", editedScheduleC, activeReleaseFreeze)
 	}
 	adminFreezesAfterStart := requirePage(t, ctx, adminSession.browser, "/freezes")
@@ -2112,7 +2112,7 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 		t.Fatal("Schedule C Start Now did not add exactly one Start Now and one open-PR sync activity")
 	}
 	scheduleCStartedActivity := requireLatestActivityRow(t, activityAfterStartNow, "Scheduled freeze Start Now")
-	requireRoleBoundaryActivity(t, scheduleCStartedActivity, "E2E Admin Only", "Scheduled freeze Start Now", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Started", "frozen", scheduleCEditedReason, "planned unfreeze "+scheduleTime(editedScheduleCPlannedEndsAt))
+	requireRoleBoundaryActivity(t, scheduleCStartedActivity, "E2E Admin Only", "Scheduled freeze Start Now", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Started", scheduleCEditedReason, "planned unfreeze "+scheduleTime(editedScheduleCPlannedEndsAt))
 	requireLatestOpenPullRequestSync(t, activityAfterStartNow, 2)
 	requireMergedForgejoPullRequest(t, ctx, forgejo, fixture.releasePullRequestIndex, fixtureReleaseBranch, fixtureScheduledPRTitle, fixture.releaseHeadSHA)
 	requireOpenForgejoPullRequest(t, ctx, forgejo, fixture.primaryPullRequestIndex, "main", fixturePrimaryPRTitle, fixture.sharedHeadSHA)
@@ -2146,7 +2146,7 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 	requireScheduleOnlyActivityDelta(t, afterAdminActiveCancel.sideEffects, afterFreezerCancel.sideEffects, 2, "Freezer active Schedule C cancellation without an open release PR")
 	requireRoleStatusHistoriesUnchanged(t, afterAdminActiveCancel.statusHistories, afterFreezerCancel.statusHistories, "Freezer active Schedule C cancellation")
 	cancelledScheduleC := afterFreezerCancel.schedules[2]
-	if cancelledScheduleC.id != 0 || cancelledScheduleC.branch != fixtureReleaseBranch || cancelledScheduleC.reason != scheduleCEditedReason || cancelledScheduleC.status != "cancelled" || cancelledScheduleC.endedAt == "" || cancelledScheduleC.endedAt == "—" {
+	if cancelledScheduleC.id != 0 || cancelledScheduleC.branch != fixtureReleaseBranch || cancelledScheduleC.reason != scheduleCEditedReason || cancelledScheduleC.status != "Cancelled" || cancelledScheduleC.endedAt == "" || cancelledScheduleC.endedAt == "—" {
 		t.Fatalf("Schedule C has unexpected active-cancellation evidence: %+v", cancelledScheduleC)
 	}
 	requireNoPendingScheduleActions(t, cancelledScheduleC)
@@ -2158,7 +2158,7 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 		t.Fatal("Freezer active Schedule C cancellation did not add exactly one open-PR sync activity")
 	}
 	scheduleCCancelledActivity := requireLatestActivityRow(t, activityAfterFreezerCancel, "Branch freeze")
-	requireRoleBoundaryActivity(t, scheduleCCancelledActivity, "E2E Freezer", "Branch freeze", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Cancelled", "warning", scheduleCEditedReason)
+	requireRoleBoundaryActivity(t, scheduleCCancelledActivity, "E2E Freezer", "Branch freeze", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Cancelled", scheduleCEditedReason)
 	requireLatestOpenPullRequestSync(t, activityAfterFreezerCancel, 2)
 
 	beforeUniqueHead := afterFreezerCancel
@@ -2211,7 +2211,7 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 		t.Fatal("unique-head synchronized webhook changed the merged release head status history")
 	}
 	uniqueDecision := requireDecisionResultRowForHead(t, requirePage(t, ctx, allRoleBrowser, "/decisions"), uniqueHeadSHA)
-	for _, want := range []string{`#` + strconv.Itoa(fixture.primaryPullRequestIndex) + `</a>`, `<code class="tg-branch">main</code>`, `<code>` + uniqueHeadSHA + `</code>`, `<span class="status status-failure">Blocked</span>`, frozenDescription} {
+	for _, want := range []string{`>#` + strconv.Itoa(fixture.primaryPullRequestIndex) + `</code>`, `>main</code>`, `title="` + uniqueHeadSHA + `"`, `>Blocked</span>`, frozenDescription} {
 		if !strings.Contains(uniqueDecision, want) {
 			t.Fatalf("unique-head synchronized decision is missing %q", want)
 		}
@@ -2245,7 +2245,7 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 	requireUnchangedRoleBoundaryEvidence(t, beforeDeniedThaws, afterDeniedThaws, "wrong-role unique-head thaw probes")
 
 	decisionsPage := requirePage(t, ctx, thawApproverSession.browser, "/decisions")
-	thawForm := requireRenderedForm(t, decisionsPage, `<form method="post" action="/decisions" class="tg-setup-form tg-thaw-form" data-thaw-form>`, "role-boundary thaw")
+	thawForm := requireRenderedForm(t, decisionsPage, `<form method="post" action="/decisions"`, "role-boundary thaw")
 	if strings.Contains(thawForm, `name="head_sha"`) {
 		t.Fatal("role-boundary thaw form must not submit a client-provided head SHA")
 	}
@@ -2299,9 +2299,9 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 	}
 	requireLatestOpenPullRequestSync(t, activityAfterAllowedThaw, 2)
 	allowedThawActivity := requireLatestActivityRow(t, activityAfterAllowedThaw, "Single-PR thaw")
-	requireRoleBoundaryActivity(t, allowedThawActivity, "E2E Thaw Approver", "Single-PR thaw", fixtureOwner+"/"+fixtureRepository+" → PR #"+strconv.Itoa(fixture.primaryPullRequestIndex), "Approved", "ok", "Branch main; head "+strings.ToLower(uniqueHeadSHA[:12])+". Reason: "+roleThawReason+".")
+	requireRoleBoundaryActivity(t, allowedThawActivity, "E2E Thaw Approver", "Single-PR thaw", fixtureOwner+"/"+fixtureRepository+" → PR #"+strconv.Itoa(fixture.primaryPullRequestIndex), "Approved", "Branch main; head "+strings.ToLower(uniqueHeadSHA[:12])+". Reason: "+roleThawReason+".")
 	allowedDecision := requireDecisionResultRowForHead(t, requirePage(t, ctx, allRoleBrowser, "/decisions"), uniqueHeadSHA)
-	for _, want := range []string{`#` + strconv.Itoa(fixture.primaryPullRequestIndex) + `</a>`, `<code>` + uniqueHeadSHA + `</code>`, `<span class="status status-success">Eligible</span>`, explicitThawDescription} {
+	for _, want := range []string{`>#` + strconv.Itoa(fixture.primaryPullRequestIndex) + `</code>`, `title="` + uniqueHeadSHA + `"`, `>Eligible</span>`, explicitThawDescription} {
 		if !strings.Contains(allowedDecision, want) {
 			t.Fatalf("allowed role-boundary thaw decision is missing %q", want)
 		}
@@ -2363,7 +2363,7 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 	if !slices.Equal(historicalThawedStatuses, fixture.historicalThawedHeadStatuses) {
 		t.Fatal("role-boundary slice changed the historical unique-head thaw status history")
 	}
-	finalWebhookPage := requirePage(t, ctx, allRoleBrowser, "/webhooks?event=pull_request&limit=100")
+	finalWebhookPage := requirePage(t, ctx, allRoleBrowser, "/webhooks")
 	if !strings.Contains(finalWebhookPage, terminalReleaseDelivery) || countPullRequestDeliveryActions(finalWebhookPage, "synchronized") != countPullRequestDeliveryActions(beforeUniqueHead.sideEffects.webhookPage, "synchronized")+1 {
 		t.Fatal("final webhook evidence did not retain the release close and exactly one role-boundary synchronized delivery")
 	}
@@ -2427,28 +2427,28 @@ func proveAuditAndDiagnosticsEvidence(t *testing.T, ctx context.Context, forgejo
 	if activityCount != before.evidence.sideEffects.activityEvents || activityCount <= 0 || activityCount >= 100 {
 		t.Fatalf("terminal activity count=%d, want persisted count %d in the untruncated range 1..99", activityCount, before.evidence.sideEffects.activityEvents)
 	}
-	repositoryAdded := requireActivityRowEvidence(t, activityPage, "E2E Admin", "Repository added", fixtureOwner+"/"+fixtureRepository, "Added", "ok", "Default branch main.")
-	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Webhook secret configuration", fixtureOwner+"/"+fixtureRepository, "Configured", "ok", "Webhook secret set; the value remains hidden.")
-	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Status token configuration", fixtureOwner+"/"+fixtureRepository, "Configured", "ok", "Status token set; the value remains hidden.")
-	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Readiness check", fixtureOwner+"/"+fixtureRepository, "Checked", "ok", "11 passed, 1 warnings, 0 failed across 2 managed branches; webhook evidence fresh.")
-	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Status-post verification", fixtureOwner+"/"+fixtureRepository+" → main", "Succeeded", "ok", "Controlled thawguard/setup post verified at head ")
-	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Enforcement activation", fixtureOwner+"/"+fixtureRepository, "Succeeded", "ok", "1 open PRs evaluated; 1 statuses posted and 0 failed.")
-	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Enforcement reconciliation", fixtureOwner+"/"+fixtureRepository, "Failed", "failed", "readiness checks failed; state unhealthy.")
-	requireActivityRowEvidence(t, activityPage, "Runtime process", "Runtime convergence", fixtureOwner+"/"+fixtureRepository, "Failed", "failed", "status publication failed; state unhealthy. Automatic recovery remains pending.")
-	requireActivityRowEvidence(t, activityPage, "Reconciliation runner", "Enforcement recovery", fixtureOwner+"/"+fixtureRepository, "Succeeded", "ok", "1 open PRs evaluated; 1 statuses posted and 0 failed.")
-	requireActivityRowEvidence(t, activityPage, "Unknown system actor", "Open pull request sync", fixtureOwner+"/"+fixtureRepository+" → all managed branches", "Succeeded", "ok", "3 open PRs synchronized; 0 cached PRs marked closed.")
-	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Branch freeze", fixtureOwner+"/"+fixtureRepository+" → main", "Frozen", "frozen", "Reason: Fictional release verification.")
-	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Branch freeze", fixtureOwner+"/"+fixtureRepository+" → main", "Lifted", "ok", "Reason: Fictional release verification.")
-	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Branch freeze", fixtureOwner+"/"+fixtureRepository+" → main", "Cancelled", "warning", "Reason: Fictional cancellation verification..")
+	repositoryAdded := requireActivityRowEvidence(t, activityPage, "E2E Admin", "Repository added", fixtureOwner+"/"+fixtureRepository, "Added", "Default branch main.")
+	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Webhook secret configuration", fixtureOwner+"/"+fixtureRepository, "Configured", "Webhook secret set; the value remains hidden.")
+	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Status token configuration", fixtureOwner+"/"+fixtureRepository, "Configured", "Status token set; the value remains hidden.")
+	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Readiness check", fixtureOwner+"/"+fixtureRepository, "Checked", "11 passed, 1 warnings, 0 failed across 2 managed branches; webhook evidence fresh.")
+	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Status-post verification", fixtureOwner+"/"+fixtureRepository+" → main", "Succeeded", "Controlled thawguard/setup post verified at head ")
+	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Enforcement activation", fixtureOwner+"/"+fixtureRepository, "Succeeded", "1 open PRs evaluated; 1 statuses posted and 0 failed.")
+	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Enforcement reconciliation", fixtureOwner+"/"+fixtureRepository, "Failed", "readiness checks failed; state unhealthy.")
+	requireActivityRowEvidence(t, activityPage, "Runtime process", "Runtime convergence", fixtureOwner+"/"+fixtureRepository, "Failed", "status publication failed; state unhealthy. Automatic recovery remains pending.")
+	requireActivityRowEvidence(t, activityPage, "Reconciliation runner", "Enforcement recovery", fixtureOwner+"/"+fixtureRepository, "Succeeded", "1 open PRs evaluated; 1 statuses posted and 0 failed.")
+	requireActivityRowEvidence(t, activityPage, "Unknown system actor", "Open pull request sync", fixtureOwner+"/"+fixtureRepository+" → all managed branches", "Succeeded", "3 open PRs synchronized; 0 cached PRs marked closed.")
+	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Branch freeze", fixtureOwner+"/"+fixtureRepository+" → main", "Frozen", "Reason: Fictional release verification.")
+	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Branch freeze", fixtureOwner+"/"+fixtureRepository+" → main", "Lifted", "Reason: Fictional release verification.")
+	requireActivityRowEvidence(t, activityPage, "E2E Admin", "Branch freeze", fixtureOwner+"/"+fixtureRepository+" → main", "Cancelled", "Reason: Fictional cancellation verification..")
 
-	requireRoleBoundaryActivity(t, lifecycle.historicalSinglePRThawActivity, "E2E Admin", "Single-PR thaw", fixtureOwner+"/"+fixtureRepository+" → PR #"+strconv.Itoa(lifecycle.primaryPullRequestIndex), "Approved", "ok", "Branch main; head "+lifecycle.historicalThawedHeadSHA[:12]+". Reason: Fictional immediate per-PR thaw verification.")
-	requireRoleBoundaryActivity(t, fixture.activity.sharedHeadThaw, "E2E Admin", "Shared-head thaw", fixtureOwner+"/"+fixtureRepository+" → shared head "+lifecycle.sharedHeadSHA[:12], "Approved", "ok", "New exceptions: #"+strconv.Itoa(lifecycle.primaryPullRequestIndex)+", #"+strconv.Itoa(lifecycle.sharedHeadPullRequestIndex), "Confirmation reason: Fictional shared-head thaw confirmation.")
-	requireRoleBoundaryActivity(t, fixture.activity.plannedUnfreeze, "Scheduler", "Scheduled planned unfreeze", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Completed", "ok", "Planned unfreeze "+scheduleTime(lifecycle.plannedEndsAt)+". Reason: "+lifecycle.activeScheduleA.reason+".")
-	requireRoleBoundaryActivity(t, fixture.activity.scheduleCCreated, "E2E Freezer", "Freeze schedule", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Scheduled", "pending", "Fictional role-boundary Schedule C")
-	requireRoleBoundaryActivity(t, fixture.activity.scheduleCEdited, "E2E Admin Only", "Freeze schedule", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Changed", "frozen", "Reason Fictional role-boundary Schedule C → Fictional role-boundary Schedule C edited")
-	requireRoleBoundaryActivity(t, fixture.activity.scheduleCStarted, "E2E Admin Only", "Scheduled freeze Start Now", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Started", "frozen", "Fictional role-boundary Schedule C edited")
-	requireRoleBoundaryActivity(t, fixture.activity.scheduleCCancelled, "E2E Freezer", "Branch freeze", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Cancelled", "warning", "Reason: Fictional role-boundary Schedule C edited.")
-	requireRoleBoundaryActivity(t, fixture.activity.roleBoundaryThaw, "E2E Thaw Approver", "Single-PR thaw", fixtureOwner+"/"+fixtureRepository+" → PR #"+strconv.Itoa(lifecycle.primaryPullRequestIndex), "Approved", "ok", "Branch main; head "+fixture.uniqueHeadSHA[:12]+". Reason: Fictional role-boundary unique-head thaw.")
+	requireRoleBoundaryActivity(t, lifecycle.historicalSinglePRThawActivity, "E2E Admin", "Single-PR thaw", fixtureOwner+"/"+fixtureRepository+" → PR #"+strconv.Itoa(lifecycle.primaryPullRequestIndex), "Approved", "Branch main; head "+lifecycle.historicalThawedHeadSHA[:12]+". Reason: Fictional immediate per-PR thaw verification.")
+	requireRoleBoundaryActivity(t, fixture.activity.sharedHeadThaw, "E2E Admin", "Shared-head thaw", fixtureOwner+"/"+fixtureRepository+" → shared head "+lifecycle.sharedHeadSHA[:12], "Approved", "New exceptions: #"+strconv.Itoa(lifecycle.primaryPullRequestIndex)+", #"+strconv.Itoa(lifecycle.sharedHeadPullRequestIndex), "Confirmation reason: Fictional shared-head thaw confirmation.")
+	requireRoleBoundaryActivity(t, fixture.activity.plannedUnfreeze, "Scheduler", "Scheduled planned unfreeze", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Completed", "Planned unfreeze "+scheduleTime(lifecycle.plannedEndsAt)+". Reason: "+lifecycle.activeScheduleA.reason+".")
+	requireRoleBoundaryActivity(t, fixture.activity.scheduleCCreated, "E2E Freezer", "Freeze schedule", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Scheduled", "Fictional role-boundary Schedule C")
+	requireRoleBoundaryActivity(t, fixture.activity.scheduleCEdited, "E2E Admin Only", "Freeze schedule", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Changed", "Reason Fictional role-boundary Schedule C → Fictional role-boundary Schedule C edited")
+	requireRoleBoundaryActivity(t, fixture.activity.scheduleCStarted, "E2E Admin Only", "Scheduled freeze Start Now", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Started", "Fictional role-boundary Schedule C edited")
+	requireRoleBoundaryActivity(t, fixture.activity.scheduleCCancelled, "E2E Freezer", "Branch freeze", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Cancelled", "Reason: Fictional role-boundary Schedule C edited.")
+	requireRoleBoundaryActivity(t, fixture.activity.roleBoundaryThaw, "E2E Thaw Approver", "Single-PR thaw", fixtureOwner+"/"+fixtureRepository+" → PR #"+strconv.Itoa(lifecycle.primaryPullRequestIndex), "Approved", "Branch main; head "+fixture.uniqueHeadSHA[:12]+". Reason: Fictional role-boundary unique-head thaw.")
 	for _, retained := range []struct {
 		label string
 		row   string
@@ -2495,22 +2495,22 @@ func proveAuditAndDiagnosticsEvidence(t *testing.T, ctx context.Context, forgejo
 		}
 	}
 
-	tokenAttempts := requireDiagnosticRowsForHead(t, publicationsPage, "<h2>Recent publication attempts</h2>", lifecycle.historicalThawedHeadSHA)
+	tokenAttempts := requireDiagnosticRowsForHead(t, publicationsPage, `aria-label="Recent publication attempts"`, lifecycle.historicalThawedHeadSHA)
 	tokenFailureIndex := diagnosticRowIndex(tokenAttempts,
-		`<td data-label="State"><span class="status status-failure">failure</span></td>`,
-		`<td data-label="Result"><span class="status status-failed">failed</span></td>`,
+		`>failure · forgejo_status</code>`,
+		`>failed</span>`,
 		frozenDescription,
 		"post forgejo commit status",
 		"forge returned 401",
 	)
 	tokenRecoveryIndex := diagnosticRowIndex(tokenAttempts,
-		`<td data-label="State"><span class="status status-failure">failure</span></td>`,
-		`<td data-label="Result"><span class="status status-ok">posted</span></td>`,
+		`>failure · forgejo_status</code>`,
+		`>posted</span>`,
 		frozenDescription,
 	)
 	tokenCurrentIndex := diagnosticRowIndex(tokenAttempts,
-		`<td data-label="State"><span class="status status-success">success</span></td>`,
-		`<td data-label="Result"><span class="status status-ok">posted</span></td>`,
+		`>success · forgejo_status</code>`,
+		`>posted</span>`,
 		explicitThawDescription,
 	)
 	if tokenFailureIndex < 0 || tokenRecoveryIndex < 0 || tokenCurrentIndex < 0 || tokenRecoveryIndex >= tokenFailureIndex || tokenCurrentIndex >= tokenFailureIndex {
@@ -2519,15 +2519,15 @@ func proveAuditAndDiagnosticsEvidence(t *testing.T, ctx context.Context, forgejo
 	tokenIntent := requirePublicationIntentRowForHead(t, publicationsPage, lifecycle.historicalThawedHeadSHA)
 	requireDiagnosticRowContains(t, tokenIntent, "token-loss current desired status",
 		fixtureOwner+"/"+fixtureRepository,
-		`#`+strconv.Itoa(lifecycle.primaryPullRequestIndex)+`<small class="tg-muted">main</small>`,
-		`<code>`+lifecycle.historicalThawedHeadSHA+`</code>`,
-		`<td data-label="Context"><code>`+requiredContext+`</code></td>`,
-		`<td data-label="State"><span class="status status-success">success</span></td>`,
-		`<td data-label="Mode"><code>forgejo_status</code></td>`,
+		`PR #`+strconv.Itoa(lifecycle.primaryPullRequestIndex)+` · main`,
+		`title="`+lifecycle.historicalThawedHeadSHA+`"`,
+		`>`+requiredContext+`</code>`,
+		`>success</span>`,
+		`>forgejo_status</code>`,
 		explicitThawDescription,
 	)
 
-	releaseAttempts := requireDiagnosticRowsForHead(t, publicationsPage, "<h2>Recent publication attempts</h2>", lifecycle.releaseHeadSHA)
+	releaseAttempts := requireDiagnosticRowsForHead(t, publicationsPage, `aria-label="Recent publication attempts"`, lifecycle.releaseHeadSHA)
 	if len(releaseAttempts) != 3 {
 		t.Fatalf("release head has %d retained publication attempts, want eligible/frozen/eligible", len(releaseAttempts))
 	}
@@ -2538,25 +2538,27 @@ func proveAuditAndDiagnosticsEvidence(t *testing.T, ctx context.Context, forgejo
 	requireCurrentStatusIntentEvidence(t, releaseIntent, lifecycle.releasePullRequestIndex, fixtureReleaseBranch, lifecycle.releaseHeadSHA, "success", noFreezeDescription)
 	requireCommitStatusProgression(t, before.evidence.statusHistories[2], []string{"success", "failure", "success"}, []string{noFreezeDescription, frozenDescription, noFreezeDescription}, "release")
 
-	roleDecisions := requireDiagnosticRowsForHead(t, decisionsPage, "<h2>Thaw approval results</h2>", fixture.uniqueHeadSHA)
+	if !strings.Contains(decisionsPage, `>`+requiredContext+`</code>`) {
+		t.Fatal("terminal decisions page does not state the required status context")
+	}
+	roleDecisions := requireDiagnosticRowsForHead(t, decisionsPage, `aria-label="Freeze decisions"`, fixture.uniqueHeadSHA)
 	if len(roleDecisions) != 2 {
 		t.Fatalf("role-boundary unique head has %d decision rows, want frozen then Eligible", len(roleDecisions))
 	}
-	roleEligibleIndex := diagnosticRowIndex(roleDecisions, `<span class="status status-success">Eligible</span>`, explicitThawDescription)
-	roleBlockedIndex := diagnosticRowIndex(roleDecisions, `<span class="status status-failure">Blocked</span>`, frozenDescription)
+	roleEligibleIndex := diagnosticRowIndex(roleDecisions, `>Eligible</span>`, explicitThawDescription)
+	roleBlockedIndex := diagnosticRowIndex(roleDecisions, `>Blocked</span>`, frozenDescription)
 	if roleEligibleIndex < 0 || roleBlockedIndex < 0 || roleEligibleIndex >= roleBlockedIndex {
 		t.Fatalf("role-boundary decision chronology is incomplete: Eligible=%d Blocked=%d", roleEligibleIndex, roleBlockedIndex)
 	}
 	for label, row := range map[string]string{"Eligible decision": roleDecisions[roleEligibleIndex], "Blocked decision": roleDecisions[roleBlockedIndex]} {
 		requireDiagnosticRowContains(t, row, "role-boundary "+label,
-			`#`+strconv.Itoa(lifecycle.primaryPullRequestIndex)+`</a>`,
-			`<code>`+fixtureOwner+`/`+fixtureRepository+`</code>`,
-			`<code class="tg-branch">main</code>`,
-			`<code>`+fixture.uniqueHeadSHA+`</code>`,
-			`<code>`+requiredContext+`</code>`,
+			`>#`+strconv.Itoa(lifecycle.primaryPullRequestIndex)+`</code>`,
+			fixtureOwner+`/`+fixtureRepository,
+			`>main</code>`,
+			`title="`+fixture.uniqueHeadSHA+`"`,
 		)
 	}
-	roleAttempts := requireDiagnosticRowsForHead(t, publicationsPage, "<h2>Recent publication attempts</h2>", fixture.uniqueHeadSHA)
+	roleAttempts := requireDiagnosticRowsForHead(t, publicationsPage, `aria-label="Recent publication attempts"`, fixture.uniqueHeadSHA)
 	if len(roleAttempts) != 2 {
 		t.Fatalf("role-boundary unique head has %d publication attempts, want failure then success", len(roleAttempts))
 	}
@@ -2568,8 +2570,8 @@ func proveAuditAndDiagnosticsEvidence(t *testing.T, ctx context.Context, forgejo
 
 	unfilteredWebhookPage := before.evidence.sideEffects.webhookPage
 	unfilteredSummary := requireWebhookPageSummary(t, unfilteredWebhookPage)
-	if unfilteredSummary.showing != before.evidence.sideEffects.webhookRows || unfilteredSummary.matching != unfilteredSummary.showing || unfilteredSummary.total != unfilteredSummary.showing || unfilteredSummary.showing <= 0 || unfilteredSummary.showing >= 100 {
-		t.Fatalf("unfiltered webhook summary is not complete: showing=%d matching=%d total=%d expected=%d", unfilteredSummary.showing, unfilteredSummary.matching, unfilteredSummary.total, before.evidence.sideEffects.webhookRows)
+	if unfilteredSummary.showing != before.evidence.sideEffects.webhookRows || unfilteredSummary.total != unfilteredSummary.showing || unfilteredSummary.showing <= 0 || unfilteredSummary.showing >= 20 {
+		t.Fatalf("unfiltered webhook summary is not complete on one page: showing=%d total=%d expected=%d", unfilteredSummary.showing, unfilteredSummary.total, before.evidence.sideEffects.webhookRows)
 	}
 	for _, action := range []string{"opened", "synchronized", "closed"} {
 		if countPullRequestDeliveryActions(unfilteredWebhookPage, action) <= 0 {
@@ -2590,67 +2592,61 @@ func proveAuditAndDiagnosticsEvidence(t *testing.T, ctx context.Context, forgejo
 	}
 
 	processedPath := "/webhooks?" + url.Values{
-		"repository_id": {strconv.FormatInt(repositoryID, 10)},
-		"event":         {"pull_request"},
-		"processing":    {"processed"},
-		"sort":          {"received"},
-		"direction":     {"asc"},
-		"limit":         {"50"},
+		"repo":       {strconv.FormatInt(repositoryID, 10)},
+		"processing": {"processed"},
+		"sort":       {"received"},
+		"dir":        {"asc"},
 	}.Encode()
 	processedPage := requirePage(t, ctx, fixture.roleSessions[0].browser, processedPath)
-	requireWebhookFilterControls(t, processedPage, repositoryID, "processed", "pull_request", "received", "asc", 50)
+	requireWebhookFilterControls(t, processedPage, repositoryID, "processed", "received", "asc")
 	processedSummary := requireWebhookPageSummary(t, processedPage)
-	if processedSummary.showing != processedSummary.matching || processedSummary.total != unfilteredSummary.total || processedSummary.showing != unfilteredSummary.showing-1 {
-		t.Fatalf("processed webhook filter has untruthful counts: showing=%d matching=%d total=%d unfiltered=%d", processedSummary.showing, processedSummary.matching, processedSummary.total, unfilteredSummary.showing)
+	if processedSummary.showing != processedSummary.total || processedSummary.total != unfilteredSummary.total-1 {
+		t.Fatalf("processed webhook filter has untruthful counts: showing=%d total=%d unfiltered=%d", processedSummary.showing, processedSummary.total, unfilteredSummary.total)
 	}
 	for _, action := range []string{"opened", "synchronized", "closed"} {
 		if countPullRequestDeliveryActions(processedPage, action) <= 0 {
 			t.Fatalf("processed webhook filter did not retain %s evidence", action)
 		}
 	}
-	if !strings.Contains(processedPage, duplicateRow) || !strings.Contains(processedPage, fixture.terminalReleaseDelivery) || !strings.Contains(processedPage, fixture.roleBoundaryDelivery) || strings.Contains(processedPage, ">retryable failure</span>") {
+	if !strings.Contains(processedPage, duplicateRow) || !strings.Contains(processedPage, fixture.terminalReleaseDelivery) || !strings.Contains(processedPage, fixture.roleBoundaryDelivery) || strings.Contains(processedPage, ">Retryable failure</span>") {
 		t.Fatal("processed webhook filter did not separate retained processed rows from retryable failure evidence")
 	}
 
 	retryPath := "/webhooks?" + url.Values{
-		"repository_id": {strconv.FormatInt(repositoryID, 10)},
-		"event":         {"pull_request"},
-		"processing":    {"retryable_failure"},
-		"sort":          {"received"},
-		"direction":     {"asc"},
-		"limit":         {"50"},
+		"repo":       {strconv.FormatInt(repositoryID, 10)},
+		"processing": {"retryable_failure"},
+		"sort":       {"received"},
+		"dir":        {"asc"},
 	}.Encode()
 	retryablePage := requirePage(t, ctx, fixture.roleSessions[0].browser, retryPath)
-	requireWebhookFilterControls(t, retryablePage, repositoryID, "retryable_failure", "pull_request", "received", "asc", 50)
+	requireWebhookFilterControls(t, retryablePage, repositoryID, "retryable_failure", "received", "asc")
 	retryableSummary := requireWebhookPageSummary(t, retryablePage)
-	if retryableSummary.showing != 1 || retryableSummary.matching != 1 || retryableSummary.total != unfilteredSummary.total {
-		t.Fatalf("retryable-failure webhook filter has unexpected counts: showing=%d matching=%d total=%d", retryableSummary.showing, retryableSummary.matching, retryableSummary.total)
+	if retryableSummary.showing != 1 || retryableSummary.total != 1 || processedSummary.total+retryableSummary.total != unfilteredSummary.total {
+		t.Fatalf("retryable-failure webhook filter has unexpected counts: showing=%d total=%d processed=%d unfiltered=%d", retryableSummary.showing, retryableSummary.total, processedSummary.total, unfilteredSummary.total)
 	}
 	retryableRow := requireLatestWebhookDeliveryRow(t, retryablePage)
 	for _, want := range []string{
-		`<td data-label="Event"><code>pull_request</code><small class="tg-muted">synchronized</small></td>`,
-		`>verified</span>`,
-		`>retryable failure</span>`,
-		`<td data-label="Details">webhook processing failed</td>`,
+		`>pull_request · synchronized</span>`,
+		`>Verified</span>`,
+		`>Retryable failure</span>`,
+		`>webhook processing failed</span>`,
 	} {
 		if !strings.Contains(retryableRow, want) {
 			t.Fatalf("retryable-failure webhook evidence is missing %q", want)
 		}
 	}
-	if strings.Contains(retryablePage, duplicateRow) || strings.Contains(retryablePage, fixture.terminalReleaseDelivery) || strings.Contains(retryablePage, fixture.roleBoundaryDelivery) || strings.Contains(retryablePage, `>processed</span>`) {
+	if strings.Contains(retryablePage, duplicateRow) || strings.Contains(retryablePage, fixture.terminalReleaseDelivery) || strings.Contains(retryablePage, fixture.roleBoundaryDelivery) || strings.Contains(retryablePage, `>Processed</span>`) {
 		t.Fatal("retryable-failure webhook filter retained processed-only delivery evidence")
 	}
 
 	processedDescendingPath := "/webhooks?" + url.Values{
-		"repository_id": {strconv.FormatInt(repositoryID, 10)},
-		"event":         {"pull_request"},
-		"processing":    {"processed"},
-		"sort":          {"received"},
-		"direction":     {"desc"},
-		"limit":         {"50"},
+		"repo":       {strconv.FormatInt(repositoryID, 10)},
+		"processing": {"processed"},
+		"sort":       {"received"},
+		"dir":        {"desc"},
 	}.Encode()
 	processedDescendingPage := requirePage(t, ctx, fixture.roleSessions[0].browser, processedDescendingPath)
-	requireWebhookFilterControls(t, processedDescendingPage, repositoryID, "processed", "pull_request", "received", "desc", 50)
+	requireWebhookFilterControls(t, processedDescendingPage, repositoryID, "processed", "received", "desc")
 	ascendingDuplicate := strings.Index(processedPage, duplicateRow)
 	ascendingClosed := strings.Index(processedPage, fixture.terminalReleaseDelivery)
 	descendingDuplicate := strings.Index(processedDescendingPage, duplicateRow)
@@ -2724,9 +2720,9 @@ func requireUnchangedTerminalReadOnlySnapshot(t *testing.T, before, after termin
 	}
 }
 
-func requireActivityRowEvidence(t *testing.T, page, actor, action, target, outcome, outcomeClass string, details ...string) string {
+func requireActivityRowEvidence(t *testing.T, page, actor, action, target, outcome string, details ...string) string {
 	t.Helper()
-	sectionStart := strings.Index(page, "<h2>Recent activity</h2>")
+	sectionStart := strings.Index(page, `aria-label="Recent activity"`)
 	if sectionStart < 0 {
 		t.Fatal("activity page is missing recent activity")
 	}
@@ -2741,16 +2737,16 @@ func requireActivityRowEvidence(t *testing.T, page, actor, action, target, outco
 	}
 	tbody := page[tbodyStart : tbodyStart+tbodyEndOffset]
 	wants := []string{
-		`<td data-label="Actor">` + html.EscapeString(actor) + `</td>`,
-		`<td data-label="Action">` + html.EscapeString(action) + `</td>`,
-		`<td data-label="Target">` + html.EscapeString(target) + `</td>`,
-		`<td data-label="Outcome"><span class="status status-` + outcomeClass + `">` + html.EscapeString(outcome) + `</span></td>`,
+		`>` + html.EscapeString(actor) + `</td>`,
+		`<span class="font-medium text-text">` + html.EscapeString(action) + `</span>`,
+		`>` + html.EscapeString(target) + `</td>`,
+		`>` + html.EscapeString(outcome) + `</span>`,
 	}
 	for _, detail := range details {
 		wants = append(wants, html.EscapeString(detail))
 	}
 	for remainder := tbody; ; {
-		rowStart := strings.Index(remainder, "<tr>")
+		rowStart := strings.Index(remainder, "<tr ")
 		if rowStart < 0 {
 			break
 		}
@@ -2792,10 +2788,10 @@ func requireDiagnosticRowsForHead(t *testing.T, page, sectionMarker, headSHA str
 		t.Fatalf("diagnostic section %q has an incomplete table body", sectionMarker)
 	}
 	tbody := page[tbodyStart : tbodyStart+tbodyEndOffset]
-	marker := `<code>` + html.EscapeString(headSHA) + `</code>`
+	marker := `title="` + html.EscapeString(headSHA) + `"`
 	var rows []string
 	for remainder := tbody; ; {
-		rowStart := strings.Index(remainder, "<tr>")
+		rowStart := strings.Index(remainder, "<tr ")
 		if rowStart < 0 {
 			break
 		}
@@ -2843,18 +2839,13 @@ func requireDiagnosticRowContains(t *testing.T, row, label string, wants ...stri
 
 func requireStatusAttemptEvidence(t *testing.T, row string, pullRequestIndex int, branch, headSHA, state, result, description string) {
 	t.Helper()
-	resultClass := "failed"
-	if result == "posted" {
-		resultClass = "ok"
-	}
 	requireDiagnosticRowContains(t, row, "status publication attempt",
 		fixtureOwner+"/"+fixtureRepository,
-		`#`+strconv.Itoa(pullRequestIndex)+`<small class="tg-muted">`+html.EscapeString(branch)+`</small>`,
-		`<code>`+html.EscapeString(headSHA)+`</code>`,
-		`<small class="tg-muted">`+requiredContext+`</small>`,
-		`<td data-label="State"><span class="status status-`+state+`">`+state+`</span></td>`,
-		`<td data-label="Mode"><code>forgejo_status</code></td>`,
-		`<td data-label="Result"><span class="status status-`+resultClass+`">`+result+`</span></td>`,
+		`PR #`+strconv.Itoa(pullRequestIndex)+` · `+html.EscapeString(branch),
+		`title="`+html.EscapeString(headSHA)+`"`,
+		`>`+requiredContext+`</code>`,
+		`>`+result+`</span>`,
+		`>`+state+` · forgejo_status</code>`,
 		html.EscapeString(description),
 	)
 }
@@ -2863,11 +2854,11 @@ func requireCurrentStatusIntentEvidence(t *testing.T, row string, pullRequestInd
 	t.Helper()
 	requireDiagnosticRowContains(t, row, "current desired status",
 		fixtureOwner+"/"+fixtureRepository,
-		`#`+strconv.Itoa(pullRequestIndex)+`<small class="tg-muted">`+html.EscapeString(branch)+`</small>`,
-		`<code>`+html.EscapeString(headSHA)+`</code>`,
-		`<td data-label="Context"><code>`+requiredContext+`</code></td>`,
-		`<td data-label="State"><span class="status status-`+state+`">`+state+`</span></td>`,
-		`<td data-label="Mode"><code>forgejo_status</code></td>`,
+		`PR #`+strconv.Itoa(pullRequestIndex)+` · `+html.EscapeString(branch),
+		`title="`+html.EscapeString(headSHA)+`"`,
+		`>`+requiredContext+`</code>`,
+		`>`+state+`</span>`,
+		`>forgejo_status</code>`,
 		html.EscapeString(description),
 	)
 }
@@ -2889,36 +2880,28 @@ func requireCommitStatusProgression(t *testing.T, statuses []commitStatus, state
 
 func requireWebhookPageSummary(t *testing.T, page string) webhookPageSummary {
 	t.Helper()
-	match := webhookSummaryPattern.FindStringSubmatch(page)
-	if len(match) != 3 {
-		t.Fatal("webhook diagnostics are missing the matching-row summary")
+	match := deliveryCountPattern.FindStringSubmatch(page)
+	if len(match) != 2 {
+		t.Fatal("webhook diagnostics are missing the delivery-count badge")
 	}
-	totalMatch := webhookTotalRowsPattern.FindStringSubmatch(page)
-	if len(totalMatch) != 2 {
-		t.Fatal("webhook diagnostics are missing the loaded-row summary")
-	}
-	parse := func(value, label string) int {
-		count, err := strconv.Atoi(value)
-		if err != nil {
-			t.Fatalf("parse webhook %s count: %v", label, err)
-		}
-		return count
+	total, err := strconv.Atoi(match[1])
+	if err != nil {
+		t.Fatalf("parse webhook delivery count: %v", err)
 	}
 	return webhookPageSummary{
-		showing:  parse(match[1], "showing"),
-		matching: parse(match[2], "matching"),
-		total:    parse(totalMatch[1], "total"),
+		showing: countWebhookDesktopRowsContaining(t, page, "<tr "),
+		total:   total,
 	}
 }
 
 func requireProcessedWebhookRowEvidence(t *testing.T, row, action string) {
 	t.Helper()
 	for _, want := range []string{
-		`<code>` + fixtureOwner + `/` + fixtureRepository + `</code>`,
-		`<td data-label="Event"><code>pull_request</code><small class="tg-muted">` + action + `</small></td>`,
-		`>verified</span>`,
-		`>processed</span>`,
-		`<td data-label="Details">No processing error</td>`,
+		`>` + fixtureOwner + `/` + fixtureRepository + `</span>`,
+		`>pull_request · ` + action + `</span>`,
+		`>Verified</span>`,
+		`>Processed</span>`,
+		`>No processing error</span>`,
 	} {
 		if !strings.Contains(row, want) {
 			t.Fatalf("processed %s webhook row is missing %q", action, want)
@@ -2928,7 +2911,7 @@ func requireProcessedWebhookRowEvidence(t *testing.T, row, action string) {
 
 func countWebhookDesktopRowsContaining(t *testing.T, page, marker string) int {
 	t.Helper()
-	sectionStart := strings.Index(page, "<h2>Signed webhook deliveries</h2>")
+	sectionStart := strings.Index(page, `aria-label="Signed webhook deliveries"`)
 	if sectionStart < 0 {
 		t.Fatal("webhook diagnostics are missing signed deliveries")
 	}
@@ -2944,23 +2927,36 @@ func countWebhookDesktopRowsContaining(t *testing.T, page, marker string) int {
 	return strings.Count(page[tbodyStart:tbodyStart+tbodyEndOffset], marker)
 }
 
-func requireWebhookFilterControls(t *testing.T, page string, repositoryID int64, processing, event, sortField, direction string, limit int) {
+func requireWebhookFilterControls(t *testing.T, page string, repositoryID int64, processing, sortField, direction string) {
 	t.Helper()
 	ariaSort := "descending"
 	if direction == "asc" {
 		ariaSort = "ascending"
 	}
-	for _, want := range []string{
-		"Filters active",
+	chipLabels := map[string]string{
+		"received":             "Received",
+		"processing":           "Processing",
+		"processed":            "Processed",
+		"processed_with_error": "Processed with error",
+		"retryable_failure":    "Retryable failure",
+	}
+	chipLabel, known := chipLabels[processing]
+	if !known {
+		t.Fatalf("unknown webhook processing filter %q", processing)
+	}
+	wants := []string{
 		`<option value="` + strconv.FormatInt(repositoryID, 10) + `" selected>` + fixtureOwner + `/` + fixtureRepository + `</option>`,
-		`<option value="` + processing + `" selected>`,
-		`<option value="` + event + `" selected>` + event + `</option>`,
-		`<input type="hidden" name="sort" value="` + sortField + `">`,
-		`<input type="hidden" name="direction" value="` + direction + `">`,
-		`<input type="hidden" name="limit" value="` + strconv.Itoa(limit) + `">`,
-		`<option value="` + strconv.Itoa(limit) + `" selected>` + strconv.Itoa(limit) + `</option>`,
+		`<input type="hidden" name="processing" value="` + processing + `">`,
+		`aria-current="true">` + chipLabel + `</a>`,
 		`aria-sort="` + ariaSort + `"`,
-	} {
+	}
+	if sortField == "processed" {
+		wants = append(wants, `<input type="hidden" name="sort" value="processed">`)
+	}
+	if direction == "asc" {
+		wants = append(wants, `<input type="hidden" name="dir" value="asc">`)
+	}
+	for _, want := range wants {
 		if !strings.Contains(page, want) {
 			t.Fatalf("webhook filter controls are missing selected evidence %q", want)
 		}
@@ -3324,7 +3320,7 @@ func proveRestartPersistenceAndReconciliation(t *testing.T, ctx context.Context,
 	}
 	csrfBefore := requireHiddenInput(t, repositoriesBefore, "csrf_token")
 	freezeBefore := requireActiveFreezeEvidence(t, requirePage(t, ctx, browser, "/freezes"))
-	if freezeBefore.id <= 0 || freezeBefore.branch != "main" || freezeBefore.reason != "Fictional release verification" || freezeBefore.status != "active" {
+	if freezeBefore.id <= 0 || freezeBefore.branch != "main" || freezeBefore.reason != "Fictional release verification" || freezeBefore.status != "Frozen" {
 		t.Fatalf("active freeze has unexpected pre-restart evidence: id=%d branch=%q reason=%q status=%q", freezeBefore.id, freezeBefore.branch, freezeBefore.reason, freezeBefore.status)
 	}
 	activityBefore := requirePage(t, ctx, browser, "/activity")
@@ -3406,11 +3402,11 @@ func proveRestartPersistenceAndReconciliation(t *testing.T, ctx context.Context,
 		return latest.ID > injected.ID &&
 			latest.Status == "failure" &&
 			latest.Description == "Branch is frozen; merge is blocked by Thawguard" &&
-			strings.Contains(repositoriesPage, `<span class="tg-badge status-ok">enforcement active</span>`) &&
+			strings.Contains(repositoriesPage, ">enforcement active</span>") &&
 			!strings.Contains(repositoriesPage, "Enforcement is unhealthy") &&
 			!strings.Contains(repositoriesPage, "Automatic recovery is pending") &&
-			strings.Contains(activityPage, `<td data-label="Actor">Reconciliation runner</td>`) &&
-			strings.Contains(activityPage, `<td data-label="Action">Enforcement recovery</td>`) &&
+			strings.Contains(activityPage, ">Reconciliation runner</td>") &&
+			strings.Contains(activityPage, `<span class="font-medium text-text">Enforcement recovery</span>`) &&
 			strings.Contains(activityPage, "1 open PRs evaluated; 1 statuses posted and 0 failed."), nil
 	})
 
@@ -3439,8 +3435,8 @@ func proveRestartPersistenceAndReconciliation(t *testing.T, ctx context.Context,
 	activityAfter := requirePage(t, ctx, browser, "/activity")
 	recoveryRow := requireLatestActivityRow(t, activityAfter, "Enforcement recovery")
 	for _, want := range []string{
-		`<td data-label="Actor">Reconciliation runner</td>`,
-		`<td data-label="Outcome"><span class="status status-ok">Succeeded</span></td>`,
+		">Reconciliation runner</td>",
+		">Succeeded</span>",
 		"1 open PRs evaluated; 1 statuses posted and 0 failed.",
 	} {
 		if !strings.Contains(recoveryRow, want) {
@@ -3567,10 +3563,8 @@ func advanceFeatureBranch(t *testing.T, ctx context.Context, forgejo *forgejoAPI
 func waitForTokenFailureEvidence(t *testing.T, ctx context.Context, forgejo *forgejoAPI, browser *thawguardBrowser, repositoryID int64, headSHA string) {
 	t.Helper()
 	webhookPath := "/webhooks?" + url.Values{
-		"repository_id": {strconv.FormatInt(repositoryID, 10)},
-		"event":         {"pull_request"},
-		"processing":    {"retryable_failure"},
-		"limit":         {"100"},
+		"repo":       {strconv.FormatInt(repositoryID, 10)},
+		"processing": {"retryable_failure"},
 	}.Encode()
 	waitFor(t, 30*time.Second, "sanitized token-loss failure evidence", func() (bool, error) {
 		webhookPage, err := browser.get(ctx, webhookPath)
@@ -3597,8 +3591,8 @@ func waitForTokenFailureEvidence(t *testing.T, ctx context.Context, forgejo *for
 			strings.Contains(repositoriesPage, "Recovery in progress")
 		return len(statuses) == 0 &&
 			strings.Contains(webhookPage, "synchronized") &&
-			strings.Contains(webhookPage, ">verified</span>") &&
-			strings.Contains(webhookPage, ">retryable failure</span>") &&
+			strings.Contains(webhookPage, ">Verified</span>") &&
+			strings.Contains(webhookPage, ">Retryable failure</span>") &&
 			strings.Contains(webhookPage, "webhook processing failed") &&
 			!strings.Contains(webhookPage, "post forgejo commit status") &&
 			strings.Contains(repositoriesPage, "Enforcement is unhealthy: status publication failed") &&
@@ -3609,7 +3603,7 @@ func waitForTokenFailureEvidence(t *testing.T, ctx context.Context, forgejo *for
 			strings.Contains(publicationsPage, "Branch is frozen; merge is blocked by Thawguard") &&
 			strings.Contains(publicationsPage, "post forgejo commit status") &&
 			strings.Contains(publicationsPage, "forge returned 401") &&
-			strings.Contains(activityPage, ">Runtime convergence</td>") &&
+			strings.Contains(activityPage, `<span class="font-medium text-text">Runtime convergence</span>`) &&
 			strings.Contains(activityPage, ">Failed</span>") &&
 			strings.Contains(activityPage, "status publication failed; state unhealthy. Automatic recovery remains pending."), nil
 	})
@@ -3709,9 +3703,9 @@ func waitForRecoveredEnforcement(t *testing.T, ctx context.Context, forgejo *for
 		return statusRecovered &&
 			strings.Contains(repositoriesPage, "enforcement active") &&
 			!strings.Contains(repositoriesPage, "Enforcement is unhealthy") &&
-			strings.Contains(activityPage, ">Status token configuration</td>") &&
+			strings.Contains(activityPage, `<span class="font-medium text-text">Status token configuration</span>`) &&
 			strings.Contains(activityPage, "Status token rotated; the value remains hidden.") &&
-			strings.Contains(activityPage, ">Enforcement recovery</td>") &&
+			strings.Contains(activityPage, `<span class="font-medium text-text">Enforcement recovery</span>`) &&
 			strings.Contains(activityPage, ">Succeeded</span>") &&
 			strings.Contains(activityPage, "1 open PRs evaluated; 1 statuses posted and 0 failed.") &&
 			strings.Contains(activityPage, "status publication failed; state unhealthy. Automatic recovery remains pending.") &&
@@ -3749,13 +3743,21 @@ func createRoleBoundaryUser(t *testing.T, ctx context.Context, browser *thawguar
 		t.Fatalf("user creation changed configured users from %d to %d, want %d", expectedUsersBefore, count, expectedUsersBefore+1)
 	}
 	row := requireRoleBoundaryUserRow(t, page, email)
-	for _, want := range []string{html.EscapeString(displayName), `<code>` + html.EscapeString(email) + `</code>`, `<span class="status status-ok">Enabled</span>`} {
+	for _, want := range []string{html.EscapeString(displayName), ">" + html.EscapeString(email) + "</code>", ">Enabled</span>"} {
 		if !strings.Contains(row, want) {
 			t.Fatalf("created user %q row is missing %q", email, want)
 		}
 	}
 	for _, candidate := range []string{"admin", "freezer", "thaw_approver", "viewer"} {
-		selected := strings.Contains(row, `name="roles" value="`+candidate+`" checked`)
+		checkboxIndex := strings.Index(row, `value="`+candidate+`"`)
+		if checkboxIndex < 0 {
+			t.Fatalf("created user %q row is missing the %q role checkbox", email, candidate)
+		}
+		tagEnd := strings.Index(row[checkboxIndex:], ">")
+		if tagEnd < 0 {
+			t.Fatalf("created user %q row has an unterminated %q role checkbox", email, candidate)
+		}
+		selected := strings.Contains(row[checkboxIndex:checkboxIndex+tagEnd], " checked")
 		if selected != (candidate == role) {
 			t.Fatalf("created user %q role %q selected=%v, want %v", email, candidate, selected, candidate == role)
 		}
@@ -3769,12 +3771,12 @@ func createRoleBoundaryUser(t *testing.T, ctx context.Context, browser *thawguar
 
 func requireRoleBoundaryUserRow(t *testing.T, page, email string) string {
 	t.Helper()
-	marker := `<code>` + html.EscapeString(email) + `</code>`
+	marker := ">" + html.EscapeString(email) + "</code>"
 	markerIndex := strings.Index(page, marker)
 	if markerIndex < 0 {
 		t.Fatalf("users page is missing fictional user %q", email)
 	}
-	rowStart := strings.LastIndex(page[:markerIndex], "<tr>")
+	rowStart := strings.LastIndex(page[:markerIndex], "<tr ")
 	rowEndOffset := strings.Index(page[markerIndex:], "</tr>")
 	if rowStart < 0 || rowEndOffset < 0 {
 		t.Fatalf("fictional user %q is missing its desktop row", email)
@@ -3825,9 +3827,9 @@ func currentRoleBoundarySession(t *testing.T, ctx context.Context, browser *thaw
 	}
 	page := string(response.body)
 	for _, want := range []string{
-		`<strong>` + html.EscapeString(displayName) + `</strong>`,
-		`<span>` + html.EscapeString(email) + `</span>`,
-		`<span class="tg-badge tg-badge-info">` + html.EscapeString(roleLabel) + `</span>`,
+		">" + html.EscapeString(displayName) + "</p>",
+		">" + html.EscapeString(email) + "</p>",
+		">" + html.EscapeString(roleLabel) + "</span>",
 	} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("%s dashboard identity is missing %q", roleLabel, want)
@@ -3890,7 +3892,7 @@ func requireRoleBoundaryReadAccess(t *testing.T, ctx context.Context, session ro
 			t.Fatalf("%s GET %s returned HTTP %d with Location %q, want 200", session.roleLabel, path, response.statusCode, response.location)
 		}
 		page := string(response.body)
-		if !strings.Contains(page, `<strong>`+html.EscapeString(session.displayName)+`</strong>`) || requireHiddenInput(t, page, "csrf_token") != session.csrfToken {
+		if !strings.Contains(page, ">"+html.EscapeString(session.displayName)+"</p>") || requireHiddenInput(t, page, "csrf_token") != session.csrfToken {
 			t.Fatalf("%s GET %s did not retain its identity and CSRF evidence", session.roleLabel, path)
 		}
 		pages[path] = page
@@ -3942,17 +3944,17 @@ func requireRoleBoundaryControls(t *testing.T, pages map[string]string, canAdmin
 			t.Fatalf("freeze control %q visibility=%v, want %v", marker, got, canFreeze)
 		}
 	}
-	if got := strings.Contains(pages["/scheduled-freezes"], `<form method="post" action="/scheduled-freezes" class="tg-setup-form tg-freeze-form"`); got != canFreeze {
+	if got := strings.Contains(pages["/scheduled-freezes"], `<form method="post" action="/scheduled-freezes"`); got != canFreeze {
 		t.Fatalf("scheduled-freeze create visibility=%v, want %v", got, canFreeze)
 	}
-	if got := strings.Contains(pages["/decisions"], `<form method="post" action="/decisions" class="tg-setup-form tg-thaw-form"`); got != canThaw {
+	if got := strings.Contains(pages["/decisions"], `<form method="post" action="/decisions"`); got != canThaw {
 		t.Fatalf("thaw approval form visibility=%v, want %v", got, canThaw)
 	}
-	if got := strings.Contains(pages["/"], `<a class="tg-btn tg-btn-primary" href="/freezes"`); got != canFreeze {
-		t.Fatalf("dashboard Freeze Branch action visibility=%v, want %v", got, canFreeze)
+	if got := strings.Contains(pages["/"], "Start freeze</a>"); got != canFreeze {
+		t.Fatalf("dashboard Start freeze action visibility=%v, want %v", got, canFreeze)
 	}
-	if got := strings.Contains(pages["/"], `<a class="tg-btn tg-btn-secondary" href="/decisions"`); got != canThaw {
-		t.Fatalf("dashboard Thaw PR action visibility=%v, want %v", got, canThaw)
+	if got := strings.Contains(pages["/"], "Review thaws</a>"); got != canThaw {
+		t.Fatalf("dashboard Review thaws action visibility=%v, want %v", got, canThaw)
 	}
 	if !canFreeze && (!strings.Contains(freezesPage, "Read-only freeze access") || !strings.Contains(pages["/scheduled-freezes"], "Read-only schedule access")) {
 		t.Fatal("non-Freezer pages are missing their read-only freeze/schedule evidence")
@@ -4088,13 +4090,13 @@ func requireSameScheduleEvidence(t *testing.T, before, after scheduledFreezeRowE
 	}
 }
 
-func requireRoleBoundaryActivity(t *testing.T, row, actor, action, target, outcome, outcomeClass string, details ...string) {
+func requireRoleBoundaryActivity(t *testing.T, row, actor, action, target, outcome string, details ...string) {
 	t.Helper()
 	wants := []string{
-		`<td data-label="Actor">` + html.EscapeString(actor) + `</td>`,
-		`<td data-label="Action">` + html.EscapeString(action) + `</td>`,
-		`<td data-label="Target">` + html.EscapeString(target) + `</td>`,
-		`<td data-label="Outcome"><span class="status status-` + outcomeClass + `">` + html.EscapeString(outcome) + `</span></td>`,
+		">" + html.EscapeString(actor) + "</td>",
+		`<span class="font-medium text-text">` + html.EscapeString(action) + `</span>`,
+		">" + html.EscapeString(target) + "</td>",
+		">" + html.EscapeString(outcome) + "</span>",
 	}
 	for _, detail := range details {
 		wants = append(wants, html.EscapeString(detail))
@@ -4110,17 +4112,15 @@ func requireScheduleRoleControls(t *testing.T, ctx context.Context, session role
 	t.Helper()
 	page := requirePage(t, ctx, session.browser, "/scheduled-freezes")
 	row := requireScheduledFreezeRow(t, page, 0, reason).row
+	if got := strings.Contains(page, `<form method="post" action="/scheduled-freezes"`); got != canCreate {
+		t.Fatalf("%s schedule create-form visibility=%v, want %v", session.roleLabel, got, canCreate)
+	}
 	for marker, want := range map[string]bool{
-		`<form method="post" action="/scheduled-freezes" class="tg-setup-form tg-freeze-form"`: canCreate,
-		`action="/scheduled-freezes/edit"`:      canEdit,
-		`action="/scheduled-freezes/start-now"`: canStart,
-		`action="/scheduled-freezes/cancel"`:    canCancel,
+		`action="/scheduled-freezes/edit"`: canEdit,
+		`aria-controls="start-scheduled-`:  canStart,
+		`aria-controls="cancel-scheduled-`: canCancel,
 	} {
-		surface := row
-		if marker == `<form method="post" action="/scheduled-freezes" class="tg-setup-form tg-freeze-form"` {
-			surface = page
-		}
-		if got := strings.Contains(surface, marker); got != want {
+		if got := strings.Contains(row, marker); got != want {
 			t.Fatalf("%s schedule control %q visibility=%v, want %v", session.roleLabel, marker, got, want)
 		}
 	}
@@ -4267,9 +4267,7 @@ func requireAcceptedWebhookResponse(t *testing.T, response apiResponse, err erro
 func collectWebhookSideEffectEvidence(t *testing.T, ctx context.Context, forgejo *forgejoAPI, browser *thawguardBrowser, repositoryID int64, headSHA string) webhookSideEffectEvidence {
 	t.Helper()
 	webhookPath := "/webhooks?" + url.Values{
-		"repository_id": {strconv.FormatInt(repositoryID, 10)},
-		"event":         {"pull_request"},
-		"limit":         {"100"},
+		"repo": {strconv.FormatInt(repositoryID, 10)},
 	}.Encode()
 	webhookPage := requirePage(t, ctx, browser, webhookPath)
 	decisionsPage := requirePage(t, ctx, browser, "/decisions")
@@ -4281,7 +4279,7 @@ func collectWebhookSideEffectEvidence(t *testing.T, ctx context.Context, forgejo
 	}
 	return webhookSideEffectEvidence{
 		webhookPage:         webhookPage,
-		webhookRows:         requirePageCount(t, webhookPage, webhookRowsPattern, "webhook rows"),
+		webhookRows:         requirePageCount(t, webhookPage, deliveryCountPattern, "webhook deliveries"),
 		statusResults:       requirePageCount(t, decisionsPage, statusResultsPattern, "status results"),
 		publicationIntents:  requirePageCount(t, publicationsPage, publicationIntentsPattern, "publication intents"),
 		publicationAttempts: requirePageCount(t, publicationsPage, publicationAttemptsPattern, "publication attempts"),
@@ -4327,18 +4325,18 @@ func listForgejoFreezeStatuses(ctx context.Context, forgejo *forgejoAPI, headSHA
 
 func requireProcessedVerifiedDelivery(t *testing.T, page, deliveryID string) string {
 	t.Helper()
-	marker := ">" + html.EscapeString(deliveryID) + "</code>"
+	marker := `title="` + html.EscapeString(deliveryID) + `"`
 	if count := strings.Count(page, marker); count != 2 {
 		t.Fatalf("delivery ID %q rendered %d times, want one desktop row and one mobile card", deliveryID, count)
 	}
 	markerIndex := strings.Index(page, marker)
-	rowStart := strings.LastIndex(page[:markerIndex], `<tr id="delivery-`)
+	rowStart := strings.LastIndex(page[:markerIndex], "<tr ")
 	rowEndOffset := strings.Index(page[markerIndex:], "</tr>")
 	if rowStart < 0 || rowEndOffset < 0 {
 		t.Fatalf("delivery ID %q is missing its desktop row", deliveryID)
 	}
 	row := page[rowStart : markerIndex+rowEndOffset]
-	if !strings.Contains(row, ">verified</span>") || !strings.Contains(row, ">processed</span>") {
+	if !strings.Contains(row, ">Verified</span>") || !strings.Contains(row, ">Processed</span>") {
 		t.Fatalf("delivery ID %q is not rendered as verified and processed", deliveryID)
 	}
 	return row
@@ -4350,9 +4348,7 @@ func waitForOneNewProcessedPullRequestDelivery(t *testing.T, ctx context.Context
 		t.Fatalf("pull request delivery action %q is not allowlisted", action)
 	}
 	webhookPath := "/webhooks?" + url.Values{
-		"repository_id": {strconv.FormatInt(repositoryID, 10)},
-		"event":         {"pull_request"},
-		"limit":         {"100"},
+		"repo": {strconv.FormatInt(repositoryID, 10)},
 	}.Encode()
 	expectedRows := beforeRows + 1
 	waitFor(t, 30*time.Second, "one new verified and processed "+action+" delivery", func() (bool, error) {
@@ -4360,20 +4356,20 @@ func waitForOneNewProcessedPullRequestDelivery(t *testing.T, ctx context.Context
 		if err != nil {
 			return false, err
 		}
-		rows := requirePageCount(t, page, webhookRowsPattern, "webhook rows")
+		rows := requirePageCount(t, page, deliveryCountPattern, "webhook deliveries")
 		if rows > expectedRows {
-			t.Fatalf("%s pull request delivery changed webhook rows from %d to %d, want exactly %d", action, beforeRows, rows, expectedRows)
+			t.Fatalf("%s pull request delivery changed webhook deliveries from %d to %d, want exactly %d", action, beforeRows, rows, expectedRows)
 		}
 		if rows != expectedRows {
 			return false, nil
 		}
 		latestRow := requireLatestWebhookDeliveryRow(t, page)
 		for _, want := range []string{
-			`<code>` + fixtureOwner + `/` + fixtureRepository + `</code>`,
-			`<td data-label="Event"><code>pull_request</code><small class="tg-muted">` + action + `</small></td>`,
-			`>verified</span>`,
-			`>processed</span>`,
-			`<td data-label="Details">No processing error</td>`,
+			">" + fixtureOwner + "/" + fixtureRepository + "</span>",
+			">pull_request · " + action + "</span>",
+			`>Verified</span>`,
+			`>Processed</span>`,
+			`>No processing error</span>`,
 		} {
 			if !strings.Contains(latestRow, want) {
 				return false, nil
@@ -4385,7 +4381,7 @@ func waitForOneNewProcessedPullRequestDelivery(t *testing.T, ctx context.Context
 
 func requireLatestWebhookDeliveryRow(t *testing.T, page string) string {
 	t.Helper()
-	sectionMarker := "<h2>Signed webhook deliveries</h2>"
+	sectionMarker := `aria-label="Signed webhook deliveries"`
 	sectionStart := strings.Index(page, sectionMarker)
 	if sectionStart < 0 {
 		t.Fatal("webhook page is missing signed deliveries")
@@ -4395,7 +4391,7 @@ func requireLatestWebhookDeliveryRow(t *testing.T, page string) string {
 		t.Fatal("signed webhook deliveries are missing their table body")
 	}
 	tbodyStart := sectionStart + tbodyOffset
-	rowStartOffset := strings.Index(page[tbodyStart:], `<tr id="delivery-`)
+	rowStartOffset := strings.Index(page[tbodyStart:], "<tr ")
 	if rowStartOffset < 0 {
 		t.Fatal("signed webhook deliveries are missing their latest row")
 	}
@@ -4408,23 +4404,37 @@ func requireLatestWebhookDeliveryRow(t *testing.T, page string) string {
 }
 
 func countOpenPullRequestSyncEvents(page string) int {
-	return strings.Count(page, `<td data-label="Action">Open pull request sync</td>`)
+	return countActivityEvents(page, "Open pull request sync")
 }
 
 func countPullRequestDeliveryActions(page, action string) int {
-	return strings.Count(page, `<td data-label="Event"><code>pull_request</code><small class="tg-muted">`+html.EscapeString(action)+`</small></td>`)
+	return strings.Count(page, ">pull_request · "+html.EscapeString(action)+"</span>")
 }
 
 func countActivityEvents(page, action string) int {
-	return strings.Count(page, `<td data-label="Action">`+html.EscapeString(action)+`</td>`)
+	return strings.Count(page, `<span class="font-medium text-text">`+html.EscapeString(action)+`</span>`)
 }
 
 func countSharedHeadThawEvents(page string) int {
-	return strings.Count(page, `<td data-label="Action">Shared-head thaw</td>`)
+	return countActivityEvents(page, "Shared-head thaw")
 }
 
 func countEligibleDecisionRows(page string) int {
-	return strings.Count(page, `<span class="status status-success">Eligible</span>`)
+	// The state badge renders in both the desktop row and the mobile card, so
+	// count only inside the desktop table body.
+	sectionStart := strings.Index(page, `aria-label="Freeze decisions"`)
+	if sectionStart < 0 {
+		return 0
+	}
+	tbodyOffset := strings.Index(page[sectionStart:], "<tbody>")
+	if tbodyOffset < 0 {
+		return 0
+	}
+	tbody := page[sectionStart+tbodyOffset:]
+	if end := strings.Index(tbody, "</tbody>"); end >= 0 {
+		tbody = tbody[:end]
+	}
+	return strings.Count(tbody, ">Eligible</span>")
 }
 
 func waitForOneNewOpenPullRequestSync(t *testing.T, ctx context.Context, browser *thawguardBrowser, before int) string {
@@ -4534,7 +4544,7 @@ func requireHealthyActiveRepository(t *testing.T, page string) {
 	t.Helper()
 	for _, want := range []string{
 		fixtureOwner + `/` + fixtureRepository,
-		`<span class="tg-badge status-ok">enforcement active</span>`,
+		`>enforcement active</span>`,
 	} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("healthy active repository evidence is missing %q", want)
@@ -4562,17 +4572,16 @@ func requireUnprotectedReleaseReadinessFailure(t *testing.T, ctx context.Context
 
 	page = requirePage(t, ctx, browser, "/repositories")
 	releaseRow := requireManagedBranchRow(t, page, fixtureReleaseBranch)
-	for _, want := range []string{
-		`<span class="tg-badge status-failed">failed</span>`,
-		`<span class="status status-ok">passed</span><div><strong>Branch protection readable</strong><small>The forge confirmed that this exact managed branch has no branch protection configuration.`,
-		`<span class="status status-failed">failed</span><div><strong>Branch protection enabled</strong>`,
-		`<span class="status status-failed">failed</span><div><strong>Required status checks enabled</strong>`,
-		`<span class="status status-failed">failed</span><div><strong>Required thawguard/freeze context configured</strong>`,
-	} {
-		if !strings.Contains(releaseRow, want) {
-			t.Fatalf("unprotected release readiness row is missing %q", want)
-		}
+	if !strings.Contains(releaseRow, `>failed</span>`) {
+		t.Fatal("unprotected release branch is missing its failed readiness badge")
 	}
+	requireReadinessCheck(t, releaseRow, "Branch protection readable", "passed")
+	if want := `Branch protection readable</strong> <span class="text-text-muted">The forge confirmed that this exact managed branch has no branch protection configuration.`; !strings.Contains(releaseRow, want) {
+		t.Fatalf("unprotected release readiness row is missing %q", want)
+	}
+	requireReadinessCheck(t, releaseRow, "Branch protection enabled", "failed")
+	requireReadinessCheck(t, releaseRow, "Required status checks enabled", "failed")
+	requireReadinessCheck(t, releaseRow, "Required thawguard/freeze context configured", "failed")
 	for _, absent := range []string{
 		`action="/repositories/status-verification"`,
 		`action="/repositories/activate"`,
@@ -4582,7 +4591,7 @@ func requireUnprotectedReleaseReadinessFailure(t *testing.T, ctx context.Context
 		}
 	}
 	for _, want := range []string{
-		`<span class="tg-badge status-warning">setup incomplete</span>`,
+		`>setup incomplete</span>`,
 		`disabled>Verify status posting</button>`,
 		`Fix the failing readiness checks and rerun them. Verification is offered once every mandatory read-only check passes.`,
 	} {
@@ -4601,18 +4610,14 @@ func requireRepairedReleaseReadiness(t *testing.T, ctx context.Context, browser 
 	t.Helper()
 	page := requirePage(t, ctx, browser, "/repositories")
 	releaseRow := requireManagedBranchRow(t, page, fixtureReleaseBranch)
-	for _, want := range []string{
-		`<span class="tg-badge status-ok">passed</span>`,
-		`<span class="status status-ok">passed</span><div><strong>Branch protection readable</strong>`,
-		`<span class="status status-ok">passed</span><div><strong>Branch protection enabled</strong>`,
-		`<span class="status status-ok">passed</span><div><strong>Required status checks enabled</strong>`,
-		`<span class="status status-ok">passed</span><div><strong>Required thawguard/freeze context configured</strong>`,
-	} {
-		if !strings.Contains(releaseRow, want) {
-			t.Fatalf("repaired release readiness row is missing %q", want)
-		}
+	if !strings.Contains(releaseRow, `>passed</span>`) {
+		t.Fatal("repaired release branch is missing its passed readiness badge")
 	}
-	if !strings.Contains(page, `<span class="tg-badge status-ok">enforcement active</span>`) {
+	requireReadinessCheck(t, releaseRow, "Branch protection readable", "passed")
+	requireReadinessCheck(t, releaseRow, "Branch protection enabled", "passed")
+	requireReadinessCheck(t, releaseRow, "Required status checks enabled", "passed")
+	requireReadinessCheck(t, releaseRow, "Required thawguard/freeze context configured", "passed")
+	if !strings.Contains(page, `>enforcement active</span>`) {
 		t.Fatal("repaired repository did not reach enforcement-active state")
 	}
 
@@ -4624,12 +4629,12 @@ func requireRepairedReleaseReadiness(t *testing.T, ctx context.Context, browser 
 
 func requireManagedBranchRow(t *testing.T, page, branch string) string {
 	t.Helper()
-	marker := `<code class="tg-branch">` + html.EscapeString(branch) + `</code>`
+	marker := `<code class="text-sm font-semibold">` + html.EscapeString(branch) + `</code>`
 	markerIndex := strings.Index(page, marker)
 	if markerIndex < 0 {
 		t.Fatalf("managed branch %q is missing from repositories page", branch)
 	}
-	rowStart := strings.LastIndex(page[:markerIndex], `<li class="tg-branch-row">`)
+	rowStart := strings.LastIndex(page[:markerIndex], "<li ")
 	rowEndOffset := strings.Index(page[markerIndex:], "</li>")
 	if rowStart < 0 || rowEndOffset < 0 {
 		t.Fatalf("managed branch %q is missing its branch row", branch)
@@ -4637,14 +4642,32 @@ func requireManagedBranchRow(t *testing.T, page, branch string) string {
 	return page[rowStart : markerIndex+rowEndOffset+len("</li>")]
 }
 
+// requireReadinessCheck asserts one named readiness check inside a readiness
+// evidence scope renders the expected status badge.
+func requireReadinessCheck(t *testing.T, scope, name, status string) {
+	t.Helper()
+	marker := `<strong class="text-text">` + html.EscapeString(name) + `</strong>`
+	markerIndex := strings.Index(scope, marker)
+	if markerIndex < 0 {
+		t.Fatalf("readiness check %q is missing", name)
+	}
+	checkStart := strings.LastIndex(scope[:markerIndex], `<div class="flex items-start gap-2.5 text-sm">`)
+	if checkStart < 0 {
+		t.Fatalf("readiness check %q is missing its evidence row", name)
+	}
+	if !strings.Contains(scope[checkStart:markerIndex], ">"+status+"</span>") {
+		t.Fatalf("readiness check %q is not rendered as %s", name, status)
+	}
+}
+
 func requireLatestActivityRow(t *testing.T, page, action string) string {
 	t.Helper()
-	marker := `<td data-label="Action">` + html.EscapeString(action) + `</td>`
+	marker := `<span class="font-medium text-text">` + html.EscapeString(action) + `</span>`
 	markerIndex := strings.Index(page, marker)
 	if markerIndex < 0 {
 		t.Fatalf("activity is missing a %q event", action)
 	}
-	rowStart := strings.LastIndex(page[:markerIndex], "<tr>")
+	rowStart := strings.LastIndex(page[:markerIndex], "<tr ")
 	rowEndOffset := strings.Index(page[markerIndex:], "</tr>")
 	if rowStart < 0 || rowEndOffset < 0 {
 		t.Fatalf("latest %q event is missing its activity row", action)
@@ -4658,24 +4681,41 @@ func requireScheduledFreezeRow(t *testing.T, page string, expectedPendingID int6
 	if reason == "" {
 		t.Fatal("scheduled freeze row lookup requires a unique reason")
 	}
-	marker := `<td data-label="Reason">` + html.EscapeString(reason) + `</td>`
+	marker := ">" + html.EscapeString(reason) + "</td>"
 	if count := strings.Count(page, marker); count != 1 {
 		t.Fatalf("scheduled freeze reason %q rendered %d desktop rows, want exactly one", reason, count)
 	}
 	markerIndex := strings.Index(page, marker)
-	rowStart := strings.LastIndex(page[:markerIndex], "<tr>")
+	rowStart := strings.LastIndex(page[:markerIndex], "<tr ")
 	rowEndOffset := strings.Index(page[markerIndex:], "</tr>")
 	if rowStart < 0 || rowEndOffset < 0 {
 		t.Fatalf("scheduled freeze reason %q is missing its desktop row", reason)
 	}
 	row := page[rowStart : markerIndex+rowEndOffset+len("</tr>")]
+	// The Starts and Planned unfreeze cells are the only two time cells in the
+	// row: a <time> element when set, an em dash otherwise.
+	timeCells := scheduleTimeCellPattern.FindAllStringSubmatch(row, -1)
+	if len(timeCells) < 2 {
+		t.Fatalf("scheduled freeze reason %q rendered %d time cells, want 2", reason, len(timeCells))
+	}
+	startsAt, plannedEndsAt := timeCells[0][1], timeCells[1][1]
+	if startsAt == "" {
+		startsAt = "—"
+	}
+	if plannedEndsAt == "" {
+		plannedEndsAt = "—"
+	}
+	endedAt := "—"
+	if subLine := scheduleSubLinePattern.FindStringSubmatch(row); subLine != nil {
+		endedAt = subLine[1]
+	}
 	evidence := scheduledFreezeRowEvidence{
-		branch:        requirePatternText(t, row, scheduledFreezeBranchPattern, "scheduled freeze branch"),
+		branch:        requirePatternText(t, row, branchCodePattern, "scheduled freeze branch"),
 		reason:        reason,
-		startsAt:      requirePatternText(t, row, scheduledFreezeStartsPattern, "scheduled freeze start"),
-		plannedEndsAt: requirePatternText(t, row, scheduledFreezePlannedEndPattern, "scheduled freeze planned unfreeze"),
+		startsAt:      startsAt,
+		plannedEndsAt: plannedEndsAt,
 		status:        requirePatternText(t, row, scheduledFreezeStatusPattern, "scheduled freeze status"),
-		endedAt:       requirePatternText(t, row, scheduledFreezeEndedPattern, "scheduled freeze end/cancellation"),
+		endedAt:       endedAt,
 		row:           row,
 	}
 	if strings.Contains(row, `name="freeze_id"`) {
@@ -4694,23 +4734,52 @@ func requireScheduledFreezeRow(t *testing.T, page string, expectedPendingID int6
 	return evidence
 }
 
-func requirePendingScheduleActions(t *testing.T, schedule scheduledFreezeRowEvidence, startsAt, plannedEndsAt time.Time) {
+func requirePendingScheduleActions(t *testing.T, page string, schedule scheduledFreezeRowEvidence, startsAt, plannedEndsAt time.Time) {
 	t.Helper()
 	if schedule.id <= 0 {
 		t.Fatalf("pending schedule %q has no exact ID", schedule.reason)
 	}
+	id := strconv.FormatInt(schedule.id, 10)
 	for _, want := range []string{
 		`action="/scheduled-freezes/edit"`,
-		`action="/scheduled-freezes/start-now"`,
-		`action="/scheduled-freezes/cancel"`,
-		`data-confirm-action="Start Now"`,
-		`data-confirm-action="Cancel schedule"`,
-		`name="freeze_id" value="` + strconv.FormatInt(schedule.id, 10) + `"`,
+		`aria-controls="start-scheduled-` + id + `"`,
+		`aria-controls="cancel-scheduled-` + id + `"`,
+		`name="freeze_id" value="` + id + `"`,
 		`data-utc-datetime="` + startsAt.UTC().Format(time.RFC3339) + `"`,
 		`data-utc-datetime="` + plannedEndsAt.UTC().Format(time.RFC3339) + `"`,
 	} {
 		if !strings.Contains(schedule.row, want) {
 			t.Fatalf("pending schedule %d (%s) is missing %q", schedule.id, schedule.reason, want)
+		}
+	}
+	// The Start Now and Cancel confirmation dialogs render outside the table.
+	requireDialogEvidence(t, page, "start-scheduled-"+id,
+		`action="/scheduled-freezes/start-now"`,
+		`name="freeze_id" value="`+id+`"`,
+		`Start Now</button>`,
+	)
+	requireDialogEvidence(t, page, "cancel-scheduled-"+id,
+		`action="/scheduled-freezes/cancel"`,
+		`name="freeze_id" value="`+id+`"`,
+		`Cancel schedule</button>`,
+	)
+}
+
+func requireDialogEvidence(t *testing.T, page, dialogID string, wants ...string) {
+	t.Helper()
+	marker := `<dialog id="` + dialogID + `"`
+	start := strings.Index(page, marker)
+	if start < 0 {
+		t.Fatalf("dialog %q is missing", dialogID)
+	}
+	endOffset := strings.Index(page[start:], "</dialog>")
+	if endOffset < 0 {
+		t.Fatalf("dialog %q is incomplete", dialogID)
+	}
+	dialog := page[start : start+endOffset]
+	for _, want := range wants {
+		if !strings.Contains(dialog, want) {
+			t.Fatalf("dialog %q is missing %q", dialogID, want)
 		}
 	}
 }
@@ -4719,10 +4788,8 @@ func requireNoPendingScheduleActions(t *testing.T, schedule scheduledFreezeRowEv
 	t.Helper()
 	for _, absent := range []string{
 		`action="/scheduled-freezes/edit"`,
-		`action="/scheduled-freezes/start-now"`,
-		`action="/scheduled-freezes/cancel"`,
-		`data-confirm-action="Start Now"`,
-		`data-confirm-action="Cancel schedule"`,
+		`aria-controls="start-scheduled-`,
+		`aria-controls="cancel-scheduled-`,
 		`name="freeze_id"`,
 	} {
 		if strings.Contains(schedule.row, absent) {
@@ -4736,20 +4803,24 @@ func requireUnchangedPendingSchedule(t *testing.T, before, after scheduledFreeze
 	if before.id != after.id || before.branch != after.branch || before.reason != after.reason || before.startsAt != after.startsAt || before.plannedEndsAt != after.plannedEndsAt || before.status != after.status || before.endedAt != after.endedAt {
 		t.Fatalf("%s changed Schedule A: before=%+v after=%+v", operation, before, after)
 	}
-	for _, action := range []string{`action="/scheduled-freezes/edit"`, `action="/scheduled-freezes/start-now"`, `action="/scheduled-freezes/cancel"`} {
+	for _, action := range []string{
+		`action="/scheduled-freezes/edit"`,
+		`aria-controls="start-scheduled-`,
+		`aria-controls="cancel-scheduled-`,
+	} {
 		if !strings.Contains(after.row, action) {
 			t.Fatalf("%s removed pending Schedule A action %q", operation, action)
 		}
 	}
 }
 
-func requireScheduleActivityEvidence(t *testing.T, row, action, outcome, outcomeClass, reason string) {
+func requireScheduleActivityEvidence(t *testing.T, row, action, outcome, reason string) {
 	t.Helper()
 	for _, want := range []string{
-		`<td data-label="Actor">E2E Admin</td>`,
-		`<td data-label="Action">` + html.EscapeString(action) + `</td>`,
-		`<td data-label="Target">` + fixtureOwner + `/` + fixtureRepository + ` → ` + fixtureReleaseBranch + `</td>`,
-		`<td data-label="Outcome"><span class="status status-` + outcomeClass + `">` + outcome + `</span></td>`,
+		`>E2E Admin</td>`,
+		`<span class="font-medium text-text">` + html.EscapeString(action) + `</span>`,
+		`>` + fixtureOwner + `/` + fixtureRepository + ` → ` + fixtureReleaseBranch + `</td>`,
+		`>` + outcome + `</span>`,
 		html.EscapeString(reason),
 	} {
 		if !strings.Contains(row, want) {
@@ -4764,64 +4835,109 @@ func scheduleTime(value time.Time) string {
 
 func requireActiveFreezeEvidence(t *testing.T, page string) activeFreezeEvidence {
 	t.Helper()
-	marker := `<form method="post" action="/freezes/end"`
+	// The lift/cancel forms live in dialogs outside the table; the desktop row
+	// carries the aria-controls buttons that open them.
+	marker := `aria-controls="lift-freeze-`
 	markerIndex := strings.Index(page, marker)
 	if markerIndex < 0 {
-		t.Fatal("active freeze is missing its desktop action row")
+		t.Fatal("active freeze is missing its lift action")
 	}
-	rowStart := strings.LastIndex(page[:markerIndex], "<tr>")
+	rowStart := strings.LastIndex(page[:markerIndex], "<tr ")
 	rowEndOffset := strings.Index(page[markerIndex:], "</tr>")
 	if rowStart < 0 || rowEndOffset < 0 {
 		t.Fatal("active freeze is missing its desktop table row")
 	}
 	row := page[rowStart : markerIndex+rowEndOffset+len("</tr>")]
-	id, err := strconv.ParseInt(requireHiddenInput(t, row, "freeze_id"), 10, 64)
-	if err != nil || id <= 0 {
-		t.Fatalf("parse active freeze ID: %v", err)
-	}
-	return activeFreezeEvidence{
-		id:     id,
-		branch: requirePatternText(t, row, activeFreezeBranchPattern, "active freeze branch"),
+	evidence := activeFreezeEvidence{
+		id:     parseLiftFreezeID(t, row),
+		branch: requirePatternText(t, row, branchCodePattern, "active freeze branch"),
 		reason: requirePatternText(t, row, activeFreezeReasonPattern, "active freeze reason"),
 		status: requirePatternText(t, row, activeFreezeStatusPattern, "active freeze status"),
 	}
+	requireActiveFreezeDialogs(t, page, evidence.id)
+	return evidence
+}
+
+func requireActiveFreezeDialogs(t *testing.T, page string, freezeID int64) {
+	t.Helper()
+	id := strconv.FormatInt(freezeID, 10)
+	requireDialogEvidence(t, page, "lift-freeze-"+id,
+		`action="/freezes/end"`,
+		`name="freeze_id" value="`+id+`"`,
+		`Lift freeze</button>`,
+	)
+	requireDialogEvidence(t, page, "cancel-freeze-"+id,
+		`action="/freezes/cancel"`,
+		`name="freeze_id" value="`+id+`"`,
+		`Cancel freeze</button>`,
+	)
+}
+
+func parseLiftFreezeID(t *testing.T, row string) int64 {
+	t.Helper()
+	marker := `aria-controls="lift-freeze-`
+	start := strings.Index(row, marker)
+	if start < 0 {
+		t.Fatal("active freeze row is missing its lift action")
+	}
+	digits := row[start+len(marker):]
+	end := strings.Index(digits, `"`)
+	if end < 0 {
+		t.Fatal("active freeze row has an unterminated lift action")
+	}
+	id, err := strconv.ParseInt(digits[:end], 10, 64)
+	if err != nil || id <= 0 {
+		t.Fatalf("parse active freeze ID: %v", err)
+	}
+	return id
 }
 
 func requireActiveFreezeEvidenceForBranch(t *testing.T, page, branch string) (activeFreezeEvidence, string) {
 	t.Helper()
-	marker := `<code class="tg-branch">` + html.EscapeString(branch) + `</code>`
-	if count := strings.Count(page, marker); count != 1 {
+	// The branch code renders in both the desktop row and the mobile card, so
+	// scope the uniqueness check to the desktop table body.
+	sectionStart := strings.Index(page, `aria-label="Active freezes"`)
+	if sectionStart < 0 {
+		t.Fatal("freezes page is missing the active freezes section")
+	}
+	tbodyOffset := strings.Index(page[sectionStart:], "<tbody>")
+	if tbodyOffset < 0 {
+		t.Fatal("active freezes section is missing its table body")
+	}
+	tbody := page[sectionStart+tbodyOffset:]
+	if end := strings.Index(tbody, "</tbody>"); end >= 0 {
+		tbody = tbody[:end]
+	}
+	marker := `<code class="font-mono text-xs text-text-muted">` + html.EscapeString(branch) + `</code>`
+	if count := strings.Count(tbody, marker); count != 1 {
 		t.Fatalf("active freeze branch %q rendered %d desktop rows, want exactly one", branch, count)
 	}
-	markerIndex := strings.Index(page, marker)
-	rowStart := strings.LastIndex(page[:markerIndex], "<tr>")
-	rowEndOffset := strings.Index(page[markerIndex:], "</tr>")
+	markerIndex := strings.Index(tbody, marker)
+	rowStart := strings.LastIndex(tbody[:markerIndex], "<tr ")
+	rowEndOffset := strings.Index(tbody[markerIndex:], "</tr>")
 	if rowStart < 0 || rowEndOffset < 0 {
 		t.Fatalf("active freeze branch %q is missing its desktop row", branch)
 	}
-	row := page[rowStart : markerIndex+rowEndOffset+len("</tr>")]
-	if !strings.Contains(row, `action="/freezes/end"`) {
+	row := tbody[rowStart : markerIndex+rowEndOffset+len("</tr>")]
+	if !strings.Contains(row, `aria-controls="lift-freeze-`) {
 		t.Fatalf("active freeze branch %q is missing its active action", branch)
 	}
-	id, err := strconv.ParseInt(requireHiddenInput(t, row, "freeze_id"), 10, 64)
-	if err != nil || id <= 0 {
-		t.Fatalf("parse active freeze ID for branch %q: %v", branch, err)
-	}
 	evidence := activeFreezeEvidence{
-		id:     id,
-		branch: requirePatternText(t, row, activeFreezeBranchPattern, "active freeze branch"),
+		id:     parseLiftFreezeID(t, row),
+		branch: requirePatternText(t, row, branchCodePattern, "active freeze branch"),
 		reason: requirePatternText(t, row, activeFreezeReasonPattern, "active freeze reason"),
 		status: requirePatternText(t, row, activeFreezeStatusPattern, "active freeze status"),
 	}
 	if evidence.branch != branch {
 		t.Fatalf("active freeze lookup for %q returned branch %q", branch, evidence.branch)
 	}
+	requireActiveFreezeDialogs(t, page, evidence.id)
 	return evidence, row
 }
 
 func requireActiveFreezeCount(t *testing.T, page string, expected int) {
 	t.Helper()
-	want := `<span class="tg-badge">` + strconv.Itoa(expected) + ` active</span>`
+	want := ">" + strconv.Itoa(expected) + " active</span>"
 	if !strings.Contains(page, want) {
 		t.Fatalf("freezes page is missing exact active count %q", want)
 	}
@@ -4829,7 +4945,7 @@ func requireActiveFreezeCount(t *testing.T, page string, expected int) {
 
 func requireNoActiveFreezeForBranch(t *testing.T, page string, freeze activeFreezeEvidence) {
 	t.Helper()
-	marker := `<code class="tg-branch">` + html.EscapeString(freeze.branch) + `</code>`
+	marker := `<code class="font-mono text-xs text-text-muted">` + html.EscapeString(freeze.branch) + `</code>`
 	for _, absent := range []string{
 		marker,
 		`name="freeze_id" value="` + strconv.FormatInt(freeze.id, 10) + `"`,
@@ -4843,7 +4959,7 @@ func requireNoActiveFreezeForBranch(t *testing.T, page string, freeze activeFree
 
 func requireNoActiveFreezeEvidence(t *testing.T, page string, freeze activeFreezeEvidence) {
 	t.Helper()
-	for _, want := range []string{`<span class="tg-badge">0 active</span>`, "No active freezes yet"} {
+	for _, want := range []string{">0 active</span>", "No active freezes"} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("freezes page is missing inactive evidence %q for freeze %d", want, freeze.id)
 		}
@@ -4860,14 +4976,14 @@ func requireNoActiveFreezeEvidence(t *testing.T, page string, freeze activeFreez
 	}
 }
 
-func requireBranchFreezeActivityEvidence(t *testing.T, row string, freeze activeFreezeEvidence, outcome, outcomeClass string) {
+func requireBranchFreezeActivityEvidence(t *testing.T, row string, freeze activeFreezeEvidence, outcome string) {
 	t.Helper()
 	for _, want := range []string{
-		`<td data-label="Actor">E2E Admin</td>`,
-		`<td data-label="Action">Branch freeze</td>`,
-		`<td data-label="Target">` + fixtureOwner + `/` + fixtureRepository + ` → ` + html.EscapeString(freeze.branch) + `</td>`,
-		`<td data-label="Outcome"><span class="status status-` + outcomeClass + `">` + outcome + `</span></td>`,
-		`<td data-label="Details">Reason: ` + html.EscapeString(freeze.reason),
+		`>E2E Admin</td>`,
+		`<span class="font-medium text-text">Branch freeze</span>`,
+		`>` + fixtureOwner + `/` + fixtureRepository + ` → ` + html.EscapeString(freeze.branch) + `</td>`,
+		`>` + outcome + `</span>`,
+		`>Reason: ` + html.EscapeString(freeze.reason),
 	} {
 		if !strings.Contains(row, want) {
 			t.Fatalf("branch-freeze activity for freeze %d is missing %q", freeze.id, want)
@@ -4877,7 +4993,7 @@ func requireBranchFreezeActivityEvidence(t *testing.T, row string, freeze active
 
 func requireLatestPublicationIntentRow(t *testing.T, page string) string {
 	t.Helper()
-	sectionMarker := "<h2>Latest desired statuses</h2>"
+	sectionMarker := `aria-label="Latest desired statuses"`
 	sectionStart := strings.Index(page, sectionMarker)
 	if sectionStart < 0 {
 		t.Fatal("publications page is missing latest desired statuses")
@@ -4887,7 +5003,7 @@ func requireLatestPublicationIntentRow(t *testing.T, page string) string {
 		t.Fatal("latest desired statuses are missing their table body")
 	}
 	tbodyStart := sectionStart + tbodyOffset
-	rowStartOffset := strings.Index(page[tbodyStart:], "<tr>")
+	rowStartOffset := strings.Index(page[tbodyStart:], "<tr ")
 	if rowStartOffset < 0 {
 		t.Fatal("latest desired statuses are missing their latest row")
 	}
@@ -4901,7 +5017,7 @@ func requireLatestPublicationIntentRow(t *testing.T, page string) string {
 
 func requirePublicationIntentRowForHead(t *testing.T, page, headSHA string) string {
 	t.Helper()
-	sectionMarker := "<h2>Latest desired statuses</h2>"
+	sectionMarker := `aria-label="Latest desired statuses"`
 	sectionStart := strings.Index(page, sectionMarker)
 	if sectionStart < 0 {
 		t.Fatal("publications page is missing latest desired statuses")
@@ -4916,12 +5032,13 @@ func requirePublicationIntentRowForHead(t *testing.T, page, headSHA string) stri
 		t.Fatal("latest desired statuses have an incomplete table body")
 	}
 	tbody := page[tbodyStart : tbodyStart+tbodyEndOffset]
-	marker := `<code>` + html.EscapeString(headSHA) + `</code>`
+	// The short SHA code element carries the full head SHA in its title.
+	marker := `title="` + html.EscapeString(headSHA) + `"`
 	if count := strings.Count(tbody, marker); count != 1 {
 		t.Fatalf("latest desired statuses render head %q in %d desktop rows, want exactly one", headSHA, count)
 	}
 	markerIndex := strings.Index(tbody, marker)
-	rowStart := strings.LastIndex(tbody[:markerIndex], "<tr>")
+	rowStart := strings.LastIndex(tbody[:markerIndex], "<tr ")
 	rowEndOffset := strings.Index(tbody[markerIndex:], "</tr>")
 	if rowStart < 0 || rowEndOffset < 0 {
 		t.Fatalf("latest desired status for head %q is incomplete", headSHA)
@@ -4931,7 +5048,7 @@ func requirePublicationIntentRowForHead(t *testing.T, page, headSHA string) stri
 
 func requireLatestPublicationAttemptRow(t *testing.T, page string) string {
 	t.Helper()
-	sectionMarker := "<h2>Recent publication attempts</h2>"
+	sectionMarker := `aria-label="Recent publication attempts"`
 	sectionStart := strings.Index(page, sectionMarker)
 	if sectionStart < 0 {
 		t.Fatal("publications page is missing recent publication attempts")
@@ -4941,7 +5058,7 @@ func requireLatestPublicationAttemptRow(t *testing.T, page string) string {
 		t.Fatal("recent publication attempts are missing their table body")
 	}
 	tbodyStart := sectionStart + tbodyOffset
-	rowStartOffset := strings.Index(page[tbodyStart:], "<tr>")
+	rowStartOffset := strings.Index(page[tbodyStart:], "<tr ")
 	if rowStartOffset < 0 {
 		t.Fatal("recent publication attempts are missing their latest row")
 	}
@@ -4955,7 +5072,7 @@ func requireLatestPublicationAttemptRow(t *testing.T, page string) string {
 
 func requirePublicationAttemptRowForHead(t *testing.T, page, headSHA string) string {
 	t.Helper()
-	sectionMarker := "<h2>Recent publication attempts</h2>"
+	sectionMarker := `aria-label="Recent publication attempts"`
 	sectionStart := strings.Index(page, sectionMarker)
 	if sectionStart < 0 {
 		t.Fatal("publications page is missing recent publication attempts")
@@ -4970,12 +5087,12 @@ func requirePublicationAttemptRowForHead(t *testing.T, page, headSHA string) str
 		t.Fatal("recent publication attempts have an incomplete table body")
 	}
 	tbody := page[tbodyStart : tbodyStart+tbodyEndOffset]
-	marker := `<code>` + html.EscapeString(headSHA) + `</code>`
+	marker := `title="` + html.EscapeString(headSHA) + `"`
 	markerIndex := strings.Index(tbody, marker)
 	if markerIndex < 0 {
 		t.Fatalf("recent publication attempts are missing head %q", headSHA)
 	}
-	rowStart := strings.LastIndex(tbody[:markerIndex], "<tr>")
+	rowStart := strings.LastIndex(tbody[:markerIndex], "<tr ")
 	rowEndOffset := strings.Index(tbody[markerIndex:], "</tr>")
 	if rowStart < 0 || rowEndOffset < 0 {
 		t.Fatalf("recent publication attempt for head %q is incomplete", headSHA)
@@ -4985,19 +5102,19 @@ func requirePublicationAttemptRowForHead(t *testing.T, page, headSHA string) str
 
 func requireLatestDecisionResultRow(t *testing.T, page string) string {
 	t.Helper()
-	sectionMarker := "<h2>Thaw approval results</h2>"
+	sectionMarker := `aria-label="Freeze decisions"`
 	sectionStart := strings.Index(page, sectionMarker)
 	if sectionStart < 0 {
-		t.Fatal("decisions page is missing thaw approval results")
+		t.Fatal("decisions page is missing the freeze decisions table")
 	}
 	tbodyOffset := strings.Index(page[sectionStart:], "<tbody>")
 	if tbodyOffset < 0 {
-		t.Fatal("thaw approval results are missing their table body")
+		t.Fatal("freeze decisions are missing their table body")
 	}
 	tbodyStart := sectionStart + tbodyOffset
-	rowStartOffset := strings.Index(page[tbodyStart:], "<tr>")
+	rowStartOffset := strings.Index(page[tbodyStart:], "<tr ")
 	if rowStartOffset < 0 {
-		t.Fatal("thaw approval results are missing their latest row")
+		t.Fatal("freeze decisions are missing their latest row")
 	}
 	rowStart := tbodyStart + rowStartOffset
 	rowEndOffset := strings.Index(page[rowStart:], "</tr>")
@@ -5009,21 +5126,21 @@ func requireLatestDecisionResultRow(t *testing.T, page string) string {
 
 func requireDecisionResultRowForHead(t *testing.T, page, headSHA string) string {
 	t.Helper()
-	sectionMarker := "<h2>Thaw approval results</h2>"
+	sectionMarker := `aria-label="Freeze decisions"`
 	sectionStart := strings.Index(page, sectionMarker)
 	if sectionStart < 0 {
-		t.Fatal("decisions page is missing thaw approval results")
+		t.Fatal("decisions page is missing the freeze decisions table")
 	}
-	marker := `<code>` + html.EscapeString(headSHA) + `</code>`
+	marker := `title="` + html.EscapeString(headSHA) + `"`
 	markerOffset := strings.Index(page[sectionStart:], marker)
 	if markerOffset < 0 {
-		t.Fatalf("thaw approval results are missing head %q", headSHA)
+		t.Fatalf("freeze decisions are missing head %q", headSHA)
 	}
 	markerIndex := sectionStart + markerOffset
-	rowStart := strings.LastIndex(page[sectionStart:markerIndex], "<tr>")
+	rowStart := strings.LastIndex(page[sectionStart:markerIndex], "<tr ")
 	rowEndOffset := strings.Index(page[markerIndex:], "</tr>")
 	if rowStart < 0 || rowEndOffset < 0 {
-		t.Fatalf("thaw approval result for head %q is incomplete", headSHA)
+		t.Fatalf("freeze decision for head %q is incomplete", headSHA)
 	}
 	rowStart += sectionStart
 	return page[rowStart : markerIndex+rowEndOffset+len("</tr>")]
@@ -5032,11 +5149,10 @@ func requireDecisionResultRowForHead(t *testing.T, page, headSHA string) string 
 func waitForLatestPostedPublicationAttempt(t *testing.T, ctx context.Context, browser *thawguardBrowser, headSHA, state, description string) {
 	t.Helper()
 	wants := []string{
-		headSHA,
-		`<small class="tg-muted">` + requiredContext + `</small>`,
-		`<td data-label="State"><span class="status status-` + state + `">` + state + `</span></td>`,
-		`<td data-label="Mode"><code>forgejo_status</code></td>`,
-		`<td data-label="Result"><span class="status status-ok">posted</span></td>`,
+		`title="` + headSHA + `"`,
+		">" + requiredContext + "</code>",
+		">" + state + " · forgejo_status</code>",
+		">posted</span>",
 		description,
 	}
 	waitFor(t, 30*time.Second, "recorded "+requiredContext+"="+state+" Forgejo publication attempt", func() (bool, error) {
@@ -5128,7 +5244,7 @@ func createFreeze(t *testing.T, ctx context.Context, browser *thawguardBrowser, 
 		"timezone_offset_minutes": {"0"},
 	}, "create Thawguard freeze")
 	created := requireActiveFreezeEvidence(t, requirePage(t, ctx, browser, "/freezes"))
-	if created.branch != "main" || created.reason != reason || created.status != "active" {
+	if created.branch != "main" || created.reason != reason || created.status != "Frozen" {
 		t.Fatalf("created freeze has unexpected rendered evidence: id=%d branch=%q reason=%q status=%q", created.id, created.branch, created.reason, created.status)
 	}
 	return created
@@ -5514,12 +5630,12 @@ func requireRenderedForm(t *testing.T, page, marker, label string) string {
 
 func requireSharedHeadConfirmationRow(t *testing.T, page string, pullRequestIndex int) string {
 	t.Helper()
-	marker := `<td class="tg-shared-head-index">#` + strconv.Itoa(pullRequestIndex)
+	marker := `<code class="font-mono text-xs font-bold text-text">#` + strconv.Itoa(pullRequestIndex) + `</code>`
 	markerIndex := strings.Index(page, marker)
 	if markerIndex < 0 {
 		t.Fatalf("shared-head confirmation is missing PR #%d", pullRequestIndex)
 	}
-	rowStart := strings.LastIndex(page[:markerIndex], "<tr>")
+	rowStart := strings.LastIndex(page[:markerIndex], "<tr ")
 	rowEndOffset := strings.Index(page[markerIndex:], "</tr>")
 	if rowStart < 0 || rowEndOffset < 0 {
 		t.Fatalf("shared-head confirmation PR #%d row is incomplete", pullRequestIndex)
@@ -5546,28 +5662,28 @@ func requireOnlyFormInputNames(t *testing.T, form string, expected []string) {
 	}
 }
 
+// The count patterns match the visible section-header badge text ("3 users",
+// "1 delivery", "0 active", …) rather than any styling classes so they survive
+// restyles. Row-field patterns anchor on visible text or the small stable
+// markers the templates emit (branch <code> elements, <time> cells, badges).
 var (
-	nonzeroMatchingRows              = regexp.MustCompile(`Showing [1-9][0-9]* of [1-9][0-9]* matching rows`)
-	userCountPattern                 = regexp.MustCompile(`<span class="tg-badge tg-badge-info">([0-9]+) users</span>`)
-	repositoryCountPattern           = regexp.MustCompile(`Repos Monitored</span><strong class="tg-stat-value">([0-9]+)</strong>`)
-	activeFreezeCountPattern         = regexp.MustCompile(`<span class="tg-badge">([0-9]+) active</span>`)
-	scheduledFreezeCountPattern      = regexp.MustCompile(`Scheduled windows</h2><span class="tg-badge tg-badge-scheduled">([0-9]+) shown</span>`)
-	webhookRowsPattern               = regexp.MustCompile(`Showing ([0-9]+) of [0-9]+ matching rows`)
-	webhookSummaryPattern            = regexp.MustCompile(`Showing ([0-9]+) of ([0-9]+) matching rows`)
-	webhookTotalRowsPattern          = regexp.MustCompile(`>([0-9]+) total rows loaded</span>`)
-	statusResultsPattern             = regexp.MustCompile(`Thaw approval results</h2><span[^>]*>([0-9]+) status results</span>`)
-	publicationIntentsPattern        = regexp.MustCompile(`Latest desired statuses</h2><span[^>]*>([0-9]+) shown</span>`)
-	publicationAttemptsPattern       = regexp.MustCompile(`Recent publication attempts</h2><span[^>]*>([0-9]+) shown</span>`)
-	activityEventsPattern            = regexp.MustCompile(`Recent activity</h2><span[^>]*>([0-9]+) shown</span>`)
-	activeFreezeBranchPattern        = regexp.MustCompile(`<code class="tg-branch">([^<]+)</code>`)
-	activeFreezeReasonPattern        = regexp.MustCompile(`<td class="tg-freeze-reason">([^<]+)</td>`)
-	activeFreezeStatusPattern        = regexp.MustCompile(`<span class="status status-frozen">([^<]+)</span>`)
-	scheduledFreezeBranchPattern     = regexp.MustCompile(`<code class="tg-branch tg-branch-scheduled">([^<]+)</code>`)
-	scheduledFreezeStartsPattern     = regexp.MustCompile(`<td data-label="Starts">([^<]+)</td>`)
-	scheduledFreezePlannedEndPattern = regexp.MustCompile(`<td data-label="Planned unfreeze">([^<]+)</td>`)
-	scheduledFreezeStatusPattern     = regexp.MustCompile(`<td data-label="Status"><span class="status status-[^"]+">([^<]+)</span></td>`)
-	scheduledFreezeEndedPattern      = regexp.MustCompile(`<td data-label="Ended/cancelled">([^<]+)</td>`)
-	formInputNamePattern             = regexp.MustCompile(`(?i)<input\b[^>]*\bname="([^"]+)"[^>]*>`)
+	userCountPattern             = regexp.MustCompile(`>([0-9]+) users?</span>`)
+	repositoryCountPattern       = regexp.MustCompile(`(?s)>Enforcing</p>\s*<p[^>]*>[0-9]+ of ([0-9]+)</p>`)
+	activeFreezeCountPattern     = regexp.MustCompile(`>([0-9]+) active</span>`)
+	scheduledFreezeCountPattern  = regexp.MustCompile(`>([0-9]+) windows?</span>`)
+	deliveryCountPattern         = regexp.MustCompile(`>([0-9]+) deliver(?:y|ies)</span>`)
+	nonzeroDeliveryCountPattern  = regexp.MustCompile(`>[1-9][0-9]* deliver(?:y|ies)</span>`)
+	statusResultsPattern         = regexp.MustCompile(`>([0-9]+) decisions?</span>`)
+	publicationIntentsPattern    = regexp.MustCompile(`>([0-9]+) status(?:es)?</span>`)
+	publicationAttemptsPattern   = regexp.MustCompile(`>([0-9]+) attempts?</span>`)
+	activityEventsPattern        = regexp.MustCompile(`>([0-9]+) events?</span>`)
+	branchCodePattern            = regexp.MustCompile(`<code class="font-mono text-xs text-text-muted">([^<]+)</code>`)
+	activeFreezeReasonPattern    = regexp.MustCompile(`(?s)<td class="px-4 py-3 text-text">\s*([^<]+?)\s*<`)
+	activeFreezeStatusPattern    = regexp.MustCompile(`>(Frozen)</span>`)
+	scheduledFreezeStatusPattern = regexp.MustCompile(`>(Upcoming|Active|Completed|Cancelled)</span>`)
+	scheduleTimeCellPattern      = regexp.MustCompile(`<td class="px-4 py-3 text-text">(?:<time datetime="[^"]*">([^<]+)</time>|<span class="text-text-muted">—</span>)</td>`)
+	scheduleSubLinePattern       = regexp.MustCompile(`(?:Ended|Cancelled) <time datetime="[^"]*">([^<]+)</time>`)
+	formInputNamePattern         = regexp.MustCompile(`(?i)<input\b[^>]*\bname="([^"]+)"[^>]*>`)
 )
 
 func requireAPIStatus(t *testing.T, response apiResponse, err error, expected int, operation string) {
