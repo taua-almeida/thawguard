@@ -1,0 +1,78 @@
+name: Bug report
+description: Report a reproducible Thawguard defect
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. GitHub is Thawguard's canonical issue tracker. Do not include secrets, tokens, passwords, signatures, private repository data, or raw production webhook payloads. Report suspected vulnerabilities through the private security-advisory link below instead.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Repository setup and readiness
+        - Immediate freezes
+        - Scheduled freezes
+        - Thaw requests
+        - Users and roles
+        - Webhooks and status publication
+        - Activity and diagnostics
+        - Docker or local E2E
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Thawguard version or commit
+      placeholder: Commit SHA, tag, or container image reference
+    validations:
+      required: true
+  - type: input
+    id: forge
+    attributes:
+      label: Forge and version
+      placeholder: Forgejo 15.0.4, Codeberg, or not applicable
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Use fictional names and redact all credentials and private data.
+      placeholder: |
+        1. Configure ...
+        2. Create ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized evidence
+      description: Add relevant logs, screenshots, or test output after removing secrets and private data.
+      render: shell
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials, signatures, session identifiers, private repository data, and personal information.
+          required: true
+        - label: This is not a vulnerability report that should use the private security-advisory flow.
+          required: true

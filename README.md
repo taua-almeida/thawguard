@@ -6,7 +6,17 @@ Thawguard is a self-hosted branch-freeze controller for Forgejo/Codeberg-first t
 
 ## Status
 
-Early Milestone 1 foundation. Not ready for production use.
+Pre-alpha developer preview. The core Forgejo/Codeberg freeze, scheduled-freeze, thaw-exception, readiness, audit, and recovery workflows are implemented and exercised against a disposable local Forgejo instance. Thawguard is not ready for production use yet.
+
+![Thawguard dashboard with fictional repository and freeze data](docs/assets/thawguard-dashboard.png)
+
+Project links:
+
+- [Roadmap](ROADMAP.md)
+- [Roadmap discussion](https://github.com/taua-almeida/thawguard/issues/7)
+- [Canonical issue tracker](https://github.com/taua-almeida/thawguard/issues)
+- [Contributing](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
 
 ## Important boundary
 
@@ -38,6 +48,12 @@ Scheduled freezes are one-time pending windows for an exact repository and manag
 **Start Now** activates a still-pending future schedule immediately when repository enforcement is active. It preserves any future planned unfreeze, synchronizes current open pull requests, evaluates shared heads across the repository, and publishes real `thawguard/freeze` statuses through the same durable convergence path as automatic due activation. A post-commit failure leaves the schedule active, marks enforcement unhealthy, and retains one bounded-backoff reconciliation job for current-state recovery.
 
 Only pending schedules can be edited, cancelled, or started now. Recurring schedules and schedule archive controls remain deferred.
+
+## Roadmap and issue tracking
+
+The current direction is documented in [ROADMAP.md](ROADMAP.md). GitHub is the canonical public issue tracker so plans and discussion do not fragment between mirrors. The [Codeberg repository](https://codeberg.org/taua-almeida/thawguard) remains available as a source mirror and carries the same versioned roadmap and contributor documentation.
+
+Roadmap items describe direction rather than release promises. Accepted work is broken into scoped issues before implementation.
 
 ## Local development
 

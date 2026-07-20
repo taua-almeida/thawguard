@@ -1,0 +1,66 @@
+name: Feature request
+description: Propose an improvement to a Thawguard workflow
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        GitHub is Thawguard's canonical roadmap and issue tracker. Please describe the maintainer workflow or failure mode before prescribing a large implementation. Thawguard provides cooperative enforcement for trusted teams rather than an unbypassable forge security boundary.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or workflow
+      description: What are maintainers trying to accomplish, and what do they do today?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe the observable result rather than only a technical solution.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Product area
+      options:
+        - Scheduling
+        - Freeze and thaw policy
+        - Repository setup
+        - Identity and access
+        - Forge integration
+        - Audit and diagnostics
+        - User interface
+        - Documentation or operations
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: forge
+    attributes:
+      label: Relevant forge or deployment
+      placeholder: Forgejo, Codeberg, GitHub, GitHub Enterprise, Gitea, or forge-independent
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and alternatives
+      description: What is the smallest useful version? What workarounds or alternatives have you tried?
+    validations:
+      required: true
+  - type: textarea
+    id: boundaries
+    attributes:
+      label: Security, privacy, or compatibility considerations
+      description: Note any credential, identity, repository-visibility, branch-protection, or backwards-compatibility concerns.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Request check
+      options:
+        - label: I searched the roadmap and existing issues for related work.
+          required: true
+        - label: This request does not rely on Thawguard being an unbypassable boundary against privileged forge writers.
+          required: true
