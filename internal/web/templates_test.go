@@ -394,10 +394,11 @@ func TestStaticAssetsServedFromEmbeddedFS(t *testing.T) {
 		path string
 		want string
 	}{
-		{"/static/thawguard.css", "@import"},
-		{"/static/css/tokens.css", ":root"},
-		{"/static/css/legacy.css", ".tg-sidebar"},
-		{"/static/css/pages/freezes.css", ".tg-freezes-page"},
+		{"/static/app.css", "tg-icon-sprite"},
+		{"/static/js/htmx.min.js", "htmx"},
+		{"/static/js/main.js", "dialog.js"},
+		{"/static/js/dialog.js", "formmethod"},
+		{"/static/js/datetime.js", "datetime"},
 	}
 	for _, tc := range cases {
 		recorder := httptest.NewRecorder()
@@ -407,6 +408,18 @@ func TestStaticAssetsServedFromEmbeddedFS(t *testing.T) {
 		}
 		if !strings.Contains(recorder.Body.String(), tc.want) {
 			t.Fatalf("expected %s to contain %q", tc.path, tc.want)
+		}
+	}
+	for _, retired := range []string{
+		"/static/thawguard.css",
+		"/static/css/tokens.css",
+		"/static/css/legacy.css",
+		"/static/css/pages/freezes.css",
+	} {
+		recorder := httptest.NewRecorder()
+		server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, retired, nil))
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("expected retired stylesheet %s to 404, got %d", retired, recorder.Code)
 		}
 	}
 }

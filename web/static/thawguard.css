@@ -1,5 +1,0 @@
-/* Thawguard stylesheet entry point. Import order defines the cascade:
-   tokens first, shared styles second, page styles last. */
-@import url("/static/css/tokens.css");
-@import url("/static/css/legacy.css");
-@import url("/static/css/pages/freezes.css");
