@@ -15,14 +15,17 @@ import (
 )
 
 type fakeScheduleStore struct {
-	schedules    []domain.Schedule
-	created      []schedule.CreateParams
-	deleted      []int64
-	createErr    error
-	rules        map[int64][]domain.ScheduleWeeklyRule
-	addedRules   []schedule.AddRulesParams
-	addRulesErr  error
-	removedRules []int64
+	schedules     []domain.Schedule
+	created       []schedule.CreateParams
+	deleted       []int64
+	activated     []int64
+	paused        []int64
+	createErr     error
+	transitionErr error
+	rules         map[int64][]domain.ScheduleWeeklyRule
+	addedRules    []schedule.AddRulesParams
+	addRulesErr   error
+	removedRules  []int64
 }
 
 func (s *fakeScheduleStore) List(ctx context.Context) ([]domain.Schedule, error) {
@@ -52,6 +55,32 @@ func (s *fakeScheduleStore) Delete(ctx context.Context, id int64, actor domain.A
 		return domain.Schedule{}, err
 	}
 	s.deleted = append(s.deleted, id)
+	return item, nil
+}
+
+func (s *fakeScheduleStore) Activate(ctx context.Context, id int64, actor domain.Actor) (domain.Schedule, error) {
+	item, err := s.Get(ctx, id)
+	if err != nil {
+		return domain.Schedule{}, err
+	}
+	if s.transitionErr != nil {
+		return domain.Schedule{}, s.transitionErr
+	}
+	s.activated = append(s.activated, id)
+	item.Active = true
+	return item, nil
+}
+
+func (s *fakeScheduleStore) Pause(ctx context.Context, id int64, actor domain.Actor) (domain.Schedule, error) {
+	item, err := s.Get(ctx, id)
+	if err != nil {
+		return domain.Schedule{}, err
+	}
+	if s.transitionErr != nil {
+		return domain.Schedule{}, s.transitionErr
+	}
+	s.paused = append(s.paused, id)
+	item.Active = false
 	return item, nil
 }
 
@@ -233,6 +262,81 @@ func TestScheduleDeleteAllowsFreezerRejectsViewerAndRedirectsWithNotice(t *testi
 	}
 	if len(store.deleted) != 1 || store.deleted[0] != 3 {
 		t.Fatalf("unexpected deletes: %+v", store.deleted)
+	}
+}
+
+func TestScheduleActivateAndPauseAllowFreezerRejectViewerAndRedirect(t *testing.T) {
+	store := &fakeScheduleStore{schedules: []domain.Schedule{{ID: 3, RepositoryID: 1, Branch: "main", Name: "Nightly release lock", Kind: domain.ScheduleKindWeekly, Timezone: "UTC"}}}
+	server := scheduleTestServer(store)
+
+	postTransition := func(sessionID, token, path string) *httptest.ResponseRecorder {
+		form := url.Values{csrfFormField: {token}}
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(form.Encode()))
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sessionID})
+		server.Routes().ServeHTTP(recorder, request)
+		return recorder
+	}
+
+	viewer := setWebSessionRoles(t, server, auth.RoleSet{auth.RoleViewer})
+	recorder := postTransition(viewer.ID, viewer.CSRFToken, "/scheduled-freezes/schedules/3/activate")
+	if recorder.Code != http.StatusForbidden || len(store.activated) != 0 {
+		t.Fatalf("expected viewer activate to be forbidden, status=%d activated=%+v", recorder.Code, store.activated)
+	}
+
+	freezer := setWebSessionRoles(t, server, auth.RoleSet{auth.RoleFreezer})
+	recorder = postTransition(freezer.ID, freezer.CSRFToken, "/scheduled-freezes/schedules/3/activate")
+	if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != "/scheduled-freezes/schedules/3?notice=activated" {
+		t.Fatalf("expected activate redirect with notice, status=%d location=%q", recorder.Code, recorder.Header().Get("Location"))
+	}
+	if len(store.activated) != 1 || store.activated[0] != 3 {
+		t.Fatalf("unexpected activations: %+v", store.activated)
+	}
+
+	recorder = postTransition(freezer.ID, freezer.CSRFToken, "/scheduled-freezes/schedules/3/pause")
+	if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != "/scheduled-freezes/schedules/3?notice=paused" {
+		t.Fatalf("expected pause redirect with notice, status=%d location=%q", recorder.Code, recorder.Header().Get("Location"))
+	}
+	if len(store.paused) != 1 || store.paused[0] != 3 {
+		t.Fatalf("unexpected pauses: %+v", store.paused)
+	}
+
+	// A double submit races the page state; the store's validation error
+	// redirects silently back to the detail page, which shows the truth.
+	store.transitionErr = schedule.ValidationError{Message: "schedule is already active"}
+	recorder = postTransition(freezer.ID, freezer.CSRFToken, "/scheduled-freezes/schedules/3/activate")
+	if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != "/scheduled-freezes/schedules/3" {
+		t.Fatalf("expected silent redirect on double submit, status=%d location=%q", recorder.Code, recorder.Header().Get("Location"))
+	}
+
+	store.transitionErr = nil
+	for _, path := range []string{"/scheduled-freezes/schedules/999/activate", "/scheduled-freezes/schedules/not-a-number/pause"} {
+		recorder = postTransition(freezer.ID, freezer.CSRFToken, path)
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("expected 404 for %s, got %d", path, recorder.Code)
+		}
+	}
+}
+
+func TestScheduleDetailRendersActiveBadgeAndSuppressionCallout(t *testing.T) {
+	suppressedUntil := time.Date(2030, 1, 5, 17, 0, 0, 0, time.UTC)
+	store := &fakeScheduleStore{schedules: []domain.Schedule{{ID: 3, RepositoryID: 1, Branch: "main", Name: "Nightly release lock", Kind: domain.ScheduleKindWeekly, Timezone: "UTC", Active: true, SuppressedUntil: &suppressedUntil, CreatedAt: time.Date(2026, 7, 18, 9, 30, 0, 0, time.UTC)}}}
+	server := scheduleTestServer(store)
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/scheduled-freezes/schedules/3", nil))
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected detail 200, got %d", recorder.Code)
+	}
+	for _, want := range []string{"Active", "ended manually", "2030-01-05 17:00 UTC"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected suppressed detail body to contain %q, got %q", want, body)
+		}
+	}
+	if strings.Contains(body, "never freezes its branch") {
+		t.Fatal("active schedule must not render the paused callout")
 	}
 }
 

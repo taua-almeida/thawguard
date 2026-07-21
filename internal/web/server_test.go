@@ -1605,6 +1605,29 @@ func TestCancelFreezePostsToStore(t *testing.T) {
 	}
 }
 
+func TestEndFreezeOfScheduleCreatedFreezeExplainsSuppression(t *testing.T) {
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
+	scheduleID := int64(3)
+	store := &fakeFreezeStore{freezes: []domain.BranchFreeze{{ID: 9, RepositoryID: repo.ID, Branch: "main", Status: domain.BranchFreezeStatusActive, Active: true, Reason: "release", ScheduleID: &scheduleID}}}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, FreezeStore: store})
+	form := freezeCloseForm(9)
+	cookie, csrfToken := getFreezeForm(t, server)
+	form.Set(csrfFormField, csrfToken)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/freezes/end", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect, got %d", recorder.Code)
+	}
+	if location := recorder.Header().Get("Location"); location != "/freezes?notice=freeze-lifted-scheduled" {
+		t.Fatalf("expected schedule-aware notice redirect, got %q", location)
+	}
+}
+
 func TestEndFreezeRejectsMissingCSRFSession(t *testing.T) {
 	store := &fakeFreezeStore{}
 	server := NewServer(Config{AppName: "Thawguard", FreezeStore: store})
@@ -2802,6 +2825,10 @@ func TestActivityMappingCoversCurrentFamilies(t *testing.T) {
 		{name: "planned unfreeze", action: audit.ActionFreezeSchedulePlannedUnfreeze, subjectType: audit.SubjectTypeBranchFreeze, subjectID: "8", details: `{"repository_id":"1","branch":"release","planned_ends_at":"2026-07-14T13:00:00Z","reason":"window"}`, outcome: "Completed", contains: []string{"Planned unfreeze 2026-07-14 13:00 UTC"}},
 		{name: "recurring schedule create", action: audit.ActionScheduleCreated, subjectType: audit.SubjectTypeSchedule, subjectID: "3", details: `{"repository_id":"1","branch":"main","name":"Nightly release lock","kind":"weekly","timezone":"America/Sao_Paulo","reason":"nightly deploy quiet hours"}`, outcome: "Created", contains: []string{"main", "Nightly release lock", "weekly", "America/Sao_Paulo", "nightly deploy quiet hours"}},
 		{name: "recurring schedule create without reason", action: audit.ActionScheduleCreated, subjectType: audit.SubjectTypeSchedule, subjectID: "3", details: `{"repository_id":"1","branch":"main","name":"Weekend lock","kind":"dated","timezone":"UTC","reason":""}`, outcome: "Created", contains: []string{"Weekend lock", "dated", "Reason: none."}},
+		{name: "recurring schedule activation", action: audit.ActionScheduleActivated, subjectType: audit.SubjectTypeSchedule, subjectID: "3", details: `{"repository_id":"1","branch":"main","name":"Nightly release lock","kind":"weekly","timezone":"America/Sao_Paulo","reason":"quiet hours"}`, outcome: "Activated", contains: []string{"Nightly release lock", "weekly", "America/Sao_Paulo"}},
+		{name: "recurring schedule pause", action: audit.ActionSchedulePaused, subjectType: audit.SubjectTypeSchedule, subjectID: "3", details: `{"repository_id":"1","branch":"main","name":"Nightly release lock","kind":"weekly","timezone":"America/Sao_Paulo","reason":"quiet hours"}`, outcome: "Paused", contains: []string{"Nightly release lock", "weekly"}},
+		{name: "recurring schedule suppression", action: audit.ActionScheduleSuppressed, subjectType: audit.SubjectTypeSchedule, subjectID: "3", details: `{"repository_id":"1","branch":"main","name":"Nightly release lock","ended_freeze_id":"7","suppressed_until":"2026-07-20T17:00:00Z","resumes_at":"2026-07-27T09:00:00Z"}`, outcome: "Manually thawed", contains: []string{"Nightly release lock", "2026-07-20 17:00 UTC", "2026-07-27 09:00 UTC"}},
+		{name: "recurring schedule suppression without a next window", action: audit.ActionScheduleSuppressed, subjectType: audit.SubjectTypeSchedule, subjectID: "3", details: `{"repository_id":"1","branch":"main","name":"Nightly release lock","ended_freeze_id":"7","suppressed_until":"2026-07-20T17:00:00Z"}`, outcome: "Manually thawed", contains: []string{"resumes none"}},
 		{name: "recurring schedule delete", action: audit.ActionScheduleDeleted, subjectType: audit.SubjectTypeSchedule, subjectID: "3", details: `{"repository_id":"1","branch":"main","name":"Nightly release lock","kind":"weekly","timezone":"America/Sao_Paulo","reason":"nightly deploy quiet hours"}`, outcome: "Deleted", contains: []string{"Nightly release lock", "America/Sao_Paulo"}},
 		{name: "recurring schedule rules added", action: audit.ActionScheduleRulesAdded, subjectType: audit.SubjectTypeSchedule, subjectID: "3", details: `{"repository_id":"1","branch":"main","name":"Nightly release lock","days":"Mon, Tue, Wed","start_time":"18:00","end_time":"08:00","end_day":"next day"}`, outcome: "Rules added", contains: []string{"Nightly release lock", "Mon, Tue, Wed", "18:00", "08:00", "next day"}},
 		{name: "recurring schedule rule removed", action: audit.ActionScheduleRuleRemoved, subjectType: audit.SubjectTypeSchedule, subjectID: "3", details: `{"repository_id":"1","branch":"main","name":"Nightly release lock","days":"Mon","start_time":"18:00","end_time":"08:00","end_day":"next day"}`, outcome: "Rule removed", contains: []string{"Nightly release lock", "Mon", "18:00"}},
@@ -4444,7 +4471,18 @@ func (s *fakeFreezeStore) End(ctx context.Context, id int64, actor domain.Actor)
 	}
 	s.ended = append(s.ended, id)
 	s.actors = append(s.actors, actor)
-	return domain.BranchFreeze{ID: id, Status: domain.BranchFreezeStatusEnded}, nil
+	// Return the seeded freeze so callers see its ScheduleID, mirroring the
+	// real store's closed-row result.
+	closed := domain.BranchFreeze{ID: id}
+	for _, item := range s.freezes {
+		if item.ID == id {
+			closed = item
+			break
+		}
+	}
+	closed.Status = domain.BranchFreezeStatusEnded
+	closed.Active = false
+	return closed, nil
 }
 
 func (s *fakeFreezeStore) Cancel(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error) {

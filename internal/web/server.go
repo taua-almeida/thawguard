@@ -141,14 +141,17 @@ type ScheduledFreezeStore interface {
 	StartScheduledNow(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error)
 }
 
-// ScheduleStore persists recurring freeze schedules. In this slice a schedule
-// is only its shell and is always created paused; nothing here starts or
-// lifts freezes.
+// ScheduleStore persists recurring freeze schedules. Schedules are created
+// paused; Activate turns coverage into real freezes (materialized by the
+// background runner), Pause stops coverage and ends the schedule's live
+// freeze if one exists.
 type ScheduleStore interface {
 	List(ctx context.Context) ([]domain.Schedule, error)
 	Get(ctx context.Context, id int64) (domain.Schedule, error)
 	Create(ctx context.Context, params schedule.CreateParams, actor domain.Actor) (domain.Schedule, error)
 	Delete(ctx context.Context, id int64, actor domain.Actor) (domain.Schedule, error)
+	Activate(ctx context.Context, id int64, actor domain.Actor) (domain.Schedule, error)
+	Pause(ctx context.Context, id int64, actor domain.Actor) (domain.Schedule, error)
 	ListRules(ctx context.Context, scheduleID int64) ([]domain.ScheduleWeeklyRule, error)
 	AddRules(ctx context.Context, params schedule.AddRulesParams, actor domain.Actor) ([]domain.ScheduleWeeklyRule, error)
 	DeleteRule(ctx context.Context, scheduleID, ruleID int64, actor domain.Actor) (domain.ScheduleWeeklyRule, error)
@@ -326,6 +329,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /scheduled-freezes/schedules/new", s.handleScheduleCreate)
 	s.mux.HandleFunc("GET /scheduled-freezes/schedules/{id}", s.handleScheduleDetail)
 	s.mux.HandleFunc("POST /scheduled-freezes/schedules/{id}/delete", s.handleScheduleDelete)
+	s.mux.HandleFunc("POST /scheduled-freezes/schedules/{id}/activate", s.handleScheduleActivate)
+	s.mux.HandleFunc("POST /scheduled-freezes/schedules/{id}/pause", s.handleSchedulePause)
 	s.mux.HandleFunc("POST /scheduled-freezes/schedules/{id}/rules", s.handleScheduleRuleAdd)
 	s.mux.HandleFunc("POST /scheduled-freezes/schedules/{id}/rules/{ruleID}/delete", s.handleScheduleRuleDelete)
 	s.mux.HandleFunc("GET /decisions", s.handleDecisions)
@@ -1270,6 +1275,8 @@ func (s *Server) handleFreezes(w http.ResponseWriter, r *http.Request) {
 		state.Notice = "Freeze started."
 	case "freeze-lifted":
 		state.Notice = "Freeze lifted."
+	case "freeze-lifted-scheduled":
+		state.Notice = "Freeze lifted. Its schedule will not re-freeze this branch until its next scheduled window."
 	case "freeze-cancelled":
 		state.Notice, state.NoticeTone = "Freeze cancelled.", "info"
 	}
@@ -1322,12 +1329,21 @@ func (s *Server) handleCreateFreeze(w http.ResponseWriter, r *http.Request) {
 type closeFreezeOutcome struct {
 	notice string
 	toast  toastView
+	// scheduledNotice/scheduledToast replace the plain messaging when the
+	// closed freeze was created by a recurring schedule; empty means no
+	// schedule-specific variant exists for this action.
+	scheduledNotice string
+	scheduledToast  toastView
 }
 
 func (s *Server) handleEndFreeze(w http.ResponseWriter, r *http.Request) {
 	s.handleCloseFreeze(w, r, s.endFreeze, closeFreezeOutcome{
 		notice: "freeze-lifted",
 		toast:  toastView{Message: "Freeze lifted.", Tone: "success"},
+		// Ending a schedule-created freeze suppresses the schedule until its
+		// next window; the messaging must say so or the thaw looks permanent.
+		scheduledNotice: "freeze-lifted-scheduled",
+		scheduledToast:  toastView{Message: "Freeze lifted. Its schedule will not re-freeze this branch until its next scheduled window.", Tone: "success"},
 	})
 }
 
@@ -1338,7 +1354,7 @@ func (s *Server) handleCancelFreeze(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleCloseFreeze(w http.ResponseWriter, r *http.Request, closeFreeze func(context.Context, int64, domain.Actor) error, outcome closeFreezeOutcome) {
+func (s *Server) handleCloseFreeze(w http.ResponseWriter, r *http.Request, closeFreeze func(context.Context, int64, domain.Actor) (domain.BranchFreeze, error), outcome closeFreezeOutcome) {
 	w.Header().Add("Vary", "HX-Request")
 	if s.cfg.FreezeStore == nil {
 		http.Error(w, "freeze store is not configured", http.StatusServiceUnavailable)
@@ -1353,7 +1369,8 @@ func (s *Server) handleCloseFreeze(w http.ResponseWriter, r *http.Request, close
 	if err != nil {
 		freezeID = 0
 	}
-	if err := closeFreeze(r.Context(), freezeID, session.auditActor()); err != nil {
+	closed, err := closeFreeze(r.Context(), freezeID, session.auditActor())
+	if err != nil {
 		if !freeze.IsValidationError(err) {
 			internalServerError(w)
 			return
@@ -1367,22 +1384,23 @@ func (s *Server) handleCloseFreeze(w http.ResponseWriter, r *http.Request, close
 		s.renderFreezes(w, r, http.StatusBadRequest, freezesPageState{FormError: err.Error()}, session)
 		return
 	}
+	notice, toast := outcome.notice, outcome.toast
+	if closed.ScheduleID != nil && outcome.scheduledNotice != "" {
+		notice, toast = outcome.scheduledNotice, outcome.scheduledToast
+	}
 	if isHXRequest(r) {
-		toast := outcome.toast
 		s.renderFreezesFragment(w, r, "components/active-freezes-fragment", freezesPageState{}, session, &toast)
 		return
 	}
-	http.Redirect(w, r, "/freezes?notice="+outcome.notice, http.StatusSeeOther)
+	http.Redirect(w, r, "/freezes?notice="+notice, http.StatusSeeOther)
 }
 
-func (s *Server) endFreeze(ctx context.Context, id int64, actor domain.Actor) error {
-	_, err := s.cfg.FreezeStore.End(ctx, id, actor)
-	return err
+func (s *Server) endFreeze(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error) {
+	return s.cfg.FreezeStore.End(ctx, id, actor)
 }
 
-func (s *Server) cancelFreeze(ctx context.Context, id int64, actor domain.Actor) error {
-	_, err := s.cfg.FreezeStore.Cancel(ctx, id, actor)
-	return err
+func (s *Server) cancelFreeze(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error) {
+	return s.cfg.FreezeStore.Cancel(ctx, id, actor)
 }
 
 func (s *Server) handleScheduledFreezes(w http.ResponseWriter, r *http.Request) {
@@ -1971,6 +1989,9 @@ var activityActionDefinitions = map[string]activityActionDefinition{
 	audit.ActionFreezeSchedulePlannedUnfreeze:      {Label: "Scheduled planned unfreeze", Outcome: "Completed", OutcomeClass: "ok"},
 	audit.ActionScheduleCreated:                    {Label: "Recurring schedule", Outcome: "Created", OutcomeClass: "ok"},
 	audit.ActionScheduleDeleted:                    {Label: "Recurring schedule", Outcome: "Deleted", OutcomeClass: "warning"},
+	audit.ActionScheduleActivated:                  {Label: "Recurring schedule", Outcome: "Activated", OutcomeClass: "ok"},
+	audit.ActionSchedulePaused:                     {Label: "Recurring schedule", Outcome: "Paused", OutcomeClass: "warning"},
+	audit.ActionScheduleSuppressed:                 {Label: "Recurring schedule", Outcome: "Manually thawed", OutcomeClass: "warning"},
 	audit.ActionScheduleRulesAdded:                 {Label: "Recurring schedule", Outcome: "Rules added", OutcomeClass: "ok"},
 	audit.ActionScheduleRuleRemoved:                {Label: "Recurring schedule", Outcome: "Rule removed", OutcomeClass: "warning"},
 	audit.ActionThawExceptionApproved:              {Label: "Single-PR thaw", Outcome: "Approved", OutcomeClass: "ok"},
@@ -2071,9 +2092,12 @@ func activityEventViewForEvent(repositories map[int64]domain.Repository, users m
 	case audit.ActionFreezeScheduleActivated, audit.ActionFreezeScheduleStartedNow:
 		view.Target = activityRepositoryTarget(repositories, event, details, "branch")
 		view.Detail = "Started " + activityTimeOrUnavailable(details, "starts_at", false) + "; planned unfreeze " + activityTimeOrUnavailable(details, "planned_ends_at", true) + ". Reason: " + activityReasonOrUnavailable(details, "reason") + "."
-	case audit.ActionScheduleCreated, audit.ActionScheduleDeleted:
+	case audit.ActionScheduleCreated, audit.ActionScheduleDeleted, audit.ActionScheduleActivated, audit.ActionSchedulePaused:
 		view.Target = activityRepositoryTarget(repositories, event, details, "branch")
 		view.Detail = "Schedule " + activityTextOrUnavailable(details, "name", 100) + " (" + activityTextOrUnavailable(details, "kind", 16) + ", " + activityTextOrUnavailable(details, "timezone", 64) + "). Reason: " + activityReasonOrUnavailable(details, "reason") + "."
+	case audit.ActionScheduleSuppressed:
+		view.Target = activityRepositoryTarget(repositories, event, details, "branch")
+		view.Detail = "Schedule " + activityTextOrUnavailable(details, "name", 100) + ": freeze ended manually; suppressed until " + activityTimeOrUnavailable(details, "suppressed_until", false) + "; resumes " + activityTimeOrUnavailable(details, "resumes_at", true) + "."
 	case audit.ActionScheduleRulesAdded, audit.ActionScheduleRuleRemoved:
 		view.Target = activityRepositoryTarget(repositories, event, details, "branch")
 		view.Detail = "Schedule " + activityTextOrUnavailable(details, "name", 100) + ": " + activityTextOrUnavailable(details, "days", 40) + " " + activityTextOrUnavailable(details, "start_time", 5) + " → " + activityTextOrUnavailable(details, "end_time", 5) + " (" + activityTextOrUnavailable(details, "end_day", 16) + ")."

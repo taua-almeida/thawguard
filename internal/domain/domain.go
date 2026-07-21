@@ -173,6 +173,10 @@ type BranchFreeze struct {
 	StartsAt       *time.Time
 	EndsAt         *time.Time
 	PlannedEndsAt  *time.Time
+	// ScheduleID links a freeze materialized by a recurring schedule back to
+	// that schedule; NULL for manual and one-time scheduled freezes, and
+	// survives schedule deletion (ON DELETE SET NULL).
+	ScheduleID *int64
 	// CreatedByUserID references the user who started or scheduled the
 	// freeze; NULL survives user deletion (ON DELETE SET NULL), so
 	// CreatedByKind keeps removed users distinguishable from actors that
@@ -209,6 +213,10 @@ type Schedule struct {
 	Timezone     string
 	Reason       string
 	Active       bool
+	// SuppressedUntil is set when an operator manually ends this schedule's
+	// materialized freeze: the schedule stays active but does not re-freeze
+	// the branch until this UTC instant (its next scheduled window).
+	SuppressedUntil *time.Time
 	// CreatedByUserID survives user deletion as NULL (ON DELETE SET NULL);
 	// CreatedByKind keeps removed users distinguishable from actors that
 	// never had a user row, mirroring BranchFreeze.

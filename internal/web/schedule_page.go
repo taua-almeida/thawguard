@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -46,7 +47,7 @@ func timezoneOffsetLabel(name string, at time.Time) string {
 }
 
 // scheduleCardView is one schedule in the overview card grid. Every card
-// carries the "Paused" truth: shells never freeze anything.
+// carries the Active/Paused truth: paused schedules never freeze anything.
 type scheduleCardView struct {
 	ID              int64
 	Name            string
@@ -55,6 +56,7 @@ type scheduleCardView struct {
 	KindLabel       string
 	TimezoneLabel   string
 	DetailURL       string
+	Active          bool
 }
 
 func scheduleCardViews(repositories []domain.Repository, schedules []domain.Schedule) []scheduleCardView {
@@ -70,6 +72,7 @@ func scheduleCardViews(repositories []domain.Repository, schedules []domain.Sche
 			KindLabel:       scheduleKindLabel(sched.Kind),
 			TimezoneLabel:   timezoneOffsetLabel(sched.Timezone, now),
 			DetailURL:       fmt.Sprintf("%s/%d", schedulesBasePath, sched.ID),
+			Active:          sched.Active,
 		})
 	}
 	return cards
@@ -156,6 +159,14 @@ type scheduleDetailView struct {
 	CreatedAtUTC    string
 	URL             string
 	DeleteAction    string
+	ActivateAction  string
+	PauseAction     string
+	Active          bool
+	// Suppressed is only true while the schedule is active and an operator's
+	// manual "End freeze" is holding it back until the next window.
+	Suppressed         bool
+	SuppressedUntil    string
+	SuppressedUntilUTC string
 }
 
 type scheduleDetailPageData struct {
@@ -179,20 +190,30 @@ type scheduleDetailPageData struct {
 }
 
 func scheduleDetailViewFrom(repositories []domain.Repository, sched domain.Schedule) scheduleDetailView {
-	return scheduleDetailView{
+	now := time.Now()
+	view := scheduleDetailView{
 		ID:              sched.ID,
 		Name:            sched.Name,
 		RepositoryLabel: publicationRepositoryLabel(repositoriesByID(repositories)[sched.RepositoryID], sched.RepositoryID),
 		Branch:          sched.Branch,
 		Kind:            string(sched.Kind),
 		KindLabel:       scheduleKindLabel(sched.Kind),
-		TimezoneLabel:   timezoneOffsetLabel(sched.Timezone, time.Now()),
+		TimezoneLabel:   timezoneOffsetLabel(sched.Timezone, now),
 		Reason:          sched.Reason,
 		CreatedAt:       sched.CreatedAt.UTC().Format("2006-01-02 15:04 UTC"),
 		CreatedAtUTC:    sched.CreatedAt.UTC().Format(time.RFC3339),
 		URL:             fmt.Sprintf("%s/%d", schedulesBasePath, sched.ID),
 		DeleteAction:    fmt.Sprintf("%s/%d/delete", schedulesBasePath, sched.ID),
+		ActivateAction:  fmt.Sprintf("%s/%d/activate", schedulesBasePath, sched.ID),
+		PauseAction:     fmt.Sprintf("%s/%d/pause", schedulesBasePath, sched.ID),
+		Active:          sched.Active,
 	}
+	if sched.Active && sched.SuppressedUntil != nil && sched.SuppressedUntil.After(now) {
+		view.Suppressed = true
+		view.SuppressedUntil = sched.SuppressedUntil.UTC().Format("2006-01-02 15:04 UTC")
+		view.SuppressedUntilUTC = sched.SuppressedUntil.UTC().Format(time.RFC3339)
+	}
+	return view
 }
 
 // scheduleNewPageData assembles the new-schedule form view model. Writes a
@@ -309,8 +330,13 @@ func (s *Server) handleScheduleDetail(w http.ResponseWriter, r *http.Request) {
 	}
 	notices := map[string]string{
 		"created":      "Schedule created. It is paused and does not freeze anything.",
-		"rules-added":  "Rules added. The schedule stays paused and freezes nothing yet.",
+		"rules-added":  "Rules added.",
 		"rule-removed": "Rule removed.",
+		"activated":    "Schedule activated. Its weekly rules now freeze this branch during covered windows.",
+		"paused":       "Schedule paused. It no longer freezes its branch; any freeze it created was ended.",
+	}
+	if r.URL.Query().Get("notice") == "rules-added" && !sched.Active {
+		notices["rules-added"] = "Rules added. The schedule stays paused and freezes nothing yet."
 	}
 	if message := notices[r.URL.Query().Get("notice")]; message != "" {
 		data.Toasts = []toastView{{Message: message, Tone: "success", DismissHref: data.Schedule.URL}}
@@ -457,6 +483,48 @@ func (s *Server) handleScheduleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/scheduled-freezes?notice=recurring-schedule-deleted", http.StatusSeeOther)
+}
+
+func (s *Server) handleScheduleActivate(w http.ResponseWriter, r *http.Request) {
+	if !s.requireScheduleStore(w) {
+		return
+	}
+	s.handleScheduleActivation(w, r, s.cfg.ScheduleStore.Activate, "activated")
+}
+
+func (s *Server) handleSchedulePause(w http.ResponseWriter, r *http.Request) {
+	if !s.requireScheduleStore(w) {
+		return
+	}
+	s.handleScheduleActivation(w, r, s.cfg.ScheduleStore.Pause, "paused")
+}
+
+// handleScheduleActivation is the shared Activate/Pause POST handler. A
+// validation error here only means a double submit (already active/paused),
+// so it redirects back to the detail page without a notice.
+func (s *Server) handleScheduleActivation(w http.ResponseWriter, r *http.Request, transition func(context.Context, int64, domain.Actor) (domain.Schedule, error), notice string) {
+	session, ok := s.requireScheduleManagerForm(w, r)
+	if !ok {
+		return
+	}
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		s.renderErrorPage(w, http.StatusNotFound, false)
+		return
+	}
+	if _, err := transition(r.Context(), id, session.auditActor()); err != nil {
+		if errors.Is(err, schedule.ErrNotFound) {
+			s.renderErrorPage(w, http.StatusNotFound, false)
+			return
+		}
+		if schedule.IsValidationError(err) {
+			http.Redirect(w, r, fmt.Sprintf("%s/%d", schedulesBasePath, id), http.StatusSeeOther)
+			return
+		}
+		internalServerError(w)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("%s/%d?notice=%s", schedulesBasePath, id, notice), http.StatusSeeOther)
 }
 
 // scheduleRuleFormState mirrors the add-rules form so a validation error

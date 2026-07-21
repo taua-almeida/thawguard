@@ -20,10 +20,20 @@ type freezeLifecycleRuntimeStore interface {
 	RetryRecompute(ctx context.Context, pending domain.BranchFreeze) error
 }
 
+// scheduleMaterializer reconciles recurring-schedule coverage into freeze
+// rows; optional so the runner works without the schedule subsystem in tests.
+type scheduleMaterializer interface {
+	RunOnce(ctx context.Context) error
+}
+
 type freezeLifecycleRunner struct {
 	store    freezeLifecycleRuntimeStore
 	logger   *slog.Logger
 	interval time.Duration
+	// materializer runs right after due planned unfreezes so a branch whose
+	// one-time planned end fired while recurring coverage still applies is
+	// re-frozen in the same tick instead of a whole interval later.
+	materializer scheduleMaterializer
 }
 
 func newFreezeLifecycleRunner(store freezeLifecycleRuntimeStore, logger *slog.Logger) *freezeLifecycleRunner {
@@ -81,6 +91,11 @@ func (r *freezeLifecycleRunner) RunDue(ctx context.Context) error {
 	}
 	for _, dueFreeze := range dueEnds {
 		if _, err := r.store.ExecutePlannedUnfreeze(ctx, dueFreeze.ID, actor); err != nil {
+			joined = errors.Join(joined, err)
+		}
+	}
+	if r.materializer != nil {
+		if err := r.materializer.RunOnce(ctx); err != nil {
 			joined = errors.Join(joined, err)
 		}
 	}

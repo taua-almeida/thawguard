@@ -37,6 +37,25 @@ type freezeLifecycleOperations interface {
 	MarkRecomputed(ctx context.Context, id int64) (domain.BranchFreeze, error)
 }
 
+// materializedFreezeEnder ends an operator-thawed materialized freeze with
+// thaw-until-next-window suppression of its covering schedules. Implemented
+// by the schedule service; optional so freeze handling works without the
+// schedule subsystem in tests.
+type materializedFreezeEnder interface {
+	EndMaterializedFreeze(ctx context.Context, freezeID int64, actor domain.Actor) (domain.BranchFreeze, error)
+}
+
+// materializedFreezeReads are the freeze store reads the schedule
+// materializer needs; freeze.Service implements them, test fakes may not.
+type materializedFreezeReads interface {
+	GetActiveForBranch(ctx context.Context, repositoryID int64, branch string) (domain.BranchFreeze, bool, error)
+	ListActiveMaterialized(ctx context.Context) ([]domain.BranchFreeze, error)
+}
+
+type freezeGetter interface {
+	Get(ctx context.Context, id int64) (domain.BranchFreeze, error)
+}
+
 type openPullRequestBranchLister interface {
 	ListOpenByTargetBranch(ctx context.Context, repositoryID int64, targetBranch string) ([]domain.PullRequest, error)
 }
@@ -70,6 +89,11 @@ type freezeRecomputingStore struct {
 	statuses     sharedHeadStatusRunner
 	publisher    statusPublisher
 	convergence  enforcementConvergence
+	// scheduleEnder, when set, receives operator-driven ends of freezes that
+	// a recurring schedule materialized, so the end also suppresses the
+	// schedule until its next window instead of being re-frozen on the next
+	// materializer tick.
+	scheduleEnder materializedFreezeEnder
 }
 
 func newFreezeRecomputingStore(freezes freezeOperations, repositories recomputeRepositoryGetter, syncer openPullRequestSyncer, pullRequests openPullRequestBranchLister, statuses sharedHeadStatusRunner, publisher statusPublisher) *freezeRecomputingStore {
@@ -107,6 +131,15 @@ func (s *freezeRecomputingStore) End(ctx context.Context, id int64, actor domain
 	if s == nil || s.freezes == nil {
 		return domain.BranchFreeze{}, errors.New("freeze recomputing store has no freeze store")
 	}
+	if ended, handled, err := s.endThroughSchedule(ctx, id, actor); handled {
+		if err != nil {
+			return domain.BranchFreeze{}, err
+		}
+		if err := s.convergeFreeze(ctx, ended); err != nil {
+			return ended, err
+		}
+		return ended, nil
+	}
 	ended, err := s.freezes.End(ctx, id, actor)
 	if err != nil {
 		return domain.BranchFreeze{}, err
@@ -115,6 +148,70 @@ func (s *freezeRecomputingStore) End(ctx context.Context, id int64, actor domain
 		return ended, err
 	}
 	return ended, nil
+}
+
+// endThroughSchedule routes an operator's "End freeze" on a materialized row
+// through the schedule service so the covering schedules are suppressed until
+// their next window. handled is false for manual freezes, for missing rows
+// (plain End reports the proper error), or when the schedule subsystem is not
+// wired.
+func (s *freezeRecomputingStore) endThroughSchedule(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, bool, error) {
+	if s.scheduleEnder == nil {
+		return domain.BranchFreeze{}, false, nil
+	}
+	getter, ok := s.freezes.(freezeGetter)
+	if !ok {
+		return domain.BranchFreeze{}, false, nil
+	}
+	target, err := getter.Get(ctx, id)
+	if err != nil || target.ScheduleID == nil {
+		return domain.BranchFreeze{}, false, nil
+	}
+	ended, err := s.scheduleEnder.EndMaterializedFreeze(ctx, id, actor)
+	if err != nil {
+		return domain.BranchFreeze{}, true, err
+	}
+	return ended, true, nil
+}
+
+// EndMaterialized ends a schedule-materialized freeze because its coverage
+// lapsed. Unlike End it never routes through manual-end suppression: the
+// schedule itself stopped covering, so it must stay eligible to freeze again
+// at its next window.
+func (s *freezeRecomputingStore) EndMaterialized(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error) {
+	if s == nil || s.freezes == nil {
+		return domain.BranchFreeze{}, errors.New("freeze recomputing store has no freeze store")
+	}
+	ended, err := s.freezes.End(ctx, id, actor)
+	if err != nil {
+		return domain.BranchFreeze{}, err
+	}
+	if err := s.convergeFreeze(ctx, ended); err != nil {
+		return ended, err
+	}
+	return ended, nil
+}
+
+func (s *freezeRecomputingStore) GetActiveForBranch(ctx context.Context, repositoryID int64, branch string) (domain.BranchFreeze, bool, error) {
+	if s == nil || s.freezes == nil {
+		return domain.BranchFreeze{}, false, errors.New("freeze recomputing store has no freeze store")
+	}
+	reads, ok := s.freezes.(materializedFreezeReads)
+	if !ok {
+		return domain.BranchFreeze{}, false, errors.New("freeze store does not support materialized freeze reads")
+	}
+	return reads.GetActiveForBranch(ctx, repositoryID, branch)
+}
+
+func (s *freezeRecomputingStore) ListActiveMaterialized(ctx context.Context) ([]domain.BranchFreeze, error) {
+	if s == nil || s.freezes == nil {
+		return nil, errors.New("freeze recomputing store has no freeze store")
+	}
+	reads, ok := s.freezes.(materializedFreezeReads)
+	if !ok {
+		return nil, errors.New("freeze store does not support materialized freeze reads")
+	}
+	return reads.ListActiveMaterialized(ctx)
 }
 
 func (s *freezeRecomputingStore) Cancel(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error) {

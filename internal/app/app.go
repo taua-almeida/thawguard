@@ -20,6 +20,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/repository"
 	"github.com/taua-almeida/thawguard/internal/repositorysetup"
 	"github.com/taua-almeida/thawguard/internal/schedule"
+	"github.com/taua-almeida/thawguard/internal/scheduler"
 	"github.com/taua-almeida/thawguard/internal/secrets"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
 	setupforgejo "github.com/taua-almeida/thawguard/internal/setupcheck/forgejo"
@@ -87,6 +88,9 @@ func (a *App) Run(ctx context.Context) error {
 	convergence := newRuntimeConvergenceService(jobStore, enforcementService)
 	freezeStoreForWeb := newFreezeRecomputingStore(freezeStore, repositoryStore, openPullRequestSyncer, pullRequestStore, statusDecisionStore, statusPublisher)
 	freezeStoreForWeb.convergence = convergence
+	scheduleStore := schedule.NewService(database)
+	freezeStoreForWeb.scheduleEnder = scheduleStore
+	scheduleMaterializer := scheduler.NewMaterializer(scheduleStore, freezeStoreForWeb, scheduler.SystemClock{}, a.logger)
 	thawApprovalStore := newThawApprovalService(repositoryStore, repositorySetup, pullRequestStore, thawExceptionStore, freezeStore, statusDecisionStore, statusPublisher, openPullRequestSyncer, forgejoThawApprovalClientForRepository)
 	thawApprovalStore.convergence = convergence
 	pullRequestWebhookProcessor := webhook.NewPullRequestProcessor(repositoryStore, pullRequestStore, statusDecisionStore, statusPublisher)
@@ -101,7 +105,7 @@ func (a *App) Run(ctx context.Context) error {
 			SetupCheckRunner:                     setupCheckRunner,
 			FreezeStore:                          freezeStoreForWeb,
 			ScheduledFreezeStore:                 freezeStoreForWeb,
-			ScheduleStore:                        schedule.NewService(database),
+			ScheduleStore:                        scheduleStore,
 			AuditStore:                           auditStore,
 			ThawExceptionStore:                   thawExceptionStore,
 			StatusDecisionStore:                  thawApprovalStore,
@@ -120,7 +124,9 @@ func (a *App) Run(ctx context.Context) error {
 	}
 
 	errc := make(chan error, 1)
-	go newFreezeLifecycleRunner(freezeStoreForWeb, a.logger).Start(ctx)
+	lifecycleRunner := newFreezeLifecycleRunner(freezeStoreForWeb, a.logger)
+	lifecycleRunner.materializer = scheduleMaterializer
+	go lifecycleRunner.Start(ctx)
 	go newRepositoryReconciliationRunner(jobStore, enforcementService, a.logger).Start(ctx)
 	go func() {
 		a.logger.Info("starting thawguard", "addr", a.cfg.HTTPAddr, "db", a.cfg.DatabasePath, "public_url", a.cfg.PublicURL)

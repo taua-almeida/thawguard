@@ -1,9 +1,11 @@
 {{/*
-  pages/schedule-detail — one recurring schedule: its shell facts, the honest
-  empty coverage region (no rules or windows exist yet, and the page says so
-  instead of pretending), and the audited delete behind a confirm dialog.
-  Delete requires a freezer or repository-manager role and posts a plain form;
-  success redirects back to /scheduled-freezes with a notice toast.
+  pages/schedule-detail — one recurring schedule: its facts, activation state
+  (active schedules freeze their branch during covered windows; paused ones
+  never do), the coverage rules and preview, and the audited delete behind a
+  confirm dialog. Activate/Pause/Delete require a freezer or repository-manager
+  role and post plain forms; success redirects back with a notice toast. When
+  an operator manually ended the schedule's freeze, a callout shows the
+  suppressed-until time so the quiet branch is explained.
 */}}
 {{ define "pages/schedule-detail" }}
 <div class="flex flex-col gap-6">
@@ -13,17 +15,38 @@
       <div class="min-w-0">
         <div class="flex flex-wrap items-center gap-2.5">
           <h1 class="m-0 text-page-title font-bold text-text">{{ .Schedule.Name }}</h1>
+          {{ if .Schedule.Active }}
+          {{ template "ui/badge" dict "Label" "Active" "Tone" "success" }}
+          {{ else }}
           {{ template "ui/badge" dict "Label" "Paused" }}
+          {{ end }}
         </div>
         <p class="m-0 mt-1 font-mono text-sm text-text-muted">{{ .Schedule.RepositoryLabel }} &middot; {{ .Schedule.Branch }}</p>
       </div>
       {{ if or .CurrentUser.CanManageRepositories .CurrentUser.CanFreeze }}
-      {{ template "ui/button" dict "Label" "Delete schedule" "Variant" "danger" "DialogTarget" "schedule-delete-dialog" }}
+      <div class="flex flex-wrap items-center gap-2">
+        {{ if .Schedule.Active }}
+        <form method="post" action="{{ .Schedule.PauseAction }}" class="m-0">
+          <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+          {{ template "ui/button" dict "Label" "Pause schedule" "Variant" "secondary" "Type" "submit" }}
+        </form>
+        {{ else }}
+        <form method="post" action="{{ .Schedule.ActivateAction }}" class="m-0">
+          <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+          {{ template "ui/button" dict "Label" "Activate schedule" "Variant" "primary" "Type" "submit" }}
+        </form>
+        {{ end }}
+        {{ template "ui/button" dict "Label" "Delete schedule" "Variant" "danger" "DialogTarget" "schedule-delete-dialog" }}
+      </div>
       {{ end }}
     </div>
   </header>
 
+  {{ if not .Schedule.Active }}
   {{ template "ui/callout" dict "Tone" "info" "Body" "This schedule is paused. A paused schedule never freezes its branch." }}
+  {{ else if .Schedule.Suppressed }}
+  {{ template "ui/callout" dict "Tone" "warning" "Body" (printf "The freeze this schedule created was ended manually. It will not re-freeze this branch before %s." .Schedule.SuppressedUntil) }}
+  {{ end }}
 
   <section class="rounded-panel border border-border bg-surface p-(--card-spacing) shadow-card" aria-label="Schedule details">
     <h2 class="m-0 text-lg font-bold text-text">Details</h2>
@@ -117,7 +140,11 @@
         <h3 class="m-0 text-base font-bold text-text">Coverage preview</h3>
         <span class="text-xs text-text-muted">{{ .Preview.FromLabel }} &ndash; {{ .Preview.ToLabel }} &middot; {{ .Preview.TimezoneLabel }}</span>
       </div>
+      {{ if .Schedule.Active }}
+      <p class="m-0 mt-1 text-sm text-text-muted">When this schedule freezes its branch.</p>
+      {{ else }}
       <p class="m-0 mt-1 text-sm text-text-muted">A preview of when this schedule would freeze its branch. It is paused, so none of this happens yet.</p>
+      {{ end }}
       <div class="mt-4 grid grid-cols-7 gap-1.5">
         {{ range .Preview.Days }}
         <div>

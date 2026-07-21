@@ -126,7 +126,7 @@ func (s *Store) Get(ctx context.Context, id int64) (domain.Schedule, error) {
 		return domain.Schedule{}, errors.New("schedule store has no database")
 	}
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, repository_id, branch, name, kind, timezone, reason, active, created_by, created_by_kind, created_at, updated_at
+SELECT id, repository_id, branch, name, kind, timezone, reason, active, suppressed_until, created_by, created_by_kind, created_at, updated_at
 FROM schedules WHERE id = ?`, id)
 	schedule, err := scanSchedule(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -146,7 +146,7 @@ func (s *Store) List(ctx context.Context) ([]domain.Schedule, error) {
 		return nil, errors.New("schedule store has no database")
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, repository_id, branch, name, kind, timezone, reason, active, created_by, created_by_kind, created_at, updated_at
+SELECT id, repository_id, branch, name, kind, timezone, reason, active, suppressed_until, created_by, created_by_kind, created_at, updated_at
 FROM schedules ORDER BY repository_id, branch, name`)
 	if err != nil {
 		return nil, fmt.Errorf("list schedules: %w", err)
@@ -189,6 +189,91 @@ func (s *Store) Delete(ctx context.Context, id int64) (domain.Schedule, error) {
 		return domain.Schedule{}, ErrNotFound
 	}
 	return schedule, nil
+}
+
+// SetActive activates or pauses a schedule. Activation always clears
+// suppression: an operator who re-enables a schedule expects its windows to
+// apply again from now, not from a stale "thawed until" leftover.
+func (s *Store) SetActive(ctx context.Context, id int64, active bool) (domain.Schedule, error) {
+	if s == nil || s.db == nil {
+		return domain.Schedule{}, errors.New("schedule store has no database")
+	}
+	activeValue := 0
+	if active {
+		activeValue = 1
+	}
+	nowText := s.now().UTC().Format(sqliteTimestampFormat)
+	result, err := s.db.ExecContext(ctx, `
+UPDATE schedules
+SET active = ?, suppressed_until = NULL, updated_at = ?
+WHERE id = ? AND active != ?`, activeValue, nowText, id, activeValue)
+	if err != nil {
+		return domain.Schedule{}, fmt.Errorf("set schedule activation: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return domain.Schedule{}, fmt.Errorf("set schedule activation rows: %w", err)
+	}
+	if affected == 0 {
+		if _, err := s.Get(ctx, id); err != nil {
+			return domain.Schedule{}, err
+		}
+		if active {
+			return domain.Schedule{}, ValidationError{Message: "schedule is already active"}
+		}
+		return domain.Schedule{}, ValidationError{Message: "schedule is already paused"}
+	}
+	return s.Get(ctx, id)
+}
+
+// Suppress records that this schedule must not re-freeze its branch until
+// the given UTC instant, without touching its activation.
+func (s *Store) Suppress(ctx context.Context, id int64, until time.Time) (domain.Schedule, error) {
+	if s == nil || s.db == nil {
+		return domain.Schedule{}, errors.New("schedule store has no database")
+	}
+	nowText := s.now().UTC().Format(sqliteTimestampFormat)
+	result, err := s.db.ExecContext(ctx, `
+UPDATE schedules
+SET suppressed_until = ?, updated_at = ?
+WHERE id = ?`, until.UTC().Format(sqliteTimestampFormat), nowText, id)
+	if err != nil {
+		return domain.Schedule{}, fmt.Errorf("suppress schedule: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return domain.Schedule{}, fmt.Errorf("suppress schedule rows: %w", err)
+	}
+	if affected == 0 {
+		return domain.Schedule{}, ErrNotFound
+	}
+	return s.Get(ctx, id)
+}
+
+// ListActiveWeeklyCoverages returns every active weekly schedule paired with
+// its rules — the materializer's whole input. Schedules without rules are
+// skipped by ExpandCoverage, so they are returned as empty coverages rather
+// than filtered here.
+func (s *Store) ListActiveWeeklyCoverages(ctx context.Context) ([]Coverage, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("schedule store has no database")
+	}
+	schedules, err := s.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	coverages := make([]Coverage, 0)
+	for _, sched := range schedules {
+		if !sched.Active || sched.Kind != domain.ScheduleKindWeekly {
+			continue
+		}
+		rules, err := s.ListRules(ctx, sched.ID)
+		if err != nil {
+			return nil, err
+		}
+		coverages = append(coverages, Coverage{Schedule: sched, Rules: rules})
+	}
+	return coverages, nil
 }
 
 // Timezones returns the IANA zone names offered by the timezone select, UTC
@@ -302,13 +387,21 @@ func scanSchedule(row scanner) (domain.Schedule, error) {
 	var schedule domain.Schedule
 	var kind string
 	var active int64
+	var suppressedUntil sql.NullString
 	var createdBy sql.NullInt64
 	var createdAt, updatedAt string
-	if err := row.Scan(&schedule.ID, &schedule.RepositoryID, &schedule.Branch, &schedule.Name, &kind, &schedule.Timezone, &schedule.Reason, &active, &createdBy, &schedule.CreatedByKind, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&schedule.ID, &schedule.RepositoryID, &schedule.Branch, &schedule.Name, &kind, &schedule.Timezone, &schedule.Reason, &active, &suppressedUntil, &createdBy, &schedule.CreatedByKind, &createdAt, &updatedAt); err != nil {
 		return domain.Schedule{}, err
 	}
 	schedule.Kind = domain.ScheduleKind(kind)
 	schedule.Active = active != 0
+	if suppressedUntil.Valid {
+		parsed, err := time.Parse(sqliteTimestampFormat, suppressedUntil.String)
+		if err != nil {
+			return domain.Schedule{}, fmt.Errorf("parse schedule suppressed_until: %w", err)
+		}
+		schedule.SuppressedUntil = &parsed
+	}
 	if createdBy.Valid {
 		id := createdBy.Int64
 		schedule.CreatedByUserID = &id

@@ -37,6 +37,20 @@ func (s *Service) ListActive(ctx context.Context) ([]domain.BranchFreeze, error)
 	return NewStore(s.db).ListActive(ctx)
 }
 
+func (s *Service) GetActiveForBranch(ctx context.Context, repositoryID int64, branch string) (domain.BranchFreeze, bool, error) {
+	if s == nil || s.db == nil {
+		return domain.BranchFreeze{}, false, errors.New("freeze service has no database")
+	}
+	return NewStore(s.db).GetActiveForBranch(ctx, repositoryID, branch)
+}
+
+func (s *Service) ListActiveMaterialized(ctx context.Context) ([]domain.BranchFreeze, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("freeze service has no database")
+	}
+	return NewStore(s.db).ListActiveMaterialized(ctx)
+}
+
 func (s *Service) ListScheduled(ctx context.Context, limit int) ([]domain.BranchFreeze, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("freeze service has no database")
@@ -311,6 +325,22 @@ func (s *Service) close(ctx context.Context, id int64, actor domain.Actor, statu
 		}
 	}()
 
+	closed, err := CloseActiveTx(ctx, tx, id, actor, status)
+	if err != nil {
+		return domain.BranchFreeze{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.BranchFreeze{}, fmt.Errorf("commit freeze close: %w", err)
+	}
+	committed = true
+	return closed, nil
+}
+
+// CloseActiveTx closes an active freeze inside the caller's transaction with
+// the same commit unit Service.End uses: status change, audit event, and
+// reconciliation enqueue together. Exported so the schedule package can end a
+// materialized freeze atomically with its own schedule mutation.
+func CloseActiveTx(ctx context.Context, tx *sql.Tx, id int64, actor domain.Actor, status domain.BranchFreezeStatus) (domain.BranchFreeze, error) {
 	closed, err := NewStoreTx(tx).closeActive(ctx, CloseParams{ID: id, Status: status})
 	if err != nil {
 		return domain.BranchFreeze{}, err
@@ -321,11 +351,25 @@ func (s *Service) close(ctx context.Context, id int64, actor domain.Actor, statu
 	if _, err := jobs.NewStoreTx(tx).EnqueueReconciliation(ctx, closed.RepositoryID); err != nil {
 		return domain.BranchFreeze{}, err
 	}
-	if err := tx.Commit(); err != nil {
-		return domain.BranchFreeze{}, fmt.Errorf("commit freeze close: %w", err)
-	}
-	committed = true
 	return closed, nil
+}
+
+// CloseLinkedActiveTx ends the live freeze a schedule materialized, if one
+// exists, inside the caller's transaction. Pausing or deleting a schedule
+// uses it so the branch never stays frozen by a row nothing owns.
+func CloseLinkedActiveTx(ctx context.Context, tx *sql.Tx, scheduleID int64, actor domain.Actor) (domain.BranchFreeze, bool, error) {
+	live, ok, err := NewStoreTx(tx).ActiveForSchedule(ctx, scheduleID)
+	if err != nil {
+		return domain.BranchFreeze{}, false, err
+	}
+	if !ok {
+		return domain.BranchFreeze{}, false, nil
+	}
+	closed, err := CloseActiveTx(ctx, tx, live.ID, actor, domain.BranchFreezeStatusEnded)
+	if err != nil {
+		return domain.BranchFreeze{}, false, err
+	}
+	return closed, true, nil
 }
 
 func branchFreezeCreatedEvent(freeze domain.BranchFreeze, actor domain.Actor) audit.Event {
@@ -339,6 +383,9 @@ func branchFreezeCreatedEvent(freeze domain.BranchFreeze, actor domain.Actor) au
 	}
 	if freeze.PlannedEndsAt != nil {
 		details["planned_ends_at"] = freeze.PlannedEndsAt.UTC().Format(time.RFC3339Nano)
+	}
+	if freeze.ScheduleID != nil {
+		details["schedule_id"] = strconv.FormatInt(*freeze.ScheduleID, 10)
 	}
 	detailsJSON, err := json.Marshal(details)
 	if err != nil {
@@ -361,6 +408,9 @@ func branchFreezeClosedEvent(freeze domain.BranchFreeze, actor domain.Actor) aud
 		"branch":        freeze.Branch,
 		"status":        string(freeze.Status),
 		"reason":        freeze.Reason,
+	}
+	if freeze.ScheduleID != nil {
+		details["schedule_id"] = strconv.FormatInt(*freeze.ScheduleID, 10)
 	}
 	detailsJSON, err := json.Marshal(details)
 	if err != nil {
