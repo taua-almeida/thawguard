@@ -218,6 +218,22 @@ type Schedule struct {
 	UpdatedAt       time.Time
 }
 
+// ScheduleWeeklyRule is one weekly recurrence rule: a start weekday+time and
+// an end weekday+time, minutes precision, no date component. Weekdays use Go's
+// time.Weekday numbering (Sunday = 0). Comparing week-minutes
+// (weekday*1440 + minutes), an end at or before its start wraps into the
+// following week — that single convention encodes "Friday 16:00 → Monday
+// 08:00". The schedule's timezone is applied only at expansion time.
+type ScheduleWeeklyRule struct {
+	ID           int64
+	ScheduleID   int64
+	StartWeekday time.Weekday
+	StartTime    string
+	EndWeekday   time.Weekday
+	EndTime      string
+	CreatedAt    time.Time
+}
+
 type ThawException struct {
 	ID               int64
 	RepositoryID     int64

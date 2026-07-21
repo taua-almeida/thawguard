@@ -15,10 +15,14 @@ import (
 )
 
 type fakeScheduleStore struct {
-	schedules []domain.Schedule
-	created   []schedule.CreateParams
-	deleted   []int64
-	createErr error
+	schedules    []domain.Schedule
+	created      []schedule.CreateParams
+	deleted      []int64
+	createErr    error
+	rules        map[int64][]domain.ScheduleWeeklyRule
+	addedRules   []schedule.AddRulesParams
+	addRulesErr  error
+	removedRules []int64
 }
 
 func (s *fakeScheduleStore) List(ctx context.Context) ([]domain.Schedule, error) {
@@ -49,6 +53,55 @@ func (s *fakeScheduleStore) Delete(ctx context.Context, id int64, actor domain.A
 	}
 	s.deleted = append(s.deleted, id)
 	return item, nil
+}
+
+func (s *fakeScheduleStore) ListRules(ctx context.Context, scheduleID int64) ([]domain.ScheduleWeeklyRule, error) {
+	return s.rules[scheduleID], nil
+}
+
+func (s *fakeScheduleStore) AddRules(ctx context.Context, params schedule.AddRulesParams, actor domain.Actor) ([]domain.ScheduleWeeklyRule, error) {
+	if _, err := s.Get(ctx, params.ScheduleID); err != nil {
+		return nil, err
+	}
+	if s.addRulesErr != nil {
+		return nil, s.addRulesErr
+	}
+	s.addedRules = append(s.addedRules, params)
+	if s.rules == nil {
+		s.rules = map[int64][]domain.ScheduleWeeklyRule{}
+	}
+	added := make([]domain.ScheduleWeeklyRule, 0, len(params.Weekdays))
+	for i, weekday := range params.Weekdays {
+		end := weekday
+		switch params.EndDayMode {
+		case schedule.EndDayNext:
+			end = (weekday + 1) % 7
+		case schedule.EndDaySpecific:
+			end = params.EndWeekday
+		}
+		added = append(added, domain.ScheduleWeeklyRule{
+			ID:           int64(100 + len(s.rules[params.ScheduleID]) + i + 1),
+			ScheduleID:   params.ScheduleID,
+			StartWeekday: weekday,
+			StartTime:    params.StartTime,
+			EndWeekday:   end,
+			EndTime:      params.EndTime,
+		})
+	}
+	s.rules[params.ScheduleID] = append(s.rules[params.ScheduleID], added...)
+	return added, nil
+}
+
+func (s *fakeScheduleStore) DeleteRule(ctx context.Context, scheduleID, ruleID int64, actor domain.Actor) (domain.ScheduleWeeklyRule, error) {
+	rules := s.rules[scheduleID]
+	for i, rule := range rules {
+		if rule.ID == ruleID {
+			s.rules[scheduleID] = append(rules[:i:i], rules[i+1:]...)
+			s.removedRules = append(s.removedRules, ruleID)
+			return rule, nil
+		}
+	}
+	return domain.ScheduleWeeklyRule{}, schedule.ErrRuleNotFound
 }
 
 func scheduleTestServer(store *fakeScheduleStore) *Server {
@@ -206,6 +259,193 @@ func TestScheduleMutationsAllowAdminWithoutFreezerRole(t *testing.T) {
 	server.Routes().ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusSeeOther || len(store.deleted) != 1 || store.deleted[0] != 3 {
 		t.Fatalf("expected admin delete to succeed, status=%d deleted=%+v", recorder.Code, store.deleted)
+	}
+}
+
+func TestScheduleRuleAddAllowsFreezerRejectsViewerAndPreservesFormOnValidationError(t *testing.T) {
+	store := &fakeScheduleStore{schedules: []domain.Schedule{{ID: 3, RepositoryID: 1, Branch: "main", Name: "Nightly release lock", Kind: domain.ScheduleKindWeekly, Timezone: "America/Sao_Paulo"}}}
+	server := scheduleTestServer(store)
+
+	viewer := setWebSessionRoles(t, server, auth.RoleSet{auth.RoleViewer})
+	form := url.Values{"days": {"1", "2"}, "start_time": {"18:00"}, "end_time": {"08:00"}, "end_day_mode": {"next"}, "end_weekday": {"1"}, csrfFormField: {viewer.CSRFToken}}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/scheduled-freezes/schedules/3/rules", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: viewer.ID})
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden || len(store.addedRules) != 0 {
+		t.Fatalf("expected viewer rule add to be forbidden, status=%d added=%d", recorder.Code, len(store.addedRules))
+	}
+
+	freezer := setWebSessionRoles(t, server, auth.RoleSet{auth.RoleFreezer})
+	form.Set(csrfFormField, freezer.CSRFToken)
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPost, "/scheduled-freezes/schedules/3/rules", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: freezer.ID})
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != "/scheduled-freezes/schedules/3?notice=rules-added" {
+		t.Fatalf("expected rule add redirect, status=%d location=%q", recorder.Code, recorder.Header().Get("Location"))
+	}
+	if len(store.addedRules) != 1 {
+		t.Fatalf("expected one add-rules call, got %+v", store.addedRules)
+	}
+	params := store.addedRules[0]
+	if params.ScheduleID != 3 || len(params.Weekdays) != 2 || params.Weekdays[0] != time.Monday || params.Weekdays[1] != time.Tuesday ||
+		params.StartTime != "18:00" || params.EndTime != "08:00" || params.EndDayMode != schedule.EndDayNext {
+		t.Fatalf("unexpected add-rules params: %+v", params)
+	}
+
+	store.addRulesErr = schedule.ValidationError{Message: "an identical rule already exists on this schedule"}
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPost, "/scheduled-freezes/schedules/3/rules", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: freezer.ID})
+	server.Routes().ServeHTTP(recorder, request)
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected validation error re-render, status=%d", recorder.Code)
+	}
+	for _, want := range []string{"an identical rule already exists on this schedule", `value="18:00"`, `value="08:00"`, `value="1" checked`, `value="2" checked`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected validation re-render to contain %q, got %q", want, body)
+		}
+	}
+
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPost, "/scheduled-freezes/schedules/999/rules", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: freezer.ID})
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for rules on unknown schedule, got %d", recorder.Code)
+	}
+}
+
+func TestScheduleDetailRendersRulesAndPreview(t *testing.T) {
+	store := &fakeScheduleStore{
+		schedules: []domain.Schedule{{ID: 3, RepositoryID: 1, Branch: "main", Name: "Nightly release lock", Kind: domain.ScheduleKindWeekly, Timezone: "America/Sao_Paulo"}},
+		rules: map[int64][]domain.ScheduleWeeklyRule{3: {
+			{ID: 101, ScheduleID: 3, StartWeekday: time.Monday, StartTime: "18:00", EndWeekday: time.Tuesday, EndTime: "08:00"},
+		}},
+	}
+	server := scheduleTestServer(store)
+
+	recorder := httptest.NewRecorder()
+	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/scheduled-freezes/schedules/3", nil))
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected detail 200, got %d body=%q", recorder.Code, body)
+	}
+	for _, want := range []string{
+		"Mon 18:00 → Tue 08:00", "next day",
+		"/scheduled-freezes/schedules/3/rules/101/delete",
+		"Coverage preview", "none of this happens yet", "Freeze periods as text",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected detail body to contain %q, got %q", want, body)
+		}
+	}
+	if strings.Contains(body, "No weekly rules yet") {
+		t.Fatalf("expected the rules empty state to be replaced, got %q", body)
+	}
+}
+
+func TestScheduleRuleDeleteRedirectsAndUnknownRuleIs404(t *testing.T) {
+	store := &fakeScheduleStore{
+		schedules: []domain.Schedule{{ID: 3, RepositoryID: 1, Branch: "main", Name: "Nightly release lock", Kind: domain.ScheduleKindWeekly, Timezone: "UTC"}},
+		rules: map[int64][]domain.ScheduleWeeklyRule{3: {
+			{ID: 101, ScheduleID: 3, StartWeekday: time.Monday, StartTime: "18:00", EndWeekday: time.Tuesday, EndTime: "08:00"},
+		}},
+	}
+	server := scheduleTestServer(store)
+
+	viewer := setWebSessionRoles(t, server, auth.RoleSet{auth.RoleViewer})
+	form := url.Values{csrfFormField: {viewer.CSRFToken}}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/scheduled-freezes/schedules/3/rules/101/delete", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: viewer.ID})
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden || len(store.removedRules) != 0 {
+		t.Fatalf("expected viewer rule delete to be forbidden, status=%d removed=%d", recorder.Code, len(store.removedRules))
+	}
+
+	freezer := setWebSessionRoles(t, server, auth.RoleSet{auth.RoleFreezer})
+	form.Set(csrfFormField, freezer.CSRFToken)
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPost, "/scheduled-freezes/schedules/3/rules/999/delete", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: freezer.ID})
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown rule, got %d", recorder.Code)
+	}
+
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPost, "/scheduled-freezes/schedules/3/rules/101/delete", strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: freezer.ID})
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != "/scheduled-freezes/schedules/3?notice=rule-removed" {
+		t.Fatalf("expected rule delete redirect, status=%d location=%q", recorder.Code, recorder.Header().Get("Location"))
+	}
+	if len(store.removedRules) != 1 || store.removedRules[0] != 101 {
+		t.Fatalf("unexpected removed rules: %+v", store.removedRules)
+	}
+}
+
+func TestSchedulePreviewFromClipsBlocksPerDayAndKeepsTrueStartsInText(t *testing.T) {
+	sched := domain.Schedule{ID: 3, Name: "Nightly release lock", Kind: domain.ScheduleKindWeekly, Timezone: "UTC"}
+	rules := []domain.ScheduleWeeklyRule{{ID: 101, ScheduleID: 3, StartWeekday: time.Monday, StartTime: "18:00", EndWeekday: time.Tuesday, EndTime: "06:00"}}
+	// 2026-07-22 is a Wednesday: the window starts mid-week, after this
+	// week's Monday rule already ended.
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+
+	preview, err := schedulePreviewFrom(sched, rules, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(preview.Days) != 14 {
+		t.Fatalf("expected 14 preview days, got %d", len(preview.Days))
+	}
+	if !preview.Days[0].Today || preview.Days[0].NowPercent != "50.00" {
+		t.Fatalf("expected day 0 to be today at 50%%, got %+v", preview.Days[0])
+	}
+	// Mon Jul 27: block from 18:00 to midnight = left 75%, width 25%.
+	monday := preview.Days[5]
+	if monday.Label != "Mon 27" || len(monday.Blocks) != 1 || monday.Blocks[0].LeftPercent != "75.00" || monday.Blocks[0].WidthPercent != "25.00" {
+		t.Fatalf("unexpected Monday cell: %+v", monday)
+	}
+	// Tue Jul 28: continuation block from midnight to 06:00 = left 0%, width 25%.
+	tuesday := preview.Days[6]
+	if tuesday.Label != "Tue 28" || len(tuesday.Blocks) != 1 || tuesday.Blocks[0].LeftPercent != "0.00" || tuesday.Blocks[0].WidthPercent != "25.00" {
+		t.Fatalf("unexpected Tuesday cell: %+v", tuesday)
+	}
+	if len(preview.Segments) != 2 || preview.Segments[0] != "Mon 27 Jul 18:00 → Tue 28 Jul 06:00" {
+		t.Fatalf("unexpected segment text: %+v", preview.Segments)
+	}
+	if len(preview.Notes) != 0 {
+		t.Fatalf("expected no DST notes in a stable zone, got %+v", preview.Notes)
+	}
+}
+
+func TestSchedulePreviewFromReportsSpringForwardNote(t *testing.T) {
+	sched := domain.Schedule{ID: 3, Name: "Nightly release lock", Kind: domain.ScheduleKindWeekly, Timezone: "America/New_York"}
+	rules := []domain.ScheduleWeeklyRule{{ID: 101, ScheduleID: 3, StartWeekday: time.Sunday, StartTime: "02:30", EndWeekday: time.Sunday, EndTime: "06:00"}}
+	// Window covers Sunday 2026-03-08, when 02:30 EST does not exist.
+	now := time.Date(2026, 3, 4, 12, 0, 0, 0, time.UTC)
+
+	preview, err := schedulePreviewFrom(sched, rules, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(preview.Notes) != 1 || preview.Notes[0].Tone != "warning" {
+		t.Fatalf("expected one warning note, got %+v", preview.Notes)
+	}
+	want := "2026-03-08 02:30 does not exist (clocks move forward). Coverage starts at 03:00 that day."
+	if preview.Notes[0].Message != want {
+		t.Fatalf("expected note %q, got %q", want, preview.Notes[0].Message)
 	}
 }
 

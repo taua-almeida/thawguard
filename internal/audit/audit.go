@@ -41,6 +41,8 @@ const (
 	ActionFreezeSchedulePlannedUnfreeze      = "freeze_schedule.planned_unfreeze_executed"
 	ActionScheduleCreated                    = "schedule.created"
 	ActionScheduleDeleted                    = "schedule.deleted"
+	ActionScheduleRulesAdded                 = "schedule.rules_added"
+	ActionScheduleRuleRemoved                = "schedule.rule_removed"
 	ActionThawExceptionApproved              = "thaw_exception.approved"
 	ActionThawExceptionSharedHeadApproved    = "thaw_exception.shared_head_approved"
 	ActionUserRolesUpdated                   = "user.roles_updated"
@@ -91,6 +93,8 @@ func KnownActions() []string {
 		ActionFreezeSchedulePlannedUnfreeze,
 		ActionScheduleCreated,
 		ActionScheduleDeleted,
+		ActionScheduleRulesAdded,
+		ActionScheduleRuleRemoved,
 		ActionThawExceptionApproved,
 		ActionThawExceptionSharedHeadApproved,
 		ActionUserRolesUpdated,

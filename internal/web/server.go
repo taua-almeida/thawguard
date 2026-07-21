@@ -149,6 +149,9 @@ type ScheduleStore interface {
 	Get(ctx context.Context, id int64) (domain.Schedule, error)
 	Create(ctx context.Context, params schedule.CreateParams, actor domain.Actor) (domain.Schedule, error)
 	Delete(ctx context.Context, id int64, actor domain.Actor) (domain.Schedule, error)
+	ListRules(ctx context.Context, scheduleID int64) ([]domain.ScheduleWeeklyRule, error)
+	AddRules(ctx context.Context, params schedule.AddRulesParams, actor domain.Actor) ([]domain.ScheduleWeeklyRule, error)
+	DeleteRule(ctx context.Context, scheduleID, ruleID int64, actor domain.Actor) (domain.ScheduleWeeklyRule, error)
 }
 
 type AuditStore interface {
@@ -323,6 +326,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /scheduled-freezes/schedules/new", s.handleScheduleCreate)
 	s.mux.HandleFunc("GET /scheduled-freezes/schedules/{id}", s.handleScheduleDetail)
 	s.mux.HandleFunc("POST /scheduled-freezes/schedules/{id}/delete", s.handleScheduleDelete)
+	s.mux.HandleFunc("POST /scheduled-freezes/schedules/{id}/rules", s.handleScheduleRuleAdd)
+	s.mux.HandleFunc("POST /scheduled-freezes/schedules/{id}/rules/{ruleID}/delete", s.handleScheduleRuleDelete)
 	s.mux.HandleFunc("GET /decisions", s.handleDecisions)
 	s.mux.HandleFunc("GET /decisions/eligibility", s.handleThawEligibility)
 	s.mux.HandleFunc("POST /decisions", s.handleCreateDecision)
@@ -1966,6 +1971,8 @@ var activityActionDefinitions = map[string]activityActionDefinition{
 	audit.ActionFreezeSchedulePlannedUnfreeze:      {Label: "Scheduled planned unfreeze", Outcome: "Completed", OutcomeClass: "ok"},
 	audit.ActionScheduleCreated:                    {Label: "Recurring schedule", Outcome: "Created", OutcomeClass: "ok"},
 	audit.ActionScheduleDeleted:                    {Label: "Recurring schedule", Outcome: "Deleted", OutcomeClass: "warning"},
+	audit.ActionScheduleRulesAdded:                 {Label: "Recurring schedule", Outcome: "Rules added", OutcomeClass: "ok"},
+	audit.ActionScheduleRuleRemoved:                {Label: "Recurring schedule", Outcome: "Rule removed", OutcomeClass: "warning"},
 	audit.ActionThawExceptionApproved:              {Label: "Single-PR thaw", Outcome: "Approved", OutcomeClass: "ok"},
 	audit.ActionThawExceptionSharedHeadApproved:    {Label: "Shared-head thaw", Outcome: "Approved", OutcomeClass: "ok"},
 	audit.ActionUserRolesUpdated:                   {Label: "User roles", Outcome: "Changed", OutcomeClass: "frozen"},
@@ -2067,6 +2074,9 @@ func activityEventViewForEvent(repositories map[int64]domain.Repository, users m
 	case audit.ActionScheduleCreated, audit.ActionScheduleDeleted:
 		view.Target = activityRepositoryTarget(repositories, event, details, "branch")
 		view.Detail = "Schedule " + activityTextOrUnavailable(details, "name", 100) + " (" + activityTextOrUnavailable(details, "kind", 16) + ", " + activityTextOrUnavailable(details, "timezone", 64) + "). Reason: " + activityReasonOrUnavailable(details, "reason") + "."
+	case audit.ActionScheduleRulesAdded, audit.ActionScheduleRuleRemoved:
+		view.Target = activityRepositoryTarget(repositories, event, details, "branch")
+		view.Detail = "Schedule " + activityTextOrUnavailable(details, "name", 100) + ": " + activityTextOrUnavailable(details, "days", 40) + " " + activityTextOrUnavailable(details, "start_time", 5) + " → " + activityTextOrUnavailable(details, "end_time", 5) + " (" + activityTextOrUnavailable(details, "end_day", 16) + ")."
 	case audit.ActionThawExceptionApproved:
 		view.Target = activityPullRequestTarget(repositories, event, details)
 		view.Detail = "Branch " + activityTextOrUnavailable(details, "target_branch", 255) + "; head " + activityHeadOrUnavailable(details, "head_sha") + ". Reason: " + activityTextOrUnavailable(details, "reason", 500) + "."
