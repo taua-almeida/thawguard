@@ -1,0 +1,253 @@
+package auth
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"time"
+
+	"github.com/taua-almeida/thawguard/internal/audit"
+)
+
+// RepositoryGrant is one repository-scoped role held by a user.
+// GrantedByUserID is the live "added by" attribution and is nil when the
+// granting account was later deleted.
+type RepositoryGrant struct {
+	RepositoryID    int64
+	UserID          int64
+	Role            Role
+	GrantedByUserID *int64
+	GrantedAt       time.Time
+}
+
+type GrantRepositoryRoleParams struct {
+	ActorUserID  int64
+	RepositoryID int64
+	UserID       int64
+	Role         Role
+}
+
+type RevokeRepositoryRoleParams struct {
+	ActorUserID  int64
+	RepositoryID int64
+	UserID       int64
+	Role         Role
+}
+
+// GrantsForUser loads the repository-aware authorization model for one
+// user. Nothing consumes it on a live path yet; HTTP wiring happens at
+// cutover.
+func (s *Service) GrantsForUser(ctx context.Context, userID int64) (Grants, error) {
+	if s == nil || s.db == nil {
+		return Grants{}, errors.New("auth service has no database")
+	}
+	record, err := s.userByID(ctx, s.db, userID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Grants{}, ValidationError{Message: "user was not found"}
+		}
+		return Grants{}, err
+	}
+	scoped, err := scopedGrantsForUser(ctx, s.db, record.ID)
+	if err != nil {
+		return Grants{}, err
+	}
+	return NewGrants(record.Roles, scoped), nil
+}
+
+// GrantRepositoryRole atomically adds one repository-scoped role and its
+// audit event; an audit persistence failure rolls the grant back.
+func (s *Service) GrantRepositoryRole(ctx context.Context, params GrantRepositoryRoleParams) error {
+	if s == nil || s.db == nil {
+		return errors.New("auth service has no database")
+	}
+	if !params.Role.ValidForRepository() {
+		return ValidationError{Message: "role cannot be granted on a repository"}
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin repository grant: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := ensureRepositoryExists(ctx, tx, params.RepositoryID); err != nil {
+		return err
+	}
+	if _, err := s.userByID(ctx, tx, params.UserID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ValidationError{Message: "user was not found"}
+		}
+		return err
+	}
+
+	result, err := tx.ExecContext(ctx, `
+INSERT OR IGNORE INTO repository_grants(repository_id, user_id, role, granted_by_user_id, granted_at)
+VALUES (?, ?, ?, ?, ?)`, params.RepositoryID, params.UserID, params.Role, params.ActorUserID, s.now().UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return fmt.Errorf("create repository grant: %w", err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("created repository grant rows: %w", err)
+	}
+	if inserted == 0 {
+		return ValidationError{Message: "user already holds this role for the repository"}
+	}
+
+	event := repositoryGrantAuditEvent(audit.ActionRepositoryGrantAdded, params.ActorUserID, params.RepositoryID, params.UserID, params.Role)
+	if err := audit.NewStoreTx(tx).Record(ctx, event); err != nil {
+		return fmt.Errorf("record repository grant audit event: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit repository grant: %w", err)
+	}
+	return nil
+}
+
+// RevokeRepositoryRole atomically removes one repository-scoped role and
+// its audit event; an audit persistence failure rolls the revoke back.
+func (s *Service) RevokeRepositoryRole(ctx context.Context, params RevokeRepositoryRoleParams) error {
+	if s == nil || s.db == nil {
+		return errors.New("auth service has no database")
+	}
+	if !params.Role.ValidForRepository() {
+		return ValidationError{Message: "role cannot be granted on a repository"}
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin repository grant revoke: %w", err)
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx, `
+DELETE FROM repository_grants
+WHERE repository_id = ? AND user_id = ? AND role = ?`, params.RepositoryID, params.UserID, params.Role)
+	if err != nil {
+		return fmt.Errorf("revoke repository grant: %w", err)
+	}
+	removed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("revoked repository grant rows: %w", err)
+	}
+	if removed == 0 {
+		return ValidationError{Message: "grant was not found"}
+	}
+
+	event := repositoryGrantAuditEvent(audit.ActionRepositoryGrantRevoked, params.ActorUserID, params.RepositoryID, params.UserID, params.Role)
+	if err := audit.NewStoreTx(tx).Record(ctx, event); err != nil {
+		return fmt.Errorf("record repository grant revoke audit event: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit repository grant revoke: %w", err)
+	}
+	return nil
+}
+
+// ListRepositoryGrants returns every grant on one repository.
+func (s *Service) ListRepositoryGrants(ctx context.Context, repositoryID int64) ([]RepositoryGrant, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("auth service has no database")
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT repository_id, user_id, role, granted_by_user_id, granted_at
+FROM repository_grants
+WHERE repository_id = ?
+ORDER BY user_id, role`, repositoryID)
+	if err != nil {
+		return nil, fmt.Errorf("list repository grants: %w", err)
+	}
+	defer rows.Close()
+
+	grants := make([]RepositoryGrant, 0)
+	for rows.Next() {
+		var grant RepositoryGrant
+		var role string
+		var grantedBy sql.NullInt64
+		var grantedAt string
+		if err := rows.Scan(&grant.RepositoryID, &grant.UserID, &role, &grantedBy, &grantedAt); err != nil {
+			return nil, fmt.Errorf("scan repository grant: %w", err)
+		}
+		grant.Role = Role(role)
+		if grantedBy.Valid {
+			id := grantedBy.Int64
+			grant.GrantedByUserID = &id
+		}
+		parsedGrantedAt, err := time.Parse(time.RFC3339Nano, grantedAt)
+		if err != nil {
+			return nil, fmt.Errorf("parse repository grant granted_at: %w", err)
+		}
+		grant.GrantedAt = parsedGrantedAt
+		grants = append(grants, grant)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list repository grants rows: %w", err)
+	}
+	return grants, nil
+}
+
+// scopedGrantsForUser loads a user's repository-scoped roles. It is a plain
+// query with no audit side effect.
+func scopedGrantsForUser(ctx context.Context, q queryer, userID int64) (map[int64]RoleSet, error) {
+	rows, err := q.QueryContext(ctx, `
+SELECT repository_id, role
+FROM repository_grants
+WHERE user_id = ?`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("list user repository grants: %w", err)
+	}
+	defer rows.Close()
+
+	scoped := make(map[int64]RoleSet)
+	for rows.Next() {
+		var repositoryID int64
+		var role string
+		if err := rows.Scan(&repositoryID, &role); err != nil {
+			return nil, fmt.Errorf("scan user repository grant: %w", err)
+		}
+		scoped[repositoryID] = append(scoped[repositoryID], Role(role))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list user repository grants rows: %w", err)
+	}
+	return scoped, nil
+}
+
+func ensureRepositoryExists(ctx context.Context, q queryer, repositoryID int64) error {
+	if repositoryID <= 0 {
+		return ValidationError{Message: "repository was not found"}
+	}
+	var id int64
+	err := q.QueryRowContext(ctx, `SELECT id FROM repositories WHERE id = ?`, repositoryID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ValidationError{Message: "repository was not found"}
+	}
+	if err != nil {
+		return fmt.Errorf("find repository: %w", err)
+	}
+	return nil
+}
+
+func repositoryGrantAuditEvent(action string, actorUserID int64, repositoryID int64, userID int64, role Role) audit.Event {
+	details := map[string]string{
+		"actor_kind": "user",
+		"user_id":    strconv.FormatInt(userID, 10),
+		"role":       string(role),
+	}
+	detailsJSON, err := json.Marshal(details)
+	if err != nil {
+		detailsJSON = []byte(`{}`)
+	}
+	actor := actorUserID
+	return audit.Event{
+		ActorUserID: &actor,
+		Action:      action,
+		SubjectType: audit.SubjectTypeRepository,
+		SubjectID:   strconv.FormatInt(repositoryID, 10),
+		DetailsJSON: string(detailsJSON),
+	}
+}

@@ -841,6 +841,144 @@ VALUES
 	}
 }
 
+func TestRepositoryGrantsMigrationCreatesEmptyTableAndPreservesLegacyRows(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-test.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	grantsIndex := migrationIndex(t, migrations, "0031_repository_grants.sql")
+	if err := ApplyMigrations(ctx, database, migrations[:grantsIndex]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO users(id, email, display_name, password_hash, role, created_at, updated_at)
+VALUES (401, 'admin@example.test', 'Admin', 'hash', 'admin', '2026-07-20T10:00:00.000000000Z', '2026-07-20T10:00:00.000000000Z');
+INSERT INTO user_roles(user_id, role, created_at)
+VALUES (401, 'admin', '2026-07-20T10:00:00.000000000Z'), (401, 'freezer', '2026-07-20T10:00:00.000000000Z');`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+		t.Fatal(err)
+	}
+	var grantCount int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM repository_grants`).Scan(&grantCount); err != nil {
+		t.Fatal(err)
+	}
+	if grantCount != 0 {
+		t.Fatalf("expected repository_grants to start empty with no backfill, got %d rows", grantCount)
+	}
+	var storedRole string
+	if err := database.QueryRowContext(ctx, `SELECT role FROM users WHERE id = 401`).Scan(&storedRole); err != nil {
+		t.Fatal(err)
+	}
+	if storedRole != "admin" {
+		t.Fatalf("expected users.role to survive unchanged, got %q", storedRole)
+	}
+	assertUserRoles(t, database, 401, []string{"admin", "freezer"})
+	var indexCount int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_repository_grants_user_id'`).Scan(&indexCount); err != nil {
+		t.Fatal(err)
+	}
+	if indexCount != 1 {
+		t.Fatalf("expected user_id index on repository_grants, got %d", indexCount)
+	}
+
+	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+		t.Fatal(err)
+	}
+	var applied int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = '0031_repository_grants'`).Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected repository grants migration applied once, got %d", applied)
+	}
+}
+
+func TestRepositoryGrantsSchemaEnforcesRolesKeysAndCascades(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-test.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO users(id, email, display_name, password_hash, role, created_at, updated_at)
+VALUES
+  (501, 'admin@example.test', 'Admin', 'hash', 'admin', '2026-07-20T10:00:00.000000000Z', '2026-07-20T10:00:00.000000000Z'),
+  (502, 'lead@example.test', 'Lead', 'hash', 'viewer', '2026-07-20T10:00:00.000000000Z', '2026-07-20T10:00:00.000000000Z');
+INSERT INTO repositories(id, forge, base_url, owner, name, default_branch, created_at, updated_at)
+VALUES
+  (601, 'forgejo', 'https://forge.example.test', 'taua-almeida', 'thawguard', 'main', '2026-07-20T10:00:00.000000000Z', '2026-07-20T10:00:00.000000000Z'),
+  (602, 'forgejo', 'https://forge.example.test', 'taua-almeida', 'other', 'main', '2026-07-20T10:00:00.000000000Z', '2026-07-20T10:00:00.000000000Z');`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO repository_grants(repository_id, user_id, role, granted_by_user_id, granted_at)
+VALUES (601, 502, 'admin', 501, '2026-07-20T10:00:00.000000000Z')`); err == nil {
+		t.Fatal("expected admin to be rejected as a repository role at the schema level")
+	}
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO repository_grants(repository_id, user_id, role, granted_by_user_id, granted_at)
+VALUES
+  (601, 502, 'freezer', 501, '2026-07-20T10:00:00.000000000Z'),
+  (602, 502, 'viewer', 501, '2026-07-20T10:00:00.000000000Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO repository_grants(repository_id, user_id, role, granted_by_user_id, granted_at)
+VALUES (601, 502, 'freezer', 501, '2026-07-20T11:00:00.000000000Z')`); err == nil {
+		t.Fatal("expected duplicate (repository, user, role) grant to violate the primary key")
+	}
+
+	if _, err := database.ExecContext(ctx, `DELETE FROM users WHERE id = 501`); err != nil {
+		t.Fatal(err)
+	}
+	var grantedBy sql.NullInt64
+	if err := database.QueryRowContext(ctx, `SELECT granted_by_user_id FROM repository_grants WHERE repository_id = 601 AND user_id = 502 AND role = 'freezer'`).Scan(&grantedBy); err != nil {
+		t.Fatal(err)
+	}
+	if grantedBy.Valid {
+		t.Fatalf("expected granter deletion to clear granted_by_user_id, got %d", grantedBy.Int64)
+	}
+
+	if _, err := database.ExecContext(ctx, `DELETE FROM repositories WHERE id = 602`); err != nil {
+		t.Fatal(err)
+	}
+	var remaining int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM repository_grants WHERE repository_id = 602`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("expected repository deletion to cascade its grants, got %d rows", remaining)
+	}
+
+	if _, err := database.ExecContext(ctx, `DELETE FROM users WHERE id = 502`); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM repository_grants`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("expected user deletion to cascade their grants, got %d rows", remaining)
+	}
+}
+
 func migrationIndex(t *testing.T, migrations []Migration, name string) int {
 	t.Helper()
 	for i, migration := range migrations {

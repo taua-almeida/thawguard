@@ -1984,6 +1984,8 @@ var activityActionDefinitions = map[string]activityActionDefinition{
 	audit.ActionRepositoryEnforcementRecovered:     {Label: "Enforcement recovery", Outcome: "Succeeded", OutcomeClass: "ok"},
 	audit.ActionRepositoryEnforcementRecoverFail:   {Label: "Enforcement recovery", Outcome: "Failed", OutcomeClass: "failed"},
 	audit.ActionRepositoryRuntimeConvergenceFail:   {Label: "Runtime convergence", Outcome: "Failed", OutcomeClass: "failed"},
+	audit.ActionRepositoryGrantAdded:               {Label: "Repository access", Outcome: "Granted", OutcomeClass: "ok"},
+	audit.ActionRepositoryGrantRevoked:             {Label: "Repository access", Outcome: "Revoked", OutcomeClass: "warning"},
 	audit.ActionBranchFreezeCreated:                {Label: "Branch freeze", Outcome: "Frozen", OutcomeClass: "frozen"},
 	audit.ActionBranchFreezeEnded:                  {Label: "Branch freeze", Outcome: "Lifted", OutcomeClass: "ok"},
 	audit.ActionBranchFreezeCancelled:              {Label: "Branch freeze", Outcome: "Cancelled", OutcomeClass: "warning"},
@@ -2134,6 +2136,12 @@ func activityEventViewForEvent(repositories map[int64]domain.Repository, users m
 	case audit.ActionUserPasswordReset:
 		view.Target = activityUserTarget(users, event.SubjectID)
 		view.Detail = "Temporary password set by an admin; all sessions revoked and a new password is required at next login."
+	case audit.ActionRepositoryGrantAdded:
+		view.Target = activityRepositoryTarget(repositories, event, details, "")
+		view.Detail = activityRolesOrUnavailable(details, "role") + " role granted to " + activityUserTarget(users, activityTextOrUnavailable(details, "user_id", 20)) + "."
+	case audit.ActionRepositoryGrantRevoked:
+		view.Target = activityRepositoryTarget(repositories, event, details, "")
+		view.Detail = activityRolesOrUnavailable(details, "role") + " role revoked from " + activityUserTarget(users, activityTextOrUnavailable(details, "user_id", 20)) + "."
 	default:
 		return fallbackActivityEventView(users, event, details, true)
 	}

@@ -2839,6 +2839,8 @@ func TestActivityMappingCoversCurrentFamilies(t *testing.T) {
 		{name: "enabled", action: audit.ActionUserEnabled, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{}`, outcome: "Enabled", contains: []string{"sessions were not restored"}},
 		{name: "password changed", action: audit.ActionUserPasswordChanged, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{}`, outcome: "Changed", contains: []string{"Self-service password change"}},
 		{name: "password reset", action: audit.ActionUserPasswordReset, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{}`, outcome: "Reset", contains: []string{"required at next login"}},
+		{name: "repository grant added", action: audit.ActionRepositoryGrantAdded, subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"user_id":"42","role":"freezer"}`, outcome: "Granted", contains: []string{"taua-almeida/thawguard", "Freezer role granted to Ada Operator (User #42)"}},
+		{name: "repository grant revoked", action: audit.ActionRepositoryGrantRevoked, subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"user_id":"42","role":"viewer"}`, outcome: "Revoked", contains: []string{"taua-almeida/thawguard", "Viewer role revoked from Ada Operator (User #42)"}},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
