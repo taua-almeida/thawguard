@@ -2,8 +2,9 @@
 <div class="flex flex-col gap-6">
   <header>
     <h1 class="m-0 text-page-title font-bold text-text">Scheduled Freezes</h1>
-    <p class="m-0 mt-1 text-sm text-text-muted">Create one-time freeze windows that activate later and can lift themselves at a planned unfreeze time.</p>
+    <p class="m-0 mt-1 text-sm text-text-muted">Plan freezes ahead of time: one-time windows that activate later, and named recurring schedules per branch.</p>
   </header>
   {{ template "components/scheduled-live" . }}
+  {{ template "components/schedules" . }}
 </div>
 {{ end }}

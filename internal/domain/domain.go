@@ -183,6 +183,41 @@ type BranchFreeze struct {
 	UpdatedAt       time.Time
 }
 
+// ScheduleKind is immutable after creation: changing it would silently
+// reinterpret every rule or window the schedule carries.
+type ScheduleKind string
+
+const (
+	ScheduleKindWeekly ScheduleKind = "weekly"
+	ScheduleKindDated  ScheduleKind = "dated"
+)
+
+func (k ScheduleKind) Valid() bool {
+	return k == ScheduleKindWeekly || k == ScheduleKindDated
+}
+
+// Schedule is a named recurring freeze schedule for one exact managed branch.
+// Timezone is a persisted IANA zone name — never a bare UTC offset — because
+// offsets change with DST while zone rules do not. A schedule with
+// Active == false never freezes anything.
+type Schedule struct {
+	ID           int64
+	RepositoryID int64
+	Branch       string
+	Name         string
+	Kind         ScheduleKind
+	Timezone     string
+	Reason       string
+	Active       bool
+	// CreatedByUserID survives user deletion as NULL (ON DELETE SET NULL);
+	// CreatedByKind keeps removed users distinguishable from actors that
+	// never had a user row, mirroring BranchFreeze.
+	CreatedByUserID *int64
+	CreatedByKind   string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
 type ThawException struct {
 	ID               int64
 	RepositoryID     int64

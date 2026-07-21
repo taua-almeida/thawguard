@@ -9,6 +9,11 @@ import (
 	"os/signal"
 	"syscall"
 
+	// Embed the IANA timezone database so schedule timezones resolve even in
+	// containers without /usr/share/zoneinfo (scratch, distroless). Without
+	// this, every time.LoadLocation call fails at runtime, not build time.
+	_ "time/tzdata"
+
 	"github.com/taua-almeida/thawguard/internal/app"
 	"github.com/taua-almeida/thawguard/internal/config"
 )

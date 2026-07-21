@@ -19,6 +19,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/pullrequest"
 	"github.com/taua-almeida/thawguard/internal/repository"
 	"github.com/taua-almeida/thawguard/internal/repositorysetup"
+	"github.com/taua-almeida/thawguard/internal/schedule"
 	"github.com/taua-almeida/thawguard/internal/secrets"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
 	setupforgejo "github.com/taua-almeida/thawguard/internal/setupcheck/forgejo"
@@ -100,6 +101,7 @@ func (a *App) Run(ctx context.Context) error {
 			SetupCheckRunner:                     setupCheckRunner,
 			FreezeStore:                          freezeStoreForWeb,
 			ScheduledFreezeStore:                 freezeStoreForWeb,
+			ScheduleStore:                        schedule.NewService(database),
 			AuditStore:                           auditStore,
 			ThawExceptionStore:                   thawExceptionStore,
 			StatusDecisionStore:                  thawApprovalStore,

@@ -39,6 +39,8 @@ const (
 	ActionFreezeScheduleActivated            = "freeze_schedule.activated"
 	ActionFreezeScheduleStartedNow           = "freeze_schedule.started_now"
 	ActionFreezeSchedulePlannedUnfreeze      = "freeze_schedule.planned_unfreeze_executed"
+	ActionScheduleCreated                    = "schedule.created"
+	ActionScheduleDeleted                    = "schedule.deleted"
 	ActionThawExceptionApproved              = "thaw_exception.approved"
 	ActionThawExceptionSharedHeadApproved    = "thaw_exception.shared_head_approved"
 	ActionUserRolesUpdated                   = "user.roles_updated"
@@ -48,6 +50,7 @@ const (
 	ActionUserPasswordReset                  = "user.password_reset"
 
 	SubjectTypeRepository    = "repository"
+	SubjectTypeSchedule      = "schedule"
 	SubjectTypeBranchFreeze  = "branch_freeze"
 	SubjectTypeThawException = "thaw_exception"
 	SubjectTypeUser          = "user"
@@ -86,6 +89,8 @@ func KnownActions() []string {
 		ActionFreezeScheduleActivated,
 		ActionFreezeScheduleStartedNow,
 		ActionFreezeSchedulePlannedUnfreeze,
+		ActionScheduleCreated,
+		ActionScheduleDeleted,
 		ActionThawExceptionApproved,
 		ActionThawExceptionSharedHeadApproved,
 		ActionUserRolesUpdated,

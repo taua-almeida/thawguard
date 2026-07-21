@@ -66,7 +66,9 @@ func activityFilterActions(filter string) []string {
 		sort.Strings(actions)
 		return actions
 	case "freeze":
-		return activityActionsWithPrefix("branch_freeze.", "freeze_schedule.", "thaw_exception.")
+		// "schedule." is matched from the string start, so it does not
+		// double-count the "freeze_schedule." one-time window actions.
+		return activityActionsWithPrefix("branch_freeze.", "freeze_schedule.", "schedule.", "thaw_exception.")
 	case "repositories":
 		return activityActionsWithPrefix("repository.")
 	case "users":

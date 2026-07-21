@@ -1,0 +1,40 @@
+{{/*
+  components/schedules — the recurring-schedule shell region under the
+  scheduled windows list. Static full-page region: it sits outside the
+  #scheduled-live htmx swap target on purpose, so window mutations never
+  re-render it. Every card carries the "Paused" truth — shells never freeze
+  anything. Hidden entirely when no ScheduleStore is wired (ShowSchedules).
+*/}}
+{{ define "components/schedules" }}
+{{ if .ShowSchedules }}
+<section class="flex flex-col gap-3" aria-label="Recurring schedules">
+  <div class="flex flex-wrap items-center justify-between gap-3">
+    <div>
+      <h2 class="m-0 text-lg font-bold text-text">Recurring schedules</h2>
+      <p class="m-0 mt-1 text-sm text-text-muted">Named repeating freeze coverage per branch. A paused schedule never freezes anything.</p>
+    </div>
+    {{ if or .CurrentUser.CanManageRepositories .CurrentUser.CanFreeze }}
+    {{ template "ui/button" dict "Label" "New schedule" "Href" "/scheduled-freezes/schedules/new" "Variant" "secondary" "Icon" "tg-i-schedule" }}
+    {{ end }}
+  </div>
+  {{ if .Schedules }}
+  <ul class="m-0 grid list-none gap-4 p-0 sm:grid-cols-2 xl:grid-cols-3">
+    {{ range .Schedules }}
+    <li class="min-w-0">
+      <a href="{{ .DetailURL }}" class="flex h-full flex-col gap-2 rounded-panel border border-border bg-surface p-(--card-spacing) no-underline shadow-card transition-colors hover:border-border-strong">
+        <div class="flex items-start justify-between gap-2">
+          <span class="min-w-0 truncate text-sm font-bold text-text">{{ .Name }}</span>
+          {{ template "ui/badge" dict "Label" "Paused" }}
+        </div>
+        <p class="m-0 truncate font-mono text-xs text-text-muted">{{ .RepositoryLabel }} &middot; {{ .Branch }}</p>
+        <p class="m-0 text-xs text-text-muted">{{ .KindLabel }} &middot; {{ .TimezoneLabel }}</p>
+      </a>
+    </li>
+    {{ end }}
+  </ul>
+  {{ else }}
+  {{ template "ui/empty-state" dict "Title" "No recurring schedules" "Hint" "A recurring schedule names repeating freeze coverage for one repository branch — nightly, over weekends, or for a named shutdown. New schedules start paused, and a paused schedule never freezes anything." "Icon" "tg-i-schedule" }}
+  {{ end }}
+</section>
+{{ end }}
+{{ end }}

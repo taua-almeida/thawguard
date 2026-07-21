@@ -2800,6 +2800,9 @@ func TestActivityMappingCoversCurrentFamilies(t *testing.T) {
 		{name: "automatic schedule activation", action: audit.ActionFreezeScheduleActivated, subjectType: audit.SubjectTypeBranchFreeze, subjectID: "8", details: `{"repository_id":"1","branch":"release","starts_at":"2026-07-14T10:00:00Z","reason":"window"}`, outcome: "Started", contains: []string{"Started 2026-07-14 10:00 UTC"}},
 		{name: "start now", action: audit.ActionFreezeScheduleStartedNow, subjectType: audit.SubjectTypeBranchFreeze, subjectID: "8", details: `{"repository_id":"1","branch":"release","starts_at":"2026-07-13T10:00:00Z","planned_ends_at":"2026-07-14T13:00:00Z","reason":"window"}`, outcome: "Started", contains: []string{"planned unfreeze 2026-07-14 13:00 UTC"}},
 		{name: "planned unfreeze", action: audit.ActionFreezeSchedulePlannedUnfreeze, subjectType: audit.SubjectTypeBranchFreeze, subjectID: "8", details: `{"repository_id":"1","branch":"release","planned_ends_at":"2026-07-14T13:00:00Z","reason":"window"}`, outcome: "Completed", contains: []string{"Planned unfreeze 2026-07-14 13:00 UTC"}},
+		{name: "recurring schedule create", action: audit.ActionScheduleCreated, subjectType: audit.SubjectTypeSchedule, subjectID: "3", details: `{"repository_id":"1","branch":"main","name":"Nightly release lock","kind":"weekly","timezone":"America/Sao_Paulo","reason":"nightly deploy quiet hours"}`, outcome: "Created", contains: []string{"main", "Nightly release lock", "weekly", "America/Sao_Paulo", "nightly deploy quiet hours"}},
+		{name: "recurring schedule create without reason", action: audit.ActionScheduleCreated, subjectType: audit.SubjectTypeSchedule, subjectID: "3", details: `{"repository_id":"1","branch":"main","name":"Weekend lock","kind":"dated","timezone":"UTC","reason":""}`, outcome: "Created", contains: []string{"Weekend lock", "dated", "Reason: none."}},
+		{name: "recurring schedule delete", action: audit.ActionScheduleDeleted, subjectType: audit.SubjectTypeSchedule, subjectID: "3", details: `{"repository_id":"1","branch":"main","name":"Nightly release lock","kind":"weekly","timezone":"America/Sao_Paulo","reason":"nightly deploy quiet hours"}`, outcome: "Deleted", contains: []string{"Nightly release lock", "America/Sao_Paulo"}},
 		{name: "single thaw", action: audit.ActionThawExceptionApproved, subjectType: audit.SubjectTypeThawException, subjectID: "9", details: `{"repository_id":"1","pull_request_index":"42","target_branch":"main","head_sha":"abcdef1234567890","reason":"production fix"}`, outcome: "Approved", contains: []string{"PR #42", "abcdef123456", "production fix"}},
 		{name: "shared thaw", action: audit.ActionThawExceptionSharedHeadApproved, subjectType: audit.SubjectTypeThawException, subjectID: "1:abcdef", details: `{"repository_id":"1","created_pull_request_indexes":"42,43","already_covered_pull_request_indexes":"","created_pull_request_count":"2","already_covered_pull_request_count":"0","head_sha":"abcdef123456","reason":"shared fix"}`, outcome: "Approved", contains: []string{"shared head abcdef123456", "New exceptions: #42, #43", "Confirmation reason: shared fix"}},
 		{name: "roles", action: audit.ActionUserRolesUpdated, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"roles_before":"viewer","roles_after":"freezer,viewer"}`, outcome: "Changed", contains: []string{"Ada Operator (User #42)", "Viewer → Freezer, Viewer"}},
@@ -2928,7 +2931,7 @@ func TestActivityFilterActionsGroupKnownActions(t *testing.T) {
 		}
 	}
 	prefixes := map[string][]string{
-		"freeze":       {"branch_freeze.", "freeze_schedule.", "thaw_exception."},
+		"freeze":       {"branch_freeze.", "freeze_schedule.", "schedule.", "thaw_exception."},
 		"repositories": {"repository."},
 		"users":        {"user."},
 	}

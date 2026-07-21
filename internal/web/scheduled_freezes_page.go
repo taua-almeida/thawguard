@@ -82,10 +82,14 @@ type scheduledFreezesPageData struct {
 	FormError               string
 	ActionError             string
 	ScheduleForm            scheduledFreezeFormState
-	CSRFToken               string
-	CSRFField               string
-	RequiredContext         string
-	Toasts                  []toastView
+	// Schedules is the recurring-schedule shell region under the windows
+	// list; ShowSchedules hides it entirely when no ScheduleStore is wired.
+	Schedules       []scheduleCardView
+	ShowSchedules   bool
+	CSRFToken       string
+	CSRFField       string
+	RequiredContext string
+	Toasts          []toastView
 }
 
 // scheduledFreezesFragment is the htmx swap payload for scheduled-freeze
@@ -259,8 +263,10 @@ func (s *Server) scheduledFreezesPageData(repositories []domain.Repository, wind
 
 // loadScheduledFreezesPageData assembles the full /scheduled-freezes view
 // model for the requested filter and page, clamping an out-of-range page back
-// to the last one. Writes a 500 and returns ok=false on load failure.
-func (s *Server) loadScheduledFreezesPageData(w http.ResponseWriter, r *http.Request, state scheduledFreezePageState, session sessionState) (scheduledFreezesPageData, bool) {
+// to the last one. withSchedules loads the recurring-schedule region; fragment
+// renders pass false because their swap targets never include it. Writes a 500
+// and returns ok=false on load failure.
+func (s *Server) loadScheduledFreezesPageData(w http.ResponseWriter, r *http.Request, state scheduledFreezePageState, session sessionState, withSchedules bool) (scheduledFreezesPageData, bool) {
 	ctx := r.Context()
 	repositories, err := s.repositories(ctx)
 	if err != nil {
@@ -289,13 +295,23 @@ func (s *Server) loadScheduledFreezesPageData(w http.ResponseWriter, r *http.Req
 	}
 	currentUser := currentUserFromSession(session)
 	views := scheduledFreezeViews(repositories, windows, state)
-	return s.scheduledFreezesPageData(repositories, views, branchOptions, total, state, session.CSRFToken, currentUser), true
+	data := s.scheduledFreezesPageData(repositories, views, branchOptions, total, state, session.CSRFToken, currentUser)
+	if withSchedules && s.cfg.ScheduleStore != nil {
+		schedules, err := s.cfg.ScheduleStore.List(ctx)
+		if err != nil {
+			internalServerError(w)
+			return scheduledFreezesPageData{}, false
+		}
+		data.ShowSchedules = true
+		data.Schedules = scheduleCardViews(repositories, schedules)
+	}
+	return data, true
 }
 
 // renderScheduledFreezes loads live data and renders the full page with the
 // given status code (200 for views, 400 for non-HX validation errors).
 func (s *Server) renderScheduledFreezes(w http.ResponseWriter, r *http.Request, statusCode int, state scheduledFreezePageState, session sessionState) {
-	data, ok := s.loadScheduledFreezesPageData(w, r, state, session)
+	data, ok := s.loadScheduledFreezesPageData(w, r, state, session, true)
 	if !ok {
 		return
 	}
@@ -310,7 +326,7 @@ func (s *Server) renderScheduledFreezes(w http.ResponseWriter, r *http.Request, 
 // htmx swap payloads ("components/scheduled-live-fragment" for create,
 // "components/scheduled-windows-fragment" for list-only updates).
 func (s *Server) renderScheduledFreezesFragment(w http.ResponseWriter, r *http.Request, name string, state scheduledFreezePageState, session sessionState, toast *toastView) {
-	data, ok := s.loadScheduledFreezesPageData(w, r, state, session)
+	data, ok := s.loadScheduledFreezesPageData(w, r, state, session, false)
 	if !ok {
 		return
 	}

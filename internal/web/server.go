@@ -20,6 +20,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/jobs"
 	"github.com/taua-almeida/thawguard/internal/repository"
 	"github.com/taua-almeida/thawguard/internal/repositorysetup"
+	"github.com/taua-almeida/thawguard/internal/schedule"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
 	"github.com/taua-almeida/thawguard/internal/statuspublication"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
@@ -38,7 +39,10 @@ type Config struct {
 	SetupCheckRunner                     SetupCheckRunner
 	FreezeStore                          FreezeStore
 	ScheduledFreezeStore                 ScheduledFreezeStore
-	AuditStore                           AuditStore
+	// ScheduleStore backs the recurring-schedule shell pages; optional (the
+	// schedules region and routes degrade gracefully when absent).
+	ScheduleStore ScheduleStore
+	AuditStore    AuditStore
 	// ThawExceptionStore feeds the dashboard's active-thaws stat; optional
 	// (the stat degrades to zero when absent).
 	ThawExceptionStore          ThawExceptionStore
@@ -135,6 +139,16 @@ type ScheduledFreezeStore interface {
 	EditScheduled(ctx context.Context, params freeze.EditScheduleParams, actor domain.Actor) (domain.BranchFreeze, error)
 	CancelScheduled(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error)
 	StartScheduledNow(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error)
+}
+
+// ScheduleStore persists recurring freeze schedules. In this slice a schedule
+// is only its shell and is always created paused; nothing here starts or
+// lifts freezes.
+type ScheduleStore interface {
+	List(ctx context.Context) ([]domain.Schedule, error)
+	Get(ctx context.Context, id int64) (domain.Schedule, error)
+	Create(ctx context.Context, params schedule.CreateParams, actor domain.Actor) (domain.Schedule, error)
+	Delete(ctx context.Context, id int64, actor domain.Actor) (domain.Schedule, error)
 }
 
 type AuditStore interface {
@@ -304,6 +318,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /scheduled-freezes/edit", s.handleEditScheduledFreeze)
 	s.mux.HandleFunc("POST /scheduled-freezes/start-now", s.handleStartScheduledFreezeNow)
 	s.mux.HandleFunc("POST /scheduled-freezes/cancel", s.handleCancelScheduledFreeze)
+	// "GET .../new" wins over "GET .../{id}" by pattern specificity.
+	s.mux.HandleFunc("GET /scheduled-freezes/schedules/new", s.handleScheduleNew)
+	s.mux.HandleFunc("POST /scheduled-freezes/schedules/new", s.handleScheduleCreate)
+	s.mux.HandleFunc("GET /scheduled-freezes/schedules/{id}", s.handleScheduleDetail)
+	s.mux.HandleFunc("POST /scheduled-freezes/schedules/{id}/delete", s.handleScheduleDelete)
 	s.mux.HandleFunc("GET /decisions", s.handleDecisions)
 	s.mux.HandleFunc("GET /decisions/eligibility", s.handleThawEligibility)
 	s.mux.HandleFunc("POST /decisions", s.handleCreateDecision)
@@ -1381,6 +1400,8 @@ func (s *Server) handleScheduledFreezes(w http.ResponseWriter, r *http.Request) 
 		state.Notice = "Freeze started."
 	case "schedule-cancelled":
 		state.Notice, state.NoticeTone = "Scheduled freeze cancelled.", "info"
+	case "recurring-schedule-deleted":
+		state.Notice, state.NoticeTone = "Recurring schedule deleted.", "info"
 	}
 	if isHXRequest(r) {
 		// Filter chips and pagination links enhance to hx-get swaps of the
@@ -1943,6 +1964,8 @@ var activityActionDefinitions = map[string]activityActionDefinition{
 	audit.ActionFreezeScheduleActivated:            {Label: "Scheduled freeze", Outcome: "Started", OutcomeClass: "frozen"},
 	audit.ActionFreezeScheduleStartedNow:           {Label: "Scheduled freeze Start Now", Outcome: "Started", OutcomeClass: "frozen"},
 	audit.ActionFreezeSchedulePlannedUnfreeze:      {Label: "Scheduled planned unfreeze", Outcome: "Completed", OutcomeClass: "ok"},
+	audit.ActionScheduleCreated:                    {Label: "Recurring schedule", Outcome: "Created", OutcomeClass: "ok"},
+	audit.ActionScheduleDeleted:                    {Label: "Recurring schedule", Outcome: "Deleted", OutcomeClass: "warning"},
 	audit.ActionThawExceptionApproved:              {Label: "Single-PR thaw", Outcome: "Approved", OutcomeClass: "ok"},
 	audit.ActionThawExceptionSharedHeadApproved:    {Label: "Shared-head thaw", Outcome: "Approved", OutcomeClass: "ok"},
 	audit.ActionUserRolesUpdated:                   {Label: "User roles", Outcome: "Changed", OutcomeClass: "frozen"},
@@ -2041,6 +2064,9 @@ func activityEventViewForEvent(repositories map[int64]domain.Repository, users m
 	case audit.ActionFreezeScheduleActivated, audit.ActionFreezeScheduleStartedNow:
 		view.Target = activityRepositoryTarget(repositories, event, details, "branch")
 		view.Detail = "Started " + activityTimeOrUnavailable(details, "starts_at", false) + "; planned unfreeze " + activityTimeOrUnavailable(details, "planned_ends_at", true) + ". Reason: " + activityReasonOrUnavailable(details, "reason") + "."
+	case audit.ActionScheduleCreated, audit.ActionScheduleDeleted:
+		view.Target = activityRepositoryTarget(repositories, event, details, "branch")
+		view.Detail = "Schedule " + activityTextOrUnavailable(details, "name", 100) + " (" + activityTextOrUnavailable(details, "kind", 16) + ", " + activityTextOrUnavailable(details, "timezone", 64) + "). Reason: " + activityReasonOrUnavailable(details, "reason") + "."
 	case audit.ActionThawExceptionApproved:
 		view.Target = activityPullRequestTarget(repositories, event, details)
 		view.Detail = "Branch " + activityTextOrUnavailable(details, "target_branch", 255) + "; head " + activityHeadOrUnavailable(details, "head_sha") + ". Reason: " + activityTextOrUnavailable(details, "reason", 500) + "."

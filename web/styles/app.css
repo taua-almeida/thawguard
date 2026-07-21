@@ -32,6 +32,9 @@
 @source "../../internal/web/templates/components/scheduled-live.html";
 @source "../../internal/web/templates/components/scheduled-workbench.html";
 @source "../../internal/web/templates/components/scheduled-windows.html";
+@source "../../internal/web/templates/components/schedules.html";
+@source "../../internal/web/templates/pages/schedule-new.html";
+@source "../../internal/web/templates/pages/schedule-detail.html";
 @source "../../internal/web/templates/pages/decisions.html";
 @source "../../internal/web/templates/components/decisions-live.html";
 @source "../../internal/web/templates/components/decisions-workbench.html";
