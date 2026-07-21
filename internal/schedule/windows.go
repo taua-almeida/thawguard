@@ -64,21 +64,23 @@ ORDER BY starts_at, ends_at, name`, scheduleID)
 // AddWindow validates and inserts one named date window. A window that has
 // already ended is rejected — it would never freeze anything — but a window
 // whose start is already past is accepted: coverage begins immediately, and
-// the caller surfaces that as a note, not an error.
-func (s *Store) AddWindow(ctx context.Context, params AddWindowParams) (domain.ScheduleDatedWindow, error) {
+// the caller surfaces that as a note, not an error. The returned bool reports
+// that already-started fact, measured by the same clock reading the ended
+// check used, so the rejection and the note can never disagree.
+func (s *Store) AddWindow(ctx context.Context, params AddWindowParams) (domain.ScheduleDatedWindow, bool, error) {
 	if s == nil || s.db == nil {
-		return domain.ScheduleDatedWindow{}, errors.New("schedule store has no database")
+		return domain.ScheduleDatedWindow{}, false, errors.New("schedule store has no database")
 	}
 	params = normalizeAddWindowParams(params)
 	if err := validateAddWindowParams(params); err != nil {
-		return domain.ScheduleDatedWindow{}, err
+		return domain.ScheduleDatedWindow{}, false, err
 	}
 	schedule, err := s.Get(ctx, params.ScheduleID)
 	if err != nil {
-		return domain.ScheduleDatedWindow{}, err
+		return domain.ScheduleDatedWindow{}, false, err
 	}
 	if schedule.Kind != domain.ScheduleKindDated {
-		return domain.ScheduleDatedWindow{}, ValidationError{Message: "date windows can only be added to a dated schedule"}
+		return domain.ScheduleDatedWindow{}, false, ValidationError{Message: "date windows can only be added to a dated schedule"}
 	}
 	start, end, err := resolveWindowBounds(schedule, domain.ScheduleDatedWindow{
 		ScheduleID: schedule.ID,
@@ -86,26 +88,27 @@ func (s *Store) AddWindow(ctx context.Context, params AddWindowParams) (domain.S
 		EndsAt:     params.EndsAt,
 	})
 	if err != nil {
-		return domain.ScheduleDatedWindow{}, err
+		return domain.ScheduleDatedWindow{}, false, err
 	}
 	if !end.After(start) {
 		// The wall clocks were already ordered; only a DST transition swallowing
 		// the whole window can land here, and such a window covers nothing.
-		return domain.ScheduleDatedWindow{}, ValidationError{Message: "a window's end must be after its start"}
+		return domain.ScheduleDatedWindow{}, false, ValidationError{Message: "a window's end must be after its start"}
 	}
-	if !end.After(s.now()) {
-		return domain.ScheduleDatedWindow{}, ValidationError{Message: "this window has already ended, so it would never freeze anything"}
+	now := s.now()
+	if !end.After(now) {
+		return domain.ScheduleDatedWindow{}, false, ValidationError{Message: "this window has already ended, so it would never freeze anything"}
 	}
+	alreadyStarted := !start.After(now)
 
-	nowText := s.now().UTC().Format(sqliteTimestampFormat)
 	_, err = s.db.ExecContext(ctx, `
 INSERT INTO schedule_dated_windows(schedule_id, name, starts_at, ends_at, created_at)
-VALUES (?, ?, ?, ?, ?)`, params.ScheduleID, params.Name, params.StartsAt, params.EndsAt, nowText)
+VALUES (?, ?, ?, ?, ?)`, params.ScheduleID, params.Name, params.StartsAt, params.EndsAt, now.UTC().Format(sqliteTimestampFormat))
 	if err != nil {
 		if isDuplicateWindowError(err) {
-			return domain.ScheduleDatedWindow{}, ValidationError{Message: "a window with this name already exists on this schedule"}
+			return domain.ScheduleDatedWindow{}, false, ValidationError{Message: "a window with this name already exists on this schedule"}
 		}
-		return domain.ScheduleDatedWindow{}, fmt.Errorf("add schedule window: %w", err)
+		return domain.ScheduleDatedWindow{}, false, fmt.Errorf("add schedule window: %w", err)
 	}
 
 	row := s.db.QueryRowContext(ctx, `
@@ -113,9 +116,9 @@ SELECT id, schedule_id, name, starts_at, ends_at, created_at
 FROM schedule_dated_windows WHERE schedule_id = ? AND name = ?`, params.ScheduleID, params.Name)
 	window, err := scanWindow(row)
 	if err != nil {
-		return domain.ScheduleDatedWindow{}, fmt.Errorf("load added schedule window: %w", err)
+		return domain.ScheduleDatedWindow{}, false, fmt.Errorf("load added schedule window: %w", err)
 	}
-	return window, nil
+	return window, alreadyStarted, nil
 }
 
 // DeleteWindow hard-deletes one window and returns the deleted row so the

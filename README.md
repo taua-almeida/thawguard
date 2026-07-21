@@ -43,11 +43,13 @@ Each repository has an explicit list of managed branches: the exact branch names
 
 ## Scheduled freezes
 
-Scheduled freezes are one-time pending windows for an exact repository and managed branch. Admins and Freezers can edit a pending schedule's reason, future start time, and optional planned unfreeze; repository and branch remain immutable. Clearing the planned-unfreeze field removes it.
+Thawguard freezes branches on a schedule in two ways: one-time scheduled freezes and named recurring schedules. Recurring schedules freeze an exact managed branch repeatedly on weekly rules or manually entered dated windows, with an explicit persisted IANA timezone, defined daylight-saving behavior, optional reasons, and truthful scheduler attribution in forge status descriptions. Coverage is additive: a branch is frozen while any manual freeze, one-time schedule, or recurring schedule covers the current moment. See [`docs/scheduled-freezes.md`](docs/scheduled-freezes.md) for the full contract.
+
+One-time scheduled freezes are pending windows for an exact repository and managed branch. Admins and Freezers can edit a pending schedule's reason, future start time, and optional planned unfreeze; repository and branch remain immutable. Clearing the planned-unfreeze field removes it.
 
 **Start Now** activates a still-pending future schedule immediately when repository enforcement is active. It preserves any future planned unfreeze, synchronizes current open pull requests, evaluates shared heads across the repository, and publishes real `thawguard/freeze` statuses through the same durable convergence path as automatic due activation. A post-commit failure leaves the schedule active, marks enforcement unhealthy, and retains one bounded-backoff reconciliation job for current-state recovery.
 
-Only pending schedules can be edited, cancelled, or started now. Recurring schedules and schedule archive controls remain deferred.
+Only pending one-time schedules can be edited, cancelled, or started now. Schedule archive controls remain deferred.
 
 ## Roadmap and issue tracking
 
@@ -91,14 +93,14 @@ Current local pages:
 - `/login` and `/logout` local user session flow
 - `/repositories` repository setup form, enforcement state, managed branch scope, and read-only readiness evidence
 - `/freezes` immediate branch-freeze form and active list, with an optional planned unfreeze time (requires an enforcement-active repository)
-- `/scheduled-freezes` one-time scheduled freeze windows with pending edit, Start Now, cancellation, and optional planned unfreeze controls
+- `/scheduled-freezes` one-time scheduled freeze windows and named recurring schedules, with weekly rules, dated windows, per-schedule timezones, and activation/pause controls
 - `/decisions` immediate thaw approval; fetches the current PR head from the forge and scopes the thaw to that PR/head SHA (requires an enforcement-active repository)
 - `/activity` primary chronological audit history for recent operator and system changes, with actor, action, affected target, outcome, timestamp, and curated sanitized details
 - `/webhooks` secondary webhook delivery diagnostics with filters, verification state, and sanitized local processing outcomes
 - `/publications` secondary status-publication diagnostics for latest desired statuses and recent posted or failed attempts
 - `/users` admin-only local user and multi-role management
 
-Local users can hold one or more explicit role flags. Admin configures repositories/users/secrets, freezer performs freeze actions, thaw approver approves PR exceptions, and viewer is read-only. Admin or Freezer may edit a pending schedule or use Start Now; Admin still does not implicitly receive general freeze, cancellation, or thaw capability. If you bind beyond loopback after first-admin setup, keep Thawguard behind the network controls appropriate for your trusted team.
+Local users can hold one or more explicit role flags. Admin configures repositories/users/secrets, freezer performs freeze actions, thaw approver approves PR exceptions, and viewer is read-only. Admin or Freezer may edit a pending one-time schedule, use Start Now, or manage recurring schedules; Admin still does not implicitly receive general freeze, cancellation, or thaw capability. If you bind beyond loopback after first-admin setup, keep Thawguard behind the network controls appropriate for your trusted team.
 
 Activity and diagnostic pages render allowlisted, sanitized metadata only. They never display raw webhook payloads, request signatures or headers, secrets, tokens, passwords or hashes, raw forge response bodies, or session IDs. Activity retention, deep-history pagination, export, and deletion remain deferred.
 

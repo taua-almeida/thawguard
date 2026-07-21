@@ -141,12 +141,13 @@ func (s *fakeScheduleStore) ListWindows(ctx context.Context, scheduleID int64) (
 	return s.windows[scheduleID], nil
 }
 
-func (s *fakeScheduleStore) AddWindow(ctx context.Context, params schedule.AddWindowParams, actor domain.Actor) (domain.ScheduleDatedWindow, error) {
-	if _, err := s.Get(ctx, params.ScheduleID); err != nil {
-		return domain.ScheduleDatedWindow{}, err
+func (s *fakeScheduleStore) AddWindow(ctx context.Context, params schedule.AddWindowParams, actor domain.Actor) (domain.ScheduleDatedWindow, bool, error) {
+	sched, err := s.Get(ctx, params.ScheduleID)
+	if err != nil {
+		return domain.ScheduleDatedWindow{}, false, err
 	}
 	if s.addWindowErr != nil {
-		return domain.ScheduleDatedWindow{}, s.addWindowErr
+		return domain.ScheduleDatedWindow{}, false, s.addWindowErr
 	}
 	s.addedWindows = append(s.addedWindows, params)
 	if s.windows == nil {
@@ -160,7 +161,11 @@ func (s *fakeScheduleStore) AddWindow(ctx context.Context, params schedule.AddWi
 		EndsAt:     params.EndsAt,
 	}
 	s.windows[params.ScheduleID] = append(s.windows[params.ScheduleID], added)
-	return added, nil
+	alreadyStarted := false
+	if start, _, err := schedule.WindowBounds(sched, added); err == nil && !start.After(time.Now()) {
+		alreadyStarted = true
+	}
+	return added, alreadyStarted, nil
 }
 
 func (s *fakeScheduleStore) DeleteWindow(ctx context.Context, scheduleID, windowID int64, actor domain.Actor) (domain.ScheduleDatedWindow, error) {

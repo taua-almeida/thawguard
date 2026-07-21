@@ -4,14 +4,16 @@ Thawguard is a pre-alpha self-hosted branch-freeze controller for trusted teams.
 
 GitHub is the [canonical issue tracker](https://github.com/taua-almeida/thawguard/issues), with a [pinned roadmap discussion](https://github.com/taua-almeida/thawguard/issues/7). The [Codeberg repository](https://codeberg.org/taua-almeida/thawguard) mirrors the source and this versioned roadmap without maintaining a duplicate issue backlog.
 
-## Now: Scheduled Freezes v2
+## Shipped: Scheduled Freezes v2
 
-- Add [named recurring weekly freeze windows](https://github.com/taua-almeida/thawguard/issues/2).
-- Store and display an explicit timezone for every recurring schedule.
-- Define daylight-saving behavior for skipped and repeated local times.
-- [Make freeze reasons optional and improve status descriptions](https://github.com/taua-almeida/thawguard/issues/4).
-- Include truthful schedule, reason, and actor context in forge-facing status descriptions within provider limits.
-- Add holiday-date handling after the weekly recurrence contract is stable.
+Documented in [docs/scheduled-freezes.md](docs/scheduled-freezes.md).
+
+- [Named recurring weekly freeze windows](https://github.com/taua-almeida/thawguard/issues/2), with rules that may wrap across the week boundary.
+- An explicit persisted IANA timezone for every recurring schedule, stored and displayed by zone name.
+- Defined daylight-saving behavior: skipped local times resolve past the gap, repeated local times resolve so coverage is never shortened.
+- [Optional freeze reasons and improved status descriptions](https://github.com/taua-almeida/thawguard/issues/4).
+- Truthful schedule, reason, and actor context in forge-facing status descriptions within provider limits.
+- Named dated freeze windows entered manually on a dated schedule; there is no bundled holiday calendar, and month/year recurrence is not implemented.
 
 ## Next: Organization readiness
 

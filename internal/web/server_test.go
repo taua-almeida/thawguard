@@ -4745,3 +4745,143 @@ func TestDevPreviewWebhooksRequiresDevMode(t *testing.T) {
 		t.Fatalf("expected filtered empty dev preview webhooks to show the filtered empty state, got %q", recorder.Body.String())
 	}
 }
+
+func TestDevPreviewScheduledFreezesRequiresDevMode(t *testing.T) {
+	// Without DevMode the route is never registered and the handler re-checks
+	// the flag, mirroring the other preview pages.
+	prod := NewServer(Config{AppName: "Thawguard"})
+	recorder := httptest.NewRecorder()
+	prod.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dev/preview/scheduled-freezes", nil))
+	for _, leaked := range []string{"Nightly deploy guard", "July maintenance shutdown", "dev-preview-fictional-token"} {
+		if strings.Contains(recorder.Body.String(), leaked) {
+			t.Fatalf("expected non-dev server not to serve preview fixture %q", leaked)
+		}
+	}
+	recorder = httptest.NewRecorder()
+	prod.handleDevPreviewScheduledFreezes(recorder, httptest.NewRequest(http.MethodGet, "/dev/preview/scheduled-freezes", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("expected dev preview scheduled-freezes handler to 404 without dev mode, got %d", recorder.Code)
+	}
+
+	dev := NewServer(Config{AppName: "Thawguard", DevMode: true})
+	recorder = httptest.NewRecorder()
+	dev.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dev/preview/scheduled-freezes", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected /dev/preview/scheduled-freezes to render in dev mode, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{
+		// Windows table across the status matrix.
+		"Aurora launch window", "Release-week hold", "Upcoming", "Cancelled",
+		// One card per schedule state, with the fixed-clock Next labels.
+		"Nightly deploy guard", "Next: Fri 18:00 → Sat 08:00",
+		"July maintenance shutdown", "Next: now → 17 Jul 14:00",
+		"Data-center move", "Next: 12 Aug 22:00",
+		"Weekend guard", "Next: — · no rules yet",
+		"Quarter-close freeze", "Next: — · no upcoming dates",
+		"America/Sao_Paulo (UTC-03:00)", "New schedule",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected dev preview scheduled-freezes to contain %q", want)
+		}
+	}
+
+	recorder = httptest.NewRecorder()
+	dev.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dev/preview/scheduled-freezes?role=viewer", nil))
+	if body := recorder.Body.String(); strings.Contains(body, "New schedule") {
+		t.Fatalf("expected viewer dev preview scheduled-freezes to hide the New schedule button")
+	}
+
+	recorder = httptest.NewRecorder()
+	dev.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dev/preview/scheduled-freezes?variant=empty", nil))
+	if body := recorder.Body.String(); !strings.Contains(body, "No recurring schedules") {
+		t.Fatalf("expected empty dev preview scheduled-freezes to show the schedules empty state")
+	}
+
+	recorder = httptest.NewRecorder()
+	dev.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dev/preview/scheduled-freezes?variant=no-schedules", nil))
+	if body := recorder.Body.String(); strings.Contains(body, "Recurring schedules") {
+		t.Fatalf("expected no-schedules dev preview scheduled-freezes to hide the schedules region")
+	}
+}
+
+func TestDevPreviewScheduleDetailRequiresDevMode(t *testing.T) {
+	prod := NewServer(Config{AppName: "Thawguard"})
+	recorder := httptest.NewRecorder()
+	prod.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dev/preview/schedule-detail", nil))
+	for _, leaked := range []string{"July maintenance shutdown", "Mid-July maintenance", "dev-preview-fictional-token"} {
+		if strings.Contains(recorder.Body.String(), leaked) {
+			t.Fatalf("expected non-dev server not to serve preview fixture %q", leaked)
+		}
+	}
+	recorder = httptest.NewRecorder()
+	prod.handleDevPreviewScheduleDetail(recorder, httptest.NewRequest(http.MethodGet, "/dev/preview/schedule-detail", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("expected dev preview schedule-detail handler to 404 without dev mode, got %d", recorder.Code)
+	}
+
+	dev := NewServer(Config{AppName: "Thawguard", DevMode: true})
+	recorder = httptest.NewRecorder()
+	dev.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dev/preview/schedule-detail", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected /dev/preview/schedule-detail to render in dev mode, got %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{
+		"July maintenance shutdown", "Special dates",
+		// Window rows: one already started, one future.
+		"Mid-July maintenance", "already started", "Anniversary freeze",
+		// Fixed-clock coverage preview: the strip renders and the in-progress
+		// window appears in the textual segment list.
+		"Coverage preview", "Fri 17 Jul 08:00 → Fri 17 Jul 14:00",
+		// Combined coverage with the weekly→dated naming handover and the
+		// current-schedule marker.
+		"Combined coverage on main", "Nightly deploy guard, then July maintenance shutdown", "this schedule",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected dev preview schedule-detail to contain %q", want)
+		}
+	}
+
+	recorder = httptest.NewRecorder()
+	dev.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dev/preview/schedule-detail?variant=weekly", nil))
+	body = recorder.Body.String()
+	for _, want := range []string{"Nightly deploy guard", "Mon 18:00 → Tue 08:00", "next day", "Combined coverage on main"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected weekly dev preview schedule-detail to contain %q", want)
+		}
+	}
+
+	recorder = httptest.NewRecorder()
+	dev.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dev/preview/schedule-detail?variant=weekly-empty", nil))
+	body = recorder.Body.String()
+	for _, want := range []string{"Weekend guard", "Add at least one rule before activating.", "This schedule is paused. A paused schedule never freezes its branch."} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected weekly-empty dev preview schedule-detail to contain %q", want)
+		}
+	}
+
+	recorder = httptest.NewRecorder()
+	dev.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dev/preview/schedule-detail?variant=empty", nil))
+	body = recorder.Body.String()
+	for _, want := range []string{"Quarter-close freeze", "Add at least one date window before activating.", "No upcoming windows"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected empty dev preview schedule-detail to contain %q", want)
+		}
+	}
+
+	recorder = httptest.NewRecorder()
+	dev.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dev/preview/schedule-detail?variant=form-error", nil))
+	body = recorder.Body.String()
+	for _, want := range []string{"this window has already ended, so it would never freeze anything", "Spring cleanup"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected form-error dev preview schedule-detail to contain %q", want)
+		}
+	}
+
+	recorder = httptest.NewRecorder()
+	dev.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dev/preview/schedule-detail?variant=suppressed", nil))
+	if body := recorder.Body.String(); !strings.Contains(body, "It will not re-freeze this branch before 2026-07-18 11:00 UTC.") {
+		t.Fatalf("expected suppressed dev preview schedule-detail to show the suppressed callout")
+	}
+}

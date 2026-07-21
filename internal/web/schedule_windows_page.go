@@ -103,7 +103,7 @@ func (s *Server) handleScheduleWindowAdd(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	form := scheduleWindowFormStateFromRequest(r)
-	added, err := s.cfg.ScheduleStore.AddWindow(r.Context(), schedule.AddWindowParams{
+	_, alreadyStarted, err := s.cfg.ScheduleStore.AddWindow(r.Context(), schedule.AddWindowParams{
 		ScheduleID: id,
 		Name:       form.Name,
 		StartsAt:   form.StartsAt,
@@ -111,12 +111,12 @@ func (s *Server) handleScheduleWindowAdd(w http.ResponseWriter, r *http.Request)
 	}, session.auditActor())
 	if err == nil {
 		// An accepted window whose start is already past gets the explicit
-		// "coverage begins immediately" notice instead of the plain one.
+		// "coverage begins immediately" notice instead of the plain one. The
+		// store decided that fact with the same clock reading that accepted
+		// the window, so the notice can never contradict the validation.
 		notice := "window-added"
-		if sched, getErr := s.cfg.ScheduleStore.Get(r.Context(), id); getErr == nil {
-			if start, _, boundsErr := schedule.WindowBounds(sched, added); boundsErr == nil && !start.After(time.Now()) {
-				notice = "window-added-started"
-			}
+		if alreadyStarted {
+			notice = "window-added-started"
 		}
 		http.Redirect(w, r, fmt.Sprintf("%s/%d?notice=%s", schedulesBasePath, id, notice), http.StatusSeeOther)
 		return

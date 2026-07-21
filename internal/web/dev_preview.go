@@ -9,6 +9,7 @@ import (
 
 	"github.com/taua-almeida/thawguard/internal/auth"
 	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/schedule"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
 	"github.com/taua-almeida/thawguard/internal/statuspublication"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
@@ -1262,4 +1263,294 @@ func (s *Server) handleDevPreviewUsers(w http.ResponseWriter, r *http.Request) {
 	data := usersPageDataFor(s.cfg.AppName, users, state, session)
 	data.Theme = devPreviewTheme(r)
 	s.renderPage(w, "layouts/users", data)
+}
+
+// devPreviewScheduleNow is the schedules-v2 fixtures' fixed clock: Friday
+// 2026-07-17 15:00 UTC, i.e. 12:00 in America/Sao_Paulo. Next labels, window
+// rows, the coverage preview, and the combined-coverage blocks all derive
+// from it, so those regions render the same states on every load.
+var devPreviewScheduleNow = time.Date(2026, time.July, 17, 15, 0, 0, 0, time.UTC)
+
+// devPreviewScheduleSet is the fictional schedules-v2 cast shared by the
+// scheduled-freezes overview and the schedule-detail preview. The weekly
+// guard and the dated shutdown share aurora/ice-station main, so the
+// combined-coverage section appears with naming handed from the weekly guard
+// to the shutdown at Sat 08:00 local; the paused pair exercises the
+// nothing-to-expand states.
+type devPreviewScheduleSet struct {
+	Weekly        domain.Schedule
+	WeeklyRules   []domain.ScheduleWeeklyRule
+	Dated         domain.Schedule
+	DatedWindows  []domain.ScheduleDatedWindow
+	FutureDated   domain.Schedule
+	FutureWindows []domain.ScheduleDatedWindow
+	PausedWeekly  domain.Schedule
+	PausedDated   domain.Schedule
+}
+
+func devPreviewScheduleFixtures() devPreviewScheduleSet {
+	created := time.Date(2026, time.June, 30, 9, 0, 0, 0, time.UTC)
+	set := devPreviewScheduleSet{
+		Weekly: domain.Schedule{
+			ID: 501, RepositoryID: 46, Branch: "main", Name: "Nightly deploy guard",
+			Kind: domain.ScheduleKindWeekly, Timezone: "America/Sao_Paulo",
+			Active: true, CreatedAt: created,
+		},
+		Dated: domain.Schedule{
+			ID: 502, RepositoryID: 46, Branch: "main", Name: "July maintenance shutdown",
+			Kind: domain.ScheduleKindDated, Timezone: "America/Sao_Paulo",
+			Reason: "Data-center maintenance", Active: true, CreatedAt: created.AddDate(0, 0, 8),
+		},
+		FutureDated: domain.Schedule{
+			ID: 503, RepositoryID: 47, Branch: "main", Name: "Data-center move",
+			Kind: domain.ScheduleKindDated, Timezone: "UTC",
+			Reason: "Rack migration cutover", Active: true, CreatedAt: created.AddDate(0, 0, 10),
+		},
+		PausedWeekly: domain.Schedule{
+			ID: 504, RepositoryID: 47, Branch: "main", Name: "Weekend guard",
+			Kind: domain.ScheduleKindWeekly, Timezone: "UTC", CreatedAt: created.AddDate(0, 0, 2),
+		},
+		PausedDated: domain.Schedule{
+			ID: 505, RepositoryID: 46, Branch: "release/1.8", Name: "Quarter-close freeze",
+			Kind: domain.ScheduleKindDated, Timezone: "America/Sao_Paulo", CreatedAt: created.AddDate(0, 0, 4),
+		},
+	}
+	set.WeeklyRules = []domain.ScheduleWeeklyRule{
+		{ID: 701, ScheduleID: 501, StartWeekday: time.Monday, StartTime: "18:00", EndWeekday: time.Tuesday, EndTime: "08:00", CreatedAt: created},
+		{ID: 702, ScheduleID: 501, StartWeekday: time.Wednesday, StartTime: "12:00", EndWeekday: time.Wednesday, EndTime: "14:00", CreatedAt: created},
+		{ID: 703, ScheduleID: 501, StartWeekday: time.Friday, StartTime: "18:00", EndWeekday: time.Saturday, EndTime: "08:00", CreatedAt: created},
+	}
+	set.DatedWindows = []domain.ScheduleDatedWindow{
+		// Started 08:00 local, four hours before the fixed clock: the detail
+		// row carries the "already started" marker and the overview card reads
+		// "Next: now → …".
+		{ID: 601, ScheduleID: 502, Name: "Mid-July maintenance", StartsAt: "2026-07-17T08:00", EndsAt: "2026-07-17T14:00", CreatedAt: created.AddDate(0, 0, 8)},
+		{ID: 602, ScheduleID: 502, Name: "Anniversary freeze", StartsAt: "2026-07-18T08:00", EndsAt: "2026-07-19T20:00", CreatedAt: created.AddDate(0, 0, 9)},
+	}
+	set.FutureWindows = []domain.ScheduleDatedWindow{
+		{ID: 603, ScheduleID: 503, Name: "Rack migration", StartsAt: "2026-08-12T22:00", EndsAt: "2026-08-13T06:00", CreatedAt: created.AddDate(0, 0, 10)},
+	}
+	return set
+}
+
+// handleDevPreviewScheduledFreezes renders the scheduled-freezes page from
+// fictional fixtures (GET /dev/preview/scheduled-freezes): the windows table
+// across all four statuses plus every recurring-schedule card state. Query
+// knobs: ?theme=dark|light, ?role=viewer, ?variant=empty|no-schedules.
+func (s *Server) handleDevPreviewScheduledFreezes(w http.ResponseWriter, r *http.Request) {
+	if !s.cfg.DevMode {
+		http.NotFound(w, r)
+		return
+	}
+	user := currentUserView{
+		Email:             "rana.kall@example.test",
+		DisplayName:       "Rana Kall",
+		RoleLabel:         "Freezer",
+		CanChangePassword: true,
+		CanFreeze:         true,
+	}
+	if r.URL.Query().Get("role") == "viewer" {
+		user = currentUserView{
+			Email:             "sten.hale@example.test",
+			DisplayName:       "Sten Hale",
+			RoleLabel:         "Viewer",
+			CanChangePassword: true,
+		}
+	}
+	repositories := []domain.Repository{
+		{ID: 46, Forge: "forgejo", BaseURL: "https://forge.example.test", Owner: "aurora", Name: "ice-station", DefaultBranch: "main", EnforcementState: domain.EnforcementActive},
+		{ID: 47, Forge: "codeberg", BaseURL: "https://codeberg.org", Owner: "borealis", Name: "frost-api", DefaultBranch: "main", EnforcementState: domain.EnforcementActive},
+	}
+	branchOptions := []managedBranchOption{
+		{RepositoryID: 46, Name: "main"},
+		{RepositoryID: 46, Name: "release/1.8"},
+		{RepositoryID: 47, Name: "main"},
+	}
+	at := func(year int, month time.Month, day, hour, minute int) *time.Time {
+		value := time.Date(year, month, day, hour, minute, 0, 0, time.UTC)
+		return &value
+	}
+	// scheduledFreezeViews reads the live clock for the Start-now affordances,
+	// so the upcoming rows start far enough out to stay upcoming; the closed
+	// rows are stable regardless.
+	freezes := []domain.BranchFreeze{
+		{ID: 401, RepositoryID: 46, Branch: "main", Status: domain.BranchFreezeStatusScheduled, Scheduled: true, Reason: "Aurora launch window", StartsAt: at(2026, time.December, 7, 6, 0), PlannedEndsAt: at(2026, time.December, 9, 18, 0)},
+		// No reason and no planned end: both placeholders on one row.
+		{ID: 402, RepositoryID: 47, Branch: "main", Status: domain.BranchFreezeStatusScheduled, Scheduled: true, StartsAt: at(2027, time.January, 11, 0, 0)},
+		// Deleted repository: the zero-value Repository blocks Start now with
+		// the enforcement reason and the row falls back to "Repository #17".
+		{ID: 403, RepositoryID: 17, Branch: "release/0.9", Status: domain.BranchFreezeStatusScheduled, Scheduled: true, Reason: "Window kept after the repository was disconnected", StartsAt: at(2026, time.December, 14, 6, 0)},
+		{ID: 400, RepositoryID: 46, Branch: "release/1.8", Status: domain.BranchFreezeStatusActive, Active: true, Scheduled: true, Reason: "Release-week hold", StartsAt: at(2026, time.July, 16, 6, 0), PlannedEndsAt: at(2026, time.August, 1, 6, 0)},
+		{ID: 398, RepositoryID: 46, Branch: "main", Status: domain.BranchFreezeStatusEnded, Scheduled: true, Reason: "June platform upgrade", StartsAt: at(2026, time.July, 1, 6, 0), EndsAt: at(2026, time.July, 3, 18, 0)},
+		// Cancelled with no EndsAt: the sub-line falls back to UpdatedAt.
+		{ID: 399, RepositoryID: 47, Branch: "main", Status: domain.BranchFreezeStatusCancelled, Scheduled: true, Reason: "Rolled into the July shutdown", StartsAt: at(2026, time.July, 8, 6, 0), UpdatedAt: time.Date(2026, time.July, 5, 9, 0, 0, 0, time.UTC)},
+	}
+	fixtures := devPreviewScheduleFixtures()
+	schedules := []domain.Schedule{fixtures.Weekly, fixtures.Dated, fixtures.FutureDated, fixtures.PausedWeekly, fixtures.PausedDated}
+	rulesBySchedule := map[int64][]domain.ScheduleWeeklyRule{fixtures.Weekly.ID: fixtures.WeeklyRules}
+	windowsBySchedule := map[int64][]domain.ScheduleDatedWindow{
+		fixtures.Dated.ID:       fixtures.DatedWindows,
+		fixtures.FutureDated.ID: fixtures.FutureWindows,
+	}
+	showSchedules := true
+	switch r.URL.Query().Get("variant") {
+	case "empty":
+		freezes = nil
+		schedules = nil
+	case "no-schedules":
+		// The unwired-ScheduleStore state: the whole region disappears.
+		showSchedules = false
+	}
+	state := scheduledFreezePageState{Query: scheduledFreezesQuery{Filter: "all", Page: 1}}
+	views := scheduledFreezeViews(repositories, freezes, state)
+	data := s.scheduledFreezesPageData(repositories, views, branchOptions, len(freezes), state, "dev-preview-fictional-token", user)
+	data.ShowSchedules = showSchedules
+	cards := scheduleCardViews(repositories, schedules)
+	for i, sched := range schedules {
+		cards[i].NextLabel = scheduleNextLabel(sched, rulesBySchedule[sched.ID], windowsBySchedule[sched.ID], devPreviewScheduleNow)
+	}
+	data.Schedules = cards
+	data.Theme = devPreviewTheme(r)
+	s.renderPage(w, "layouts/scheduled-freezes", data)
+}
+
+// handleDevPreviewScheduleDetail renders the schedule-detail page from
+// fictional fixtures (GET /dev/preview/schedule-detail). The default variant
+// is the active dated shutdown: an already-started window, a future window,
+// the coverage preview, and the combined-coverage section where naming hands
+// from the weekly peer to this schedule. Query knobs: ?theme=dark|light,
+// ?role=viewer, ?variant=weekly|weekly-empty|empty|form-error|suppressed.
+func (s *Server) handleDevPreviewScheduleDetail(w http.ResponseWriter, r *http.Request) {
+	if !s.cfg.DevMode {
+		http.NotFound(w, r)
+		return
+	}
+	user := currentUserView{
+		Email:             "rana.kall@example.test",
+		DisplayName:       "Rana Kall",
+		RoleLabel:         "Freezer",
+		CanChangePassword: true,
+		CanFreeze:         true,
+	}
+	if r.URL.Query().Get("role") == "viewer" {
+		user = currentUserView{
+			Email:             "sten.hale@example.test",
+			DisplayName:       "Sten Hale",
+			RoleLabel:         "Viewer",
+			CanChangePassword: true,
+		}
+	}
+	repositories := []domain.Repository{
+		{ID: 46, Forge: "forgejo", BaseURL: "https://forge.example.test", Owner: "aurora", Name: "ice-station", DefaultBranch: "main", EnforcementState: domain.EnforcementActive},
+		{ID: 47, Forge: "codeberg", BaseURL: "https://codeberg.org", Owner: "borealis", Name: "frost-api", DefaultBranch: "main", EnforcementState: domain.EnforcementActive},
+	}
+	fixtures := devPreviewScheduleFixtures()
+	now := devPreviewScheduleNow
+
+	sched := fixtures.Dated
+	variant := r.URL.Query().Get("variant")
+	switch variant {
+	case "weekly":
+		sched = fixtures.Weekly
+	case "weekly-empty":
+		sched = fixtures.PausedWeekly
+	case "empty":
+		sched = fixtures.PausedDated
+	}
+	var rules []domain.ScheduleWeeklyRule
+	var windows []domain.ScheduleDatedWindow
+	switch sched.ID {
+	case fixtures.Weekly.ID:
+		rules = fixtures.WeeklyRules
+	case fixtures.Dated.ID:
+		windows = fixtures.DatedWindows
+	}
+
+	forms := defaultScheduleDetailForms()
+	if variant == "form-error" {
+		forms.WindowForm = scheduleWindowFormState{Submitted: true, Name: "Spring cleanup", StartsAt: "2026-03-06T08:00", EndsAt: "2026-03-07T18:00"}
+		forms.WindowFormError = "this window has already ended, so it would never freeze anything"
+	}
+
+	view := scheduleDetailViewFrom(repositories, sched)
+	if variant == "suppressed" {
+		// Fixed strings instead of a real SuppressedUntil pointer so the
+		// suppressed state cannot expire as real time passes.
+		view.Suppressed = true
+		view.SuppressedUntil = "2026-07-18 11:00 UTC"
+		view.SuppressedUntilUTC = "2026-07-18T11:00:00Z"
+	}
+
+	// The assembly below mirrors scheduleDetailPageData without touching a
+	// store: rules/windows come from the fixtures, the clock is fixed.
+	data := scheduleDetailPageData{
+		AppName:           s.cfg.AppName,
+		PageTitle:         view.Name,
+		Theme:             devPreviewTheme(r),
+		ActivePage:        "scheduled",
+		CurrentUser:       user,
+		Schedule:          view,
+		RuleAddAction:     fmt.Sprintf("%s/%d/rules", schedulesBasePath, sched.ID),
+		RuleDayOptions:    scheduleRuleDayOptions(forms.RuleForm),
+		RuleEndDayOptions: scheduleRuleEndDayOptions(forms.RuleForm),
+		RuleForm:          forms.RuleForm,
+		RuleFormError:     forms.RuleFormError,
+		WindowAddAction:   fmt.Sprintf("%s/%d/windows", schedulesBasePath, sched.ID),
+		WindowForm:        forms.WindowForm,
+		WindowFormError:   forms.WindowFormError,
+		CSRFToken:         "dev-preview-fictional-token",
+		CSRFField:         csrfFormField,
+	}
+	switch sched.Kind {
+	case domain.ScheduleKindWeekly:
+		data.Rules = scheduleRuleViews(sched.ID, rules)
+		if len(rules) == 0 {
+			data.ActivateDisabledReason = "Add at least one rule before activating."
+		} else {
+			preview, err := schedulePreviewFrom(sched, schedule.Coverage{Schedule: sched, Rules: rules}, now)
+			if err != nil {
+				internalServerError(w)
+				return
+			}
+			data.HasPreview = true
+			data.Preview = preview
+		}
+	case domain.ScheduleKindDated:
+		if len(windows) == 0 {
+			data.ActivateDisabledReason = "Add at least one date window before activating."
+		}
+		upcoming, err := upcomingScheduleWindows(sched, windows, now)
+		if err != nil {
+			internalServerError(w)
+			return
+		}
+		data.Windows = scheduleWindowViews(sched, upcoming, now)
+		if len(upcoming) > 0 {
+			preview, err := schedulePreviewFrom(sched, schedule.Coverage{Schedule: sched, Windows: upcoming}, now)
+			if err != nil {
+				internalServerError(w)
+				return
+			}
+			data.HasPreview = true
+			data.Preview = preview
+		}
+	}
+	// Both fixture schedules on aurora/ice-station main are active, so the
+	// combined-coverage section appears whenever one of them is previewed —
+	// mirroring scheduleContext's "at least two active peers" rule.
+	if sched.Active && sched.RepositoryID == fixtures.Weekly.RepositoryID && sched.Branch == fixtures.Weekly.Branch {
+		peers := []domain.Schedule{fixtures.Weekly, fixtures.Dated}
+		coverages := []schedule.Coverage{
+			{Schedule: fixtures.Weekly, Rules: fixtures.WeeklyRules},
+			{Schedule: fixtures.Dated, Windows: fixtures.DatedWindows},
+		}
+		context, err := scheduleContextViewFrom(sched, peers, coverages, now)
+		if err != nil {
+			internalServerError(w)
+			return
+		}
+		data.HasContext = true
+		data.Context = context
+	}
+	s.renderPage(w, "layouts/schedule-detail", data)
 }

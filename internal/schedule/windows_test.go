@@ -17,7 +17,7 @@ func TestStoreAddWindowInsertsAndListsOrderedByStart(t *testing.T) {
 	created := createTestDatedSchedule(t, ctx, database)
 	store := NewStore(database)
 
-	later, err := store.AddWindow(ctx, AddWindowParams{
+	later, alreadyStarted, err := store.AddWindow(ctx, AddWindowParams{
 		ScheduleID: created.ID,
 		Name:       "New Year change lock",
 		StartsAt:   "2030-12-24T08:00",
@@ -26,10 +26,13 @@ func TestStoreAddWindowInsertsAndListsOrderedByStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if alreadyStarted {
+		t.Fatalf("expected a future window not to report already started")
+	}
 	if later.ID == 0 || later.ScheduleID != created.ID || later.StartsAt != "2030-12-24T08:00" || later.EndsAt != "2031-01-02T08:00" {
 		t.Fatalf("window not persisted as submitted: %+v", later)
 	}
-	earlier, err := store.AddWindow(ctx, AddWindowParams{
+	earlier, _, err := store.AddWindow(ctx, AddWindowParams{
 		ScheduleID: created.ID,
 		Name:       "Independence day",
 		StartsAt:   "2030-09-07T00:00",
@@ -89,7 +92,7 @@ func TestStoreAddWindowValidation(t *testing.T) {
 		}, "this window has already ended, so it would never freeze anything"},
 	}
 	for _, tc := range cases {
-		_, err := store.AddWindow(ctx, tc.mutate(valid))
+		_, _, err := store.AddWindow(ctx, tc.mutate(valid))
 		if !IsValidationError(err) {
 			t.Fatalf("%s: expected validation error, got %v", tc.name, err)
 		}
@@ -99,10 +102,10 @@ func TestStoreAddWindowValidation(t *testing.T) {
 	}
 
 	// The valid submission still passes after every rejection above.
-	if _, err := store.AddWindow(ctx, valid); err != nil {
+	if _, _, err := store.AddWindow(ctx, valid); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.AddWindow(ctx, valid); !IsValidationError(err) {
+	if _, _, err := store.AddWindow(ctx, valid); !IsValidationError(err) {
 		t.Fatalf("expected duplicate-name validation error, got %v", err)
 	} else if err.Error() != "a window with this name already exists on this schedule" {
 		t.Fatalf("unexpected duplicate message: %q", err.Error())
@@ -115,9 +118,10 @@ func TestStoreAddWindowAcceptsAlreadyStartedWindow(t *testing.T) {
 	created := createTestDatedSchedule(t, ctx, database)
 	store := NewStore(database)
 
-	// Started in 2020, ends in 2030: still coverable, so accepted. The
-	// "coverage begins immediately" note is the caller's concern.
-	window, err := store.AddWindow(ctx, AddWindowParams{
+	// Started in 2020, ends in 2030: still coverable, so accepted, and the
+	// same clock reading that accepted it reports it as already started so
+	// the caller can surface the "coverage begins immediately" note.
+	window, alreadyStarted, err := store.AddWindow(ctx, AddWindowParams{
 		ScheduleID: created.ID,
 		Name:       "Long maintenance moratorium",
 		StartsAt:   "2020-01-01T00:00",
@@ -129,6 +133,9 @@ func TestStoreAddWindowAcceptsAlreadyStartedWindow(t *testing.T) {
 	if window.ID == 0 {
 		t.Fatalf("window not persisted: %+v", window)
 	}
+	if !alreadyStarted {
+		t.Fatalf("expected an in-progress window to report already started")
+	}
 }
 
 func TestStoreAddWindowRequiresExistingDatedSchedule(t *testing.T) {
@@ -136,12 +143,12 @@ func TestStoreAddWindowRequiresExistingDatedSchedule(t *testing.T) {
 	database := newTestDB(t, ctx)
 	store := NewStore(database)
 
-	if _, err := store.AddWindow(ctx, AddWindowParams{ScheduleID: 999, Name: "Nowhere", StartsAt: "2030-12-24T08:00", EndsAt: "2031-01-02T08:00"}); !errors.Is(err, ErrNotFound) {
+	if _, _, err := store.AddWindow(ctx, AddWindowParams{ScheduleID: 999, Name: "Nowhere", StartsAt: "2030-12-24T08:00", EndsAt: "2031-01-02T08:00"}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 
 	weekly := createTestWeeklySchedule(t, ctx, database)
-	_, err := store.AddWindow(ctx, AddWindowParams{ScheduleID: weekly.ID, Name: "Wrong kind", StartsAt: "2030-12-24T08:00", EndsAt: "2031-01-02T08:00"})
+	_, _, err := store.AddWindow(ctx, AddWindowParams{ScheduleID: weekly.ID, Name: "Wrong kind", StartsAt: "2030-12-24T08:00", EndsAt: "2031-01-02T08:00"})
 	if !IsValidationError(err) || err.Error() != "date windows can only be added to a dated schedule" {
 		t.Fatalf("expected kind validation error, got %v", err)
 	}
@@ -154,7 +161,7 @@ func TestStoreDeleteWindowIsScopedToItsSchedule(t *testing.T) {
 	other := createTestDatedScheduleNamed(t, ctx, database, created.RepositoryID, "Other dated lock")
 	store := NewStore(database)
 
-	window, err := store.AddWindow(ctx, AddWindowParams{
+	window, _, err := store.AddWindow(ctx, AddWindowParams{
 		ScheduleID: created.ID,
 		Name:       "Year-end freeze",
 		StartsAt:   "2030-12-24T08:00",
@@ -189,7 +196,7 @@ func TestScheduleDeleteCascadesWindows(t *testing.T) {
 	created := createTestDatedSchedule(t, ctx, database)
 	store := NewStore(database)
 
-	if _, err := store.AddWindow(ctx, AddWindowParams{
+	if _, _, err := store.AddWindow(ctx, AddWindowParams{
 		ScheduleID: created.ID,
 		Name:       "Year-end freeze",
 		StartsAt:   "2030-12-24T08:00",
@@ -216,7 +223,7 @@ func TestServiceAddWindowRecordsOneAuditEventPerSubmission(t *testing.T) {
 	service := NewService(database)
 	actor := domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}
 
-	added, err := service.AddWindow(ctx, AddWindowParams{
+	added, _, err := service.AddWindow(ctx, AddWindowParams{
 		ScheduleID: created.ID,
 		Name:       "Year-end freeze",
 		StartsAt:   "2030-12-24T08:00",
@@ -246,7 +253,7 @@ func TestServiceRejectedWindowSubmissionRecordsNoAudit(t *testing.T) {
 	service := NewService(database)
 	actor := domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}
 
-	if _, err := service.AddWindow(ctx, AddWindowParams{ScheduleID: created.ID, Name: "Backwards", StartsAt: "2031-01-02T08:00", EndsAt: "2030-12-24T08:00"}, actor); !IsValidationError(err) {
+	if _, _, err := service.AddWindow(ctx, AddWindowParams{ScheduleID: created.ID, Name: "Backwards", StartsAt: "2031-01-02T08:00", EndsAt: "2030-12-24T08:00"}, actor); !IsValidationError(err) {
 		t.Fatalf("expected validation error, got %v", err)
 	}
 	events, err := audit.NewStore(database).List(ctx, 10)
@@ -276,7 +283,7 @@ func TestServiceActivateRequiresCoverageDefinition(t *testing.T) {
 		t.Fatalf("expected empty-dated activation rejection, got %v", err)
 	}
 
-	if _, err := NewStore(database).AddWindow(ctx, AddWindowParams{
+	if _, _, err := NewStore(database).AddWindow(ctx, AddWindowParams{
 		ScheduleID: dated.ID,
 		Name:       "Year-end freeze",
 		StartsAt:   "2030-12-24T08:00",

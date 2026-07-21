@@ -292,12 +292,16 @@ func (s *Service) ListWindows(ctx context.Context, scheduleID int64) ([]domain.S
 }
 
 // AddWindow records one audit event per form submission, mirroring AddRules:
-// one submitted window is a single operator action.
-func (s *Service) AddWindow(ctx context.Context, params AddWindowParams, actor domain.Actor) (domain.ScheduleDatedWindow, error) {
+// one submitted window is a single operator action. The bool passes through
+// the store's already-started determination so callers surface the
+// coverage-begins-immediately note from the same clock reading that accepted
+// the window.
+func (s *Service) AddWindow(ctx context.Context, params AddWindowParams, actor domain.Actor) (domain.ScheduleDatedWindow, bool, error) {
 	var added domain.ScheduleDatedWindow
+	var alreadyStarted bool
 	err := s.transact(ctx, func(store *Store, recorder *audit.Store) error {
 		var err error
-		if added, err = store.AddWindow(ctx, params); err != nil {
+		if added, alreadyStarted, err = store.AddWindow(ctx, params); err != nil {
 			return err
 		}
 		schedule, err := store.Get(ctx, params.ScheduleID)
@@ -311,9 +315,9 @@ func (s *Service) AddWindow(ctx context.Context, params AddWindowParams, actor d
 		return nil
 	})
 	if err != nil {
-		return domain.ScheduleDatedWindow{}, err
+		return domain.ScheduleDatedWindow{}, false, err
 	}
-	return added, nil
+	return added, alreadyStarted, nil
 }
 
 func (s *Service) DeleteWindow(ctx context.Context, scheduleID, windowID int64, actor domain.Actor) (domain.ScheduleDatedWindow, error) {

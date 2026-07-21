@@ -156,7 +156,7 @@ type ScheduleStore interface {
 	AddRules(ctx context.Context, params schedule.AddRulesParams, actor domain.Actor) ([]domain.ScheduleWeeklyRule, error)
 	DeleteRule(ctx context.Context, scheduleID, ruleID int64, actor domain.Actor) (domain.ScheduleWeeklyRule, error)
 	ListWindows(ctx context.Context, scheduleID int64) ([]domain.ScheduleDatedWindow, error)
-	AddWindow(ctx context.Context, params schedule.AddWindowParams, actor domain.Actor) (domain.ScheduleDatedWindow, error)
+	AddWindow(ctx context.Context, params schedule.AddWindowParams, actor domain.Actor) (domain.ScheduleDatedWindow, bool, error)
 	DeleteWindow(ctx context.Context, scheduleID, windowID int64, actor domain.Actor) (domain.ScheduleDatedWindow, error)
 }
 
@@ -365,6 +365,8 @@ func (s *Server) routes() {
 		s.mux.HandleFunc("GET /dev/preview/publications", s.handleDevPreviewPublications)
 		s.mux.HandleFunc("GET /dev/preview/webhooks", s.handleDevPreviewWebhooks)
 		s.mux.HandleFunc("GET /dev/preview/users", s.handleDevPreviewUsers)
+		s.mux.HandleFunc("GET /dev/preview/scheduled-freezes", s.handleDevPreviewScheduledFreezes)
+		s.mux.HandleFunc("GET /dev/preview/schedule-detail", s.handleDevPreviewScheduleDetail)
 	}
 }
 
