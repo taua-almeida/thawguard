@@ -32,6 +32,7 @@
         </div>
         <p class="m-0 truncate font-mono text-xs text-text-muted">{{ .RepositoryLabel }} &middot; {{ .Branch }}</p>
         <p class="m-0 text-xs text-text-muted">{{ .KindLabel }} &middot; {{ .TimezoneLabel }}</p>
+        {{ if .NextLabel }}<p class="m-0 font-mono text-xs text-text">{{ .NextLabel }}</p>{{ end }}
       </a>
     </li>
     {{ end }}

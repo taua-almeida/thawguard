@@ -303,7 +303,10 @@ func (s *Server) loadScheduledFreezesPageData(w http.ResponseWriter, r *http.Req
 			return scheduledFreezesPageData{}, false
 		}
 		data.ShowSchedules = true
-		data.Schedules = scheduleCardViews(repositories, schedules)
+		if data.Schedules, err = s.scheduleCardViewsWithNext(ctx, repositories, schedules); err != nil {
+			internalServerError(w)
+			return scheduledFreezesPageData{}, false
+		}
 	}
 	return data, true
 }

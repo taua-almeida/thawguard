@@ -175,7 +175,7 @@ func TestServiceRunLocalBlocksFrozenBranch(t *testing.T) {
 	if result.State != domain.CommitStatusFailure || result.Context != domain.RequiredStatusContext {
 		t.Fatalf("expected failure decision for frozen branch, got %+v", result)
 	}
-	if result.Description != "Branch is frozen; merge is blocked by Thawguard" {
+	if result.Description != "Branch is frozen; merge is blocked by Thawguard: release" {
 		t.Fatalf("unexpected description: %q", result.Description)
 	}
 }
@@ -265,7 +265,7 @@ func TestServiceRunForPullRequestBlocksChangedHeadAfterThaw(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.State != domain.CommitStatusFailure || result.Description != "Branch is frozen; merge is blocked by Thawguard" {
+	if result.State != domain.CommitStatusFailure || result.Description != "Branch is frozen; merge is blocked by Thawguard: release" {
 		t.Fatalf("expected changed head to ignore stale thaw, got %+v", result)
 	}
 }

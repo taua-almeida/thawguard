@@ -43,6 +43,8 @@ const (
 	ActionScheduleDeleted                    = "schedule.deleted"
 	ActionScheduleRulesAdded                 = "schedule.rules_added"
 	ActionScheduleRuleRemoved                = "schedule.rule_removed"
+	ActionScheduleWindowAdded                = "schedule.window_added"
+	ActionScheduleWindowRemoved              = "schedule.window_removed"
 	ActionScheduleActivated                  = "schedule.activated"
 	ActionSchedulePaused                     = "schedule.paused"
 	ActionScheduleSuppressed                 = "schedule.suppressed"
@@ -98,6 +100,8 @@ func KnownActions() []string {
 		ActionScheduleDeleted,
 		ActionScheduleRulesAdded,
 		ActionScheduleRuleRemoved,
+		ActionScheduleWindowAdded,
+		ActionScheduleWindowRemoved,
 		ActionScheduleActivated,
 		ActionSchedulePaused,
 		ActionScheduleSuppressed,

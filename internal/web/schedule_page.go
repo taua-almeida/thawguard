@@ -57,6 +57,8 @@ type scheduleCardView struct {
 	TimezoneLabel   string
 	DetailURL       string
 	Active          bool
+	// NextLabel is the card's "Next: …" coverage line; empty hides it.
+	NextLabel string
 }
 
 func scheduleCardViews(repositories []domain.Repository, schedules []domain.Schedule) []scheduleCardView {
@@ -76,6 +78,31 @@ func scheduleCardViews(repositories []domain.Repository, schedules []domain.Sche
 		})
 	}
 	return cards
+}
+
+// scheduleCardViewsWithNext decorates the overview cards with each schedule's
+// next coverage, loading rules or windows per schedule. A card whose lookup
+// fails fails the page: a silently missing "Next:" line would read as "no
+// coverage" and that is a lie.
+func (s *Server) scheduleCardViewsWithNext(ctx context.Context, repositories []domain.Repository, schedules []domain.Schedule) ([]scheduleCardView, error) {
+	cards := scheduleCardViews(repositories, schedules)
+	now := time.Now()
+	for i, sched := range schedules {
+		var rules []domain.ScheduleWeeklyRule
+		var windows []domain.ScheduleDatedWindow
+		var err error
+		switch sched.Kind {
+		case domain.ScheduleKindWeekly:
+			rules, err = s.cfg.ScheduleStore.ListRules(ctx, sched.ID)
+		case domain.ScheduleKindDated:
+			windows, err = s.cfg.ScheduleStore.ListWindows(ctx, sched.ID)
+		}
+		if err != nil {
+			return nil, err
+		}
+		cards[i].NextLabel = scheduleNextLabel(sched, rules, windows, now)
+	}
+	return cards, nil
 }
 
 // scheduleFormState mirrors the new-schedule form so a validation error
@@ -182,11 +209,34 @@ type scheduleDetailPageData struct {
 	RuleEndDayOptions []scheduleRuleEndDayOption
 	RuleForm          scheduleRuleFormState
 	RuleFormError     string
-	HasPreview        bool
-	Preview           schedulePreviewView
-	CSRFToken         string
-	CSRFField         string
-	Toasts            []toastView
+	Windows           []scheduleWindowView
+	WindowAddAction   string
+	WindowForm        scheduleWindowFormState
+	WindowFormError   string
+	// ActivateDisabledReason disables the Activate button while the schedule
+	// has nothing to expand; it mirrors the service's own validation message.
+	ActivateDisabledReason string
+	HasPreview             bool
+	Preview                schedulePreviewView
+	HasContext             bool
+	Context                scheduleContextView
+	CSRFToken              string
+	CSRFField              string
+	Toasts                 []toastView
+}
+
+// scheduleDetailForms bundles the detail page's two mutation forms so a
+// validation error on either re-renders the page with that form's submitted
+// values and message preserved.
+type scheduleDetailForms struct {
+	RuleForm        scheduleRuleFormState
+	RuleFormError   string
+	WindowForm      scheduleWindowFormState
+	WindowFormError string
+}
+
+func defaultScheduleDetailForms() scheduleDetailForms {
+	return scheduleDetailForms{RuleForm: defaultScheduleRuleFormState()}
 }
 
 func scheduleDetailViewFrom(repositories []domain.Repository, sched domain.Schedule) scheduleDetailView {
@@ -324,19 +374,25 @@ func (s *Server) handleScheduleDetail(w http.ResponseWriter, r *http.Request) {
 		internalServerError(w)
 		return
 	}
-	data, ok := s.scheduleDetailPageData(w, r, sched, defaultScheduleRuleFormState(), "", session)
+	data, ok := s.scheduleDetailPageData(w, r, sched, defaultScheduleDetailForms(), session)
 	if !ok {
 		return
 	}
 	notices := map[string]string{
-		"created":      "Schedule created. It is paused and does not freeze anything.",
-		"rules-added":  "Rules added.",
-		"rule-removed": "Rule removed.",
-		"activated":    "Schedule activated. Its weekly rules now freeze this branch during covered windows.",
-		"paused":       "Schedule paused. It no longer freezes its branch; any freeze it created was ended.",
+		"created":              "Schedule created. It is paused and does not freeze anything.",
+		"rules-added":          "Rules added.",
+		"rule-removed":         "Rule removed.",
+		"window-added":         "Window added.",
+		"window-added-started": "Window added. This window has already started; coverage begins immediately.",
+		"window-removed":       "Window removed.",
+		"activated":            "Schedule activated. It now freezes this branch during covered windows.",
+		"paused":               "Schedule paused. It no longer freezes its branch; any freeze it created was ended.",
 	}
-	if r.URL.Query().Get("notice") == "rules-added" && !sched.Active {
+	if !sched.Active {
 		notices["rules-added"] = "Rules added. The schedule stays paused and freezes nothing yet."
+		pausedWindow := "Window added. The schedule stays paused and freezes nothing yet."
+		notices["window-added"] = pausedWindow
+		notices["window-added-started"] = pausedWindow
 	}
 	if message := notices[r.URL.Query().Get("notice")]; message != "" {
 		data.Toasts = []toastView{{Message: message, Tone: "success", DismissHref: data.Schedule.URL}}
@@ -344,15 +400,16 @@ func (s *Server) handleScheduleDetail(w http.ResponseWriter, r *http.Request) {
 	s.renderPage(w, "layouts/schedule-detail", data)
 }
 
-// scheduleDetailPageData assembles the detail page view model, including the
-// rules card and the coverage preview for weekly schedules. Writes a 500 and
-// returns ok=false on load failure.
-func (s *Server) scheduleDetailPageData(w http.ResponseWriter, r *http.Request, sched domain.Schedule, ruleForm scheduleRuleFormState, ruleFormError string, session sessionState) (scheduleDetailPageData, bool) {
+// scheduleDetailPageData assembles the detail page view model: the rules or
+// date-windows card by kind, the coverage preview, and the branch's combined
+// coverage context. Writes a 500 and returns ok=false on load failure.
+func (s *Server) scheduleDetailPageData(w http.ResponseWriter, r *http.Request, sched domain.Schedule, forms scheduleDetailForms, session sessionState) (scheduleDetailPageData, bool) {
 	repositories, err := s.repositories(r.Context())
 	if err != nil {
 		internalServerError(w)
 		return scheduleDetailPageData{}, false
 	}
+	now := time.Now()
 	view := scheduleDetailViewFrom(repositories, sched)
 	data := scheduleDetailPageData{
 		AppName:           s.cfg.AppName,
@@ -361,31 +418,67 @@ func (s *Server) scheduleDetailPageData(w http.ResponseWriter, r *http.Request, 
 		CurrentUser:       currentUserFromSession(session),
 		Schedule:          view,
 		RuleAddAction:     fmt.Sprintf("%s/%d/rules", schedulesBasePath, sched.ID),
-		RuleDayOptions:    scheduleRuleDayOptions(ruleForm),
-		RuleEndDayOptions: scheduleRuleEndDayOptions(ruleForm),
-		RuleForm:          ruleForm,
-		RuleFormError:     ruleFormError,
+		RuleDayOptions:    scheduleRuleDayOptions(forms.RuleForm),
+		RuleEndDayOptions: scheduleRuleEndDayOptions(forms.RuleForm),
+		RuleForm:          forms.RuleForm,
+		RuleFormError:     forms.RuleFormError,
+		WindowAddAction:   fmt.Sprintf("%s/%d/windows", schedulesBasePath, sched.ID),
+		WindowForm:        forms.WindowForm,
+		WindowFormError:   forms.WindowFormError,
 		CSRFToken:         session.CSRFToken,
 		CSRFField:         csrfFormField,
 	}
-	if sched.Kind != domain.ScheduleKindWeekly {
-		return data, true
-	}
-	rules, err := s.cfg.ScheduleStore.ListRules(r.Context(), sched.ID)
-	if err != nil {
-		internalServerError(w)
-		return scheduleDetailPageData{}, false
-	}
-	data.Rules = scheduleRuleViews(sched.ID, rules)
-	if len(rules) > 0 {
-		preview, err := schedulePreviewFrom(sched, rules, time.Now())
+	switch sched.Kind {
+	case domain.ScheduleKindWeekly:
+		rules, err := s.cfg.ScheduleStore.ListRules(r.Context(), sched.ID)
 		if err != nil {
 			internalServerError(w)
 			return scheduleDetailPageData{}, false
 		}
-		data.HasPreview = true
-		data.Preview = preview
+		data.Rules = scheduleRuleViews(sched.ID, rules)
+		if len(rules) == 0 {
+			data.ActivateDisabledReason = "Add at least one rule before activating."
+		} else {
+			preview, err := schedulePreviewFrom(sched, schedule.Coverage{Schedule: sched, Rules: rules}, now)
+			if err != nil {
+				internalServerError(w)
+				return scheduleDetailPageData{}, false
+			}
+			data.HasPreview = true
+			data.Preview = preview
+		}
+	case domain.ScheduleKindDated:
+		windows, err := s.cfg.ScheduleStore.ListWindows(r.Context(), sched.ID)
+		if err != nil {
+			internalServerError(w)
+			return scheduleDetailPageData{}, false
+		}
+		if len(windows) == 0 {
+			data.ActivateDisabledReason = "Add at least one date window before activating."
+		}
+		upcoming, err := upcomingScheduleWindows(sched, windows, now)
+		if err != nil {
+			internalServerError(w)
+			return scheduleDetailPageData{}, false
+		}
+		data.Windows = scheduleWindowViews(sched, upcoming, now)
+		if len(upcoming) > 0 {
+			preview, err := schedulePreviewFrom(sched, schedule.Coverage{Schedule: sched, Windows: upcoming}, now)
+			if err != nil {
+				internalServerError(w)
+				return scheduleDetailPageData{}, false
+			}
+			data.HasPreview = true
+			data.Preview = preview
+		}
 	}
+	context, hasContext, err := s.scheduleContext(r.Context(), repositories, sched, now)
+	if err != nil {
+		internalServerError(w)
+		return scheduleDetailPageData{}, false
+	}
+	data.HasContext = hasContext
+	data.Context = context
 	return data, true
 }
 
@@ -425,7 +518,10 @@ func (s *Server) handleScheduleRuleAdd(w http.ResponseWriter, r *http.Request) {
 		internalServerError(w)
 		return
 	}
-	data, ok := s.scheduleDetailPageData(w, r, sched, form, err.Error(), session)
+	forms := defaultScheduleDetailForms()
+	forms.RuleForm = form
+	forms.RuleFormError = err.Error()
+	data, ok := s.scheduleDetailPageData(w, r, sched, forms, session)
 	if !ok {
 		return
 	}
@@ -703,7 +799,7 @@ type schedulePreviewView struct {
 	Notes         []scheduleDSTNoteView
 }
 
-func schedulePreviewFrom(sched domain.Schedule, rules []domain.ScheduleWeeklyRule, now time.Time) (schedulePreviewView, error) {
+func schedulePreviewFrom(sched domain.Schedule, coverage schedule.Coverage, now time.Time) (schedulePreviewView, error) {
 	loc, err := time.LoadLocation(sched.Timezone)
 	if err != nil {
 		return schedulePreviewView{}, fmt.Errorf("load schedule %d timezone %q: %w", sched.ID, sched.Timezone, err)
@@ -711,7 +807,7 @@ func schedulePreviewFrom(sched domain.Schedule, rules []domain.ScheduleWeeklyRul
 	localNow := now.In(loc)
 	windowStart := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, loc)
 	windowEnd := windowStart.AddDate(0, 0, 14)
-	segments, notes, err := schedule.ExpandCoverage([]schedule.Coverage{{Schedule: sched, Rules: rules}}, windowStart, windowEnd)
+	segments, notes, err := schedule.ExpandCoverage([]schedule.Coverage{coverage}, windowStart, windowEnd)
 	if err != nil {
 		return schedulePreviewView{}, err
 	}

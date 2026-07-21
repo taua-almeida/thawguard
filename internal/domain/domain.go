@@ -177,6 +177,11 @@ type BranchFreeze struct {
 	// that schedule; NULL for manual and one-time scheduled freezes, and
 	// survives schedule deletion (ON DELETE SET NULL).
 	ScheduleID *int64
+	// ScheduleName snapshots the winning schedule's name at creation or last
+	// relabel. Forge status descriptions are built from this snapshot, so
+	// hard-deleting a schedule mid-window cannot silently relabel an
+	// already-posted status. Empty for manual freezes.
+	ScheduleName string
 	// CreatedByUserID references the user who started or scheduled the
 	// freeze; NULL survives user deletion (ON DELETE SET NULL), so
 	// CreatedByKind keeps removed users distinguishable from actors that
@@ -240,6 +245,21 @@ type ScheduleWeeklyRule struct {
 	EndWeekday   time.Weekday
 	EndTime      string
 	CreatedAt    time.Time
+}
+
+// ScheduleDatedWindow is one named calendar window on a dated schedule.
+// StartsAt and EndsAt are local wall-clock timestamps ("2006-01-02T15:04") in
+// the schedule's timezone, not UTC instants: the window means "these local
+// dates and times", and expansion resolves them through the zone's DST rules.
+// Rows are kept after the window passes for occurrence idempotency, but past
+// windows are never rendered.
+type ScheduleDatedWindow struct {
+	ID         int64
+	ScheduleID int64
+	Name       string
+	StartsAt   string
+	EndsAt     string
+	CreatedAt  time.Time
 }
 
 type ThawException struct {

@@ -82,9 +82,34 @@ func (s *Service) Delete(ctx context.Context, id int64, actor domain.Actor) (dom
 	return deleted, nil
 }
 
-// Activate enables a schedule's windows and clears any suppression.
+// Activate enables a schedule's windows and clears any suppression. A
+// schedule with nothing to expand — a weekly schedule with no rules, a dated
+// schedule with no windows — is rejected: activating it would claim coverage
+// that cannot exist, and the UI disables the button with the same reason.
 func (s *Service) Activate(ctx context.Context, id int64, actor domain.Actor) (domain.Schedule, error) {
 	return s.withAudit(ctx, actor, audit.ActionScheduleActivated, func(store *Store) (domain.Schedule, error) {
+		schedule, err := store.Get(ctx, id)
+		if err != nil {
+			return domain.Schedule{}, err
+		}
+		switch schedule.Kind {
+		case domain.ScheduleKindWeekly:
+			rules, err := store.ListRules(ctx, id)
+			if err != nil {
+				return domain.Schedule{}, err
+			}
+			if len(rules) == 0 {
+				return domain.Schedule{}, ValidationError{Message: "add at least one rule before activating"}
+			}
+		case domain.ScheduleKindDated:
+			windows, err := store.ListWindows(ctx, id)
+			if err != nil {
+				return domain.Schedule{}, err
+			}
+			if len(windows) == 0 {
+				return domain.Schedule{}, ValidationError{Message: "add at least one date window before activating"}
+			}
+		}
 		return store.SetActive(ctx, id, true)
 	})
 }
@@ -112,13 +137,13 @@ func (s *Service) Pause(ctx context.Context, id int64, actor domain.Actor) (doma
 	return paused, nil
 }
 
-// ListActiveWeeklyCoverages returns the materializer's input outside any
+// ListActiveCoverages returns the materializer's input outside any
 // transaction.
-func (s *Service) ListActiveWeeklyCoverages(ctx context.Context) ([]Coverage, error) {
+func (s *Service) ListActiveCoverages(ctx context.Context) ([]Coverage, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("schedule service has no database")
 	}
-	return NewStore(s.db).ListActiveWeeklyCoverages(ctx)
+	return NewStore(s.db).ListActiveCoverages(ctx)
 }
 
 // EndMaterializedFreeze implements manual "End freeze" on a schedule-created
@@ -139,7 +164,7 @@ func (s *Service) EndMaterializedFreeze(ctx context.Context, freezeID int64, act
 		}
 		ended = closed
 
-		coverages, err := store.ListActiveWeeklyCoverages(ctx)
+		coverages, err := store.ListActiveCoverages(ctx)
 		if err != nil {
 			return err
 		}
@@ -259,6 +284,60 @@ func (s *Service) DeleteRule(ctx context.Context, scheduleID, ruleID int64, acto
 	return removed, nil
 }
 
+func (s *Service) ListWindows(ctx context.Context, scheduleID int64) ([]domain.ScheduleDatedWindow, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("schedule service has no database")
+	}
+	return NewStore(s.db).ListWindows(ctx, scheduleID)
+}
+
+// AddWindow records one audit event per form submission, mirroring AddRules:
+// one submitted window is a single operator action.
+func (s *Service) AddWindow(ctx context.Context, params AddWindowParams, actor domain.Actor) (domain.ScheduleDatedWindow, error) {
+	var added domain.ScheduleDatedWindow
+	err := s.transact(ctx, func(store *Store, recorder *audit.Store) error {
+		var err error
+		if added, err = store.AddWindow(ctx, params); err != nil {
+			return err
+		}
+		schedule, err := store.Get(ctx, params.ScheduleID)
+		if err != nil {
+			return err
+		}
+		event := scheduleWindowEvent(schedule, added, actor, audit.ActionScheduleWindowAdded)
+		if err := recorder.Record(ctx, event); err != nil {
+			return fmt.Errorf("record %s audit event: %w", audit.ActionScheduleWindowAdded, err)
+		}
+		return nil
+	})
+	if err != nil {
+		return domain.ScheduleDatedWindow{}, err
+	}
+	return added, nil
+}
+
+func (s *Service) DeleteWindow(ctx context.Context, scheduleID, windowID int64, actor domain.Actor) (domain.ScheduleDatedWindow, error) {
+	var removed domain.ScheduleDatedWindow
+	err := s.transact(ctx, func(store *Store, recorder *audit.Store) error {
+		schedule, err := store.Get(ctx, scheduleID)
+		if err != nil {
+			return err
+		}
+		if removed, err = store.DeleteWindow(ctx, scheduleID, windowID); err != nil {
+			return err
+		}
+		event := scheduleWindowEvent(schedule, removed, actor, audit.ActionScheduleWindowRemoved)
+		if err := recorder.Record(ctx, event); err != nil {
+			return fmt.Errorf("record %s audit event: %w", audit.ActionScheduleWindowRemoved, err)
+		}
+		return nil
+	})
+	if err != nil {
+		return domain.ScheduleDatedWindow{}, err
+	}
+	return removed, nil
+}
+
 func (s *Service) withAudit(ctx context.Context, actor domain.Actor, action string, mutate func(*Store) (domain.Schedule, error)) (domain.Schedule, error) {
 	var mutated domain.Schedule
 	err := s.transact(ctx, func(store *Store, recorder *audit.Store) error {
@@ -331,6 +410,33 @@ func scheduleRulesEvent(schedule domain.Schedule, rules []domain.ScheduleWeeklyR
 		"start_time":    rules[0].StartTime,
 		"end_time":      rules[0].EndTime,
 		"end_day":       ruleEndDayLabel(rules),
+	}
+	detailsJSON, err := json.Marshal(details)
+	if err != nil {
+		detailsJSON = []byte(`{}`)
+	}
+	return audit.Event{
+		ActorUserID: actor.UserID,
+		Action:      action,
+		SubjectType: audit.SubjectTypeSchedule,
+		SubjectID:   strconv.FormatInt(schedule.ID, 10),
+		DetailsJSON: string(detailsJSON),
+	}
+}
+
+// scheduleWindowEvent describes one window addition or removal. starts_at and
+// ends_at are the window's literal local wall clocks in the schedule's
+// timezone, not UTC instants, matching how the window is defined.
+func scheduleWindowEvent(schedule domain.Schedule, window domain.ScheduleDatedWindow, actor domain.Actor, action string) audit.Event {
+	details := map[string]string{
+		"actor_kind":    actor.Kind,
+		"actor_role":    actor.Role,
+		"repository_id": strconv.FormatInt(schedule.RepositoryID, 10),
+		"branch":        schedule.Branch,
+		"name":          schedule.Name,
+		"window_name":   window.Name,
+		"starts_at":     window.StartsAt,
+		"ends_at":       window.EndsAt,
 	}
 	detailsJSON, err := json.Marshal(details)
 	if err != nil {

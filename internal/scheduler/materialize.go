@@ -13,25 +13,26 @@ import (
 	"github.com/taua-almeida/thawguard/internal/schedule"
 )
 
-// ScheduleSource lists the active weekly schedules whose coverage the
-// materializer turns into freeze rows.
+// ScheduleSource lists the active schedules (weekly and dated) whose coverage
+// the materializer turns into freeze rows.
 type ScheduleSource interface {
-	ListActiveWeeklyCoverages(ctx context.Context) ([]schedule.Coverage, error)
+	ListActiveCoverages(ctx context.Context) ([]schedule.Coverage, error)
 }
 
-// FreezeStore is the freeze surface the materializer drives. CreateActive and
-// EndMaterialized must publish enforcement state the same way operator-driven
-// freezes do; EndMaterialized must end without triggering manual-end
-// suppression — a lapse in coverage is the schedule's own doing, not an
-// operator overriding it.
+// FreezeStore is the freeze surface the materializer drives. CreateActive,
+// EndMaterialized, and UpdateMaterializedAttribution must publish enforcement
+// state the same way operator-driven freezes do; EndMaterialized must end
+// without triggering manual-end suppression — a lapse in coverage is the
+// schedule's own doing, not an operator overriding it.
 type FreezeStore interface {
 	GetActiveForBranch(ctx context.Context, repositoryID int64, branch string) (domain.BranchFreeze, bool, error)
 	ListActiveMaterialized(ctx context.Context) ([]domain.BranchFreeze, error)
 	CreateActive(ctx context.Context, params freeze.CreateParams, actor domain.Actor) (domain.BranchFreeze, error)
 	EndMaterialized(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error)
+	UpdateMaterializedAttribution(ctx context.Context, params freeze.UpdateAttributionParams) (domain.BranchFreeze, error)
 }
 
-// Materializer reconciles active weekly schedule coverage into ordinary
+// Materializer reconciles active schedule coverage into ordinary
 // branch_freezes rows: covered branches get a live linked row, linked rows
 // whose coverage lapsed get ended. It is idempotent — every run recomputes
 // the desired state from scratch, so restarts and double ticks are safe.
@@ -58,7 +59,7 @@ type branchKey struct {
 }
 
 // RunOnce reconciles every candidate branch once. Candidates are the branches
-// of active weekly schedules plus the branches of live materialized rows, so
+// of active schedules plus the branches of live materialized rows, so
 // orphaned rows (schedule paused, deleted, or rules removed mid-window) fall
 // out of the same decision table as regular coverage. Per-branch failures are
 // joined, not fatal: one broken repository must not stall the rest.
@@ -70,9 +71,9 @@ func (m *Materializer) RunOnce(ctx context.Context) error {
 	windowStart := now.Add(-schedule.CoverageLookback)
 	windowEnd := now.Add(schedule.CoverageHorizon)
 
-	coverages, err := m.schedules.ListActiveWeeklyCoverages(ctx)
+	coverages, err := m.schedules.ListActiveCoverages(ctx)
 	if err != nil {
-		return fmt.Errorf("list active weekly coverages: %w", err)
+		return fmt.Errorf("list active schedule coverages: %w", err)
 	}
 	segments, _, err := schedule.ExpandCoverage(coverages, windowStart, windowEnd)
 	if err != nil {
@@ -150,6 +151,7 @@ func (m *Materializer) reconcileBranch(ctx context.Context, now, windowEnd time.
 			Reason:        decision.Reason,
 			PlannedEndsAt: decision.PlannedEndsAt,
 			ScheduleID:    &decision.ScheduleID,
+			ScheduleName:  decision.ScheduleName,
 		}
 		if _, err := m.freezes.CreateActive(ctx, params, materializerActor); err != nil {
 			// Enforcement not active, branch no longer managed, or a race
@@ -175,6 +177,29 @@ func (m *Materializer) reconcileBranch(ctx context.Context, now, windowEnd time.
 			}
 			return fmt.Errorf("end materialized freeze %d: %w", decision.EndFreezeID, err)
 		}
+	case DecisionUpdate:
+		params := freeze.UpdateAttributionParams{
+			FreezeID:      decision.UpdateFreezeID,
+			ScheduleID:    decision.ScheduleID,
+			ScheduleName:  decision.ScheduleName,
+			Reason:        decision.Reason,
+			PlannedEndsAt: decision.PlannedEndsAt,
+		}
+		if _, err := m.freezes.UpdateMaterializedAttribution(ctx, params); err != nil {
+			// A race with an operator or another tick ending the freeze: skip.
+			var validation freeze.ValidationError
+			if errors.As(err, &validation) {
+				m.logger.Warn("schedule attribution update skipped",
+					"repository_id", key.RepositoryID, "branch", key.Branch,
+					"freeze_id", decision.UpdateFreezeID, "reason", validation.Message)
+				return nil
+			}
+			return fmt.Errorf("update materialized freeze %d attribution: %w", decision.UpdateFreezeID, err)
+		}
+		m.logger.Info("schedule attribution updated",
+			"repository_id", key.RepositoryID, "branch", key.Branch,
+			"freeze_id", decision.UpdateFreezeID, "schedule_id", decision.ScheduleID,
+			"schedule_name", decision.ScheduleName)
 	case DecisionNone:
 	}
 	return nil

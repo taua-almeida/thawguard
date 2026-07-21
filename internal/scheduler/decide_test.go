@@ -26,9 +26,20 @@ func activeSchedule(id int64, reason string) domain.Schedule {
 	return domain.Schedule{ID: id, RepositoryID: 1, Branch: "main", Name: "Nightly release lock", Kind: domain.ScheduleKindWeekly, Timezone: "UTC", Reason: reason, Active: true}
 }
 
+func activeDatedSchedule(id int64, name, reason string, createdAt time.Time) domain.Schedule {
+	return domain.Schedule{ID: id, RepositoryID: 1, Branch: "main", Name: name, Kind: domain.ScheduleKindDated, Timezone: "UTC", Reason: reason, Active: true, CreatedAt: createdAt}
+}
+
 func TestDecide(t *testing.T) {
 	materialized := &domain.BranchFreeze{ID: 40, RepositoryID: 1, Branch: "main", ScheduleID: int64Ptr(7)}
 	manual := &domain.BranchFreeze{ID: 41, RepositoryID: 1, Branch: "main"}
+	// settled matches what the single weekly schedule 7 would attribute right
+	// now, so a covered branch carrying it must be left completely alone.
+	settled := &domain.BranchFreeze{
+		ID: 40, RepositoryID: 1, Branch: "main",
+		ScheduleID: int64Ptr(7), ScheduleName: "Nightly release lock",
+		Reason: "Nightly lock", PlannedEndsAt: timePtr(at(3 * time.Hour)),
+	}
 
 	cases := []struct {
 		name  string
@@ -46,14 +57,23 @@ func TestDecide(t *testing.T) {
 				Schedules: []domain.Schedule{activeSchedule(7, "Nightly lock")},
 				Segments:  []schedule.Segment{segment(7, at(-2*time.Hour), at(3*time.Hour))},
 			},
-			want: Decision{Action: DecisionCreate, ScheduleID: 7, Reason: "Nightly lock", PlannedEndsAt: timePtr(at(3 * time.Hour))},
+			want: Decision{Action: DecisionCreate, ScheduleID: 7, ScheduleName: "Nightly release lock", Reason: "Nightly lock", PlannedEndsAt: timePtr(at(3 * time.Hour))},
 		},
 		{
-			name: "covered branch with any live freeze is left alone",
+			name: "covered branch with a manual live freeze is left alone",
 			state: BranchState{
 				Schedules: []domain.Schedule{activeSchedule(7, "")},
 				Segments:  []schedule.Segment{segment(7, at(-2*time.Hour), at(3*time.Hour))},
 				Live:      manual,
+			},
+			want: Decision{Action: DecisionNone},
+		},
+		{
+			name: "covered materialized freeze with unchanged attribution does nothing",
+			state: BranchState{
+				Schedules: []domain.Schedule{activeSchedule(7, "Nightly lock")},
+				Segments:  []schedule.Segment{segment(7, at(-2*time.Hour), at(3*time.Hour))},
+				Live:      settled,
 			},
 			want: Decision{Action: DecisionNone},
 		},
@@ -103,7 +123,7 @@ func TestDecide(t *testing.T) {
 				}()},
 				Segments: []schedule.Segment{segment(7, at(-time.Hour), at(3*time.Hour))},
 			},
-			want: Decision{Action: DecisionCreate, ScheduleID: 7, Reason: "Resumed lock", PlannedEndsAt: timePtr(at(3 * time.Hour))},
+			want: Decision{Action: DecisionCreate, ScheduleID: 7, ScheduleName: "Nightly release lock", Reason: "Resumed lock", PlannedEndsAt: timePtr(at(3 * time.Hour))},
 		},
 		{
 			name: "touching segments from different schedules form one union block",
@@ -114,10 +134,40 @@ func TestDecide(t *testing.T) {
 					segment(7, at(-2*time.Hour), at(2*time.Hour)),
 				},
 			},
-			want: Decision{Action: DecisionCreate, ScheduleID: 7, Reason: "First window", PlannedEndsAt: timePtr(at(6 * time.Hour))},
+			// Only schedule 7's segment contains now, so it names the freeze;
+			// the planned end still comes from the whole union block.
+			want: Decision{Action: DecisionCreate, ScheduleID: 7, ScheduleName: "Nightly release lock", Reason: "First window", PlannedEndsAt: timePtr(at(6 * time.Hour))},
 		},
 		{
-			name: "attribution ties on equal starts break to the lowest schedule id",
+			name: "dated outranks weekly for naming without changing coverage",
+			state: BranchState{
+				Schedules: []domain.Schedule{
+					activeSchedule(7, "Weekly lock"),
+					activeDatedSchedule(9, "Christmas maintenance", "Holiday change stop", at(-24*time.Hour)),
+				},
+				Segments: []schedule.Segment{
+					segment(7, at(-2*time.Hour), at(6*time.Hour)),
+					segment(9, at(-time.Hour), at(2*time.Hour)),
+				},
+			},
+			want: Decision{Action: DecisionCreate, ScheduleID: 9, ScheduleName: "Christmas maintenance", Reason: "Holiday change stop", PlannedEndsAt: timePtr(at(6 * time.Hour))},
+		},
+		{
+			name: "peer ties break to the most recently created schedule",
+			state: BranchState{
+				Schedules: []domain.Schedule{
+					activeDatedSchedule(9, "Older window", "", at(-48*time.Hour)),
+					activeDatedSchedule(7, "Newer window", "", at(-24*time.Hour)),
+				},
+				Segments: []schedule.Segment{
+					segment(9, at(-time.Hour), at(4*time.Hour)),
+					segment(7, at(-time.Hour), at(2*time.Hour)),
+				},
+			},
+			want: Decision{Action: DecisionCreate, ScheduleID: 7, ScheduleName: "Newer window", PlannedEndsAt: timePtr(at(4 * time.Hour))},
+		},
+		{
+			name: "equal creation times break to the highest schedule id",
 			state: BranchState{
 				Schedules: []domain.Schedule{activeSchedule(9, "Higher id"), activeSchedule(7, "Lower id")},
 				Segments: []schedule.Segment{
@@ -125,7 +175,7 @@ func TestDecide(t *testing.T) {
 					segment(7, at(-time.Hour), at(2*time.Hour)),
 				},
 			},
-			want: Decision{Action: DecisionCreate, ScheduleID: 7, Reason: "Lower id", PlannedEndsAt: timePtr(at(4 * time.Hour))},
+			want: Decision{Action: DecisionCreate, ScheduleID: 9, ScheduleName: "Nightly release lock", Reason: "Higher id", PlannedEndsAt: timePtr(at(4 * time.Hour))},
 		},
 		{
 			name: "suppressed attributing schedule leaves attribution to the other coverer",
@@ -143,7 +193,7 @@ func TestDecide(t *testing.T) {
 					segment(9, at(-time.Hour), at(4*time.Hour)),
 				},
 			},
-			want: Decision{Action: DecisionCreate, ScheduleID: 9, Reason: "Still covering", PlannedEndsAt: timePtr(at(4 * time.Hour))},
+			want: Decision{Action: DecisionCreate, ScheduleID: 9, ScheduleName: "Nightly release lock", Reason: "Still covering", PlannedEndsAt: timePtr(at(4 * time.Hour))},
 		},
 		{
 			name: "coverage reaching the horizon has no planned end",
@@ -151,7 +201,34 @@ func TestDecide(t *testing.T) {
 				Schedules: []domain.Schedule{activeSchedule(7, "Continuous")},
 				Segments:  []schedule.Segment{segment(7, at(-time.Hour), decideWindowEnd)},
 			},
-			want: Decision{Action: DecisionCreate, ScheduleID: 7, Reason: "Continuous"},
+			want: Decision{Action: DecisionCreate, ScheduleID: 7, ScheduleName: "Nightly release lock", Reason: "Continuous"},
+		},
+		{
+			name: "winning source change relabels the live freeze in place",
+			state: BranchState{
+				Schedules: []domain.Schedule{
+					activeSchedule(7, "Nightly lock"),
+					activeDatedSchedule(9, "Christmas maintenance", "Holiday change stop", at(-24*time.Hour)),
+				},
+				Segments: []schedule.Segment{
+					segment(7, at(-2*time.Hour), at(3*time.Hour)),
+					segment(9, at(-time.Hour), at(2*time.Hour)),
+				},
+				Live: settled,
+			},
+			want: Decision{Action: DecisionUpdate, UpdateFreezeID: 40, ScheduleID: 9, ScheduleName: "Christmas maintenance", Reason: "Holiday change stop", PlannedEndsAt: timePtr(at(3 * time.Hour))},
+		},
+		{
+			name: "extended union end relabels the planned end in place",
+			state: BranchState{
+				Schedules: []domain.Schedule{activeSchedule(7, "Nightly lock")},
+				Segments: []schedule.Segment{
+					segment(7, at(-2*time.Hour), at(3*time.Hour)),
+					segment(7, at(3*time.Hour), at(6*time.Hour)),
+				},
+				Live: settled,
+			},
+			want: Decision{Action: DecisionUpdate, UpdateFreezeID: 40, ScheduleID: 7, ScheduleName: "Nightly release lock", Reason: "Nightly lock", PlannedEndsAt: timePtr(at(6 * time.Hour))},
 		},
 		{
 			name: "segments from unknown schedules are ignored",
@@ -165,7 +242,9 @@ func TestDecide(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := Decide(decideNow, decideWindowEnd, tc.state)
-			if got.Action != tc.want.Action || got.ScheduleID != tc.want.ScheduleID || got.Reason != tc.want.Reason || got.EndFreezeID != tc.want.EndFreezeID {
+			if got.Action != tc.want.Action || got.ScheduleID != tc.want.ScheduleID ||
+				got.ScheduleName != tc.want.ScheduleName || got.Reason != tc.want.Reason ||
+				got.EndFreezeID != tc.want.EndFreezeID || got.UpdateFreezeID != tc.want.UpdateFreezeID {
 				t.Fatalf("Decide() = %+v, want %+v", got, tc.want)
 			}
 			switch {

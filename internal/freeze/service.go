@@ -51,6 +51,16 @@ func (s *Service) ListActiveMaterialized(ctx context.Context) ([]domain.BranchFr
 	return NewStore(s.db).ListActiveMaterialized(ctx)
 }
 
+// UpdateMaterializedAttribution relabels a live materialized freeze in place
+// for the scheduler. It records no audit event: the relabel is a derived
+// consequence of schedule changes that are themselves audited.
+func (s *Service) UpdateMaterializedAttribution(ctx context.Context, params UpdateAttributionParams) (domain.BranchFreeze, error) {
+	if s == nil || s.db == nil {
+		return domain.BranchFreeze{}, errors.New("freeze service has no database")
+	}
+	return NewStore(s.db).UpdateMaterializedAttribution(ctx, params)
+}
+
 func (s *Service) ListScheduled(ctx context.Context, limit int) ([]domain.BranchFreeze, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("freeze service has no database")

@@ -64,7 +64,7 @@ func TestPullRequestProcessorCachesAndRecomputesLocalDecision(t *testing.T) {
 	if !processed.Recomputed || len(processed.StatusResults) != 1 {
 		t.Fatalf("expected status recomputation, got %+v", processed)
 	}
-	if processed.StatusResults[0].State != domain.CommitStatusFailure || processed.StatusResults[0].Description != "Branch is frozen; merge is blocked by Thawguard" {
+	if processed.StatusResults[0].State != domain.CommitStatusFailure || processed.StatusResults[0].Description != "Branch is frozen; merge is blocked by Thawguard: release" {
 		t.Fatalf("unexpected status result: %+v", processed.StatusResults[0])
 	}
 	if len(processed.Publications) != 1 || processed.Publications[0].StatusResultID != processed.StatusResults[0].ID || processed.Publications[0].DeliveryMode != statuspublication.DeliveryModeForgejoStatus {

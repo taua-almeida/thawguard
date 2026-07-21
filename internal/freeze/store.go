@@ -43,9 +43,25 @@ type CreateParams struct {
 	PlannedEndsAt *time.Time
 	// ScheduleID marks a freeze materialized from a recurring schedule; nil
 	// for manual freezes.
-	ScheduleID      *int64
+	ScheduleID *int64
+	// ScheduleName snapshots the winning schedule's name so the forge status
+	// description survives a hard schedule delete mid-window. Empty for manual
+	// freezes.
+	ScheduleName    string
 	CreatedByUserID *int64
 	CreatedByKind   string
+}
+
+// UpdateAttributionParams relabels a live materialized freeze in place: the
+// winning schedule's identity, name, reason, or the union coverage's planned
+// end changed while the branch stayed frozen. Attribution only — the row's
+// status and start never change here.
+type UpdateAttributionParams struct {
+	FreezeID      int64
+	ScheduleID    int64
+	ScheduleName  string
+	Reason        string
+	PlannedEndsAt *time.Time
 }
 
 type ScheduleParams struct {
@@ -119,8 +135,8 @@ func (s *Store) CreateActive(ctx context.Context, params CreateParams) (domain.B
 		scheduleID = *params.ScheduleID
 	}
 	result, err := s.db.ExecContext(ctx, `
-INSERT INTO branch_freezes(repository_id, branch, status, reason, starts_at, ends_at, scheduled, planned_ends_at, schedule_id, created_by, created_by_kind, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, params.RepositoryID, params.Branch, domain.BranchFreezeStatusActive, params.Reason, nowText, nil, 0, plannedEndsAt, scheduleID, createdBy, params.CreatedByKind, nowText, nowText)
+INSERT INTO branch_freezes(repository_id, branch, status, reason, starts_at, ends_at, scheduled, planned_ends_at, schedule_id, schedule_name, created_by, created_by_kind, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, params.RepositoryID, params.Branch, domain.BranchFreezeStatusActive, params.Reason, nowText, nil, 0, plannedEndsAt, scheduleID, params.ScheduleName, createdBy, params.CreatedByKind, nowText, nowText)
 	if err != nil {
 		return domain.BranchFreeze{}, createActiveFreezeError(err)
 	}
@@ -192,7 +208,7 @@ func (s *Store) Get(ctx context.Context, id int64) (domain.BranchFreeze, error) 
 		return domain.BranchFreeze{}, errors.New("freeze store has no database")
 	}
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, schedule_id, created_by, created_by_kind, created_at, updated_at
+SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, schedule_id, schedule_name, created_by, created_by_kind, created_at, updated_at
 FROM branch_freezes
 WHERE id = ?`, id)
 	return scanBranchFreeze(row)
@@ -203,7 +219,7 @@ func (s *Store) ListActive(ctx context.Context) ([]domain.BranchFreeze, error) {
 		return nil, errors.New("freeze store has no database")
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, schedule_id, created_by, created_by_kind, created_at, updated_at
+SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, schedule_id, schedule_name, created_by, created_by_kind, created_at, updated_at
 FROM branch_freezes
 WHERE status = ?
 ORDER BY created_at DESC, id DESC`, domain.BranchFreezeStatusActive)
@@ -234,7 +250,7 @@ func (s *Store) ListScheduled(ctx context.Context, limit int) ([]domain.BranchFr
 		limit = 100
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, schedule_id, created_by, created_by_kind, created_at, updated_at
+SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, schedule_id, schedule_name, created_by, created_by_kind, created_at, updated_at
 FROM branch_freezes
 WHERE scheduled = 1
 ORDER BY
@@ -285,7 +301,7 @@ func (s *Store) ListScheduledPage(ctx context.Context, status domain.BranchFreez
 
 	args := append(append([]any{}, countArgs...), limit, offset)
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, schedule_id, created_by, created_by_kind, created_at, updated_at
+SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, schedule_id, schedule_name, created_by, created_by_kind, created_at, updated_at
 FROM branch_freezes
 `+where+`
 ORDER BY
@@ -321,7 +337,7 @@ func (s *Store) ListDueScheduled(ctx context.Context, limit int) ([]domain.Branc
 	}
 	now := s.now().UTC().Format(sqliteTimestampFormat)
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, schedule_id, created_by, created_by_kind, created_at, updated_at
+SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, schedule_id, schedule_name, created_by, created_by_kind, created_at, updated_at
 FROM branch_freezes
 WHERE scheduled = 1 AND status = ? AND starts_at <= ?
 ORDER BY starts_at ASC, id ASC
@@ -354,7 +370,7 @@ func (s *Store) ListDuePlannedUnfreezes(ctx context.Context, limit int) ([]domai
 	}
 	now := s.now().UTC().Format(sqliteTimestampFormat)
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, schedule_id, created_by, created_by_kind, created_at, updated_at
+SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, schedule_id, schedule_name, created_by, created_by_kind, created_at, updated_at
 FROM branch_freezes
 WHERE status = ? AND planned_ends_at IS NOT NULL AND planned_ends_at <= ?
 ORDER BY planned_ends_at ASC, id ASC
@@ -386,7 +402,7 @@ func (s *Store) ListNeedsRecompute(ctx context.Context, limit int) ([]domain.Bra
 		limit = 50
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, schedule_id, created_by, created_by_kind, created_at, updated_at
+SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, schedule_id, schedule_name, created_by, created_by_kind, created_at, updated_at
 FROM branch_freezes
 WHERE needs_recompute = 1
 ORDER BY updated_at ASC, id ASC
@@ -645,7 +661,7 @@ func (s *Store) GetActiveForBranch(ctx context.Context, repositoryID int64, bran
 		return domain.BranchFreeze{}, false, errors.New("freeze store has no database")
 	}
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, schedule_id, created_by, created_by_kind, created_at, updated_at
+SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, schedule_id, schedule_name, created_by, created_by_kind, created_at, updated_at
 FROM branch_freezes
 WHERE repository_id = ? AND branch = ? AND status = ?
 LIMIT 1`, repositoryID, branch, domain.BranchFreezeStatusActive)
@@ -667,7 +683,7 @@ func (s *Store) ActiveForSchedule(ctx context.Context, scheduleID int64) (domain
 		return domain.BranchFreeze{}, false, errors.New("freeze store has no database")
 	}
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, schedule_id, created_by, created_by_kind, created_at, updated_at
+SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, schedule_id, schedule_name, created_by, created_by_kind, created_at, updated_at
 FROM branch_freezes
 WHERE schedule_id = ? AND status = ?
 LIMIT 1`, scheduleID, domain.BranchFreezeStatusActive)
@@ -689,7 +705,7 @@ func (s *Store) ListActiveMaterialized(ctx context.Context) ([]domain.BranchFree
 		return nil, errors.New("freeze store has no database")
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, schedule_id, created_by, created_by_kind, created_at, updated_at
+SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, schedule_id, schedule_name, created_by, created_by_kind, created_at, updated_at
 FROM branch_freezes
 WHERE status = ? AND schedule_id IS NOT NULL
 ORDER BY id ASC`, domain.BranchFreezeStatusActive)
@@ -710,6 +726,41 @@ ORDER BY id ASC`, domain.BranchFreezeStatusActive)
 		return nil, fmt.Errorf("list materialized branch freezes rows: %w", err)
 	}
 	return freezes, nil
+}
+
+// UpdateMaterializedAttribution relabels a live materialized freeze in place.
+// The WHERE clause insists the row is still active and still schedule-linked:
+// an operator ending the freeze or converting it is a race, not an error, and
+// surfaces as a ValidationError the materializer skips.
+func (s *Store) UpdateMaterializedAttribution(ctx context.Context, params UpdateAttributionParams) (domain.BranchFreeze, error) {
+	if s == nil || s.db == nil {
+		return domain.BranchFreeze{}, errors.New("freeze store has no database")
+	}
+	if params.FreezeID <= 0 {
+		return domain.BranchFreeze{}, ValidationError{Message: "active freeze is required"}
+	}
+	if params.ScheduleID <= 0 {
+		return domain.BranchFreeze{}, ValidationError{Message: "schedule is required"}
+	}
+
+	now := s.now().UTC().Format(sqliteTimestampFormat)
+	var plannedEndsAt any
+	if params.PlannedEndsAt != nil {
+		plannedEndsAt = params.PlannedEndsAt.UTC().Format(sqliteTimestampFormat)
+	}
+	result, err := s.db.ExecContext(ctx, `
+UPDATE branch_freezes
+SET schedule_id = ?, schedule_name = ?, reason = ?, planned_ends_at = ?, needs_recompute = 1, updated_at = ?
+WHERE id = ? AND status = ? AND schedule_id IS NOT NULL`,
+		params.ScheduleID, params.ScheduleName, params.Reason, plannedEndsAt, now,
+		params.FreezeID, domain.BranchFreezeStatusActive)
+	if err != nil {
+		return domain.BranchFreeze{}, fmt.Errorf("update materialized freeze attribution: %w", err)
+	}
+	if err := requireAffectedFreeze(result, "freeze is no longer an active materialized freeze"); err != nil {
+		return domain.BranchFreeze{}, err
+	}
+	return s.Get(ctx, params.FreezeID)
 }
 
 func requireAffectedFreeze(result sql.Result, message string) error {
@@ -949,7 +1000,7 @@ func scanBranchFreeze(row scanner) (domain.BranchFreeze, error) {
 	var scheduled, needsRecompute int
 	var scheduleID, createdBy sql.NullInt64
 	var createdAt, updatedAt string
-	if err := row.Scan(&freeze.ID, &freeze.RepositoryID, &freeze.Branch, &freeze.Status, &scheduled, &needsRecompute, &freeze.Reason, &startsAt, &endsAt, &plannedEndsAt, &scheduleID, &createdBy, &freeze.CreatedByKind, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&freeze.ID, &freeze.RepositoryID, &freeze.Branch, &freeze.Status, &scheduled, &needsRecompute, &freeze.Reason, &startsAt, &endsAt, &plannedEndsAt, &scheduleID, &freeze.ScheduleName, &createdBy, &freeze.CreatedByKind, &createdAt, &updatedAt); err != nil {
 		return domain.BranchFreeze{}, fmt.Errorf("scan branch freeze: %w", err)
 	}
 	freeze.Active = freeze.Status == domain.BranchFreezeStatusActive

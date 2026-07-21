@@ -126,12 +126,32 @@ func TestBuildFreezeDescriptionClipsNameInsideParentheses(t *testing.T) {
 	}
 }
 
-// The evaluator's active-freeze description and the builder's manual-freeze
-// lead must stay the same string; several forge and status tests assert it
-// verbatim.
-func TestManualFreezeDescriptionMatchesEvaluator(t *testing.T) {
-	decision := Evaluate(Input{PullRequest: pr(1, "sha-1"), ActiveFreeze: freeze("main")})
+// The evaluator's active-freeze description must be BuildFreezeDescription's
+// output for that freeze, so the forge status names the schedule and reason
+// truthfully. A freeze with neither keeps the original manual copy that
+// several forge and status tests assert verbatim.
+func TestActiveFreezeDescriptionComesFromBuilder(t *testing.T) {
+	bare := freeze("main")
+	bare.Reason = ""
+	decision := Evaluate(Input{PullRequest: pr(1, "sha-1"), ActiveFreeze: bare})
 	if decision.Description != manualFreezeDescription {
 		t.Fatalf("evaluator description = %q, want %q", decision.Description, manualFreezeDescription)
+	}
+
+	withReason := freeze("main")
+	decision = Evaluate(Input{PullRequest: pr(1, "sha-1"), ActiveFreeze: withReason})
+	if want := manualFreezeDescription + ": release window"; decision.Description != want {
+		t.Fatalf("evaluator description = %q, want %q", decision.Description, want)
+	}
+
+	scheduled := freeze("main")
+	scheduled.ScheduleName = "Nightly release lock"
+	decision = Evaluate(Input{PullRequest: pr(1, "sha-1"), ActiveFreeze: scheduled})
+	want := BuildFreezeDescription(FreezeDescriptionInput{ScheduleName: "Nightly release lock", Reason: "release window"})
+	if decision.Description != want {
+		t.Fatalf("evaluator description = %q, want %q", decision.Description, want)
+	}
+	if want != "Frozen by Thawguard scheduler; Scheduled (Nightly release lock): release window" {
+		t.Fatalf("scheduled description copy drifted: %q", want)
 	}
 }

@@ -52,6 +52,12 @@ type materializedFreezeReads interface {
 	ListActiveMaterialized(ctx context.Context) ([]domain.BranchFreeze, error)
 }
 
+// materializedFreezeAttributionUpdater relabels a live materialized freeze in
+// place; freeze.Service implements it, test fakes may not.
+type materializedFreezeAttributionUpdater interface {
+	UpdateMaterializedAttribution(ctx context.Context, params freeze.UpdateAttributionParams) (domain.BranchFreeze, error)
+}
+
 type freezeGetter interface {
 	Get(ctx context.Context, id int64) (domain.BranchFreeze, error)
 }
@@ -212,6 +218,27 @@ func (s *freezeRecomputingStore) ListActiveMaterialized(ctx context.Context) ([]
 		return nil, errors.New("freeze store does not support materialized freeze reads")
 	}
 	return reads.ListActiveMaterialized(ctx)
+}
+
+// UpdateMaterializedAttribution relabels a live materialized freeze in place
+// and republishes, because the forge status description names the winning
+// schedule and must follow the relabel.
+func (s *freezeRecomputingStore) UpdateMaterializedAttribution(ctx context.Context, params freeze.UpdateAttributionParams) (domain.BranchFreeze, error) {
+	if s == nil || s.freezes == nil {
+		return domain.BranchFreeze{}, errors.New("freeze recomputing store has no freeze store")
+	}
+	updater, ok := s.freezes.(materializedFreezeAttributionUpdater)
+	if !ok {
+		return domain.BranchFreeze{}, errors.New("freeze store does not support attribution updates")
+	}
+	updated, err := updater.UpdateMaterializedAttribution(ctx, params)
+	if err != nil {
+		return domain.BranchFreeze{}, err
+	}
+	if err := s.convergeFreeze(ctx, updated); err != nil {
+		return updated, err
+	}
+	return updated, nil
 }
 
 func (s *freezeRecomputingStore) Cancel(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error) {

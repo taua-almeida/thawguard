@@ -8,15 +8,15 @@ import (
 )
 
 // BranchState is everything Decide needs to know about one branch: its active
-// weekly schedules, their expanded coverage segments, and the live freeze row
-// if one exists. It carries no clock and no database handle, so decisions are
+// schedules, their expanded coverage segments, and the live freeze row if one
+// exists. It carries no clock and no database handle, so decisions are
 // table-testable.
 type BranchState struct {
 	RepositoryID int64
 	Branch       string
-	// Schedules are the branch's active weekly schedules. Suppression is
-	// honored here, not by the caller: a suppressed schedule stays in the
-	// slice and Decide ignores its current window.
+	// Schedules are the branch's active schedules, weekly and dated.
+	// Suppression is honored here, not by the caller: a suppressed schedule
+	// stays in the slice and Decide ignores its current window.
 	Schedules []domain.Schedule
 	// Segments are the merged coverage segments for those schedules from
 	// schedule.ExpandCoverage over [now-CoverageLookback, now+CoverageHorizon).
@@ -40,21 +40,35 @@ const (
 	// a schedule and no active schedule covers now — the coverage shrank, the
 	// schedule was paused or deleted mid-window, or a crash orphaned the row.
 	DecisionEnd DecisionAction = "end"
+	// DecisionUpdate relabels a live materialized freeze in place: coverage
+	// still contains now, but the winning source's identity or the union
+	// block's end changed — a dated window took over from a weekly rule at
+	// midnight, or an added schedule extended the block. Coverage itself never
+	// changes here, only attribution and the planned end.
+	DecisionUpdate DecisionAction = "update"
 )
 
 // Decision is the materializer's plan for one branch.
 type Decision struct {
 	Action DecisionAction
-	// ScheduleID attributes a created freeze to the covering schedule whose
-	// current window started earliest (ties broken by lowest ID).
+	// ScheduleID attributes a created or updated freeze to the winning
+	// covering schedule: Dated outranks Weekly, ties break to the most
+	// recently created schedule. Precedence decides naming only — which name
+	// appears on the timeline and in the forge status — never coverage.
 	ScheduleID int64
-	// Reason is the attributing schedule's freeze reason.
+	// ScheduleName is the winning schedule's name, snapshotted onto the
+	// freeze row so deleting the schedule mid-window cannot silently relabel
+	// an already-posted status.
+	ScheduleName string
+	// Reason is the winning schedule's freeze reason.
 	Reason string
 	// PlannedEndsAt is when union coverage over all schedules ends; nil when
 	// coverage reaches the expansion horizon (effectively continuous).
 	PlannedEndsAt *time.Time
 	// EndFreezeID is the live row to end for DecisionEnd.
 	EndFreezeID int64
+	// UpdateFreezeID is the live row to relabel for DecisionUpdate.
+	UpdateFreezeID int64
 }
 
 // Decide maps one branch's coverage and live freeze onto an action. windowEnd
@@ -66,33 +80,70 @@ func Decide(now time.Time, windowEnd time.Time, state BranchState) Decision {
 	block, covered := unionBlockContaining(eligible, now)
 
 	if state.Live != nil {
-		if covered {
+		if !covered {
+			if state.Live.ScheduleID != nil {
+				return Decision{Action: DecisionEnd, EndFreezeID: state.Live.ID}
+			}
 			return Decision{Action: DecisionNone}
 		}
-		if state.Live.ScheduleID != nil {
-			return Decision{Action: DecisionEnd, EndFreezeID: state.Live.ID}
+		if state.Live.ScheduleID == nil {
+			// Manual freeze: the operator's row is never touched.
+			return Decision{Action: DecisionNone}
 		}
-		return Decision{Action: DecisionNone}
+		winner, ok := attributingSchedule(state, eligible, now)
+		if !ok {
+			return Decision{Action: DecisionNone}
+		}
+		planned := plannedEnd(block, windowEnd)
+		if winner.ID == *state.Live.ScheduleID &&
+			winner.Name == state.Live.ScheduleName &&
+			winner.Reason == state.Live.Reason &&
+			plannedEndsEqual(planned, state.Live.PlannedEndsAt) {
+			return Decision{Action: DecisionNone}
+		}
+		return Decision{
+			Action:         DecisionUpdate,
+			UpdateFreezeID: state.Live.ID,
+			ScheduleID:     winner.ID,
+			ScheduleName:   winner.Name,
+			Reason:         winner.Reason,
+			PlannedEndsAt:  planned,
+		}
 	}
 	if !covered {
 		return Decision{Action: DecisionNone}
 	}
 
-	attributing, ok := attributingSchedule(state, eligible, now)
+	winner, ok := attributingSchedule(state, eligible, now)
 	if !ok {
 		// Unreachable when covered, but never create an unattributable row.
 		return Decision{Action: DecisionNone}
 	}
-	decision := Decision{
-		Action:     DecisionCreate,
-		ScheduleID: attributing.ID,
-		Reason:     attributing.Reason,
+	return Decision{
+		Action:        DecisionCreate,
+		ScheduleID:    winner.ID,
+		ScheduleName:  winner.Name,
+		Reason:        winner.Reason,
+		PlannedEndsAt: plannedEnd(block, windowEnd),
 	}
+}
+
+// plannedEnd converts the union block's end into a planned freeze end: a
+// block reaching the expansion window's edge is effectively continuous
+// coverage with no planned end.
+func plannedEnd(block interval, windowEnd time.Time) *time.Time {
 	if block.End.Before(windowEnd) {
 		end := block.End
-		decision.PlannedEndsAt = &end
+		return &end
 	}
-	return decision
+	return nil
+}
+
+func plannedEndsEqual(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Equal(*b)
 }
 
 // eligibleSegments drops the windows suppression turns off: while a schedule
@@ -165,29 +216,45 @@ func sortIntervals(intervals []interval) {
 	}
 }
 
-// attributingSchedule picks which schedule a created freeze names: the one
-// whose eligible window containing now started earliest, ties broken by
-// lowest schedule ID for determinism.
+// attributingSchedule picks which schedule the freeze names, by peer
+// precedence among schedules with an eligible segment containing now: Dated
+// outranks Weekly, ties break to the most recently created schedule (then
+// highest ID for determinism). Precedence decides naming only — which name
+// appears on the timeline and in the forge status description — it never
+// changes coverage.
 func attributingSchedule(state BranchState, eligible []schedule.Segment, now time.Time) (domain.Schedule, bool) {
 	byID := make(map[int64]domain.Schedule, len(state.Schedules))
 	for _, sched := range state.Schedules {
 		byID[sched.ID] = sched
 	}
-	var best *schedule.Segment
-	for i := range eligible {
-		segment := &eligible[i]
+	var winner domain.Schedule
+	found := false
+	for _, segment := range eligible {
 		if segment.Start.After(now) || !segment.End.After(now) {
 			continue
 		}
-		if best == nil ||
-			segment.Start.Before(best.Start) ||
-			(segment.Start.Equal(best.Start) && segment.ScheduleID < best.ScheduleID) {
-			best = segment
+		sched, ok := byID[segment.ScheduleID]
+		if !ok {
+			continue
+		}
+		if !found || Outranks(sched, winner) {
+			winner = sched
+			found = true
 		}
 	}
-	if best == nil {
-		return domain.Schedule{}, false
+	return winner, found
+}
+
+// Outranks reports whether schedule a beats schedule b for freeze
+// attribution: Dated outranks Weekly, ties break to the most recently created
+// schedule, then to the highest id. It decides naming only, never coverage;
+// the web timeline shares it so labels match the forge status.
+func Outranks(a, b domain.Schedule) bool {
+	if (a.Kind == domain.ScheduleKindDated) != (b.Kind == domain.ScheduleKindDated) {
+		return a.Kind == domain.ScheduleKindDated
 	}
-	sched, ok := byID[best.ScheduleID]
-	return sched, ok
+	if !a.CreatedAt.Equal(b.CreatedAt) {
+		return a.CreatedAt.After(b.CreatedAt)
+	}
+	return a.ID > b.ID
 }

@@ -250,11 +250,12 @@ WHERE id = ?`, until.UTC().Format(sqliteTimestampFormat), nowText, id)
 	return s.Get(ctx, id)
 }
 
-// ListActiveWeeklyCoverages returns every active weekly schedule paired with
-// its rules — the materializer's whole input. Schedules without rules are
-// skipped by ExpandCoverage, so they are returned as empty coverages rather
-// than filtered here.
-func (s *Store) ListActiveWeeklyCoverages(ctx context.Context) ([]Coverage, error) {
+// ListActiveCoverages returns every active schedule paired with its
+// recurrence definition — weekly schedules with their rules, dated schedules
+// with their windows — the materializer's whole input. Schedules with nothing
+// to expand are skipped by ExpandCoverage, so they are returned as empty
+// coverages rather than filtered here.
+func (s *Store) ListActiveCoverages(ctx context.Context) ([]Coverage, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("schedule store has no database")
 	}
@@ -264,14 +265,21 @@ func (s *Store) ListActiveWeeklyCoverages(ctx context.Context) ([]Coverage, erro
 	}
 	coverages := make([]Coverage, 0)
 	for _, sched := range schedules {
-		if !sched.Active || sched.Kind != domain.ScheduleKindWeekly {
+		if !sched.Active {
 			continue
 		}
-		rules, err := s.ListRules(ctx, sched.ID)
-		if err != nil {
-			return nil, err
+		coverage := Coverage{Schedule: sched}
+		switch sched.Kind {
+		case domain.ScheduleKindWeekly:
+			if coverage.Rules, err = s.ListRules(ctx, sched.ID); err != nil {
+				return nil, err
+			}
+		case domain.ScheduleKindDated:
+			if coverage.Windows, err = s.ListWindows(ctx, sched.ID); err != nil {
+				return nil, err
+			}
 		}
-		coverages = append(coverages, Coverage{Schedule: sched, Rules: rules})
+		coverages = append(coverages, coverage)
 	}
 	return coverages, nil
 }

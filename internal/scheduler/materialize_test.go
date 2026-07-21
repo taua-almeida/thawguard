@@ -20,7 +20,7 @@ type fakeScheduleSource struct {
 	err       error
 }
 
-func (s *fakeScheduleSource) ListActiveWeeklyCoverages(ctx context.Context) ([]schedule.Coverage, error) {
+func (s *fakeScheduleSource) ListActiveCoverages(ctx context.Context) ([]schedule.Coverage, error) {
 	return s.coverages, s.err
 }
 
@@ -30,8 +30,10 @@ type fakeFreezeStore struct {
 	created        []freeze.CreateParams
 	createdActors  []domain.Actor
 	ended          []int64
+	updated        []freeze.UpdateAttributionParams
 	createErr      error
 	endErr         error
+	updateErr      error
 }
 
 func (s *fakeFreezeStore) GetActiveForBranch(ctx context.Context, repositoryID int64, branch string) (domain.BranchFreeze, bool, error) {
@@ -58,6 +60,14 @@ func (s *fakeFreezeStore) EndMaterialized(ctx context.Context, id int64, actor d
 	}
 	s.ended = append(s.ended, id)
 	return domain.BranchFreeze{ID: id}, nil
+}
+
+func (s *fakeFreezeStore) UpdateMaterializedAttribution(ctx context.Context, params freeze.UpdateAttributionParams) (domain.BranchFreeze, error) {
+	if s.updateErr != nil {
+		return domain.BranchFreeze{}, s.updateErr
+	}
+	s.updated = append(s.updated, params)
+	return domain.BranchFreeze{ID: params.FreezeID}, nil
 }
 
 // weeklyCoverage builds one active schedule covering Mon 09:00 → Fri 17:00 UTC
@@ -93,6 +103,9 @@ func TestMaterializerCreatesLinkedFreezeForCoveredBranch(t *testing.T) {
 	if created.ScheduleID == nil || *created.ScheduleID != 7 {
 		t.Fatalf("expected freeze linked to schedule 7, got %+v", created.ScheduleID)
 	}
+	if created.ScheduleName != "Work week lock" {
+		t.Fatalf("expected snapshotted schedule name, got %q", created.ScheduleName)
+	}
 	wantEnd := time.Date(2026, 7, 24, 17, 0, 0, 0, time.UTC)
 	if created.PlannedEndsAt == nil || !created.PlannedEndsAt.Equal(wantEnd) {
 		t.Fatalf("expected planned end %v, got %v", wantEnd, created.PlannedEndsAt)
@@ -105,7 +118,11 @@ func TestMaterializerCreatesLinkedFreezeForCoveredBranch(t *testing.T) {
 
 func TestMaterializerIsIdempotentWhileBranchStaysFrozen(t *testing.T) {
 	ctx := context.Background()
-	live := domain.BranchFreeze{ID: 40, RepositoryID: 1, Branch: "main", ScheduleID: int64Ptr(7)}
+	live := domain.BranchFreeze{
+		ID: 40, RepositoryID: 1, Branch: "main",
+		ScheduleID: int64Ptr(7), ScheduleName: "Work week lock",
+		PlannedEndsAt: timePtr(time.Date(2026, 7, 24, 17, 0, 0, 0, time.UTC)),
+	}
 	freezes := &fakeFreezeStore{
 		activeByBranch: map[branchKey]domain.BranchFreeze{{RepositoryID: 1, Branch: "main"}: live},
 		materialized:   []domain.BranchFreeze{live},
@@ -119,8 +136,75 @@ func TestMaterializerIsIdempotentWhileBranchStaysFrozen(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if len(freezes.created) != 0 || len(freezes.ended) != 0 || len(freezes.updated) != 0 {
+		t.Fatalf("expected no churn on a covered frozen branch, created=%+v ended=%+v updated=%+v", freezes.created, freezes.ended, freezes.updated)
+	}
+}
+
+// datedCoverage builds one active dated schedule with a window covering the
+// fixed test clock's day (Mon 2026-07-20, UTC wall clocks).
+func datedCoverage(scheduleID int64, branch, name, reason string, createdAt time.Time) schedule.Coverage {
+	return schedule.Coverage{
+		Schedule: domain.Schedule{ID: scheduleID, RepositoryID: 1, Branch: branch, Name: name, Kind: domain.ScheduleKindDated, Timezone: "UTC", Reason: reason, Active: true, CreatedAt: createdAt},
+		Windows: []domain.ScheduleDatedWindow{{
+			ID: scheduleID * 10, ScheduleID: scheduleID, Name: "Holiday",
+			StartsAt: "2026-07-20T00:00", EndsAt: "2026-07-21T00:00",
+		}},
+	}
+}
+
+func TestMaterializerRelabelsFreezeWhenDatedWindowTakesOver(t *testing.T) {
+	ctx := context.Background()
+	live := domain.BranchFreeze{
+		ID: 40, RepositoryID: 1, Branch: "main",
+		ScheduleID: int64Ptr(7), ScheduleName: "Work week lock", Reason: "Work week",
+		PlannedEndsAt: timePtr(time.Date(2026, 7, 24, 17, 0, 0, 0, time.UTC)),
+	}
+	freezes := &fakeFreezeStore{
+		activeByBranch: map[branchKey]domain.BranchFreeze{{RepositoryID: 1, Branch: "main"}: live},
+		materialized:   []domain.BranchFreeze{live},
+	}
+	materializer := NewMaterializer(
+		&fakeScheduleSource{coverages: []schedule.Coverage{
+			weeklyCoverage(7, "main", "Work week"),
+			datedCoverage(9, "main", "Christmas maintenance", "Holiday change stop", decideNow.Add(-24*time.Hour)),
+		}},
+		freezes, fixedClock{now: decideNow}, nil)
+
+	if err := materializer.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if len(freezes.created) != 0 || len(freezes.ended) != 0 {
-		t.Fatalf("expected no churn on a covered frozen branch, created=%+v ended=%+v", freezes.created, freezes.ended)
+		t.Fatalf("relabel must not churn rows, created=%+v ended=%+v", freezes.created, freezes.ended)
+	}
+	if len(freezes.updated) != 1 {
+		t.Fatalf("expected one attribution update, got %+v", freezes.updated)
+	}
+	updated := freezes.updated[0]
+	if updated.FreezeID != 40 || updated.ScheduleID != 9 || updated.ScheduleName != "Christmas maintenance" || updated.Reason != "Holiday change stop" {
+		t.Fatalf("unexpected update params: %+v", updated)
+	}
+	// Coverage is untouched: the union still runs to the weekly rule's end.
+	wantEnd := time.Date(2026, 7, 24, 17, 0, 0, 0, time.UTC)
+	if updated.PlannedEndsAt == nil || !updated.PlannedEndsAt.Equal(wantEnd) {
+		t.Fatalf("expected planned end %v, got %v", wantEnd, updated.PlannedEndsAt)
+	}
+}
+
+func TestMaterializerSkipsAttributionUpdateValidationFailures(t *testing.T) {
+	ctx := context.Background()
+	live := domain.BranchFreeze{ID: 40, RepositoryID: 1, Branch: "main", ScheduleID: int64Ptr(7)}
+	freezes := &fakeFreezeStore{
+		activeByBranch: map[branchKey]domain.BranchFreeze{{RepositoryID: 1, Branch: "main"}: live},
+		materialized:   []domain.BranchFreeze{live},
+		updateErr:      freeze.ValidationError{Message: "freeze is no longer an active materialized freeze"},
+	}
+	materializer := NewMaterializer(
+		&fakeScheduleSource{coverages: []schedule.Coverage{weeklyCoverage(7, "main", "")}},
+		freezes, fixedClock{now: decideNow}, nil)
+
+	if err := materializer.RunOnce(ctx); err != nil {
+		t.Fatalf("attribution update races must be skipped, got %v", err)
 	}
 }
 

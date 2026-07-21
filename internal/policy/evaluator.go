@@ -45,7 +45,10 @@ func Evaluate(input Input) Decision {
 		return success("PR is explicitly thawed during an active freeze", "thawed_exception")
 	}
 
-	return failure(manualFreezeDescription, "active_freeze")
+	return failure(BuildFreezeDescription(FreezeDescriptionInput{
+		ScheduleName: freeze.ScheduleName,
+		Reason:       freeze.Reason,
+	}), "active_freeze")
 }
 
 func thawMatchesPullRequest(thaw domain.ThawException, pr domain.PullRequest) bool {

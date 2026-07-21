@@ -15,17 +15,21 @@ import (
 )
 
 type fakeScheduleStore struct {
-	schedules     []domain.Schedule
-	created       []schedule.CreateParams
-	deleted       []int64
-	activated     []int64
-	paused        []int64
-	createErr     error
-	transitionErr error
-	rules         map[int64][]domain.ScheduleWeeklyRule
-	addedRules    []schedule.AddRulesParams
-	addRulesErr   error
-	removedRules  []int64
+	schedules      []domain.Schedule
+	created        []schedule.CreateParams
+	deleted        []int64
+	activated      []int64
+	paused         []int64
+	createErr      error
+	transitionErr  error
+	rules          map[int64][]domain.ScheduleWeeklyRule
+	addedRules     []schedule.AddRulesParams
+	addRulesErr    error
+	removedRules   []int64
+	windows        map[int64][]domain.ScheduleDatedWindow
+	addedWindows   []schedule.AddWindowParams
+	addWindowErr   error
+	removedWindows []int64
 }
 
 func (s *fakeScheduleStore) List(ctx context.Context) ([]domain.Schedule, error) {
@@ -131,6 +135,44 @@ func (s *fakeScheduleStore) DeleteRule(ctx context.Context, scheduleID, ruleID i
 		}
 	}
 	return domain.ScheduleWeeklyRule{}, schedule.ErrRuleNotFound
+}
+
+func (s *fakeScheduleStore) ListWindows(ctx context.Context, scheduleID int64) ([]domain.ScheduleDatedWindow, error) {
+	return s.windows[scheduleID], nil
+}
+
+func (s *fakeScheduleStore) AddWindow(ctx context.Context, params schedule.AddWindowParams, actor domain.Actor) (domain.ScheduleDatedWindow, error) {
+	if _, err := s.Get(ctx, params.ScheduleID); err != nil {
+		return domain.ScheduleDatedWindow{}, err
+	}
+	if s.addWindowErr != nil {
+		return domain.ScheduleDatedWindow{}, s.addWindowErr
+	}
+	s.addedWindows = append(s.addedWindows, params)
+	if s.windows == nil {
+		s.windows = map[int64][]domain.ScheduleDatedWindow{}
+	}
+	added := domain.ScheduleDatedWindow{
+		ID:         int64(200 + len(s.windows[params.ScheduleID]) + 1),
+		ScheduleID: params.ScheduleID,
+		Name:       params.Name,
+		StartsAt:   params.StartsAt,
+		EndsAt:     params.EndsAt,
+	}
+	s.windows[params.ScheduleID] = append(s.windows[params.ScheduleID], added)
+	return added, nil
+}
+
+func (s *fakeScheduleStore) DeleteWindow(ctx context.Context, scheduleID, windowID int64, actor domain.Actor) (domain.ScheduleDatedWindow, error) {
+	windows := s.windows[scheduleID]
+	for i, window := range windows {
+		if window.ID == windowID {
+			s.windows[scheduleID] = append(windows[:i:i], windows[i+1:]...)
+			s.removedWindows = append(s.removedWindows, windowID)
+			return window, nil
+		}
+	}
+	return domain.ScheduleDatedWindow{}, schedule.ErrWindowNotFound
 }
 
 func scheduleTestServer(store *fakeScheduleStore) *Server {
@@ -506,7 +548,7 @@ func TestSchedulePreviewFromClipsBlocksPerDayAndKeepsTrueStartsInText(t *testing
 	// week's Monday rule already ended.
 	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
 
-	preview, err := schedulePreviewFrom(sched, rules, now)
+	preview, err := schedulePreviewFrom(sched, schedule.Coverage{Schedule: sched, Rules: rules}, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -540,7 +582,7 @@ func TestSchedulePreviewFromReportsSpringForwardNote(t *testing.T) {
 	// Window covers Sunday 2026-03-08, when 02:30 EST does not exist.
 	now := time.Date(2026, 3, 4, 12, 0, 0, 0, time.UTC)
 
-	preview, err := schedulePreviewFrom(sched, rules, now)
+	preview, err := schedulePreviewFrom(sched, schedule.Coverage{Schedule: sched, Rules: rules}, now)
 	if err != nil {
 		t.Fatal(err)
 	}

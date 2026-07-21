@@ -8,13 +8,15 @@ import (
 	"github.com/taua-almeida/thawguard/internal/domain"
 )
 
-// Coverage pairs a schedule with its weekly rules for expansion. Dated
-// schedules and paused state are the caller's concern: ExpandCoverage expands
-// whatever it is given, which is what lets the preview show a paused
-// schedule's would-be coverage truthfully labeled as a preview.
+// Coverage pairs a schedule with its recurrence definition for expansion:
+// Rules for a weekly schedule, Windows for a dated one. Paused state is the
+// caller's concern: ExpandCoverage expands whatever it is given, which is
+// what lets the preview show a paused schedule's would-be coverage truthfully
+// labeled as a preview.
 type Coverage struct {
 	Schedule domain.Schedule
 	Rules    []domain.ScheduleWeeklyRule
+	Windows  []domain.ScheduleDatedWindow
 }
 
 // Segment is one concrete coverage interval in absolute time. Segments are
@@ -73,25 +75,24 @@ func ExpandCoverage(coverages []Coverage, from, to time.Time) ([]Segment, []DSTN
 	seenNotes := make(map[DSTNote]bool)
 
 	for _, coverage := range coverages {
-		if coverage.Schedule.Kind != domain.ScheduleKindWeekly || len(coverage.Rules) == 0 {
+		var expanded []Segment
+		var coverageNotes []DSTNote
+		var err error
+		switch {
+		case coverage.Schedule.Kind == domain.ScheduleKindWeekly && len(coverage.Rules) > 0:
+			expanded, coverageNotes, err = expandWeekly(coverage, from, to)
+		case coverage.Schedule.Kind == domain.ScheduleKindDated && len(coverage.Windows) > 0:
+			expanded, coverageNotes, err = expandDated(coverage, from, to)
+		default:
 			continue
 		}
-		loc, err := time.LoadLocation(coverage.Schedule.Timezone)
 		if err != nil {
-			return nil, nil, fmt.Errorf("load schedule %d timezone %q: %w", coverage.Schedule.ID, coverage.Schedule.Timezone, err)
+			return nil, nil, err
 		}
-		expanded := make([]Segment, 0)
-		for _, rule := range coverage.Rules {
-			ruleSegments, ruleNotes, err := expandRule(coverage.Schedule, rule, loc, from, to)
-			if err != nil {
-				return nil, nil, err
-			}
-			expanded = append(expanded, ruleSegments...)
-			for _, note := range ruleNotes {
-				if !seenNotes[note] {
-					seenNotes[note] = true
-					notes = append(notes, note)
-				}
+		for _, note := range coverageNotes {
+			if !seenNotes[note] {
+				seenNotes[note] = true
+				notes = append(notes, note)
 			}
 		}
 		segments = append(segments, mergeSegments(expanded)...)
@@ -104,6 +105,57 @@ func ExpandCoverage(coverages []Coverage, from, to time.Time) ([]Segment, []DSTN
 		return segments[i].ScheduleID < segments[j].ScheduleID
 	})
 	sort.Slice(notes, func(i, j int) bool { return notes[i].Resolved.Before(notes[j].Resolved) })
+	return segments, notes, nil
+}
+
+func expandWeekly(coverage Coverage, from, to time.Time) ([]Segment, []DSTNote, error) {
+	loc, err := time.LoadLocation(coverage.Schedule.Timezone)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load schedule %d timezone %q: %w", coverage.Schedule.ID, coverage.Schedule.Timezone, err)
+	}
+	segments := make([]Segment, 0)
+	notes := make([]DSTNote, 0)
+	for _, rule := range coverage.Rules {
+		ruleSegments, ruleNotes, err := expandRule(coverage.Schedule, rule, loc, from, to)
+		if err != nil {
+			return nil, nil, err
+		}
+		segments = append(segments, ruleSegments...)
+		notes = append(notes, ruleNotes...)
+	}
+	return segments, notes, nil
+}
+
+// expandDated resolves each window's wall clocks into one segment and keeps
+// the ones overlapping [from, to). Unlike weekly rules there is no recurrence
+// to walk: a window is already a concrete date range.
+func expandDated(coverage Coverage, from, to time.Time) ([]Segment, []DSTNote, error) {
+	segments := make([]Segment, 0)
+	notes := make([]DSTNote, 0)
+	for _, window := range coverage.Windows {
+		start, end, windowNotes, err := resolveWindowBoundsWithNotes(coverage.Schedule, window)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !end.After(start) {
+			// A DST transition swallowed the whole window; nothing to cover.
+			continue
+		}
+		if !start.Before(to) || !end.After(from) {
+			continue
+		}
+		segments = append(segments, Segment{
+			ScheduleID:   coverage.Schedule.ID,
+			ScheduleName: coverage.Schedule.Name,
+			Start:        start,
+			End:          end,
+		})
+		for _, note := range windowNotes {
+			if !note.Resolved.Before(from) && note.Resolved.Before(to) {
+				notes = append(notes, note)
+			}
+		}
+	}
 	return segments, notes, nil
 }
 

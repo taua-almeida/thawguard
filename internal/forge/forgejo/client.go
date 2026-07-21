@@ -95,7 +95,7 @@ func (c *Client) PostCommitStatus(ctx context.Context, owner, repo string, statu
 	body, err := json.Marshal(commitStatusRequest{
 		State:       string(status.State),
 		TargetURL:   status.TargetURL,
-		Description: status.Description,
+		Description: clipDescription(status.Description),
 		Context:     status.Context,
 	})
 	if err != nil {
@@ -210,6 +210,20 @@ type commitStatusRequest struct {
 	TargetURL   string `json:"target_url,omitempty"`
 	Description string `json:"description,omitempty"`
 	Context     string `json:"context"`
+}
+
+// commitStatusDescriptionMaxRunes is Forgejo's commit status description
+// limit. Callers already build descriptions within it, but this client is the
+// last boundary before the API, so it clips defensively rather than trusting
+// every caller forever.
+const commitStatusDescriptionMaxRunes = 255
+
+func clipDescription(description string) string {
+	runes := []rune(description)
+	if len(runes) <= commitStatusDescriptionMaxRunes {
+		return description
+	}
+	return string(runes[:commitStatusDescriptionMaxRunes-1]) + "…"
 }
 
 type pullRequestResponse struct {
