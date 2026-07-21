@@ -42,6 +42,7 @@ const (
 	fixtureRoleThawFilename  = "role-boundary-thaw.txt"
 	primaryStatusTokenName   = "thawguard-e2e-status-primary"
 	requiredContext          = "thawguard/freeze"
+	manualFreezeDescription  = "Branch is frozen; merge is blocked by Thawguard"
 	e2eComposeProject        = "thawguard-e2e"
 	thawguardSessionCookie   = "thawguard_session"
 	injectedDriftDescription = "E2E injected status drift while Thawguard was stopped"
@@ -248,7 +249,8 @@ func TestLocalForgejoFreezeLifecycle(t *testing.T) {
 	activateEnforcement(t, ctx, browser, repositoryID)
 	requireRepairedReleaseReadiness(t, ctx, browser)
 	firstFreeze := createFreeze(t, ctx, browser, repositoryID, "Fictional release verification")
-	waitForStatusWithDescription(t, ctx, forgejo, pr.Head.SHA, "failure", "Branch is frozen; merge is blocked by Thawguard")
+	firstFreezeDescription := manualFreezeStatusDescription(firstFreeze.reason)
+	waitForStatusWithDescription(t, ctx, forgejo, pr.Head.SHA, "failure", firstFreezeDescription)
 	assertMergeBlockedByRequiredStatus(t, ctx, forgejo, pr.Number)
 	proveRestartPersistenceAndReconciliation(t, ctx, forgejo, browser, cfg, repositoryID, pr)
 
@@ -265,7 +267,7 @@ func TestLocalForgejoFreezeLifecycle(t *testing.T) {
 		"new head for token-loss recovery proof\n",
 		"token-loss",
 	)
-	waitForTokenFailureEvidence(t, ctx, forgejo, browser, repositoryID, newHeadSHA)
+	waitForTokenFailureEvidence(t, ctx, forgejo, browser, repositoryID, newHeadSHA, firstFreezeDescription)
 	afterTokenFailure := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, newHeadSHA)
 	requireTokenFailureSideEffects(t, beforeTokenFailure, afterTokenFailure)
 	assertNoFreezeStatus(t, ctx, forgejo, newHeadSHA)
@@ -273,7 +275,7 @@ func TestLocalForgejoFreezeLifecycle(t *testing.T) {
 	scanRenderedTokenSurfaces(t, ctx, browser)
 
 	rotateStatusTokenAndRecover(t, ctx, browser, cfg, repositoryID)
-	waitForRecoveredEnforcement(t, ctx, forgejo, browser, newHeadSHA)
+	waitForRecoveredEnforcement(t, ctx, forgejo, browser, newHeadSHA, firstFreezeDescription)
 	assertMergeBlockedByRequiredStatus(t, ctx, forgejo, pr.Number)
 	scanRenderedTokenSurfaces(t, ctx, browser)
 
@@ -320,14 +322,15 @@ func proveActiveFreezeCancellation(t *testing.T, ctx context.Context, forgejo *f
 	requireBranchFreezeActivityEvidence(t, firstLiftRow, firstFreeze, "Lifted")
 
 	secondFreeze := createFreeze(t, ctx, browser, repositoryID, cancellationReason)
+	secondFreezeDescription := manualFreezeStatusDescription(secondFreeze.reason)
 	if secondFreeze.id == firstFreeze.id {
 		t.Fatalf("second freeze reused lifted freeze ID %d", secondFreeze.id)
 	}
 	if secondFreeze.reason == firstFreeze.reason {
 		t.Fatalf("second freeze reason %q did not remain distinct from lifted freeze", secondFreeze.reason)
 	}
-	waitForStatusWithDescription(t, ctx, forgejo, headSHA, "failure", "Branch is frozen; merge is blocked by Thawguard")
-	waitForLatestPostedPublicationAttempt(t, ctx, browser, headSHA, "failure", "Branch is frozen; merge is blocked by Thawguard")
+	waitForStatusWithDescription(t, ctx, forgejo, headSHA, "failure", secondFreezeDescription)
+	waitForLatestPostedPublicationAttempt(t, ctx, browser, headSHA, "failure", secondFreezeDescription)
 	assertMergeBlockedByRequiredStatus(t, ctx, forgejo, pullRequestIndex)
 
 	if active := requireActiveFreezeEvidence(t, requirePage(t, ctx, browser, "/freezes")); active != secondFreeze {
@@ -341,7 +344,7 @@ func proveActiveFreezeCancellation(t *testing.T, ctx context.Context, forgejo *f
 		t.Fatal("second active freeze is missing its pre-cancel Forgejo status")
 	}
 	latestBefore := before.freezeStatuses[len(before.freezeStatuses)-1]
-	if latestBefore.Context != requiredContext || latestBefore.Status != "failure" || latestBefore.Description != "Branch is frozen; merge is blocked by Thawguard" {
+	if latestBefore.Context != requiredContext || latestBefore.Status != "failure" || latestBefore.Description != secondFreezeDescription {
 		t.Fatalf("unexpected pre-cancel required status: id=%d context=%q state=%q description=%q", latestBefore.ID, latestBefore.Context, latestBefore.Status, latestBefore.Description)
 	}
 
@@ -385,9 +388,9 @@ func proveImmediatePerPullRequestThaw(t *testing.T, ctx context.Context, forgejo
 	const (
 		freezeReason = "Fictional per-PR thaw verification."
 		thawReason   = "Fictional immediate per-PR thaw verification"
-		frozenReason = "Branch is frozen; merge is blocked by Thawguard"
 		explicitThaw = "PR is explicitly thawed during an active freeze"
 	)
+	frozenReason := manualFreezeStatusDescription(freezeReason)
 	if len(headSHA) < 12 {
 		t.Fatalf("current pull request head %q is too short for activity evidence", headSHA)
 	}
@@ -517,9 +520,9 @@ func proveStaleHeadThawReevaluation(t *testing.T, ctx context.Context, forgejo *
 	t.Helper()
 	const (
 		freezeReason = "Fictional per-PR thaw verification."
-		frozenReason = "Branch is frozen; merge is blocked by Thawguard"
 		explicitThaw = "PR is explicitly thawed during an active freeze"
 	)
+	frozenReason := manualFreezeStatusDescription(freezeReason)
 
 	oldHeadSHA := strings.ToLower(strings.TrimSpace(headSHA))
 	if len(oldHeadSHA) < 12 {
@@ -680,7 +683,6 @@ func proveSharedHeadConfirmation(t *testing.T, ctx context.Context, forgejo *for
 	t.Helper()
 	const (
 		thawReason   = "Fictional shared-head thaw confirmation"
-		frozenReason = "Branch is frozen; merge is blocked by Thawguard"
 		explicitThaw = "PR is explicitly thawed during an active freeze"
 	)
 	historicalThawedHeadSHA = strings.ToLower(strings.TrimSpace(historicalThawedHeadSHA))
@@ -693,6 +695,7 @@ func proveSharedHeadConfirmation(t *testing.T, ctx context.Context, forgejo *for
 	if activeFreeze.branch != "main" || activeFreeze.status != "Frozen" {
 		t.Fatalf("shared-head confirmation started without the expected active main freeze: %+v", activeFreeze)
 	}
+	frozenReason := manualFreezeStatusDescription(activeFreeze.reason)
 	historicalStatuses, err := listForgejoFreezeStatuses(ctx, forgejo, historicalThawedHeadSHA)
 	if err != nil {
 		t.Fatal(err)
@@ -1045,12 +1048,12 @@ func proveScheduledFreezeLifecycle(t *testing.T, ctx context.Context, forgejo *f
 	t.Helper()
 	const (
 		noFreezeReason        = "No active freeze applies to this PR"
-		frozenReason          = "Branch is frozen; merge is blocked by Thawguard"
 		explicitThaw          = "PR is explicitly thawed during an active freeze"
 		scheduleAReason       = "Fictional scheduled release freeze"
 		scheduleAEditedReason = "Fictional edited scheduled release freeze"
 		scheduleBReason       = "Fictional cancelled scheduled release freeze"
 	)
+	frozenReason := manualFreezeStatusDescription(scheduleAEditedReason)
 	historicalThawedHeadSHA = strings.ToLower(strings.TrimSpace(historicalThawedHeadSHA))
 	sharedHeadSHA = strings.ToLower(strings.TrimSpace(sharedHeadSHA))
 	if len(historicalThawedHeadSHA) < 12 || len(sharedHeadSHA) < 12 || historicalThawedHeadSHA == sharedHeadSHA {
@@ -1448,10 +1451,8 @@ func proveScheduledFreezeLifecycle(t *testing.T, ctx context.Context, forgejo *f
 
 func provePlannedUnfreezeAcrossRestart(t *testing.T, ctx context.Context, forgejo *forgejoAPI, browser *thawguardBrowser, cfg e2eConfig, repositoryID int64, fixture scheduledFreezeLifecycleFixture) {
 	t.Helper()
-	const (
-		frozenDescription = "Branch is frozen; merge is blocked by Thawguard"
-		thawedDescription = "No active freeze applies to this PR"
-	)
+	const thawedDescription = "No active freeze applies to this PR"
+	frozenDescription := manualFreezeStatusDescription(fixture.activeScheduleA.reason)
 	sliceStartedAt := time.Now().UTC()
 	plannedEndsAt := fixture.plannedEndsAt.UTC()
 	contextDeadline, hasDeadline := ctx.Deadline()
@@ -1857,9 +1858,9 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 		scheduleCReason         = "Fictional role-boundary Schedule C"
 		scheduleCEditedReason   = "Fictional role-boundary Schedule C edited"
 		roleThawReason          = "Fictional role-boundary unique-head thaw"
-		frozenDescription       = "Branch is frozen; merge is blocked by Thawguard"
 		explicitThawDescription = "PR is explicitly thawed during an active freeze"
 	)
+	frozenDescription := manualFreezeStatusDescription(fixture.activeMainFreeze.reason)
 	sliceStartedAt := time.Now().UTC()
 	if fixture.primaryPullRequestIndex <= 0 || fixture.sharedHeadPullRequestIndex <= 0 || fixture.releasePullRequestIndex <= 0 || len(fixture.sharedHeadSHA) < 12 || len(fixture.releaseHeadSHA) < 12 || fixture.activeMainFreeze.id <= 0 {
 		t.Fatalf("role-boundary proof received an incomplete fixture: %+v", fixture)
@@ -2397,11 +2398,13 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 func proveAuditAndDiagnosticsEvidence(t *testing.T, ctx context.Context, forgejo *forgejoAPI, cfg e2eConfig, repositoryID int64, lifecycle scheduledFreezeLifecycleFixture, fixture terminalDiagnosticsFixture) {
 	t.Helper()
 	const (
-		frozenDescription       = "Branch is frozen; merge is blocked by Thawguard"
 		noFreezeDescription     = "No active freeze applies to this PR"
 		explicitThawDescription = "PR is explicitly thawed during an active freeze"
 		statusDiagnosticLimit   = 25
 	)
+	initialFrozenDescription := manualFreezeStatusDescription("Fictional release verification")
+	mainFrozenDescription := manualFreezeStatusDescription(lifecycle.activeMainFreeze.reason)
+	releaseFrozenDescription := manualFreezeStatusDescription(lifecycle.activeScheduleA.reason)
 	sliceStartedAt := time.Now().UTC()
 	if len(fixture.uniqueHeadSHA) < 12 || len(fixture.roleSessions) != 5 || len(fixture.scheduleReasons) != 3 || fixture.expectedSideEffects.webhookRows <= 0 {
 		t.Fatalf("terminal diagnostics proof received an incomplete fixture: unique head length=%d sessions=%d schedules=%d webhooks=%d", len(fixture.uniqueHeadSHA), len(fixture.roleSessions), len(fixture.scheduleReasons), fixture.expectedSideEffects.webhookRows)
@@ -2499,14 +2502,14 @@ func proveAuditAndDiagnosticsEvidence(t *testing.T, ctx context.Context, forgejo
 	tokenFailureIndex := diagnosticRowIndex(tokenAttempts,
 		`>failure · forgejo_status</code>`,
 		`>failed</span>`,
-		frozenDescription,
+		initialFrozenDescription,
 		"post forgejo commit status",
 		"forge returned 401",
 	)
 	tokenRecoveryIndex := diagnosticRowIndex(tokenAttempts,
 		`>failure · forgejo_status</code>`,
 		`>posted</span>`,
-		frozenDescription,
+		initialFrozenDescription,
 	)
 	tokenCurrentIndex := diagnosticRowIndex(tokenAttempts,
 		`>success · forgejo_status</code>`,
@@ -2532,11 +2535,11 @@ func proveAuditAndDiagnosticsEvidence(t *testing.T, ctx context.Context, forgejo
 		t.Fatalf("release head has %d retained publication attempts, want eligible/frozen/eligible", len(releaseAttempts))
 	}
 	requireStatusAttemptEvidence(t, releaseAttempts[2], lifecycle.releasePullRequestIndex, fixtureReleaseBranch, lifecycle.releaseHeadSHA, "success", "posted", noFreezeDescription)
-	requireStatusAttemptEvidence(t, releaseAttempts[1], lifecycle.releasePullRequestIndex, fixtureReleaseBranch, lifecycle.releaseHeadSHA, "failure", "posted", frozenDescription)
+	requireStatusAttemptEvidence(t, releaseAttempts[1], lifecycle.releasePullRequestIndex, fixtureReleaseBranch, lifecycle.releaseHeadSHA, "failure", "posted", releaseFrozenDescription)
 	requireStatusAttemptEvidence(t, releaseAttempts[0], lifecycle.releasePullRequestIndex, fixtureReleaseBranch, lifecycle.releaseHeadSHA, "success", "posted", noFreezeDescription)
 	releaseIntent := requirePublicationIntentRowForHead(t, publicationsPage, lifecycle.releaseHeadSHA)
 	requireCurrentStatusIntentEvidence(t, releaseIntent, lifecycle.releasePullRequestIndex, fixtureReleaseBranch, lifecycle.releaseHeadSHA, "success", noFreezeDescription)
-	requireCommitStatusProgression(t, before.evidence.statusHistories[2], []string{"success", "failure", "success"}, []string{noFreezeDescription, frozenDescription, noFreezeDescription}, "release")
+	requireCommitStatusProgression(t, before.evidence.statusHistories[2], []string{"success", "failure", "success"}, []string{noFreezeDescription, releaseFrozenDescription, noFreezeDescription}, "release")
 
 	if !strings.Contains(decisionsPage, `>`+requiredContext+`</code>`) {
 		t.Fatal("terminal decisions page does not state the required status context")
@@ -2546,7 +2549,7 @@ func proveAuditAndDiagnosticsEvidence(t *testing.T, ctx context.Context, forgejo
 		t.Fatalf("role-boundary unique head has %d decision rows, want frozen then Eligible", len(roleDecisions))
 	}
 	roleEligibleIndex := diagnosticRowIndex(roleDecisions, `>Eligible</span>`, explicitThawDescription)
-	roleBlockedIndex := diagnosticRowIndex(roleDecisions, `>Blocked</span>`, frozenDescription)
+	roleBlockedIndex := diagnosticRowIndex(roleDecisions, `>Blocked</span>`, mainFrozenDescription)
 	if roleEligibleIndex < 0 || roleBlockedIndex < 0 || roleEligibleIndex >= roleBlockedIndex {
 		t.Fatalf("role-boundary decision chronology is incomplete: Eligible=%d Blocked=%d", roleEligibleIndex, roleBlockedIndex)
 	}
@@ -2562,11 +2565,11 @@ func proveAuditAndDiagnosticsEvidence(t *testing.T, ctx context.Context, forgejo
 	if len(roleAttempts) != 2 {
 		t.Fatalf("role-boundary unique head has %d publication attempts, want failure then success", len(roleAttempts))
 	}
-	requireStatusAttemptEvidence(t, roleAttempts[1], lifecycle.primaryPullRequestIndex, "main", fixture.uniqueHeadSHA, "failure", "posted", frozenDescription)
+	requireStatusAttemptEvidence(t, roleAttempts[1], lifecycle.primaryPullRequestIndex, "main", fixture.uniqueHeadSHA, "failure", "posted", mainFrozenDescription)
 	requireStatusAttemptEvidence(t, roleAttempts[0], lifecycle.primaryPullRequestIndex, "main", fixture.uniqueHeadSHA, "success", "posted", explicitThawDescription)
 	roleIntent := requirePublicationIntentRowForHead(t, publicationsPage, fixture.uniqueHeadSHA)
 	requireCurrentStatusIntentEvidence(t, roleIntent, lifecycle.primaryPullRequestIndex, "main", fixture.uniqueHeadSHA, "success", explicitThawDescription)
-	requireCommitStatusProgression(t, before.evidence.statusHistories[0], []string{"failure", "success"}, []string{frozenDescription, explicitThawDescription}, "role-boundary")
+	requireCommitStatusProgression(t, before.evidence.statusHistories[0], []string{"failure", "success"}, []string{mainFrozenDescription, explicitThawDescription}, "role-boundary")
 
 	unfilteredWebhookPage := before.evidence.sideEffects.webhookPage
 	unfilteredSummary := requireWebhookPageSummary(t, unfilteredWebhookPage)
@@ -3333,6 +3336,7 @@ func proveRestartPersistenceAndReconciliation(t *testing.T, ctx context.Context,
 	if freezeBefore.id <= 0 || freezeBefore.branch != "main" || freezeBefore.reason != "Fictional release verification" || freezeBefore.status != "Frozen" {
 		t.Fatalf("active freeze has unexpected pre-restart evidence: id=%d branch=%q reason=%q status=%q", freezeBefore.id, freezeBefore.branch, freezeBefore.reason, freezeBefore.status)
 	}
+	frozenDescription := manualFreezeStatusDescription(freezeBefore.reason)
 	activityBefore := requireAllActivityPages(t, ctx, browser)
 	freezeHistoryBefore := requireLatestActivityRow(t, activityBefore, "Branch freeze")
 	evidenceBefore := collectWebhookSideEffectEvidence(t, ctx, forgejo, browser, repositoryID, pr.Head.SHA)
@@ -3340,7 +3344,7 @@ func proveRestartPersistenceAndReconciliation(t *testing.T, ctx context.Context,
 		t.Fatal("missing pre-restart Thawguard freeze status")
 	}
 	oldFailure := evidenceBefore.freezeStatuses[len(evidenceBefore.freezeStatuses)-1]
-	if oldFailure.Context != requiredContext || oldFailure.Status != "failure" || oldFailure.Description != "Branch is frozen; merge is blocked by Thawguard" {
+	if oldFailure.Context != requiredContext || oldFailure.Status != "failure" || oldFailure.Description != frozenDescription {
 		t.Fatalf("unexpected pre-restart required status: id=%d context=%q state=%q description=%q", oldFailure.ID, oldFailure.Context, oldFailure.Status, oldFailure.Description)
 	}
 
@@ -3411,7 +3415,7 @@ func proveRestartPersistenceAndReconciliation(t *testing.T, ctx context.Context,
 		latest := statuses[len(statuses)-1]
 		return latest.ID > injected.ID &&
 			latest.Status == "failure" &&
-			latest.Description == "Branch is frozen; merge is blocked by Thawguard" &&
+			latest.Description == frozenDescription &&
 			strings.Contains(repositoriesPage, ">enforcement active</span>") &&
 			!strings.Contains(repositoriesPage, "Enforcement is unhealthy") &&
 			!strings.Contains(repositoriesPage, "Automatic recovery is pending") &&
@@ -3468,7 +3472,7 @@ func proveRestartPersistenceAndReconciliation(t *testing.T, ctx context.Context,
 		t.Fatalf("restart recovery changed publication attempts by %d, want 1", evidenceAfter.publicationAttempts-evidenceBefore.publicationAttempts)
 	}
 	publicationRow := requireLatestPublicationAttemptRow(t, requirePage(t, ctx, browser, "/publications"))
-	for _, want := range []string{pr.Head.SHA, requiredContext, ">failure · forgejo_status</code>", ">posted</span>", "Branch is frozen; merge is blocked by Thawguard"} {
+	for _, want := range []string{pr.Head.SHA, requiredContext, ">failure · forgejo_status</code>", ">posted</span>", frozenDescription} {
 		if !strings.Contains(publicationRow, want) {
 			t.Fatalf("restart recovery publication attempt is missing %q", want)
 		}
@@ -3484,7 +3488,7 @@ func proveRestartPersistenceAndReconciliation(t *testing.T, ctx context.Context,
 	if injected.Context != requiredContext || injected.Status != "success" || injected.Description != injectedDriftDescription {
 		t.Fatalf("unexpected injected drift status: id=%d context=%q state=%q description=%q", injected.ID, injected.Context, injected.Status, injected.Description)
 	}
-	if recovered.Context != requiredContext || recovered.Status != "failure" || recovered.Description != "Branch is frozen; merge is blocked by Thawguard" {
+	if recovered.Context != requiredContext || recovered.Status != "failure" || recovered.Description != frozenDescription {
 		t.Fatalf("unexpected recovered required status: id=%d context=%q state=%q description=%q", recovered.ID, recovered.Context, recovered.Status, recovered.Description)
 	}
 	assertMergeBlockedByRequiredStatus(t, ctx, forgejo, pr.Number)
@@ -3570,7 +3574,7 @@ func advanceFeatureBranch(t *testing.T, ctx context.Context, forgejo *forgejoAPI
 	return newHeadSHA
 }
 
-func waitForTokenFailureEvidence(t *testing.T, ctx context.Context, forgejo *forgejoAPI, browser *thawguardBrowser, repositoryID int64, headSHA string) {
+func waitForTokenFailureEvidence(t *testing.T, ctx context.Context, forgejo *forgejoAPI, browser *thawguardBrowser, repositoryID int64, headSHA, expectedDescription string) {
 	t.Helper()
 	webhookPath := "/webhooks?" + url.Values{
 		"repo":       {strconv.FormatInt(repositoryID, 10)},
@@ -3610,7 +3614,7 @@ func waitForTokenFailureEvidence(t *testing.T, ctx context.Context, forgejo *for
 			recoveryVisible &&
 			strings.Contains(publicationsPage, headSHA) &&
 			strings.Contains(publicationsPage, ">failed</span>") &&
-			strings.Contains(publicationsPage, "Branch is frozen; merge is blocked by Thawguard") &&
+			strings.Contains(publicationsPage, expectedDescription) &&
 			strings.Contains(publicationsPage, "post forgejo commit status") &&
 			strings.Contains(publicationsPage, "forge returned 401") &&
 			strings.Contains(activityPage, `<span class="font-medium text-text">Runtime convergence</span>`) &&
@@ -3688,7 +3692,7 @@ func rotateStatusTokenAndRecover(t *testing.T, ctx context.Context, browser *tha
 	t.Fatalf("trigger Thawguard enforcement recovery returned HTTP %d", response.statusCode)
 }
 
-func waitForRecoveredEnforcement(t *testing.T, ctx context.Context, forgejo *forgejoAPI, browser *thawguardBrowser, headSHA string) {
+func waitForRecoveredEnforcement(t *testing.T, ctx context.Context, forgejo *forgejoAPI, browser *thawguardBrowser, headSHA, expectedDescription string) {
 	t.Helper()
 	waitFor(t, 45*time.Second, "manual or harmless worker-race enforcement recovery", func() (bool, error) {
 		repositoriesPage, err := browser.get(ctx, "/repositories")
@@ -3709,7 +3713,7 @@ func waitForRecoveredEnforcement(t *testing.T, ctx context.Context, forgejo *for
 		}
 		statusRecovered := len(statuses) > 0 &&
 			statuses[len(statuses)-1].Status == "failure" &&
-			statuses[len(statuses)-1].Description == "Branch is frozen; merge is blocked by Thawguard"
+			statuses[len(statuses)-1].Description == expectedDescription
 		return statusRecovered &&
 			strings.Contains(repositoriesPage, "enforcement active") &&
 			!strings.Contains(repositoriesPage, "Enforcement is unhealthy") &&
@@ -5330,6 +5334,17 @@ func cancelFreeze(t *testing.T, ctx context.Context, browser *thawguardBrowser, 
 		"csrf_token": {requireHiddenInput(t, page, "csrf_token")},
 		"freeze_id":  {strconv.FormatInt(freeze.id, 10)},
 	}, "cancel active Thawguard freeze")
+}
+
+// manualFreezeStatusDescription mirrors the public integration contract without
+// calling the production formatter, so the E2E still detects wiring or copy
+// regressions while sharing one expectation across its fictional reasons.
+func manualFreezeStatusDescription(reason string) string {
+	reason = strings.Join(strings.Fields(reason), " ")
+	if reason == "" {
+		return manualFreezeDescription
+	}
+	return manualFreezeDescription + ": " + reason
 }
 
 func waitForStatusWithDescription(t *testing.T, ctx context.Context, forgejo *forgejoAPI, sha, expected, description string) {
