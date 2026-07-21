@@ -172,11 +172,17 @@ func TestStoreRejectsInvalidFreezeParams(t *testing.T) {
 	if _, err := store.CreateActive(ctx, CreateParams{RepositoryID: repo.ID, Reason: "release"}); !IsValidationError(err) {
 		t.Fatalf("expected missing branch validation error, got %v", err)
 	}
-	if _, err := store.CreateActive(ctx, CreateParams{RepositoryID: repo.ID, Branch: "main"}); !IsValidationError(err) {
-		t.Fatalf("expected missing reason validation error, got %v", err)
+	if _, err := store.CreateActive(ctx, CreateParams{RepositoryID: repo.ID, Branch: "main"}); err != nil {
+		t.Fatalf("expected a freeze without a reason to be accepted, got %v", err)
 	}
 	if _, err := store.CreateActive(ctx, CreateParams{RepositoryID: 999, Branch: "main", Reason: "release"}); !IsValidationError(err) {
 		t.Fatalf("expected missing repository validation error, got %v", err)
+	}
+	if _, err := store.CreateActive(ctx, CreateParams{RepositoryID: repo.ID, Branch: "dev", Reason: strings.Repeat("r", 501)}); !IsValidationError(err) {
+		t.Fatalf("expected over-length reason validation error, got %v", err)
+	}
+	if _, err := store.CreateActive(ctx, CreateParams{RepositoryID: repo.ID, Branch: "dev", Reason: "line one\nline two"}); !IsValidationError(err) {
+		t.Fatalf("expected control-character reason validation error, got %v", err)
 	}
 }
 
@@ -625,6 +631,31 @@ func TestStoreRejectsInvalidScheduledFreezeParams(t *testing.T) {
 	}
 	if _, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: 999, Branch: "main", Reason: "release", StartsAt: startsAt}); !IsValidationError(err) {
 		t.Fatalf("expected missing repository validation error, got %v", err)
+	}
+}
+
+func TestStoreAcceptsScheduledFreezeWithoutReason(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo := createTestRepository(t, ctx, database)
+	store := NewStore(database)
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+
+	scheduled, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repo.ID, Branch: "main", StartsAt: now.Add(time.Hour)})
+	if err != nil {
+		t.Fatalf("expected a scheduled freeze without a reason to be accepted, got %v", err)
+	}
+	if scheduled.Reason != "" {
+		t.Fatalf("expected an empty reason, got %q", scheduled.Reason)
+	}
+
+	edited, err := store.EditScheduled(ctx, EditScheduleParams{ID: scheduled.ID, StartsAt: now.Add(2 * time.Hour)})
+	if err != nil {
+		t.Fatalf("expected an edit clearing the reason to be accepted, got %v", err)
+	}
+	if edited.Reason != "" {
+		t.Fatalf("expected the cleared reason to persist, got %q", edited.Reason)
 	}
 }
 

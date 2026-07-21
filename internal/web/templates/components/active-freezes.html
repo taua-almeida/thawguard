@@ -46,7 +46,7 @@
             </span>
           </td>
           <td class="px-4 py-3 text-text">
-            {{ .Freeze.Reason }}
+            {{ if .Freeze.Reason }}{{ .Freeze.Reason }}{{ else }}<span class="text-text-muted">—</span>{{ end }}
             {{ if .StartedLabel }}<span class="mt-0.5 block text-xs text-text-muted">Started <time datetime="{{ .StartedTitle }}" title="{{ .StartedTitle }}">{{ .StartedLabel }}</time>{{ if .CreatedByLabel }} by {{ .CreatedByLabel }}{{ end }}</span>{{ end }}
           </td>
           <td class="px-4 py-3 text-text">{{ if .HasPlannedEndAt }}<time datetime="{{ .PlannedEndsAtUTC }}">{{ .PlannedEndsAt }}</time>{{ else }}<span class="text-text-muted">No planned unfreeze</span>{{ end }}</td>
@@ -67,7 +67,7 @@
         </div>
         {{ template "ui/badge" dict "Label" "Frozen" "Tone" "frozen" "Icon" "tg-i-lock" }}
       </div>
-      <p class="m-0 mt-2 text-sm text-text">{{ .Freeze.Reason }}</p>
+      <p class="m-0 mt-2 text-sm text-text">{{ if .Freeze.Reason }}{{ .Freeze.Reason }}{{ else }}<span class="text-text-muted">No reason given</span>{{ end }}</p>
       {{ if .StartedLabel }}<p class="m-0 mt-1 text-xs text-text-muted">Started <time datetime="{{ .StartedTitle }}" title="{{ .StartedTitle }}">{{ .StartedLabel }}</time>{{ if .CreatedByLabel }} by {{ .CreatedByLabel }}{{ end }}</p>{{ end }}
       <p class="m-0 mt-1 text-xs text-text-muted">Planned unfreeze: {{ if .HasPlannedEndAt }}<time datetime="{{ .PlannedEndsAtUTC }}">{{ .PlannedEndsAt }}</time>{{ else }}none — lift manually{{ end }}</p>
       <div class="mt-3 flex flex-wrap gap-2">{{ template "components/active-freeze-actions" . }}</div>

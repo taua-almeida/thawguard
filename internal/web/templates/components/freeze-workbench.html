@@ -46,7 +46,7 @@
           </select>
         </div>
       </div>
-      {{ template "ui/input" dict "ID" "freeze-reason" "Name" "reason" "Label" "Reason" "Value" .FreezeForm.Reason "Placeholder" "Release cut 2026-07 — QA verification in progress" "Required" true }}
+      {{ template "ui/input" dict "ID" "freeze-reason" "Name" "reason" "Label" "Reason (optional)" "Hint" "Shown on freeze lists and audit events. Leave empty to record no reason." "Value" .FreezeForm.Reason "Maxlength" "500" }}
       <div class="flex flex-col gap-1.5">
         <label for="freeze-planned-ends-at" class="text-sm font-semibold text-text">Planned unfreeze</label>
         <p id="freeze-planned-ends-at-hint" class="m-0 text-xs text-text-muted">Optional. Enabled when browser-local timezone conversion is available; stored as UTC.</p>

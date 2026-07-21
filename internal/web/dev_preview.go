@@ -364,7 +364,9 @@ func (s *Server) handleDevPreviewDashboard(w http.ResponseWriter, r *http.Reques
 			StateClass:       "pending",
 		},
 		{
-			Freeze:      domain.BranchFreeze{ID: 402, RepositoryID: 47, Branch: "main", Reason: "Quarterly audit hold"},
+			// Reasons are optional: no Reason here, so the scheduled window
+			// renders its empty-reason placeholder.
+			Freeze:      domain.BranchFreeze{ID: 402, RepositoryID: 47, Branch: "main"},
 			Repository:  borealisFrostAPI,
 			StartsAt:    "2026-07-28 00:00 UTC",
 			StartsAtUTC: "2026-07-28T00:00:00Z",
@@ -586,6 +588,15 @@ func (s *Server) handleDevPreviewFreezes(w http.ResponseWriter, r *http.Request)
 			// fall back to "Repository #17" while keeping the row liftable.
 			// No StartedLabel: pre-backfill row, attribution line omitted.
 			Freeze: domain.BranchFreeze{ID: 303, RepositoryID: 17, Branch: "release/0.9", Reason: "Repository disconnected mid-freeze — evidence retained"},
+		},
+		{
+			// Reasons are optional: this row exercises the empty-reason
+			// placeholder on both the desktop table and the mobile card.
+			Freeze:         domain.BranchFreeze{ID: 306, RepositoryID: 46, Branch: "release/2.0"},
+			Repository:     repositories[0],
+			StartedLabel:   "2026-07-11",
+			StartedTitle:   "2026-07-11T08:15:00Z",
+			CreatedByLabel: "rana.kall@example.test",
 		},
 	}
 	impact := &impactView{

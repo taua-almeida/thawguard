@@ -754,11 +754,11 @@ func validateCreateParams(params CreateParams, now time.Time) error {
 	if params.Branch == "" {
 		missing = append(missing, "branch")
 	}
-	if params.Reason == "" {
-		missing = append(missing, "reason")
-	}
 	if len(missing) > 0 {
 		return ValidationError{Message: fmt.Sprintf("missing required freeze fields: %s", strings.Join(missing, ", "))}
+	}
+	if err := validateFreezeReason(params.Reason); err != nil {
+		return err
 	}
 	if params.PlannedEndsAt != nil && !params.PlannedEndsAt.After(now) {
 		return ValidationError{Message: "planned unfreeze time must be in the future"}
@@ -795,16 +795,13 @@ func validateScheduleParams(params ScheduleParams, now time.Time) error {
 	if params.Branch == "" {
 		missing = append(missing, "branch")
 	}
-	if params.Reason == "" {
-		missing = append(missing, "reason")
-	}
 	if params.StartsAt.IsZero() {
 		missing = append(missing, "start time")
 	}
 	if len(missing) > 0 {
 		return ValidationError{Message: fmt.Sprintf("missing required scheduled freeze fields: %s", strings.Join(missing, ", "))}
 	}
-	if err := validateScheduledFreezeReason(params.Reason); err != nil {
+	if err := validateFreezeReason(params.Reason); err != nil {
 		return err
 	}
 	if !params.StartsAt.After(now) {
@@ -820,13 +817,10 @@ func validateEditScheduleParams(params EditScheduleParams, now time.Time) error 
 	if params.ID <= 0 {
 		return ValidationError{Message: "scheduled freeze is required"}
 	}
-	if params.Reason == "" {
-		return ValidationError{Message: "scheduled freeze reason is required"}
-	}
 	if params.StartsAt.IsZero() {
 		return ValidationError{Message: "scheduled freeze start time is required"}
 	}
-	if err := validateScheduledFreezeReason(params.Reason); err != nil {
+	if err := validateFreezeReason(params.Reason); err != nil {
 		return err
 	}
 	if !params.StartsAt.After(now) {
@@ -838,13 +832,16 @@ func validateEditScheduleParams(params EditScheduleParams, now time.Time) error 
 	return nil
 }
 
-func validateScheduledFreezeReason(reason string) error {
+// validateFreezeReason bounds the optional reason on every freeze path,
+// manual and scheduled alike, so downstream renderers (audit details, forge
+// status descriptions) can rely on a single-line value of sane length.
+func validateFreezeReason(reason string) error {
 	if len(reason) > scheduledFreezeReasonMaxLength {
-		return ValidationError{Message: "scheduled freeze reason must be 500 characters or fewer"}
+		return ValidationError{Message: "freeze reason must be 500 characters or fewer"}
 	}
 	for _, r := range reason {
 		if r < 0x20 || r == 0x7f {
-			return ValidationError{Message: "scheduled freeze reason contains unsupported control characters"}
+			return ValidationError{Message: "freeze reason contains unsupported control characters"}
 		}
 	}
 	return nil

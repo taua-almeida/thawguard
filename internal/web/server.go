@@ -2025,22 +2025,22 @@ func activityEventViewForEvent(repositories map[int64]domain.Repository, users m
 		view.Detail = activityFailureDetail(details) + " Automatic recovery remains pending."
 	case audit.ActionBranchFreezeCreated, audit.ActionBranchFreezeEnded, audit.ActionBranchFreezeCancelled:
 		view.Target = activityRepositoryTarget(repositories, event, details, "branch")
-		view.Detail = "Reason: " + activityTextOrUnavailable(details, "reason", scheduledFreezeReasonMaxLength) + "."
+		view.Detail = "Reason: " + activityReasonOrUnavailable(details, "reason") + "."
 	case audit.ActionBranchFreezePlannedUnfreeze, audit.ActionFreezeSchedulePlannedUnfreeze:
 		view.Target = activityRepositoryTarget(repositories, event, details, "branch")
-		view.Detail = "Planned unfreeze " + activityTimeOrUnavailable(details, "planned_ends_at", false) + ". Reason: " + activityTextOrUnavailable(details, "reason", scheduledFreezeReasonMaxLength) + "."
+		view.Detail = "Planned unfreeze " + activityTimeOrUnavailable(details, "planned_ends_at", false) + ". Reason: " + activityReasonOrUnavailable(details, "reason") + "."
 	case audit.ActionFreezeScheduleCreated:
 		view.Target = activityRepositoryTarget(repositories, event, details, "branch")
-		view.Detail = "Starts " + activityTimeOrUnavailable(details, "starts_at", false) + "; planned unfreeze " + activityTimeOrUnavailable(details, "planned_ends_at", true) + ". Reason: " + activityTextOrUnavailable(details, "reason", scheduledFreezeReasonMaxLength) + "."
+		view.Detail = "Starts " + activityTimeOrUnavailable(details, "starts_at", false) + "; planned unfreeze " + activityTimeOrUnavailable(details, "planned_ends_at", true) + ". Reason: " + activityReasonOrUnavailable(details, "reason") + "."
 	case audit.ActionFreezeScheduleUpdated:
 		view.Target = activityRepositoryTarget(repositories, event, details, "branch")
 		view.Detail = activityScheduleUpdateDetail(details)
 	case audit.ActionFreezeScheduleCancelled:
 		view.Target = activityRepositoryTarget(repositories, event, details, "branch")
-		view.Detail = "Reason: " + activityTextOrUnavailable(details, "reason", scheduledFreezeReasonMaxLength) + "."
+		view.Detail = "Reason: " + activityReasonOrUnavailable(details, "reason") + "."
 	case audit.ActionFreezeScheduleActivated, audit.ActionFreezeScheduleStartedNow:
 		view.Target = activityRepositoryTarget(repositories, event, details, "branch")
-		view.Detail = "Started " + activityTimeOrUnavailable(details, "starts_at", false) + "; planned unfreeze " + activityTimeOrUnavailable(details, "planned_ends_at", true) + ". Reason: " + activityTextOrUnavailable(details, "reason", scheduledFreezeReasonMaxLength) + "."
+		view.Detail = "Started " + activityTimeOrUnavailable(details, "starts_at", false) + "; planned unfreeze " + activityTimeOrUnavailable(details, "planned_ends_at", true) + ". Reason: " + activityReasonOrUnavailable(details, "reason") + "."
 	case audit.ActionThawExceptionApproved:
 		view.Target = activityPullRequestTarget(repositories, event, details)
 		view.Detail = "Branch " + activityTextOrUnavailable(details, "target_branch", 255) + "; head " + activityHeadOrUnavailable(details, "head_sha") + ". Reason: " + activityTextOrUnavailable(details, "reason", 500) + "."
@@ -2302,6 +2302,24 @@ func activityTextOrUnavailable(details activityDetails, key string, maxLength in
 	return "unavailable"
 }
 
+// activityReasonOrUnavailable renders an optional freeze reason from audit
+// details. Reasons may legitimately be empty, so a recorded blank renders as
+// "none" while a missing or unsafe value still renders as "unavailable".
+func activityReasonOrUnavailable(details activityDetails, key string) string {
+	raw, ok := details[key]
+	if !ok {
+		return "unavailable"
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "unavailable"
+	}
+	if strings.TrimSpace(value) == "" {
+		return "none"
+	}
+	return activityTextOrUnavailable(details, key, scheduledFreezeReasonMaxLength)
+}
+
 func activityCountOrUnknown(details activityDetails, key string) string {
 	if value, ok := activityNonnegativeInt64Detail(details, key); ok {
 		return strconv.FormatInt(value, 10)
@@ -2363,7 +2381,7 @@ func activityTimeOrUnavailable(details activityDetails, key string, optional boo
 }
 
 func activityScheduleUpdateDetail(details activityDetails) string {
-	return "Reason " + activityTextOrUnavailable(details, "reason_before", scheduledFreezeReasonMaxLength) + " → " + activityTextOrUnavailable(details, "reason_after", scheduledFreezeReasonMaxLength) + "; starts " + activityTimeOrUnavailable(details, "starts_at_before", false) + " → " + activityTimeOrUnavailable(details, "starts_at_after", false) + "; planned unfreeze " + activityTimeOrUnavailable(details, "planned_ends_at_before", true) + " → " + activityTimeOrUnavailable(details, "planned_ends_at_after", true) + "."
+	return "Reason " + activityReasonOrUnavailable(details, "reason_before") + " → " + activityReasonOrUnavailable(details, "reason_after") + "; starts " + activityTimeOrUnavailable(details, "starts_at_before", false) + " → " + activityTimeOrUnavailable(details, "starts_at_after", false) + "; planned unfreeze " + activityTimeOrUnavailable(details, "planned_ends_at_before", true) + " → " + activityTimeOrUnavailable(details, "planned_ends_at_after", true) + "."
 }
 
 func activityHeadDetail(details activityDetails, key string) (string, bool) {

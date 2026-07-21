@@ -45,7 +45,7 @@ func Evaluate(input Input) Decision {
 		return success("PR is explicitly thawed during an active freeze", "thawed_exception")
 	}
 
-	return failure("Branch is frozen; merge is blocked by Thawguard", "active_freeze")
+	return failure(manualFreezeDescription, "active_freeze")
 }
 
 func thawMatchesPullRequest(thaw domain.ThawException, pr domain.PullRequest) bool {
