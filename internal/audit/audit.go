@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 )
 
 const (
@@ -119,6 +121,190 @@ func KnownActions() []string {
 	}
 }
 
+// Repository association for scoped reads.
+//
+// Bounded read scopes may only receive audit events whose repository can be
+// derived safely. Classification is exact: an event associates with a
+// repository only when its action is listed in exactly one family below and
+// its stored subject_type matches that family's expected subject. User
+// actions, unknown actions, mismatched subjects, and unusable IDs derive a
+// NULL association, which bounded scopes exclude and repositoryscope.All()
+// keeps, so a new action stays admin-only until it is classified here.
+
+// repositorySubjectActions expect subject_type "repository". Their
+// repository is details_json.repository_id when that is safely positive;
+// otherwise the numeric subject id. repository.created and the
+// repository-grant events store no repository_id detail, so the subject
+// fallback is required.
+var repositorySubjectActions = []string{
+	ActionRepositoryCreated,
+	ActionRepositoryWebhookSecretConfigured,
+	ActionRepositoryStatusTokenConfigured,
+	ActionRepositoryOpenPullRequestsSynced,
+	ActionRepositoryBranchAdded,
+	ActionRepositoryBranchRemoved,
+	ActionRepositorySetupCheckRun,
+	ActionRepositorySetupDriftDetected,
+	ActionRepositoryStatusPostVerified,
+	ActionRepositoryStatusPostVerifyFailed,
+	ActionRepositoryEnforcementActivated,
+	ActionRepositoryEnforcementDeactivated,
+	ActionRepositoryEnforcementActivateFail,
+	ActionRepositoryEnforcementReconciled,
+	ActionRepositoryEnforcementReconcileFail,
+	ActionRepositoryEnforcementRecovered,
+	ActionRepositoryEnforcementRecoverFail,
+	ActionRepositoryRuntimeConvergenceFail,
+	ActionRepositoryGrantAdded,
+	ActionRepositoryGrantRevoked,
+}
+
+// branchFreezeSubjectActions expect subject_type "branch_freeze". The
+// subject id is the freeze id, never a repository id, so only
+// details_json.repository_id may associate.
+var branchFreezeSubjectActions = []string{
+	ActionBranchFreezeCreated,
+	ActionBranchFreezeEnded,
+	ActionBranchFreezeCancelled,
+	ActionBranchFreezePlannedUnfreeze,
+	ActionFreezeScheduleCreated,
+	ActionFreezeScheduleUpdated,
+	ActionFreezeScheduleCancelled,
+	ActionFreezeScheduleActivated,
+	ActionFreezeScheduleStartedNow,
+	ActionFreezeSchedulePlannedUnfreeze,
+}
+
+// scheduleSubjectActions expect subject_type "schedule". The subject id is
+// the schedule id, so only details_json.repository_id may associate.
+var scheduleSubjectActions = []string{
+	ActionScheduleCreated,
+	ActionScheduleDeleted,
+	ActionScheduleRulesAdded,
+	ActionScheduleRuleRemoved,
+	ActionScheduleWindowAdded,
+	ActionScheduleWindowRemoved,
+	ActionScheduleActivated,
+	ActionSchedulePaused,
+	ActionScheduleSuppressed,
+}
+
+// thawExceptionSubjectActions expect subject_type "thaw_exception". Subject
+// ids — including shared-head ids — are never repository ids, so only
+// details_json.repository_id may associate.
+var thawExceptionSubjectActions = []string{
+	ActionThawExceptionApproved,
+	ActionThawExceptionSharedHeadApproved,
+}
+
+// User actions are deliberately absent from every family: account
+// administration stays admin-only even when details carry a repository_id.
+
+// scopedAuditEventsSQL derives a nullable associated_repository_id for
+// every audit event entirely inside SQL, so read scopes filter before
+// ordering, limits, offsets, and counts. Every JSON operation is guarded by
+// nested CASE expressions — SQLite's only guaranteed short-circuit — so
+// malformed historical rows derive NULL instead of failing the query. The
+// accepted detail forms are deliberately narrower than a general JSON
+// number parser: a JSON int64, or a positive canonical base-10 string
+// trimmed of ordinary whitespace with no sign, leading zeros, or exotic
+// whitespace. Production writers emit canonical decimal IDs, and
+// under-association fails closed while over-association would leak events.
+var scopedAuditEventsSQL = buildScopedAuditEventsSQL()
+
+func buildScopedAuditEventsSQL() string {
+	const columns = "id, actor_user_id, action, subject_type, subject_id, details_json, created_at"
+	// Ordinary whitespace tolerated around a numeric string: space, tab,
+	// line feed, carriage return, matching the strings.TrimSpace forms the
+	// web renderer accepts for common historical rows.
+	const whitespace = "' ' || char(9) || char(10) || char(13)"
+	// A canonical positive base-10 int64: first digit 1-9, digits only, and
+	// unchanged by a CAST round-trip, which rejects int64 overflow because
+	// SQLite CAST saturates instead of failing.
+	canonical := func(column string) string {
+		return column + " GLOB '[1-9]*' AND " + column + " NOT GLOB '*[^0-9]*'" +
+			" AND CAST(CAST(" + column + " AS INTEGER) AS TEXT) = " + column
+	}
+	return `
+WITH audit_event_objects AS (
+	SELECT ` + columns + `,
+		CASE WHEN json_valid(details_json) THEN
+			CASE WHEN json_type(details_json) = 'object' THEN details_json END
+		END AS details_object
+	FROM audit_events
+),
+audit_event_detail_counts AS (
+	SELECT ` + columns + `, details_object,
+		-- Multiple repository_id keys are ambiguous. Carry the count through
+		-- every later CTE so repository-subject events cannot fall back to
+		-- subject_id after duplicate details are rejected.
+		CASE WHEN details_object IS NOT NULL THEN
+			(SELECT COUNT(*) FROM json_each(details_object) WHERE json_each.key = 'repository_id')
+		END AS repository_id_key_count
+	FROM audit_event_objects
+),
+audit_event_detail_values AS (
+	SELECT ` + columns + `, repository_id_key_count,
+		CASE WHEN details_object IS NOT NULL THEN
+			CASE WHEN repository_id_key_count = 1
+			THEN json_extract(details_object, '$.repository_id') END
+		END AS detail_value,
+		CASE WHEN details_object IS NOT NULL THEN
+			CASE WHEN repository_id_key_count = 1
+			THEN json_type(details_object, '$.repository_id') END
+		END AS detail_type
+	FROM audit_event_detail_counts
+),
+audit_event_texts AS (
+	SELECT ` + columns + `, repository_id_key_count, detail_value, detail_type,
+		CASE WHEN detail_type = 'text' THEN trim(detail_value, ` + whitespace + `) END AS detail_text,
+		trim(subject_id, ` + whitespace + `) AS subject_text
+	FROM audit_event_detail_values
+),
+audit_event_ids AS (
+	SELECT ` + columns + `, repository_id_key_count,
+		CASE
+			WHEN detail_type = 'integer' AND typeof(detail_value) = 'integer' AND detail_value > 0
+				THEN detail_value
+			WHEN ` + canonical("detail_text") + `
+				THEN CAST(detail_text AS INTEGER)
+		END AS detail_repository_id,
+		CASE WHEN ` + canonical("subject_text") + ` THEN CAST(subject_text AS INTEGER) END AS subject_repository_id
+	FROM audit_event_texts
+),
+scoped_audit_events AS (
+	SELECT ` + columns + `,
+		CASE
+			WHEN subject_type = ` + sqlQuotedText(SubjectTypeRepository) + ` AND action IN (` + sqlQuotedList(repositorySubjectActions) + `)
+				THEN CASE WHEN repository_id_key_count > 1 THEN NULL
+					ELSE COALESCE(detail_repository_id, subject_repository_id) END
+			WHEN subject_type = ` + sqlQuotedText(SubjectTypeBranchFreeze) + ` AND action IN (` + sqlQuotedList(branchFreezeSubjectActions) + `)
+				THEN detail_repository_id
+			WHEN subject_type = ` + sqlQuotedText(SubjectTypeSchedule) + ` AND action IN (` + sqlQuotedList(scheduleSubjectActions) + `)
+				THEN detail_repository_id
+			WHEN subject_type = ` + sqlQuotedText(SubjectTypeThawException) + ` AND action IN (` + sqlQuotedList(thawExceptionSubjectActions) + `)
+				THEN detail_repository_id
+		END AS associated_repository_id
+	FROM audit_event_ids
+)
+`
+}
+
+// sqlQuotedText embeds a code-owned constant as a SQL text literal. Values
+// come only from package constants, never user input; quotes are doubled
+// defensively anyway.
+func sqlQuotedText(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}
+
+func sqlQuotedList(values []string) string {
+	quoted := make([]string, len(values))
+	for i, value := range values {
+		quoted[i] = sqlQuotedText(value)
+	}
+	return strings.Join(quoted, ", ")
+}
+
 type Event struct {
 	ID          int64
 	ActorUserID *int64
@@ -182,18 +368,30 @@ VALUES (?, ?, ?, ?, ?, ?)`, actorUserID, event.Action, event.SubjectType, event.
 }
 
 func (s *Store) List(ctx context.Context, limit int) ([]Event, error) {
+	return s.ListForScope(ctx, repositoryscope.All(), limit)
+}
+
+// ListForScope lists the newest audit events visible through the caller's
+// read scope. The scope filters on the SQL-derived repository association
+// before ordering and the limit, so invisible rows never consume result
+// slots. repositoryscope.All() preserves the complete trail — user,
+// unknown, unassociated, and malformed rows included — while bounded scopes
+// fail closed to events with a safely derived repository.
+func (s *Store) ListForScope(ctx context.Context, scope repositoryscope.ReadScope, limit int) ([]Event, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("audit store has no database")
 	}
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
+	predicate, scopeArgs := scope.SQLPredicate("associated_repository_id")
 
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.db.QueryContext(ctx, scopedAuditEventsSQL+`
 SELECT id, actor_user_id, action, subject_type, subject_id, details_json, created_at
-FROM audit_events
+FROM scoped_audit_events
+WHERE `+predicate+`
 ORDER BY julianday(created_at) DESC, id DESC
-LIMIT ?`, limit)
+LIMIT ?`, append(append([]any{}, scopeArgs...), limit)...)
 	if err != nil {
 		return nil, fmt.Errorf("list audit events: %w", err)
 	}
@@ -217,6 +415,16 @@ LIMIT ?`, limit)
 // number of matching events. A non-empty actions list restricts the result
 // to those exact action names; nil or empty means all actions.
 func (s *Store) ListPage(ctx context.Context, actions []string, offset, limit int) ([]Event, int, error) {
+	return s.ListPageForScope(ctx, repositoryscope.All(), actions, offset, limit)
+}
+
+// ListPageForScope returns one page of the audit events visible through the
+// caller's read scope, newest first, plus the total number of visible
+// matching events. The scope and the exact-action filter intersect inside
+// the same SQL WHERE before ordering and pagination, and the count query
+// shares identical conditions and argument order, so rows and total always
+// agree and an action filter can never widen past the scope.
+func (s *Store) ListPageForScope(ctx context.Context, scope repositoryscope.ReadScope, actions []string, offset, limit int) ([]Event, int, error) {
 	if s == nil || s.db == nil {
 		return nil, 0, errors.New("audit store has no database")
 	}
@@ -226,24 +434,24 @@ func (s *Store) ListPage(ctx context.Context, actions []string, offset, limit in
 	if offset < 0 {
 		offset = 0
 	}
-	where := ""
-	filterArgs := []any{}
+	predicate, filterArgs := scope.SQLPredicate("associated_repository_id")
+	where := "WHERE " + predicate
 	if len(actions) > 0 {
-		where = "WHERE action IN (?" + strings.Repeat(", ?", len(actions)-1) + ")"
+		where += " AND action IN (?" + strings.Repeat(", ?", len(actions)-1) + ")"
 		for _, action := range actions {
 			filterArgs = append(filterArgs, action)
 		}
 	}
 
 	var total int
-	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM audit_events "+where, filterArgs...).Scan(&total); err != nil {
+	if err := s.db.QueryRowContext(ctx, scopedAuditEventsSQL+"SELECT COUNT(*) FROM scoped_audit_events "+where, filterArgs...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("count audit events: %w", err)
 	}
 
 	args := append(append([]any{}, filterArgs...), limit, offset)
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.db.QueryContext(ctx, scopedAuditEventsSQL+`
 SELECT id, actor_user_id, action, subject_type, subject_id, details_json, created_at
-FROM audit_events
+FROM scoped_audit_events
 `+where+`
 ORDER BY julianday(created_at) DESC, id DESC
 LIMIT ? OFFSET ?`, args...)
