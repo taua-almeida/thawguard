@@ -2193,6 +2193,10 @@ func activityActor(users map[int64]auth.User, event audit.Event, details activit
 	kind, _ := activityTextDetail(details, "actor_kind", 64)
 	role, _ := activityTextDetail(details, "actor_role", 64)
 	switch kind {
+	case domain.ActorKindUser:
+		// A user event with no surviving actor ID means the human actor's
+		// account was deleted; never present them as a system actor.
+		return "Deleted user"
 	case domain.ActorKindBootstrapAdmin:
 		return "Bootstrap admin"
 	case domain.ActorKindSystem:

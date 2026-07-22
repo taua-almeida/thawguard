@@ -38,8 +38,11 @@ type RevokeRepositoryRoleParams struct {
 }
 
 // GrantsForUser loads the repository-aware authorization model for one
-// user. Nothing consumes it on a live path yet; HTTP wiring happens at
-// cutover.
+// user. It is an administrative state lookup, not an authentication
+// gateway: it returns retained grants even for a disabled user so their
+// access stays visible and manageable. Live request authorization must
+// start from a valid enabled session, which SessionByID already enforces.
+// Nothing consumes it on a live path yet; HTTP wiring happens at cutover.
 func (s *Service) GrantsForUser(ctx context.Context, userID int64) (Grants, error) {
 	if s == nil || s.db == nil {
 		return Grants{}, errors.New("auth service has no database")
@@ -59,7 +62,11 @@ func (s *Service) GrantsForUser(ctx context.Context, userID int64) (Grants, erro
 }
 
 // GrantRepositoryRole atomically adds one repository-scoped role and its
-// audit event; an audit persistence failure rolls the grant back.
+// audit event; an audit persistence failure rolls the grant back. Only an
+// enabled global Admin may grant, checked inside the transaction as
+// defense in depth ahead of any handler-level authorization. The target
+// may be disabled: their access stays administratively manageable while
+// disabled-session rejection keeps them out of live requests.
 func (s *Service) GrantRepositoryRole(ctx context.Context, params GrantRepositoryRoleParams) error {
 	if s == nil || s.db == nil {
 		return errors.New("auth service has no database")
@@ -74,6 +81,9 @@ func (s *Service) GrantRepositoryRole(ctx context.Context, params GrantRepositor
 	}
 	defer tx.Rollback()
 
+	if err := s.requireEnabledAdminActor(ctx, tx, params.ActorUserID); err != nil {
+		return err
+	}
 	if err := ensureRepositoryExists(ctx, tx, params.RepositoryID); err != nil {
 		return err
 	}
@@ -110,6 +120,8 @@ VALUES (?, ?, ?, ?, ?)`, params.RepositoryID, params.UserID, params.Role, params
 
 // RevokeRepositoryRole atomically removes one repository-scoped role and
 // its audit event; an audit persistence failure rolls the revoke back.
+// Only an enabled global Admin may revoke, checked inside the transaction
+// as defense in depth ahead of any handler-level authorization.
 func (s *Service) RevokeRepositoryRole(ctx context.Context, params RevokeRepositoryRoleParams) error {
 	if s == nil || s.db == nil {
 		return errors.New("auth service has no database")
@@ -124,6 +136,9 @@ func (s *Service) RevokeRepositoryRole(ctx context.Context, params RevokeReposit
 	}
 	defer tx.Rollback()
 
+	if err := s.requireEnabledAdminActor(ctx, tx, params.ActorUserID); err != nil {
+		return err
+	}
 	result, err := tx.ExecContext(ctx, `
 DELETE FROM repository_grants
 WHERE repository_id = ? AND user_id = ? AND role = ?`, params.RepositoryID, params.UserID, params.Role)
@@ -188,6 +203,29 @@ ORDER BY user_id, role`, repositoryID)
 		return nil, fmt.Errorf("list repository grants rows: %w", err)
 	}
 	return grants, nil
+}
+
+// requireEnabledAdminActor guards manual access mutations: the actor must
+// exist, be enabled, and hold the global Admin role in user_roles. A future
+// system-owned provisioning path must get its own operation rather than
+// impersonate an Admin here. Callers run it inside their transaction before
+// mutating, so a rejected actor leaves no grant row and no audit event.
+func (s *Service) requireEnabledAdminActor(ctx context.Context, q queryer, actorUserID int64) error {
+	denied := ValidationError{Message: "only an enabled admin can change repository access"}
+	if actorUserID <= 0 {
+		return denied
+	}
+	record, err := s.userByID(ctx, q, actorUserID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return denied
+		}
+		return err
+	}
+	if record.Disabled() || !record.Roles.Contains(RoleAdmin) {
+		return denied
+	}
+	return nil
 }
 
 // scopedGrantsForUser loads a user's repository-scoped roles. It is a plain

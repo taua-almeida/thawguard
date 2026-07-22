@@ -2881,6 +2881,7 @@ func TestActivityActorAndMissingTargetResolution(t *testing.T) {
 		details string
 		actor   string
 	}{
+		{details: `{"actor_kind":"user"}`, actor: "Deleted user"},
 		{details: `{"actor_kind":"bootstrap_admin"}`, actor: "Bootstrap admin"},
 		{details: `{"actor_kind":"system","actor_role":"scheduler"}`, actor: "Scheduler"},
 		{details: `{"actor_kind":"system","actor_role":"reconciliation_runner"}`, actor: "Reconciliation runner"},
@@ -2889,7 +2890,7 @@ func TestActivityActorAndMissingTargetResolution(t *testing.T) {
 	} {
 		view = activityEventViewForEvent(nil, nil, audit.Event{Action: audit.ActionRepositoryCreated, SubjectType: audit.SubjectTypeRepository, SubjectID: "1", DetailsJSON: test.details})
 		if view.Actor != test.actor || strings.Contains(view.Actor, "secret-token") {
-			t.Fatalf("unexpected allowlisted system actor for %s: %+v", test.details, view)
+			t.Fatalf("unexpected actor resolution for %s: %+v", test.details, view)
 		}
 	}
 }

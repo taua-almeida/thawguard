@@ -97,7 +97,7 @@ func TestGrantRepositoryRoleRejectsInvalidInput(t *testing.T) {
 	}
 }
 
-func TestGrantRepositoryRoleAllowsDisabledUsers(t *testing.T) {
+func TestDisabledTargetsRetainReceiveAndLoseGrants(t *testing.T) {
 	ctx := context.Background()
 	database := newAuthTestDB(t, ctx)
 	service := NewService(database)
@@ -105,11 +105,83 @@ func TestGrantRepositoryRoleAllowsDisabledUsers(t *testing.T) {
 	user := mustCreateUser(t, ctx, service, "lead@example.test", []Role{RoleViewer})
 	repositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "thawguard")
 
+	if err := service.GrantRepositoryRole(ctx, GrantRepositoryRoleParams{ActorUserID: admin.User.ID, RepositoryID: repositoryID, UserID: user.ID, Role: RoleFreezer}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := service.DisableUser(ctx, admin.User.ID, user.ID); err != nil {
 		t.Fatal(err)
 	}
 	if err := service.GrantRepositoryRole(ctx, GrantRepositoryRoleParams{ActorUserID: admin.User.ID, RepositoryID: repositoryID, UserID: user.ID, Role: RoleViewer}); err != nil {
 		t.Fatalf("expected disabled user to accept a grant, got %v", err)
+	}
+
+	grants, err := service.GrantsForUser(ctx, user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !grants.CanFreezeRepository(repositoryID) || !grants.CanViewRepository(repositoryID) {
+		t.Fatalf("expected disabled user's retained and new grants to stay readable for administration, got %+v", grants)
+	}
+
+	if err := service.RevokeRepositoryRole(ctx, RevokeRepositoryRoleParams{ActorUserID: admin.User.ID, RepositoryID: repositoryID, UserID: user.ID, Role: RoleViewer}); err != nil {
+		t.Fatalf("expected disabled user to lose a grant, got %v", err)
+	}
+}
+
+func TestRepositoryGrantMutationsRequireEnabledAdminActor(t *testing.T) {
+	ctx := context.Background()
+	database := newAuthTestDB(t, ctx)
+	service := NewService(database)
+	admin := mustCreateFirstAdmin(t, ctx, service)
+	viewer := mustCreateUser(t, ctx, service, "viewer@example.test", []Role{RoleViewer})
+	freezer := mustCreateUser(t, ctx, service, "freezer@example.test", []Role{RoleFreezer})
+	approver := mustCreateUser(t, ctx, service, "approver@example.test", []Role{RoleThawApprover})
+	disabledAdmin := mustCreateUser(t, ctx, service, "former-admin@example.test", []Role{RoleAdmin})
+	target := mustCreateUser(t, ctx, service, "lead@example.test", []Role{RoleViewer})
+	repositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "thawguard")
+
+	if _, err := service.DisableUser(ctx, admin.User.ID, disabledAdmin.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.GrantRepositoryRole(ctx, GrantRepositoryRoleParams{ActorUserID: admin.User.ID, RepositoryID: repositoryID, UserID: target.ID, Role: RoleFreezer}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		actor int64
+	}{
+		{name: "viewer actor", actor: viewer.ID},
+		{name: "freezer actor", actor: freezer.ID},
+		{name: "thaw approver actor", actor: approver.ID},
+		{name: "disabled admin actor", actor: disabledAdmin.ID},
+		{name: "unknown actor", actor: target.ID + 100},
+		{name: "zero actor", actor: 0},
+		{name: "negative actor", actor: -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := service.GrantRepositoryRole(ctx, GrantRepositoryRoleParams{ActorUserID: tc.actor, RepositoryID: repositoryID, UserID: target.ID, Role: RoleViewer}); !IsValidationError(err) {
+				t.Fatalf("expected grant by non-admin actor to be rejected, got %v", err)
+			}
+			if err := service.RevokeRepositoryRole(ctx, RevokeRepositoryRoleParams{ActorUserID: tc.actor, RepositoryID: repositoryID, UserID: target.ID, Role: RoleFreezer}); !IsValidationError(err) {
+				t.Fatalf("expected revoke by non-admin actor to be rejected, got %v", err)
+			}
+		})
+	}
+
+	grants, err := service.ListRepositoryGrants(ctx, repositoryID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(grants) != 1 || grants[0].Role != RoleFreezer {
+		t.Fatalf("expected rejected mutations to leave the admin's grant untouched, got %+v", grants)
+	}
+	var count int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM audit_events WHERE action IN (?, ?)`, audit.ActionRepositoryGrantAdded, audit.ActionRepositoryGrantRevoked).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("expected rejected mutations to record no audit events, got %d", count)
 	}
 }
 
@@ -190,7 +262,7 @@ func TestRepositoryGrantSurvivesGranterDeletionWithoutAttribution(t *testing.T) 
 	database := newAuthTestDB(t, ctx)
 	service := NewService(database)
 	mustCreateFirstAdmin(t, ctx, service)
-	granter := mustCreateUser(t, ctx, service, "granter@example.test", []Role{RoleViewer})
+	granter := mustCreateUser(t, ctx, service, "granter@example.test", []Role{RoleAdmin})
 	user := mustCreateUser(t, ctx, service, "lead@example.test", []Role{RoleViewer})
 	repositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "thawguard")
 

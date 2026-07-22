@@ -3,13 +3,15 @@ package auth
 // Grants is the repository-aware authorization model: the global role set
 // filtered to Admin plus every repository-scoped role a user holds. It is
 // pure and has no HTTP callers yet; session hydration and handler wiring
-// stay on the global RoleSet until cutover.
+// stay on the global RoleSet until cutover. Its state is unexported so a
+// Grants value can only be built through NewGrants and only answers
+// authorization questions through its capability methods.
 type Grants struct {
-	// Global carries at most the Admin role. Legacy global freezer, thaw
+	// global carries at most the Admin role. Legacy global freezer, thaw
 	// approver, and viewer rows in user_roles authorize nothing here.
-	Global RoleSet
-	// ByRepository maps a repository ID to the roles granted on it.
-	ByRepository map[int64]RoleSet
+	global RoleSet
+	// byRepository maps a repository ID to the roles granted on it.
+	byRepository map[int64]RoleSet
 }
 
 // RepositoryRoles returns the roles a repository grant may carry, in the
@@ -33,9 +35,9 @@ func (r Role) ValidForRepository() bool {
 // that are not repository roles are dropped, and repository IDs that cannot
 // identify a repository are dropped.
 func NewGrants(global RoleSet, scoped map[int64]RoleSet) Grants {
-	grants := Grants{Global: RoleSet{}, ByRepository: map[int64]RoleSet{}}
+	grants := Grants{global: RoleSet{}, byRepository: map[int64]RoleSet{}}
 	if global.Contains(RoleAdmin) {
-		grants.Global = RoleSet{RoleAdmin}
+		grants.global = RoleSet{RoleAdmin}
 	}
 	for repositoryID, roles := range scoped {
 		if repositoryID <= 0 {
@@ -48,7 +50,7 @@ func NewGrants(global RoleSet, scoped map[int64]RoleSet) Grants {
 			}
 		}
 		if len(kept) > 0 {
-			grants.ByRepository[repositoryID] = kept
+			grants.byRepository[repositoryID] = kept
 		}
 	}
 	return grants
@@ -61,10 +63,10 @@ func (g Grants) CanViewRepository(repositoryID int64) bool {
 	if repositoryID <= 0 {
 		return false
 	}
-	if g.Global.Contains(RoleAdmin) {
+	if g.global.Contains(RoleAdmin) {
 		return true
 	}
-	return len(g.ByRepository[repositoryID]) > 0
+	return len(g.byRepository[repositoryID]) > 0
 }
 
 // CanFreezeRepository reports whether the user may freeze the repository.
@@ -73,7 +75,7 @@ func (g Grants) CanFreezeRepository(repositoryID int64) bool {
 	if repositoryID <= 0 {
 		return false
 	}
-	return g.ByRepository[repositoryID].Contains(RoleFreezer)
+	return g.byRepository[repositoryID].Contains(RoleFreezer)
 }
 
 // CanThawRepository reports whether the user may approve thaws for the
@@ -83,5 +85,5 @@ func (g Grants) CanThawRepository(repositoryID int64) bool {
 	if repositoryID <= 0 {
 		return false
 	}
-	return g.ByRepository[repositoryID].Contains(RoleThawApprover)
+	return g.byRepository[repositoryID].Contains(RoleThawApprover)
 }

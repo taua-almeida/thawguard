@@ -10,13 +10,13 @@ func TestNewGrantsKeepsOnlyAdminGloballyAndRepositoryRolesScoped(t *testing.T) {
 		-3: {RoleViewer},
 	})
 
-	if len(grants.Global) != 1 || !grants.Global.Contains(RoleAdmin) {
-		t.Fatalf("expected global set filtered to admin only, got %+v", grants.Global)
+	if len(grants.global) != 1 || !grants.global.Contains(RoleAdmin) {
+		t.Fatalf("expected global set filtered to admin only, got %+v", grants.global)
 	}
-	if len(grants.ByRepository) != 1 {
-		t.Fatalf("expected only repository 1 to keep grants, got %+v", grants.ByRepository)
+	if len(grants.byRepository) != 1 {
+		t.Fatalf("expected only repository 1 to keep grants, got %+v", grants.byRepository)
 	}
-	kept := grants.ByRepository[1]
+	kept := grants.byRepository[1]
 	if len(kept) != 1 || !kept.Contains(RoleFreezer) {
 		t.Fatalf("expected repository 1 to keep only the freezer role, got %+v", kept)
 	}
