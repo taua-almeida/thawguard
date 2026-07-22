@@ -13,6 +13,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/repository"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 	"github.com/taua-almeida/thawguard/internal/secrets"
 )
 
@@ -62,6 +63,24 @@ func (s *Service) List(ctx context.Context) ([]domain.Repository, error) {
 		return nil, errors.New("repository setup service has no database")
 	}
 	return repository.NewStore(s.db).List(ctx)
+}
+
+// ListForScope lists the repositories visible through the caller's read
+// scope, for web handlers that serve a session-derived scope.
+func (s *Service) ListForScope(ctx context.Context, scope repositoryscope.ReadScope) ([]domain.Repository, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("repository setup service has no database")
+	}
+	return repository.NewStore(s.db).ListForScope(ctx, scope)
+}
+
+// GetForScope looks a repository up through the caller's read scope; hidden
+// and nonexistent repositories both return sql.ErrNoRows.
+func (s *Service) GetForScope(ctx context.Context, scope repositoryscope.ReadScope, id int64) (domain.Repository, error) {
+	if s == nil || s.db == nil {
+		return domain.Repository{}, errors.New("repository setup service has no database")
+	}
+	return repository.NewStore(s.db).GetForScope(ctx, scope, id)
 }
 
 func (s *Service) FindActiveByRemote(ctx context.Context, params repository.RemoteParams) (domain.Repository, bool, error) {

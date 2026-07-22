@@ -9,7 +9,15 @@ import (
 	"time"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 )
+
+const selectRepository = `
+SELECT id, forge, base_url, owner, name, default_branch, active, enforcement_state,
+  EXISTS(SELECT 1 FROM repository_webhook_secrets WHERE repository_id = repositories.id),
+  EXISTS(SELECT 1 FROM repository_status_tokens WHERE repository_id = repositories.id),
+  status_post_verified_at, enforcement_failure_reason, enforcement_failed_at, created_at, updated_at
+FROM repositories`
 
 type database interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
@@ -116,30 +124,37 @@ func isDuplicateRepositoryError(err error) bool {
 }
 
 func (s *Store) Get(ctx context.Context, id int64) (domain.Repository, error) {
+	return s.GetForScope(ctx, repositoryscope.All(), id)
+}
+
+// GetForScope looks a repository up through the caller's read scope. An
+// existing repository outside the scope and a nonexistent repository both
+// return sql.ErrNoRows, so a response cannot reveal which of the two it was.
+func (s *Store) GetForScope(ctx context.Context, scope repositoryscope.ReadScope, id int64) (domain.Repository, error) {
 	if s == nil || s.db == nil {
 		return domain.Repository{}, errors.New("repository store has no database")
 	}
-	row := s.db.QueryRowContext(ctx, `
-SELECT id, forge, base_url, owner, name, default_branch, active, enforcement_state,
-  EXISTS(SELECT 1 FROM repository_webhook_secrets WHERE repository_id = repositories.id),
-  EXISTS(SELECT 1 FROM repository_status_tokens WHERE repository_id = repositories.id),
-  status_post_verified_at, enforcement_failure_reason, enforcement_failed_at, created_at, updated_at
-FROM repositories
-WHERE id = ?`, id)
+	predicate, scopeArgs := scope.SQLPredicate("id")
+	row := s.db.QueryRowContext(ctx, selectRepository+`
+WHERE id = ? AND `+predicate, append([]any{id}, scopeArgs...)...)
 	return scanRepository(row)
 }
 
 func (s *Store) List(ctx context.Context) ([]domain.Repository, error) {
+	return s.ListForScope(ctx, repositoryscope.All())
+}
+
+// ListForScope lists the repositories visible through the caller's read
+// scope; the scope filters inside SQL so invisible rows never leave the
+// database.
+func (s *Store) ListForScope(ctx context.Context, scope repositoryscope.ReadScope) ([]domain.Repository, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("repository store has no database")
 	}
-	rows, err := s.db.QueryContext(ctx, `
-SELECT id, forge, base_url, owner, name, default_branch, active, enforcement_state,
-  EXISTS(SELECT 1 FROM repository_webhook_secrets WHERE repository_id = repositories.id),
-  EXISTS(SELECT 1 FROM repository_status_tokens WHERE repository_id = repositories.id),
-  status_post_verified_at, enforcement_failure_reason, enforcement_failed_at, created_at, updated_at
-FROM repositories
-ORDER BY owner, name`)
+	predicate, scopeArgs := scope.SQLPredicate("id")
+	rows, err := s.db.QueryContext(ctx, selectRepository+`
+WHERE `+predicate+`
+ORDER BY owner, name`, scopeArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("list repositories: %w", err)
 	}
@@ -167,13 +182,8 @@ func (s *Store) FindActiveByRemote(ctx context.Context, params RemoteParams) (do
 	if params.Forge == "" || params.BaseURL == "" || params.Owner == "" || params.Name == "" {
 		return domain.Repository{}, false, ValidationError{Message: "missing required repository remote fields"}
 	}
-	row := s.db.QueryRowContext(ctx, `
-SELECT id, forge, base_url, owner, name, default_branch, active, enforcement_state,
-  EXISTS(SELECT 1 FROM repository_webhook_secrets WHERE repository_id = repositories.id),
-  EXISTS(SELECT 1 FROM repository_status_tokens WHERE repository_id = repositories.id),
-  status_post_verified_at, enforcement_failure_reason, enforcement_failed_at, created_at, updated_at
-FROM repositories
-	WHERE forge = ? AND base_url = ? AND owner = ? AND name = ? AND active = 1`, params.Forge, params.BaseURL, params.Owner, params.Name)
+	row := s.db.QueryRowContext(ctx, selectRepository+`
+WHERE forge = ? AND base_url = ? AND owner = ? AND name = ? AND active = 1`, params.Forge, params.BaseURL, params.Owner, params.Name)
 	repo, err := scanRepository(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

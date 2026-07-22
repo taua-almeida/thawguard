@@ -1,5 +1,7 @@
 package auth
 
+import "github.com/taua-almeida/thawguard/internal/repositoryscope"
+
 // Grants is the repository-aware authorization model: the global role set
 // filtered to Admin plus every repository-scoped role a user holds. It is
 // pure and has no HTTP callers yet; session hydration and handler wiring
@@ -67,6 +69,22 @@ func (g Grants) CanViewRepository(repositoryID int64) bool {
 		return true
 	}
 	return len(g.byRepository[repositoryID]) > 0
+}
+
+// RepositoryReadScope projects the grants onto repository read queries:
+// Admin reads every repository, any scoped role reads its own repository,
+// and no grants — including the zero value — reads none. The scope reflects
+// only this Grants snapshot, so it stays as fresh as the SessionByID request
+// that produced it; callers must not rebuild it from storage.
+func (g Grants) RepositoryReadScope() repositoryscope.ReadScope {
+	if g.global.Contains(RoleAdmin) {
+		return repositoryscope.All()
+	}
+	ids := make([]int64, 0, len(g.byRepository))
+	for repositoryID := range g.byRepository {
+		ids = append(ids, repositoryID)
+	}
+	return repositoryscope.IDs(ids...)
 }
 
 // CanFreezeRepository reports whether the user may freeze the repository.

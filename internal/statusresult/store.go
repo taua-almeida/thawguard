@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 )
 
 type database interface {
@@ -158,6 +159,15 @@ LIMIT ?`, limit)
 }
 
 func (s *Store) ListDecisionsPage(ctx context.Context, state domain.CommitStatusState, repositoryID int64, offset, limit int) ([]Result, int, error) {
+	return s.ListDecisionsPageForScope(ctx, repositoryscope.All(), state, repositoryID, offset, limit)
+}
+
+// ListDecisionsPageForScope pages status decisions visible through the
+// caller's read scope. The scope, state filter, and repository filter all
+// intersect inside SQL before ordering and pagination, and the count query
+// shares the identical conditions, so rows and total always agree and a
+// filter can never widen past the scope.
+func (s *Store) ListDecisionsPageForScope(ctx context.Context, scope repositoryscope.ReadScope, state domain.CommitStatusState, repositoryID int64, offset, limit int) ([]Result, int, error) {
 	if s == nil || s.db == nil {
 		return nil, 0, errors.New("status result store has no database")
 	}
@@ -167,18 +177,14 @@ func (s *Store) ListDecisionsPage(ctx context.Context, state domain.CommitStatus
 	if offset < 0 {
 		offset = 0
 	}
-	where := ""
-	countArgs := []any{}
+	predicate, countArgs := scope.SQLPredicate("repository_id")
+	where := "WHERE " + predicate
 	if state != "" {
-		where = "WHERE state = ?"
+		where += " AND state = ?"
 		countArgs = append(countArgs, state)
 	}
 	if repositoryID > 0 {
-		if where == "" {
-			where = "WHERE repository_id = ?"
-		} else {
-			where += " AND repository_id = ?"
-		}
+		where += " AND repository_id = ?"
 		countArgs = append(countArgs, repositoryID)
 	}
 

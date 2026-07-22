@@ -11,8 +11,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/taua-almeida/thawguard/internal/auth"
 	"github.com/taua-almeida/thawguard/internal/db"
 	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 )
 
 func TestStoreCreatesAndListsRepositories(t *testing.T) {
@@ -586,4 +588,112 @@ func projectMigrationsDir(t *testing.T) string {
 		t.Fatal("runtime.Caller failed")
 	}
 	return filepath.Join(filepath.Dir(file), "..", "..", "migrations")
+}
+
+func TestStoreScopedListAndLookup(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	repoA, err := store.Create(ctx, CreateParams{Owner: "taua-almeida", Name: "thawguard"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoB, err := store.Create(ctx, CreateParams{Owner: "taua-almeida", Name: "frost-api"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assertListedIDs := func(t *testing.T, scope repositoryscope.ReadScope, wantIDs []int64) {
+		t.Helper()
+		listed, err := store.ListForScope(ctx, scope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotIDs := make([]int64, 0, len(listed))
+		for _, repo := range listed {
+			gotIDs = append(gotIDs, repo.ID)
+		}
+		if !slices.Equal(gotIDs, wantIDs) {
+			t.Fatalf("expected repository ids %v, got %v", wantIDs, gotIDs)
+		}
+	}
+
+	// List still orders by owner and name, so frost-api precedes thawguard.
+	assertListedIDs(t, repositoryscope.All(), []int64{repoB.ID, repoA.ID})
+	assertListedIDs(t, repositoryscope.IDs(repoA.ID), []int64{repoA.ID})
+	assertListedIDs(t, repositoryscope.ReadScope{}, nil)
+
+	scopeA := repositoryscope.IDs(repoA.ID)
+	if got, err := store.GetForScope(ctx, scopeA, repoA.ID); err != nil || got.ID != repoA.ID {
+		t.Fatalf("expected in-scope lookup to succeed, got %+v, %v", got, err)
+	}
+	inaccessibleErr := func(t *testing.T, scope repositoryscope.ReadScope, id int64) error {
+		t.Helper()
+		_, err := store.GetForScope(ctx, scope, id)
+		if err == nil {
+			t.Fatalf("expected lookup of repository %d to fail", id)
+		}
+		return err
+	}
+	hiddenErr := inaccessibleErr(t, scopeA, repoB.ID)
+	missingErr := inaccessibleErr(t, scopeA, 999_999)
+	if !errors.Is(hiddenErr, sql.ErrNoRows) || !errors.Is(missingErr, sql.ErrNoRows) {
+		t.Fatalf("expected sql.ErrNoRows for hidden and missing repositories, got %v and %v", hiddenErr, missingErr)
+	}
+	if hiddenErr.Error() != missingErr.Error() {
+		t.Fatalf("expected indistinguishable errors, got %q and %q", hiddenErr.Error(), missingErr.Error())
+	}
+	if err := inaccessibleErr(t, repositoryscope.ReadScope{}, repoA.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected zero-value scope to deny lookup, got %v", err)
+	}
+
+	// The unrestricted APIs stay unrestricted for workers and internal paths.
+	unrestricted, err := store.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unrestricted) != 2 {
+		t.Fatalf("expected unrestricted list to keep both repositories, got %+v", unrestricted)
+	}
+	if got, err := store.Get(ctx, repoB.ID); err != nil || got.ID != repoB.ID {
+		t.Fatalf("expected unrestricted lookup to keep repository B, got %+v, %v", got, err)
+	}
+}
+
+func TestStoreScopedListMatchesRepositoryGrants(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	repoA, err := store.Create(ctx, CreateParams{Owner: "taua-almeida", Name: "thawguard"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(ctx, CreateParams{Owner: "taua-almeida", Name: "frost-api"}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, role := range auth.RepositoryRoles() {
+		scope := auth.NewGrants(nil, map[int64]auth.RoleSet{repoA.ID: {role}}).RepositoryReadScope()
+		listed, err := store.ListForScope(ctx, scope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(listed) != 1 || listed[0].ID != repoA.ID {
+			t.Fatalf("%s: expected visibility for exactly the granted repository, got %+v", role, listed)
+		}
+	}
+
+	admin, err := store.ListForScope(ctx, auth.NewGrants(auth.RoleSet{auth.RoleAdmin}, nil).RepositoryReadScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(admin) != 2 {
+		t.Fatalf("expected admin to see both repositories, got %+v", admin)
+	}
+
+	nobody, err := store.ListForScope(ctx, auth.NewGrants(nil, nil).RepositoryReadScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nobody) != 0 {
+		t.Fatalf("expected a user without grants to see no repositories, got %+v", nobody)
+	}
 }

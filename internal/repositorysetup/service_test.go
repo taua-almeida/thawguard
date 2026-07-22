@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/db"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/repository"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 	"github.com/taua-almeida/thawguard/internal/secrets"
 )
 
@@ -355,4 +357,45 @@ func projectMigrationsDir(t *testing.T) string {
 		t.Fatal("runtime.Caller failed")
 	}
 	return filepath.Join(filepath.Dir(file), "..", "..", "migrations")
+}
+
+func TestServiceScopedListAndGetPassThrough(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	service := NewService(database)
+	actor := domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}
+
+	repoA, err := service.Create(ctx, repository.CreateParams{Owner: "taua-almeida", Name: "thawguard"}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoB, err := service.Create(ctx, repository.CreateParams{Owner: "taua-almeida", Name: "frost-api"}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scoped, err := service.ListForScope(ctx, repositoryscope.IDs(repoA.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scoped) != 1 || scoped[0].ID != repoA.ID {
+		t.Fatalf("expected scoped list with only repository A, got %+v", scoped)
+	}
+	all, err := service.ListForScope(ctx, repositoryscope.All())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("expected all-repositories scope to list both, got %+v", all)
+	}
+
+	if got, err := service.GetForScope(ctx, repositoryscope.IDs(repoA.ID), repoA.ID); err != nil || got.ID != repoA.ID {
+		t.Fatalf("expected in-scope lookup to succeed, got %+v, %v", got, err)
+	}
+	if _, err := service.GetForScope(ctx, repositoryscope.IDs(repoA.ID), repoB.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected sql.ErrNoRows for out-of-scope lookup, got %v", err)
+	}
+	if _, err := service.GetForScope(ctx, repositoryscope.ReadScope{}, repoA.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected zero-value scope to deny lookup, got %v", err)
+	}
 }

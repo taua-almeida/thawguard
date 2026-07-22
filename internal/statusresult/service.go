@@ -9,6 +9,7 @@ import (
 
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/policy"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 )
 
 type FreezeLister interface {
@@ -244,6 +245,13 @@ func (s *Service) ListDecisionsPage(ctx context.Context, state domain.CommitStat
 		return nil, 0, errors.New("status result service has no store")
 	}
 	return s.store.ListDecisionsPage(ctx, state, repositoryID, offset, limit)
+}
+
+func (s *Service) ListDecisionsPageForScope(ctx context.Context, scope repositoryscope.ReadScope, state domain.CommitStatusState, repositoryID int64, offset, limit int) ([]Result, int, error) {
+	if s == nil || s.store == nil {
+		return nil, 0, errors.New("status result service has no store")
+	}
+	return s.store.ListDecisionsPageForScope(ctx, scope, state, repositoryID, offset, limit)
 }
 
 func (s *Service) activeFreeze(ctx context.Context, repositoryID int64, targetBranch string) (*domain.BranchFreeze, error) {

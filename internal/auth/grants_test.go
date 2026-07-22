@@ -1,6 +1,11 @@
 package auth
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
+)
 
 func TestNewGrantsKeepsOnlyAdminGloballyAndRepositoryRolesScoped(t *testing.T) {
 	grants := NewGrants(RoleSet{RoleAdmin, RoleFreezer, RoleViewer}, map[int64]RoleSet{
@@ -81,5 +86,29 @@ func TestGrantsGlobalRepositoryRolesAuthorizeNothing(t *testing.T) {
 	legacyLead := NewGrants(RoleSet{RoleFreezer, RoleThawApprover, RoleViewer}, nil)
 	if legacyLead.CanViewRepository(1) || legacyLead.CanFreezeRepository(1) || legacyLead.CanThawRepository(1) {
 		t.Fatalf("expected legacy global roles to authorize nothing repository-scoped, got %+v", legacyLead)
+	}
+}
+
+func TestGrantsRepositoryReadScope(t *testing.T) {
+	cases := []struct {
+		name   string
+		grants Grants
+		want   repositoryscope.ReadScope
+	}{
+		{name: "admin reads every repository", grants: NewGrants(RoleSet{RoleAdmin}, nil), want: repositoryscope.All()},
+		{name: "scoped viewer reads own repository", grants: NewGrants(nil, map[int64]RoleSet{7: {RoleViewer}}), want: repositoryscope.IDs(7)},
+		{name: "scoped freezer reads own repository", grants: NewGrants(nil, map[int64]RoleSet{7: {RoleFreezer}}), want: repositoryscope.IDs(7)},
+		{name: "scoped thaw approver reads own repository", grants: NewGrants(nil, map[int64]RoleSet{7: {RoleThawApprover}}), want: repositoryscope.IDs(7)},
+		{name: "combined roles keep one id per repository", grants: NewGrants(nil, map[int64]RoleSet{7: {RoleFreezer, RoleThawApprover}, 3: {RoleViewer}}), want: repositoryscope.IDs(3, 7)},
+		{name: "legacy global repository roles read nothing", grants: NewGrants(RoleSet{RoleFreezer, RoleThawApprover, RoleViewer}, nil), want: repositoryscope.ReadScope{}},
+		{name: "no grants reads nothing", grants: NewGrants(nil, nil), want: repositoryscope.ReadScope{}},
+		{name: "zero-value grants reads nothing", grants: Grants{}, want: repositoryscope.ReadScope{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.grants.RepositoryReadScope(); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("RepositoryReadScope() = %+v, want %+v", got, tc.want)
+			}
+		})
 	}
 }
