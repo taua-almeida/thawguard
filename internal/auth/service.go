@@ -32,6 +32,11 @@ type Session struct {
 	ID        string
 	CSRFToken string
 	User      User
+	// Grants is the repository-aware capability set current as of when this
+	// Session value was produced. For live requests only the fresh SessionByID
+	// result is authoritative; nothing consumes Grants on an HTTP path until
+	// the authorization cutover.
+	Grants    Grants
 	ExpiresAt time.Time
 	CreatedAt time.Time
 }
@@ -243,7 +248,12 @@ WHERE s.id = ?`, id)
 	if err != nil {
 		return Session{}, false, err
 	}
+	grants, err := loadGrants(ctx, s.db, user)
+	if err != nil {
+		return Session{}, false, err
+	}
 	session.User = user
+	session.Grants = grants
 	return session, true, nil
 }
 
@@ -420,15 +430,19 @@ func (s *Service) rolesForUser(ctx context.Context, q queryer, userID int64) (Ro
 }
 
 func (s *Service) insertSession(ctx context.Context, q queryer, user User, sessionID string, csrfToken string) (Session, error) {
+	grants, err := loadGrants(ctx, q, user)
+	if err != nil {
+		return Session{}, err
+	}
 	now := s.now().UTC()
 	expiresAt := now.Add(s.sessionTTL)
-	_, err := q.ExecContext(ctx, `
+	_, err = q.ExecContext(ctx, `
 INSERT INTO sessions(id, user_id, csrf_token, expires_at, created_at)
 VALUES (?, ?, ?, ?, ?)`, sessionID, user.ID, csrfToken, expiresAt.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
 	if err != nil {
 		return Session{}, fmt.Errorf("create session: %w", err)
 	}
-	return Session{ID: sessionID, CSRFToken: csrfToken, User: user, ExpiresAt: expiresAt, CreatedAt: now}, nil
+	return Session{ID: sessionID, CSRFToken: csrfToken, User: user, Grants: grants, ExpiresAt: expiresAt, CreatedAt: now}, nil
 }
 
 func scanUser(row scanner) (User, error) {

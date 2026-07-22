@@ -34,13 +34,17 @@ const (
 )
 
 type sessionState struct {
-	ID                 string
-	CSRFToken          string
-	UserID             *int64
-	Email              string
-	DisplayName        string
-	Role               auth.Role
-	Roles              auth.RoleSet
+	ID          string
+	CSRFToken   string
+	UserID      *int64
+	Email       string
+	DisplayName string
+	Role        auth.Role
+	Roles       auth.RoleSet
+	// Grants carries the repository-aware capabilities loaded with the auth
+	// session. No guard, handler, or template consumes it until the
+	// authorization cutover; guards stay on the global Roles set.
+	Grants             auth.Grants
 	MustChangePassword bool
 	ExpiresAt          time.Time
 }

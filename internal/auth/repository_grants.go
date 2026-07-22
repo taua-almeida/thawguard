@@ -54,11 +54,19 @@ func (s *Service) GrantsForUser(ctx context.Context, userID int64) (Grants, erro
 		}
 		return Grants{}, err
 	}
-	scoped, err := scopedGrantsForUser(ctx, s.db, record.ID)
+	return loadGrants(ctx, s.db, record.User)
+}
+
+// loadGrants builds the current repository-aware Grants for an
+// already-hydrated user: the legacy role set filtered by NewGrants plus the
+// live repository_grants rows read through q, so a transaction sees its own
+// writes.
+func loadGrants(ctx context.Context, q queryer, user User) (Grants, error) {
+	scoped, err := scopedGrantsForUser(ctx, q, user.ID)
 	if err != nil {
 		return Grants{}, err
 	}
-	return NewGrants(record.Roles, scoped), nil
+	return NewGrants(user.Roles, scoped), nil
 }
 
 // GrantRepositoryRole atomically adds one repository-scoped role and its

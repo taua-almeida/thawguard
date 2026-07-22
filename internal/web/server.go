@@ -1928,6 +1928,7 @@ func sessionStateFromAuth(session auth.Session) sessionState {
 		DisplayName:        session.User.DisplayName,
 		Role:               session.User.Role,
 		Roles:              session.User.Roles,
+		Grants:             session.Grants,
 		MustChangePassword: session.User.MustChangePassword,
 		ExpiresAt:          session.ExpiresAt,
 	}
