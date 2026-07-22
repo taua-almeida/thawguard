@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 )
 
 const sqliteTimestampFormat = "2006-01-02T15:04:05.000000000Z"
@@ -122,12 +123,20 @@ VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`,
 }
 
 func (s *Store) Get(ctx context.Context, id int64) (domain.Schedule, error) {
+	return s.GetForScope(ctx, repositoryscope.All(), id)
+}
+
+// GetForScope looks a schedule up through the caller's read scope. An
+// existing schedule outside the scope and a nonexistent schedule both return
+// ErrNotFound, so a response cannot reveal which of the two it was.
+func (s *Store) GetForScope(ctx context.Context, scope repositoryscope.ReadScope, id int64) (domain.Schedule, error) {
 	if s == nil || s.db == nil {
 		return domain.Schedule{}, errors.New("schedule store has no database")
 	}
+	predicate, scopeArgs := scope.SQLPredicate("repository_id")
 	row := s.db.QueryRowContext(ctx, `
 SELECT id, repository_id, branch, name, kind, timezone, reason, active, suppressed_until, created_by, created_by_kind, created_at, updated_at
-FROM schedules WHERE id = ?`, id)
+FROM schedules WHERE id = ? AND `+predicate, append([]any{id}, scopeArgs...)...)
 	schedule, err := scanSchedule(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.Schedule{}, ErrNotFound
@@ -142,12 +151,20 @@ FROM schedules WHERE id = ?`, id)
 // then branch, then name. Slice counts stay small enough that pagination is
 // not worth its states yet.
 func (s *Store) List(ctx context.Context) ([]domain.Schedule, error) {
+	return s.ListForScope(ctx, repositoryscope.All())
+}
+
+// ListForScope lists the schedules visible through the caller's read scope;
+// the scope filters inside SQL before ordering so invisible rows never leave
+// the database.
+func (s *Store) ListForScope(ctx context.Context, scope repositoryscope.ReadScope) ([]domain.Schedule, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("schedule store has no database")
 	}
+	predicate, scopeArgs := scope.SQLPredicate("repository_id")
 	rows, err := s.db.QueryContext(ctx, `
 SELECT id, repository_id, branch, name, kind, timezone, reason, active, suppressed_until, created_by, created_by_kind, created_at, updated_at
-FROM schedules ORDER BY repository_id, branch, name`)
+FROM schedules WHERE `+predicate+` ORDER BY repository_id, branch, name`, scopeArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("list schedules: %w", err)
 	}

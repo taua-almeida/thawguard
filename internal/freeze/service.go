@@ -13,6 +13,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/jobs"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 )
 
 type Service struct {
@@ -30,11 +31,25 @@ func (s *Service) Get(ctx context.Context, id int64) (domain.BranchFreeze, error
 	return NewStore(s.db).Get(ctx, id)
 }
 
+func (s *Service) GetForScope(ctx context.Context, scope repositoryscope.ReadScope, id int64) (domain.BranchFreeze, error) {
+	if s == nil || s.db == nil {
+		return domain.BranchFreeze{}, errors.New("freeze service has no database")
+	}
+	return NewStore(s.db).GetForScope(ctx, scope, id)
+}
+
 func (s *Service) ListActive(ctx context.Context) ([]domain.BranchFreeze, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("freeze service has no database")
 	}
 	return NewStore(s.db).ListActive(ctx)
+}
+
+func (s *Service) ListActiveForScope(ctx context.Context, scope repositoryscope.ReadScope) ([]domain.BranchFreeze, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("freeze service has no database")
+	}
+	return NewStore(s.db).ListActiveForScope(ctx, scope)
 }
 
 func (s *Service) GetActiveForBranch(ctx context.Context, repositoryID int64, branch string) (domain.BranchFreeze, bool, error) {
@@ -68,11 +83,25 @@ func (s *Service) ListScheduled(ctx context.Context, limit int) ([]domain.Branch
 	return NewStore(s.db).ListScheduled(ctx, limit)
 }
 
+func (s *Service) ListScheduledForScope(ctx context.Context, scope repositoryscope.ReadScope, limit int) ([]domain.BranchFreeze, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("freeze service has no database")
+	}
+	return NewStore(s.db).ListScheduledForScope(ctx, scope, limit)
+}
+
 func (s *Service) ListScheduledPage(ctx context.Context, status domain.BranchFreezeStatus, offset, limit int) ([]domain.BranchFreeze, int, error) {
 	if s == nil || s.db == nil {
 		return nil, 0, errors.New("freeze service has no database")
 	}
 	return NewStore(s.db).ListScheduledPage(ctx, status, offset, limit)
+}
+
+func (s *Service) ListScheduledPageForScope(ctx context.Context, scope repositoryscope.ReadScope, status domain.BranchFreezeStatus, offset, limit int) ([]domain.BranchFreeze, int, error) {
+	if s == nil || s.db == nil {
+		return nil, 0, errors.New("freeze service has no database")
+	}
+	return NewStore(s.db).ListScheduledPageForScope(ctx, scope, status, offset, limit)
 }
 
 func (s *Service) ListDueScheduled(ctx context.Context, limit int) ([]domain.BranchFreeze, error) {

@@ -13,6 +13,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/freeze"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 )
 
 // CoverageLookback and CoverageHorizon bound every materialization-facing
@@ -43,11 +44,25 @@ func (s *Service) Get(ctx context.Context, id int64) (domain.Schedule, error) {
 	return NewStore(s.db).Get(ctx, id)
 }
 
+func (s *Service) GetForScope(ctx context.Context, scope repositoryscope.ReadScope, id int64) (domain.Schedule, error) {
+	if s == nil || s.db == nil {
+		return domain.Schedule{}, errors.New("schedule service has no database")
+	}
+	return NewStore(s.db).GetForScope(ctx, scope, id)
+}
+
 func (s *Service) List(ctx context.Context) ([]domain.Schedule, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("schedule service has no database")
 	}
 	return NewStore(s.db).List(ctx)
+}
+
+func (s *Service) ListForScope(ctx context.Context, scope repositoryscope.ReadScope) ([]domain.Schedule, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("schedule service has no database")
+	}
+	return NewStore(s.db).ListForScope(ctx, scope)
 }
 
 func (s *Service) Create(ctx context.Context, params CreateParams, actor domain.Actor) (domain.Schedule, error) {

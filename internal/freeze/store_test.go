@@ -18,6 +18,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/jobs"
 	"github.com/taua-almeida/thawguard/internal/repository"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 )
 
 func TestStoreCreatesAndListsActiveFreezes(t *testing.T) {
@@ -312,6 +313,312 @@ func TestStoreListsScheduledPageWithFilterAndOffset(t *testing.T) {
 	}
 	if total != 1 || len(cancelled) != 1 || cancelled[0].ID != ids[2] {
 		t.Fatalf("expected single cancelled window, got total=%d list=%+v", total, cancelled)
+	}
+}
+
+func TestStoreScopesActiveFreezeReads(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repoA := createTestRepository(t, ctx, database)
+	repoB := createTestRepositoryNamed(t, ctx, database, "thawguard-docs")
+	store := NewStore(database)
+	base := time.Date(2026, 7, 20, 10, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return base }
+
+	frozenA, err := store.CreateActive(ctx, CreateParams{RepositoryID: repoA.ID, Branch: "main", Reason: "release freeze"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.now = func() time.Time { return base.Add(time.Minute) }
+	frozenB, err := store.CreateActive(ctx, CreateParams{RepositoryID: repoB.ID, Branch: "main", Reason: "docs freeze"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	all, err := store.ListActiveForScope(ctx, repositoryscope.All())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 || all[0].ID != frozenB.ID || all[1].ID != frozenA.ID {
+		t.Fatalf("expected both active freezes newest first, got %+v", all)
+	}
+
+	scoped, err := store.ListActiveForScope(ctx, repositoryscope.IDs(repoA.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scoped) != 1 || scoped[0].ID != frozenA.ID {
+		t.Fatalf("expected only repo A's active freeze, got %+v", scoped)
+	}
+
+	denied, err := store.ListActiveForScope(ctx, repositoryscope.ReadScope{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(denied) != 0 {
+		t.Fatalf("expected zero-value scope to hide every freeze, got %+v", denied)
+	}
+
+	unrestricted, err := store.ListActive(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unrestricted) != 2 {
+		t.Fatalf("expected unrestricted list to keep both freezes, got %+v", unrestricted)
+	}
+
+	viaService, err := NewService(database).ListActiveForScope(ctx, repositoryscope.IDs(repoA.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(viaService) != 1 || viaService[0].ID != frozenA.ID {
+		t.Fatalf("expected service pass-through to scope like the store, got %+v", viaService)
+	}
+}
+
+func TestStoreGetForScopeHidesForeignAndMissingFreezes(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repoA := createTestRepository(t, ctx, database)
+	repoB := createTestRepositoryNamed(t, ctx, database, "thawguard-docs")
+	store := NewStore(database)
+
+	frozenA, err := store.CreateActive(ctx, CreateParams{RepositoryID: repoA.ID, Branch: "main", Reason: "release freeze"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozenB, err := store.CreateActive(ctx, CreateParams{RepositoryID: repoB.ID, Branch: "main", Reason: "docs freeze"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scopeA := repositoryscope.IDs(repoA.ID)
+	visible, err := store.GetForScope(ctx, scopeA, frozenA.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if visible.ID != frozenA.ID {
+		t.Fatalf("expected in-scope freeze, got %+v", visible)
+	}
+
+	if _, err := store.GetForScope(ctx, scopeA, frozenB.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected hidden freeze to look nonexistent, got %v", err)
+	}
+	if _, err := store.GetForScope(ctx, scopeA, frozenB.ID+99999); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected missing freeze to return sql.ErrNoRows, got %v", err)
+	}
+	if _, err := store.GetForScope(ctx, repositoryscope.ReadScope{}, frozenA.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected zero-value scope to hide every freeze, got %v", err)
+	}
+
+	foreign, err := store.Get(ctx, frozenB.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if foreign.ID != frozenB.ID {
+		t.Fatalf("expected unrestricted get to keep fetching any freeze, got %+v", foreign)
+	}
+
+	if _, err := NewService(database).GetForScope(ctx, scopeA, frozenB.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected service pass-through to hide the foreign freeze, got %v", err)
+	}
+}
+
+func TestStoreListScheduledForScopeFiltersBeforeLimit(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repoA := createTestRepository(t, ctx, database)
+	repoB := createTestRepositoryNamed(t, ctx, database, "thawguard-docs")
+	store := NewStore(database)
+	base := time.Date(2026, 7, 20, 9, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return base }
+
+	foreign, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repoB.ID, Branch: "main", Reason: "docs window", StartsAt: base.Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstA, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repoA.ID, Branch: "main", Reason: "first window", StartsAt: base.Add(2 * time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondA, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repoA.ID, Branch: "release", Reason: "second window", StartsAt: base.Add(3 * time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scoped, err := store.ListScheduledForScope(ctx, repositoryscope.IDs(repoA.ID), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scoped) != 2 || scoped[0].ID != firstA.ID || scoped[1].ID != secondA.ID {
+		t.Fatalf("expected the limit to fill with in-scope rows even though a foreign row sorts first, got %+v", scoped)
+	}
+
+	all, err := store.ListScheduledForScope(ctx, repositoryscope.All(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 3 || all[0].ID != foreign.ID || all[1].ID != firstA.ID || all[2].ID != secondA.ID {
+		t.Fatalf("expected every scheduled freeze in start order, got %+v", all)
+	}
+
+	denied, err := store.ListScheduledForScope(ctx, repositoryscope.ReadScope{}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(denied) != 0 {
+		t.Fatalf("expected zero-value scope to hide every scheduled freeze, got %+v", denied)
+	}
+
+	unrestricted, err := store.ListScheduled(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unrestricted) != 3 {
+		t.Fatalf("expected unrestricted list to keep every scheduled freeze, got %+v", unrestricted)
+	}
+
+	viaService, err := NewService(database).ListScheduledForScope(ctx, repositoryscope.IDs(repoA.ID), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(viaService) != 2 || viaService[0].ID != firstA.ID {
+		t.Fatalf("expected service pass-through to scope like the store, got %+v", viaService)
+	}
+}
+
+func TestStoreListScheduledPageForScopeCountsAndPagesInsideScope(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repoA := createTestRepository(t, ctx, database)
+	repoB := createTestRepositoryNamed(t, ctx, database, "thawguard-docs")
+	store := NewStore(database)
+	base := time.Date(2026, 7, 20, 8, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return base }
+
+	if _, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repoB.ID, Branch: "main", Reason: "docs window", StartsAt: base.Add(30 * time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repoB.ID, Branch: "release", Reason: "docs release window", StartsAt: base.Add(45 * time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	pendingA, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repoA.ID, Branch: "main", Reason: "first window", StartsAt: base.Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelledA, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repoA.ID, Branch: "release", Reason: "abandoned window", StartsAt: base.Add(90 * time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CancelScheduled(ctx, cancelledA.ID); err != nil {
+		t.Fatal(err)
+	}
+	laterA, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repoA.ID, Branch: "hotfix", Reason: "second window", StartsAt: base.Add(2 * time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scopeA := repositoryscope.IDs(repoA.ID)
+	rows, total, err := store.ListScheduledPageForScope(ctx, scopeA, "", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 3 || len(rows) != 3 || rows[0].ID != pendingA.ID || rows[1].ID != laterA.ID || rows[2].ID != cancelledA.ID {
+		t.Fatalf("expected repo A's three windows with agreeing total, got total=%d list=%+v", total, rows)
+	}
+
+	pending, total, err := store.ListScheduledPageForScope(ctx, scopeA, domain.BranchFreezeStatusScheduled, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 || len(pending) != 2 || pending[0].ID != pendingA.ID || pending[1].ID != laterA.ID {
+		t.Fatalf("expected the status filter to intersect the scope, got total=%d list=%+v", total, pending)
+	}
+
+	page, total, err := store.ListScheduledPageForScope(ctx, scopeA, "", 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 3 || len(page) != 1 || page[0].ID != laterA.ID {
+		t.Fatalf("expected offset and limit to apply after the scope filter, got total=%d list=%+v", total, page)
+	}
+
+	allRows, total, err := store.ListScheduledPageForScope(ctx, repositoryscope.All(), "", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 5 || len(allRows) != 5 {
+		t.Fatalf("expected the all scope to page every window, got total=%d list=%+v", total, allRows)
+	}
+
+	deniedRows, total, err := store.ListScheduledPageForScope(ctx, repositoryscope.ReadScope{}, "", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 0 || len(deniedRows) != 0 {
+		t.Fatalf("expected zero-value scope to hide every window, got total=%d list=%+v", total, deniedRows)
+	}
+
+	unrestricted, total, err := store.ListScheduledPage(ctx, "", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 5 || len(unrestricted) != 5 {
+		t.Fatalf("expected unrestricted page to keep every window, got total=%d list=%+v", total, unrestricted)
+	}
+
+	viaService, total, err := NewService(database).ListScheduledPageForScope(ctx, scopeA, domain.BranchFreezeStatusScheduled, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 || len(viaService) != 2 {
+		t.Fatalf("expected service pass-through to scope like the store, got total=%d list=%+v", total, viaService)
+	}
+}
+
+func TestStoreWorkerReadsRemainUnrestrictedAcrossRepositories(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repoA := createTestRepository(t, ctx, database)
+	repoB := createTestRepositoryNamed(t, ctx, database, "thawguard-docs")
+	store := NewStore(database)
+	base := time.Date(2026, 7, 20, 7, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return base }
+
+	dueA, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repoA.ID, Branch: "release", Reason: "window a", StartsAt: base.Add(30 * time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dueB, err := store.CreateScheduled(ctx, ScheduleParams{RepositoryID: repoB.ID, Branch: "release", Reason: "window b", StartsAt: base.Add(30 * time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plannedEndA := base.Add(time.Hour)
+	immediateA, err := store.CreateActive(ctx, CreateParams{RepositoryID: repoA.ID, Branch: "main", Reason: "freeze a", PlannedEndsAt: &plannedEndA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plannedEndB := base.Add(70 * time.Minute)
+	immediateB, err := store.CreateActive(ctx, CreateParams{RepositoryID: repoB.ID, Branch: "main", Reason: "freeze b", PlannedEndsAt: &plannedEndB})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store.now = func() time.Time { return base.Add(2 * time.Hour) }
+	dueScheduled, err := store.ListDueScheduled(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dueScheduled) != 2 || dueScheduled[0].ID != dueA.ID || dueScheduled[1].ID != dueB.ID {
+		t.Fatalf("expected due scheduled freezes from both repositories, got %+v", dueScheduled)
+	}
+
+	dueUnfreezes, err := store.ListDuePlannedUnfreezes(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dueUnfreezes) != 2 || dueUnfreezes[0].ID != immediateA.ID || dueUnfreezes[1].ID != immediateB.ID {
+		t.Fatalf("expected due planned unfreezes from both repositories, got %+v", dueUnfreezes)
 	}
 }
 
@@ -1191,7 +1498,12 @@ func TestServiceRollsBackFreezeWhenAuditFails(t *testing.T) {
 
 func createTestRepository(t *testing.T, ctx context.Context, database *sql.DB) domain.Repository {
 	t.Helper()
-	repo, err := repository.NewStore(database).Create(ctx, repository.CreateParams{Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"})
+	return createTestRepositoryNamed(t, ctx, database, "thawguard")
+}
+
+func createTestRepositoryNamed(t *testing.T, ctx context.Context, database *sql.DB, name string) domain.Repository {
+	t.Helper()
+	repo, err := repository.NewStore(database).Create(ctx, repository.CreateParams{Owner: "taua-almeida", Name: name, DefaultBranch: "main"})
 	if err != nil {
 		t.Fatal(err)
 	}

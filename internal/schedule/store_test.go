@@ -19,6 +19,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/db"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/repository"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 )
 
 func TestStoreCreatesPausedScheduleShell(t *testing.T) {
@@ -77,6 +78,125 @@ func TestStoreListsSchedulesOrderedByBranchAndName(t *testing.T) {
 	}
 	if len(schedules) != 2 || schedules[0].Name != "Christmas shutdown" || schedules[1].Name != "Nightly release lock" {
 		t.Fatalf("expected two schedules ordered by name, got %+v", schedules)
+	}
+}
+
+func TestStoreScopesScheduleReads(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repoA := createTestRepository(t, ctx, database)
+	repoB := createTestRepositoryNamed(t, ctx, database, "thawguard-docs")
+	store := NewStore(database)
+
+	scheduleA, err := store.Create(ctx, CreateParams{RepositoryID: repoA.ID, Branch: "main", Name: "Nightly release lock", Kind: domain.ScheduleKindWeekly, Timezone: "UTC"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduleB, err := store.Create(ctx, CreateParams{RepositoryID: repoB.ID, Branch: "main", Name: "Docs freeze", Kind: domain.ScheduleKindWeekly, Timezone: "UTC"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	all, err := store.ListForScope(ctx, repositoryscope.All())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 || all[0].ID != scheduleA.ID || all[1].ID != scheduleB.ID {
+		t.Fatalf("expected both schedules in repository order, got %+v", all)
+	}
+
+	scoped, err := store.ListForScope(ctx, repositoryscope.IDs(repoA.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scoped) != 1 || scoped[0].ID != scheduleA.ID {
+		t.Fatalf("expected only repo A's schedule, got %+v", scoped)
+	}
+
+	denied, err := store.ListForScope(ctx, repositoryscope.ReadScope{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(denied) != 0 {
+		t.Fatalf("expected zero-value scope to hide every schedule, got %+v", denied)
+	}
+
+	scopeA := repositoryscope.IDs(repoA.ID)
+	visible, err := store.GetForScope(ctx, scopeA, scheduleA.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if visible.ID != scheduleA.ID {
+		t.Fatalf("expected in-scope schedule, got %+v", visible)
+	}
+	if _, err := store.GetForScope(ctx, scopeA, scheduleB.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected hidden schedule to look nonexistent, got %v", err)
+	}
+	if _, err := store.GetForScope(ctx, scopeA, scheduleB.ID+99999); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected missing schedule to return ErrNotFound, got %v", err)
+	}
+	if _, err := store.GetForScope(ctx, repositoryscope.ReadScope{}, scheduleA.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected zero-value scope to hide every schedule, got %v", err)
+	}
+
+	foreign, err := store.Get(ctx, scheduleB.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if foreign.ID != scheduleB.ID {
+		t.Fatalf("expected unrestricted get to keep fetching any schedule, got %+v", foreign)
+	}
+	unrestricted, err := store.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unrestricted) != 2 {
+		t.Fatalf("expected unrestricted list to keep both schedules, got %+v", unrestricted)
+	}
+
+	service := NewService(database)
+	if _, err := service.GetForScope(ctx, scopeA, scheduleB.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected service pass-through to hide the foreign schedule, got %v", err)
+	}
+	viaService, err := service.ListForScope(ctx, scopeA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(viaService) != 1 || viaService[0].ID != scheduleA.ID {
+		t.Fatalf("expected service pass-through to scope like the store, got %+v", viaService)
+	}
+}
+
+func TestStoreListActiveCoveragesRemainsUnrestricted(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repoA := createTestRepository(t, ctx, database)
+	repoB := createTestRepositoryNamed(t, ctx, database, "thawguard-docs")
+	store := NewStore(database)
+
+	scheduleA, err := store.Create(ctx, CreateParams{RepositoryID: repoA.ID, Branch: "main", Name: "Nightly release lock", Kind: domain.ScheduleKindWeekly, Timezone: "UTC"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduleB, err := store.Create(ctx, CreateParams{RepositoryID: repoB.ID, Branch: "main", Name: "Docs freeze", Kind: domain.ScheduleKindWeekly, Timezone: "UTC"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []int64{scheduleA.ID, scheduleB.ID} {
+		if _, err := store.SetActive(ctx, id, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	coverages, err := store.ListActiveCoverages(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(coverages) != 2 {
+		t.Fatalf("expected the materializer to keep seeing every active schedule, got %+v", coverages)
+	}
+	if coverages[0].Schedule.RepositoryID != repoA.ID || coverages[1].Schedule.RepositoryID != repoB.ID {
+		t.Fatalf("expected coverages across both repositories, got %+v", coverages)
 	}
 }
 
@@ -263,7 +383,12 @@ func assertLatestScheduleAudit(t *testing.T, ctx context.Context, database *sql.
 
 func createTestRepository(t *testing.T, ctx context.Context, database *sql.DB) domain.Repository {
 	t.Helper()
-	repo, err := repository.NewStore(database).Create(ctx, repository.CreateParams{Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"})
+	return createTestRepositoryNamed(t, ctx, database, "thawguard")
+}
+
+func createTestRepositoryNamed(t *testing.T, ctx context.Context, database *sql.DB, name string) domain.Repository {
+	t.Helper()
+	repo, err := repository.NewStore(database).Create(ctx, repository.CreateParams{Owner: "taua-almeida", Name: name, DefaultBranch: "main"})
 	if err != nil {
 		t.Fatal(err)
 	}

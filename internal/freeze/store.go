@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 )
 
 const sqliteTimestampFormat = "2006-01-02T15:04:05.000000000Z"
@@ -204,25 +205,41 @@ func createScheduledFreezeError(err error) error {
 }
 
 func (s *Store) Get(ctx context.Context, id int64) (domain.BranchFreeze, error) {
+	return s.GetForScope(ctx, repositoryscope.All(), id)
+}
+
+// GetForScope looks a branch freeze up through the caller's read scope. An
+// existing freeze outside the scope and a nonexistent freeze both return
+// sql.ErrNoRows, so a response cannot reveal which of the two it was.
+func (s *Store) GetForScope(ctx context.Context, scope repositoryscope.ReadScope, id int64) (domain.BranchFreeze, error) {
 	if s == nil || s.db == nil {
 		return domain.BranchFreeze{}, errors.New("freeze store has no database")
 	}
+	predicate, scopeArgs := scope.SQLPredicate("repository_id")
 	row := s.db.QueryRowContext(ctx, `
 SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, schedule_id, schedule_name, created_by, created_by_kind, created_at, updated_at
 FROM branch_freezes
-WHERE id = ?`, id)
+WHERE id = ? AND `+predicate, append([]any{id}, scopeArgs...)...)
 	return scanBranchFreeze(row)
 }
 
 func (s *Store) ListActive(ctx context.Context) ([]domain.BranchFreeze, error) {
+	return s.ListActiveForScope(ctx, repositoryscope.All())
+}
+
+// ListActiveForScope lists the active freezes visible through the caller's
+// read scope; the scope filters inside SQL before ordering so invisible rows
+// never leave the database.
+func (s *Store) ListActiveForScope(ctx context.Context, scope repositoryscope.ReadScope) ([]domain.BranchFreeze, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("freeze store has no database")
 	}
+	predicate, scopeArgs := scope.SQLPredicate("repository_id")
 	rows, err := s.db.QueryContext(ctx, `
 SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, schedule_id, schedule_name, created_by, created_by_kind, created_at, updated_at
 FROM branch_freezes
-WHERE status = ?
-ORDER BY created_at DESC, id DESC`, domain.BranchFreezeStatusActive)
+WHERE status = ? AND `+predicate+`
+ORDER BY created_at DESC, id DESC`, append([]any{domain.BranchFreezeStatusActive}, scopeArgs...)...)
 	if err != nil {
 		return nil, fmt.Errorf("list active branch freezes: %w", err)
 	}
@@ -243,21 +260,29 @@ ORDER BY created_at DESC, id DESC`, domain.BranchFreezeStatusActive)
 }
 
 func (s *Store) ListScheduled(ctx context.Context, limit int) ([]domain.BranchFreeze, error) {
+	return s.ListScheduledForScope(ctx, repositoryscope.All(), limit)
+}
+
+// ListScheduledForScope lists the scheduled freezes visible through the
+// caller's read scope; the scope filters inside SQL before ordering and the
+// limit, so invisible rows never consume result slots.
+func (s *Store) ListScheduledForScope(ctx context.Context, scope repositoryscope.ReadScope, limit int) ([]domain.BranchFreeze, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("freeze store has no database")
 	}
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
+	predicate, scopeArgs := scope.SQLPredicate("repository_id")
 	rows, err := s.db.QueryContext(ctx, `
 SELECT id, repository_id, branch, status, scheduled, needs_recompute, reason, starts_at, ends_at, planned_ends_at, schedule_id, schedule_name, created_by, created_by_kind, created_at, updated_at
 FROM branch_freezes
-WHERE scheduled = 1
+WHERE scheduled = 1 AND `+predicate+`
 ORDER BY
   CASE status WHEN 'scheduled' THEN 0 WHEN 'active' THEN 1 WHEN 'ended' THEN 2 WHEN 'cancelled' THEN 3 ELSE 4 END,
   starts_at ASC,
   id ASC
-LIMIT ?`, limit)
+LIMIT ?`, append(append([]any{}, scopeArgs...), limit)...)
 	if err != nil {
 		return nil, fmt.Errorf("list scheduled branch freezes: %w", err)
 	}
@@ -278,6 +303,15 @@ LIMIT ?`, limit)
 }
 
 func (s *Store) ListScheduledPage(ctx context.Context, status domain.BranchFreezeStatus, offset, limit int) ([]domain.BranchFreeze, int, error) {
+	return s.ListScheduledPageForScope(ctx, repositoryscope.All(), status, offset, limit)
+}
+
+// ListScheduledPageForScope pages the scheduled freezes visible through the
+// caller's read scope. The scope and status filter intersect inside SQL
+// before ordering and pagination, and the count query shares the identical
+// conditions, so rows and total always agree and the status filter can never
+// widen past the scope.
+func (s *Store) ListScheduledPageForScope(ctx context.Context, scope repositoryscope.ReadScope, status domain.BranchFreezeStatus, offset, limit int) ([]domain.BranchFreeze, int, error) {
 	if s == nil || s.db == nil {
 		return nil, 0, errors.New("freeze store has no database")
 	}
@@ -287,8 +321,8 @@ func (s *Store) ListScheduledPage(ctx context.Context, status domain.BranchFreez
 	if offset < 0 {
 		offset = 0
 	}
-	where := "WHERE scheduled = 1"
-	countArgs := []any{}
+	predicate, countArgs := scope.SQLPredicate("repository_id")
+	where := "WHERE scheduled = 1 AND " + predicate
 	if status != "" {
 		where += " AND status = ?"
 		countArgs = append(countArgs, status)
