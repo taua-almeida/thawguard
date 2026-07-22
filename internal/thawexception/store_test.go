@@ -14,6 +14,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/jobs"
 	"github.com/taua-almeida/thawguard/internal/repository"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 )
 
 func TestStoreApprovesAndFindsActiveExceptionForPullRequest(t *testing.T) {
@@ -109,6 +110,80 @@ func TestStoreCountActiveIgnoresExpiredExceptions(t *testing.T) {
 	}
 	if serviceCount != count {
 		t.Fatalf("expected service CountActive to match store, got %d and %d", serviceCount, count)
+	}
+}
+
+func TestStoreCountsActiveForScope(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repoA := createTestRepository(t, ctx, database)
+	repoB, err := repository.NewStore(database).Create(ctx, repository.CreateParams{Owner: "taua-almeida", Name: "frost-api", DefaultBranch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repoB, err = repository.NewStore(database).SetEnforcementState(ctx, repoB.ID, domain.EnforcementActive); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(database)
+	actor := domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: "admin"}
+
+	// Repository A: one active exception, one expired, one revoked; only the
+	// first may count. Repository B: two active exceptions.
+	if _, err := store.Approve(ctx, ApproveParams{RepositoryID: repoA.ID, PullRequestIndex: 42, TargetBranch: "main", HeadSHA: "abc123", Reason: "production fix"}, actor); err != nil {
+		t.Fatal(err)
+	}
+	pastExpiry := time.Now().UTC().Add(-time.Hour)
+	if _, err := store.Approve(ctx, ApproveParams{RepositoryID: repoA.ID, PullRequestIndex: 43, TargetBranch: "main", HeadSHA: "def456", Reason: "production fix", ExpiresAt: &pastExpiry}, actor); err != nil {
+		t.Fatal(err)
+	}
+	revoked, err := store.Approve(ctx, ApproveParams{RepositoryID: repoA.ID, PullRequestIndex: 44, TargetBranch: "main", HeadSHA: "fed789", Reason: "production fix"}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `UPDATE thaw_exceptions SET status = 'revoked' WHERE id = ?`, revoked.ID); err != nil {
+		t.Fatal(err)
+	}
+	futureExpiry := time.Now().UTC().Add(time.Hour)
+	if _, err := store.Approve(ctx, ApproveParams{RepositoryID: repoB.ID, PullRequestIndex: 50, TargetBranch: "main", HeadSHA: "aaa111", Reason: "production fix"}, actor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Approve(ctx, ApproveParams{RepositoryID: repoB.ID, PullRequestIndex: 51, TargetBranch: "main", HeadSHA: "bbb222", Reason: "production fix", ExpiresAt: &futureExpiry}, actor); err != nil {
+		t.Fatal(err)
+	}
+
+	assertCount := func(t *testing.T, scope repositoryscope.ReadScope, want int) {
+		t.Helper()
+		count, err := store.CountActiveForScope(ctx, scope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if count != want {
+			t.Fatalf("expected scoped count %d, got %d", want, count)
+		}
+	}
+
+	assertCount(t, repositoryscope.IDs(repoA.ID), 1)
+	assertCount(t, repositoryscope.IDs(repoB.ID), 2)
+	assertCount(t, repositoryscope.IDs(repoA.ID, repoB.ID), 3)
+	// The zero-value scope denies everything; the all scope matches the
+	// unrestricted method.
+	assertCount(t, repositoryscope.ReadScope{}, 0)
+	assertCount(t, repositoryscope.All(), 3)
+
+	unrestricted, err := store.CountActive(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unrestricted != 3 {
+		t.Fatalf("expected unrestricted count to keep every active exception, got %d", unrestricted)
+	}
+
+	serviceCount, err := NewService(database).CountActiveForScope(ctx, repositoryscope.IDs(repoA.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if serviceCount != 1 {
+		t.Fatalf("expected service scoped count to match store, got %d", serviceCount)
 	}
 }
 

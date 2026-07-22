@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 )
 
 const (
@@ -303,32 +305,40 @@ func deliveryOrderClause(order DeliveryOrder) string {
 }
 
 // deliveryPageFilter builds the shared WHERE clause for the paged list
-// queries: an optional derived processing-state partition plus an optional
-// repository scope. An unknown processing value matches nothing.
-func deliveryPageFilter(processing string, repositoryID int64) (string, []any) {
-	conditions := make([]string, 0, 2)
-	args := make([]any, 0, 1)
+// queries: the scope's visibility predicate, an optional derived
+// processing-state partition, and an optional exact repository filter, always
+// intersected so a filter can only narrow the scope. An unknown processing
+// value matches nothing.
+func deliveryPageFilter(scope repositoryscope.ReadScope, processing string, repositoryID int64) (string, []any) {
+	predicate, args := scope.SQLPredicate("repository_id")
+	where := "WHERE " + predicate
 	if processing != "" {
 		condition, known := deliveryProcessingConditions[processing]
 		if !known {
 			condition = "1 = 0"
 		}
-		conditions = append(conditions, condition)
+		where += " AND " + condition
 	}
 	if repositoryID > 0 {
-		conditions = append(conditions, "repository_id = ?")
+		where += " AND repository_id = ?"
 		args = append(args, repositoryID)
 	}
-	if len(conditions) == 0 {
-		return "", nil
-	}
-	return "WHERE " + strings.Join(conditions, " AND "), args
+	return where, args
 }
 
 // ListPage returns one page of deliveries plus the total count matching the
 // same filters. An empty processing value or zero repositoryID leaves that
 // filter off.
 func (s *DeliveryStore) ListPage(ctx context.Context, processing string, repositoryID int64, order DeliveryOrder, offset, limit int) ([]Delivery, int, error) {
+	return s.ListPageForScope(ctx, repositoryscope.All(), processing, repositoryID, order, offset, limit)
+}
+
+// ListPageForScope pages webhook deliveries visible through the caller's read
+// scope. The scope, processing filter, and repository filter all intersect
+// inside SQL before ordering and pagination, and the count query shares the
+// identical conditions, so rows and total always agree and a filter can never
+// widen past the scope.
+func (s *DeliveryStore) ListPageForScope(ctx context.Context, scope repositoryscope.ReadScope, processing string, repositoryID int64, order DeliveryOrder, offset, limit int) ([]Delivery, int, error) {
 	if s == nil || s.db == nil {
 		return nil, 0, errors.New("webhook delivery store has no database")
 	}
@@ -338,7 +348,7 @@ func (s *DeliveryStore) ListPage(ctx context.Context, processing string, reposit
 	if offset < 0 {
 		offset = 0
 	}
-	where, filterArgs := deliveryPageFilter(processing, repositoryID)
+	where, filterArgs := deliveryPageFilter(scope, processing, repositoryID)
 
 	var total int
 	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM webhook_deliveries "+where, filterArgs...).Scan(&total); err != nil {

@@ -13,6 +13,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/jobs"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 )
 
 type Service struct {
@@ -132,6 +133,15 @@ func (s *Service) CountActive(ctx context.Context) (int, error) {
 		return 0, errors.New("thaw exception service has no database")
 	}
 	return NewStore(s.db).CountActive(ctx)
+}
+
+// CountActiveForScope counts the currently active, unexpired thaw exceptions
+// on repositories visible through the caller's read scope.
+func (s *Service) CountActiveForScope(ctx context.Context, scope repositoryscope.ReadScope) (int, error) {
+	if s == nil || s.db == nil {
+		return 0, errors.New("thaw exception service has no database")
+	}
+	return NewStore(s.db).CountActiveForScope(ctx, scope)
 }
 
 func thawExceptionApprovedEvent(thaw domain.ThawException, actor domain.Actor) audit.Event {

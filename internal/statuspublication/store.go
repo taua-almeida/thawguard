@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
 )
 
@@ -169,6 +170,15 @@ LIMIT ?`, limit)
 // count matching the same filters. An empty state or zero repositoryID leaves
 // that filter off; an unknown state simply matches nothing.
 func (s *Store) ListPage(ctx context.Context, state string, repositoryID int64, offset, limit int) ([]Publication, int, error) {
+	return s.ListPageForScope(ctx, repositoryscope.All(), state, repositoryID, offset, limit)
+}
+
+// ListPageForScope pages publication intents visible through the caller's
+// read scope. The scope, state filter, and repository filter all intersect
+// inside SQL before ordering and pagination, and the count query shares the
+// identical conditions, so rows and total always agree and a filter can never
+// widen past the scope.
+func (s *Store) ListPageForScope(ctx context.Context, scope repositoryscope.ReadScope, state string, repositoryID int64, offset, limit int) ([]Publication, int, error) {
 	if s == nil || s.db == nil {
 		return nil, 0, errors.New("status publication store has no database")
 	}
@@ -178,7 +188,7 @@ func (s *Store) ListPage(ctx context.Context, state string, repositoryID int64, 
 	if offset < 0 {
 		offset = 0
 	}
-	where, filterArgs := publicationPageFilter("state", state, repositoryID)
+	where, filterArgs := publicationPageFilter(scope, "state", state, repositoryID)
 
 	var total int
 	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM status_publication_intents "+where, filterArgs...).Scan(&total); err != nil {
@@ -212,23 +222,21 @@ LIMIT ? OFFSET ?`, args...)
 }
 
 // publicationPageFilter builds the shared WHERE clause for the paged list
-// queries: an optional exact match on one text column plus an optional
-// repository scope.
-func publicationPageFilter(column, value string, repositoryID int64) (string, []any) {
-	conditions := make([]string, 0, 2)
-	args := make([]any, 0, 2)
+// queries: the scope's visibility predicate, an optional exact match on one
+// text column, and an optional exact repository filter, always intersected so
+// a filter can only narrow the scope.
+func publicationPageFilter(scope repositoryscope.ReadScope, column, value string, repositoryID int64) (string, []any) {
+	predicate, args := scope.SQLPredicate("repository_id")
+	where := "WHERE " + predicate
 	if value != "" {
-		conditions = append(conditions, column+" = ?")
+		where += " AND " + column + " = ?"
 		args = append(args, value)
 	}
 	if repositoryID > 0 {
-		conditions = append(conditions, "repository_id = ?")
+		where += " AND repository_id = ?"
 		args = append(args, repositoryID)
 	}
-	if len(conditions) == 0 {
-		return "", nil
-	}
-	return "WHERE " + strings.Join(conditions, " AND "), args
+	return where, args
 }
 
 func (s *Store) RecordForgejoStatusAttempt(ctx context.Context, publication Publication, result string, errorMessage string) (Attempt, error) {
@@ -309,6 +317,13 @@ LIMIT ?`, limit)
 // leaves that filter off; historical results from removed modes stay reachable
 // through the unfiltered view.
 func (s *Store) ListAttemptsPage(ctx context.Context, result string, repositoryID int64, offset, limit int) ([]Attempt, int, error) {
+	return s.ListAttemptsPageForScope(ctx, repositoryscope.All(), result, repositoryID, offset, limit)
+}
+
+// ListAttemptsPageForScope pages delivery attempts visible through the
+// caller's read scope, intersecting the scope with the result and repository
+// filters under the same conditions as the total count.
+func (s *Store) ListAttemptsPageForScope(ctx context.Context, scope repositoryscope.ReadScope, result string, repositoryID int64, offset, limit int) ([]Attempt, int, error) {
 	if s == nil || s.db == nil {
 		return nil, 0, errors.New("status publication store has no database")
 	}
@@ -318,7 +333,7 @@ func (s *Store) ListAttemptsPage(ctx context.Context, result string, repositoryI
 	if offset < 0 {
 		offset = 0
 	}
-	where, filterArgs := publicationPageFilter("result", result, repositoryID)
+	where, filterArgs := publicationPageFilter(scope, "result", result, repositoryID)
 
 	var total int
 	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM status_publication_attempts "+where, filterArgs...).Scan(&total); err != nil {

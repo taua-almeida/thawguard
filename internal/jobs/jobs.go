@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 )
 
 const (
@@ -127,12 +128,22 @@ WHERE type = ? AND repository_id = ?`, ReconcileRepositoryEnforcement, repositor
 }
 
 func (s *Store) ListReconciliations(ctx context.Context) ([]Job, error) {
+	return s.ListReconciliationsForScope(ctx, repositoryscope.All())
+}
+
+// ListReconciliationsForScope lists reconciliation jobs for repositories
+// visible through the caller's read scope, in repository order. Worker claim
+// paths stay unrestricted; this scoped variant exists only for reads shown to
+// a caller.
+func (s *Store) ListReconciliationsForScope(ctx context.Context, scope repositoryscope.ReadScope) ([]Job, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("job store has no database")
 	}
+	predicate, scopeArgs := scope.SQLPredicate("repository_id")
+	args := append([]any{ReconcileRepositoryEnforcement}, scopeArgs...)
 	rows, err := s.db.QueryContext(ctx, reconciliationSelect+`
-WHERE type = ? AND repository_id IS NOT NULL
-ORDER BY repository_id ASC`, ReconcileRepositoryEnforcement)
+WHERE type = ? AND repository_id IS NOT NULL AND `+predicate+`
+ORDER BY repository_id ASC`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list repository reconciliations: %w", err)
 	}

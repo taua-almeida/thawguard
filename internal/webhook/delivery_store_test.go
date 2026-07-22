@@ -10,6 +10,7 @@ import (
 
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/repository"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 )
 
 func TestDeliveryStoreRecordsAndMarksProcessed(t *testing.T) {
@@ -398,6 +399,95 @@ func TestDeliveryStoreListPagePaginates(t *testing.T) {
 	if _, _, err := NewDeliveryStore(nil).ListPage(ctx, "", 0, DeliveryOrderReceivedDesc, 0, 10); err == nil {
 		t.Fatal("expected nil-database store to error")
 	}
+}
+
+func TestDeliveryStoreListsPageForScope(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repoA := createWebhookDeliveryTestRepository(t, ctx, database)
+	repoB, err := repository.NewStore(database).Create(ctx, repository.CreateParams{Owner: "other", Name: "other", DefaultBranch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewDeliveryStore(database)
+	base := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
+
+	// Every repository B delivery is received after every repository A
+	// delivery, so the newest rows an unrestricted page would serve first are
+	// all foreign to a scope over repository A.
+	states := []string{
+		DeliveryProcessingReceived,
+		DeliveryProcessingProcessing,
+		DeliveryProcessingProcessed,
+		DeliveryProcessingProcessedWithError,
+		DeliveryProcessingRetryableFailure,
+	}
+	scopedByState := map[string]Delivery{}
+	scopedIDs := make([]int64, 0, len(states))
+	for i, state := range states {
+		receivedAt := base.Add(time.Duration(i) * time.Hour)
+		delivery := seedPagedDelivery(t, ctx, store, repoA.ID, "delivery-a-"+state, state, receivedAt, receivedAt.Add(30*time.Minute))
+		scopedByState[state] = delivery
+		scopedIDs = append(scopedIDs, delivery.ID)
+	}
+	for i, state := range states {
+		receivedAt := base.Add(time.Duration(12+i) * time.Hour)
+		seedPagedDelivery(t, ctx, store, repoB.ID, "delivery-b-"+state, state, receivedAt, receivedAt.Add(30*time.Minute))
+	}
+
+	assertPage := func(t *testing.T, scope repositoryscope.ReadScope, processing string, repositoryID int64, order DeliveryOrder, offset, limit int, wantTotal int, wantIDs []int64) {
+		t.Helper()
+		deliveries, total, err := store.ListPageForScope(ctx, scope, processing, repositoryID, order, offset, limit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if total != wantTotal {
+			t.Fatalf("expected total %d, got %d", wantTotal, total)
+		}
+		if len(deliveries) != len(wantIDs) {
+			t.Fatalf("expected %d deliveries, got %+v", len(wantIDs), deliveries)
+		}
+		for i, id := range wantIDs {
+			if deliveries[i].ID != id {
+				t.Fatalf("expected ids %v, got %+v", wantIDs, deliveries)
+			}
+		}
+	}
+
+	scopeA := repositoryscope.IDs(repoA.ID)
+	// Each derived processing state intersects the scope: the same-state
+	// foreign delivery never appears even without a repository filter.
+	for _, state := range states {
+		assertPage(t, scopeA, state, 0, DeliveryOrderReceivedDesc, 0, 10, 1, []int64{scopedByState[state].ID})
+	}
+	// An unknown processing value still matches nothing inside the scope.
+	assertPage(t, scopeA, "bogus", 0, DeliveryOrderReceivedDesc, 0, 10, 0, nil)
+	// Scope applies before ordering and pagination: a two-row first page
+	// serves the two newest accessible deliveries, not empty slots consumed
+	// by the newer foreign rows, and the total counts only accessible rows.
+	assertPage(t, scopeA, "", 0, DeliveryOrderReceivedDesc, 0, 2, 5, []int64{scopedIDs[4], scopedIDs[3]})
+	assertPage(t, scopeA, "", 0, DeliveryOrderReceivedDesc, 4, 2, 5, []int64{scopedIDs[0]})
+	assertPage(t, scopeA, "", 0, DeliveryOrderReceivedAsc, 0, 2, 5, []int64{scopedIDs[0], scopedIDs[1]})
+	// Filtering for an inaccessible repository yields nothing, not the
+	// accessible rows.
+	assertPage(t, scopeA, "", repoB.ID, DeliveryOrderReceivedDesc, 0, 10, 0, nil)
+	assertPage(t, scopeA, DeliveryProcessingProcessed, repoB.ID, DeliveryOrderReceivedDesc, 0, 10, 0, nil)
+	// The zero-value scope denies everything.
+	assertPage(t, repositoryscope.ReadScope{}, "", 0, DeliveryOrderReceivedDesc, 0, 10, 0, nil)
+
+	// The all scope matches the unrestricted method row for row.
+	unrestricted, unrestrictedTotal, err := store.ListPage(ctx, "", 0, DeliveryOrderReceivedDesc, 0, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unrestrictedTotal != 10 || len(unrestricted) != 10 {
+		t.Fatalf("expected unrestricted page to keep every row, got total %d and %d rows", unrestrictedTotal, len(unrestricted))
+	}
+	allIDs := make([]int64, 0, len(unrestricted))
+	for _, delivery := range unrestricted {
+		allIDs = append(allIDs, delivery.ID)
+	}
+	assertPage(t, repositoryscope.All(), "", 0, DeliveryOrderReceivedDesc, 0, 20, 10, allIDs)
 }
 
 // seedPagedDelivery records one delivery and drives it into the requested

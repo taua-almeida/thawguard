@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 )
 
 type database interface {
@@ -146,16 +147,27 @@ LIMIT 1`, pr.RepositoryID, pr.Index, pr.HeadSHA, pr.TargetBranch, now)
 // CountActive counts thaw exceptions that are in effect right now: status
 // 'active' and either no expiry or an expiry still in the future.
 func (s *Store) CountActive(ctx context.Context) (int, error) {
+	return s.CountActiveForScope(ctx, repositoryscope.All())
+}
+
+// CountActiveForScope counts the currently active, unexpired thaw exceptions
+// on repositories visible through the caller's read scope. The scope predicate
+// intersects with the active/expiry conditions inside SQL, so invisible
+// repositories never contribute to the count.
+func (s *Store) CountActiveForScope(ctx context.Context, scope repositoryscope.ReadScope) (int, error) {
 	if s == nil || s.db == nil {
 		return 0, errors.New("thaw exception store has no database")
 	}
+	predicate, args := scope.SQLPredicate("repository_id")
 	now := s.now().UTC().Format(time.RFC3339Nano)
+	args = append(args, now)
 	var count int
 	err := s.db.QueryRowContext(ctx, `
 SELECT COUNT(*)
 FROM thaw_exceptions
-WHERE status = 'active'
-  AND (expires_at IS NULL OR expires_at > ?)`, now).Scan(&count)
+WHERE `+predicate+`
+  AND status = 'active'
+  AND (expires_at IS NULL OR expires_at > ?)`, args...).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("count active thaw exceptions: %w", err)
 	}

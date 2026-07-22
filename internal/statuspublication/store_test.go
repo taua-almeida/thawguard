@@ -12,6 +12,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/db"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/repository"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
 )
 
@@ -385,6 +386,174 @@ func TestStoreListAttemptsPageFiltersAndPaginates(t *testing.T) {
 	}
 	if total != 4 || len(page) != 4 {
 		t.Fatalf("expected clamped page to return everything, got total %d rows %d", total, len(page))
+	}
+}
+
+func TestStoreListsPageForScope(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repoA := createTestRepository(t, ctx, database)
+	repoB, err := repository.NewStore(database).Create(ctx, repository.CreateParams{Owner: "example-owner", Name: "second-repo", DefaultBranch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(database)
+
+	// Repository B rows are created after each repository A row, so the
+	// newest intents an unrestricted page would serve first are foreign to a
+	// scope over repository A.
+	seed := []struct {
+		repositoryID int64
+		index        int
+		state        domain.CommitStatusState
+	}{
+		{repoA.ID, 1, domain.CommitStatusSuccess},
+		{repoB.ID, 2, domain.CommitStatusFailure},
+		{repoB.ID, 3, domain.CommitStatusSuccess},
+		{repoA.ID, 4, domain.CommitStatusFailure},
+		{repoB.ID, 5, domain.CommitStatusSuccess},
+	}
+	ids := make([]int64, 0, len(seed))
+	for _, entry := range seed {
+		result := createStatusResultWithParams(t, ctx, database, entry.repositoryID, entry.index, "main", fmt.Sprintf("abc%03d", entry.index), entry.state, "seeded")
+		publication, err := store.PublishForgejoStatus(ctx, result)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, publication.ID)
+	}
+
+	assertPage := func(t *testing.T, scope repositoryscope.ReadScope, state string, repositoryID int64, offset, limit int, wantTotal int, wantIDs []int64) {
+		t.Helper()
+		rows, total, err := store.ListPageForScope(ctx, scope, state, repositoryID, offset, limit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if total != wantTotal {
+			t.Fatalf("expected total %d, got %d", wantTotal, total)
+		}
+		if len(rows) != len(wantIDs) {
+			t.Fatalf("expected %d rows, got %+v", len(wantIDs), rows)
+		}
+		for i, row := range rows {
+			if row.ID != wantIDs[i] {
+				t.Fatalf("row %d: expected id %d, got %d", i, wantIDs[i], row.ID)
+			}
+		}
+	}
+
+	scopeA := repositoryscope.IDs(repoA.ID)
+	// A one-row page skips the newer foreign intent and still serves the
+	// accessible one, with the total counted under the same conditions.
+	assertPage(t, scopeA, "", 0, 0, 1, 2, []int64{ids[3]})
+	assertPage(t, scopeA, "", 0, 1, 1, 2, []int64{ids[0]})
+	// State and repository filters intersect the scope, never widen it.
+	assertPage(t, scopeA, string(domain.CommitStatusSuccess), 0, 0, 10, 1, []int64{ids[0]})
+	assertPage(t, scopeA, string(domain.CommitStatusSuccess), repoA.ID, 0, 10, 1, []int64{ids[0]})
+	// Filtering for an inaccessible repository yields nothing, not the
+	// accessible rows.
+	assertPage(t, scopeA, "", repoB.ID, 0, 10, 0, nil)
+	assertPage(t, scopeA, string(domain.CommitStatusSuccess), repoB.ID, 0, 10, 0, nil)
+	// The zero-value scope denies everything; the all scope matches the
+	// unrestricted method.
+	assertPage(t, repositoryscope.ReadScope{}, "", 0, 0, 10, 0, nil)
+	assertPage(t, repositoryscope.All(), "", 0, 0, 10, 5, []int64{ids[4], ids[3], ids[2], ids[1], ids[0]})
+
+	unrestricted, total, err := store.ListPage(ctx, "", 0, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 5 || len(unrestricted) != 5 {
+		t.Fatalf("expected unrestricted page to keep every row, got total %d and %+v", total, unrestricted)
+	}
+}
+
+func TestStoreListsAttemptsPageForScope(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repoA := createTestRepository(t, ctx, database)
+	repoB, err := repository.NewStore(database).Create(ctx, repository.CreateParams{Owner: "example-owner", Name: "second-repo", DefaultBranch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(database)
+
+	resultA := createStatusResultWithParams(t, ctx, database, repoA.ID, 1, "main", "abc001", domain.CommitStatusFailure, "seeded")
+	publicationA, err := store.PublishForgejoStatus(ctx, resultA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resultB := createStatusResultWithParams(t, ctx, database, repoB.ID, 2, "main", "abc002", domain.CommitStatusSuccess, "seeded")
+	publicationB, err := store.PublishForgejoStatus(ctx, resultB)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The final attempts belong to repository B, so the newest rows an
+	// unrestricted page would serve first are foreign to a scope over
+	// repository A.
+	seed := []struct {
+		publication Publication
+		result      string
+		message     string
+	}{
+		{publicationA, AttemptResultPosted, ""},
+		{publicationB, AttemptResultFailed, "forge returned 500"},
+		{publicationA, AttemptResultFailed, "forge returned 502"},
+		{publicationB, AttemptResultPosted, ""},
+		{publicationB, AttemptResultPosted, ""},
+	}
+	ids := make([]int64, 0, len(seed))
+	for _, entry := range seed {
+		attempt, err := store.RecordForgejoStatusAttempt(ctx, entry.publication, entry.result, entry.message)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, attempt.ID)
+	}
+
+	assertPage := func(t *testing.T, scope repositoryscope.ReadScope, result string, repositoryID int64, offset, limit int, wantTotal int, wantIDs []int64) {
+		t.Helper()
+		rows, total, err := store.ListAttemptsPageForScope(ctx, scope, result, repositoryID, offset, limit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if total != wantTotal {
+			t.Fatalf("expected total %d, got %d", wantTotal, total)
+		}
+		if len(rows) != len(wantIDs) {
+			t.Fatalf("expected %d rows, got %+v", len(wantIDs), rows)
+		}
+		for i, row := range rows {
+			if row.ID != wantIDs[i] {
+				t.Fatalf("row %d: expected id %d, got %d", i, wantIDs[i], row.ID)
+			}
+		}
+	}
+
+	scopeA := repositoryscope.IDs(repoA.ID)
+	// A one-row page skips the newer foreign attempts and still serves the
+	// accessible one, with the total counted under the same conditions.
+	assertPage(t, scopeA, "", 0, 0, 1, 2, []int64{ids[2]})
+	assertPage(t, scopeA, "", 0, 1, 1, 2, []int64{ids[0]})
+	// Result and repository filters intersect the scope, never widen it.
+	assertPage(t, scopeA, AttemptResultPosted, 0, 0, 10, 1, []int64{ids[0]})
+	assertPage(t, scopeA, AttemptResultPosted, repoA.ID, 0, 10, 1, []int64{ids[0]})
+	// Filtering for an inaccessible repository yields nothing, not the
+	// accessible rows.
+	assertPage(t, scopeA, "", repoB.ID, 0, 10, 0, nil)
+	assertPage(t, scopeA, AttemptResultFailed, repoB.ID, 0, 10, 0, nil)
+	// The zero-value scope denies everything; the all scope matches the
+	// unrestricted method.
+	assertPage(t, repositoryscope.ReadScope{}, "", 0, 0, 10, 0, nil)
+	assertPage(t, repositoryscope.All(), "", 0, 0, 10, 5, []int64{ids[4], ids[3], ids[2], ids[1], ids[0]})
+
+	unrestricted, total, err := store.ListAttemptsPage(ctx, "", 0, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 5 || len(unrestricted) != 5 {
+		t.Fatalf("expected unrestricted page to keep every row, got total %d and %+v", total, unrestricted)
 	}
 }
 

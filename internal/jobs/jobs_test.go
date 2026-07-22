@@ -12,6 +12,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/db"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/repository"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 )
 
 func TestReconciliationEnqueueDeduplicatesAndAdvancesGeneration(t *testing.T) {
@@ -47,6 +48,63 @@ func TestReconciliationEnqueueDeduplicatesAndAdvancesGeneration(t *testing.T) {
 	}
 	if _, err := database.ExecContext(ctx, `INSERT INTO jobs(type, payload_json, repository_id, generation, run_at, created_at) VALUES (?, '{}', ?, 1, ?, ?)`, ReconcileRepositoryEnforcement, repo1.ID, formatTime(now), formatTime(now)); err == nil {
 		t.Fatal("expected partial unique index to reject duplicate repository job")
+	}
+}
+
+func TestListReconciliationsForScopeBoundsVisibilityButNotWorkers(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repo1 := createRepository(t, ctx, database, "one")
+	repo2 := createRepository(t, ctx, database, "two")
+	repo3 := createRepository(t, ctx, database, "three")
+	store := NewStore(database)
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+	for _, id := range []int64{repo1.ID, repo2.ID, repo3.ID} {
+		if _, err := store.EnqueueReconciliation(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	assertScoped := func(t *testing.T, scope repositoryscope.ReadScope, wantRepositoryIDs []int64) {
+		t.Helper()
+		listed, err := store.ListReconciliationsForScope(ctx, scope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(listed) != len(wantRepositoryIDs) {
+			t.Fatalf("expected %d scoped jobs, got %+v", len(wantRepositoryIDs), listed)
+		}
+		for i, want := range wantRepositoryIDs {
+			if listed[i].RepositoryID != want {
+				t.Fatalf("job %d: expected repository %d, got %+v", i, want, listed[i])
+			}
+		}
+	}
+
+	// A bounded scope lists only its repository's job; multi-repository
+	// scopes keep the repository ordering; the zero-value scope denies all.
+	assertScoped(t, repositoryscope.IDs(repo2.ID), []int64{repo2.ID})
+	assertScoped(t, repositoryscope.IDs(repo3.ID, repo1.ID), []int64{repo1.ID, repo3.ID})
+	assertScoped(t, repositoryscope.ReadScope{}, nil)
+	assertScoped(t, repositoryscope.All(), []int64{repo1.ID, repo2.ID, repo3.ID})
+
+	unrestricted, err := store.ListReconciliations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unrestricted) != 3 {
+		t.Fatalf("expected unrestricted list to keep every job, got %+v", unrestricted)
+	}
+
+	// Worker claiming stays unrestricted: every repository's due job is
+	// claimed regardless of any read scope.
+	claimed, err := store.ClaimDue(ctx, 25)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 3 {
+		t.Fatalf("expected workers to claim every repository's job, got %+v", claimed)
 	}
 }
 
