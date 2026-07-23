@@ -6,41 +6,36 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/taua-almeida/thawguard/internal/audit"
 )
 
 const accountTestPassword = "correct horse battery staple"
 
-func TestSetUserAdminChangesOnlyGlobalAdminAndPrimaryRole(t *testing.T) {
+func TestSetUserAdminChangesOnlyAdminState(t *testing.T) {
 	ctx := context.Background()
 	database := newAuthTestDB(t, ctx)
 	service := NewService(database)
 	admin := mustCreateFirstAdmin(t, ctx, service)
-	user := mustCreateUser(t, ctx, service, "lead@example.test", nil)
+	user := mustCreateUser(t, ctx, service, "lead@example.test", false)
+	repositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "thawguard")
+	if err := service.GrantRepositoryRole(ctx, GrantRepositoryRoleParams{ActorUserID: admin.User.ID, RepositoryID: repositoryID, UserID: user.ID, Role: RoleFreezer}); err != nil {
+		t.Fatal(err)
+	}
 
 	updated, err := service.SetUserAdmin(ctx, SetUserAdminParams{ActorUserID: admin.User.ID, UserID: user.ID, Admin: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !updated.Roles.Contains(RoleAdmin) || len(updated.Roles) != 1 || updated.Role != RoleAdmin {
+	if !updated.IsAdmin {
 		t.Fatalf("unexpected updated user: %+v", updated)
 	}
 	updated, err = service.SetUserAdmin(ctx, SetUserAdminParams{ActorUserID: admin.User.ID, UserID: user.ID, Admin: false})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(updated.Roles) != 0 || updated.Role != "" {
-		t.Fatalf("expected no live global role after demotion, got %+v", updated)
-	}
-
-	var storedPrimary string
-	if err := database.QueryRowContext(ctx, `SELECT role FROM users WHERE id = ?`, user.ID).Scan(&storedPrimary); err != nil {
-		t.Fatal(err)
-	}
-	if storedPrimary != string(RoleViewer) {
-		t.Fatalf("expected primary role column synchronized to viewer, got %q", storedPrimary)
+	if updated.IsAdmin {
+		t.Fatalf("expected no Admin authority after demotion, got %+v", updated)
 	}
 	var roleCount int
 	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM user_roles WHERE user_id = ?`, user.ID).Scan(&roleCount); err != nil {
@@ -48,6 +43,13 @@ func TestSetUserAdminChangesOnlyGlobalAdminAndPrimaryRole(t *testing.T) {
 	}
 	if roleCount != 0 {
 		t.Fatalf("expected Admin row removed atomically, got %d rows", roleCount)
+	}
+	grants, err := service.GrantsForUser(ctx, user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !grants.CanFreezeRepository(repositoryID) {
+		t.Fatalf("expected demotion to preserve repository grants, got %+v", grants)
 	}
 	assertAuditEvent(t, ctx, database, audit.ActionUserRolesUpdated, user.ID, admin.User.ID)
 }
@@ -57,7 +59,7 @@ func TestSetUserAdminRequiresEnabledAdminActorAndExistingTarget(t *testing.T) {
 	database := newAuthTestDB(t, ctx)
 	service := NewService(database)
 	admin := mustCreateFirstAdmin(t, ctx, service)
-	user := mustCreateUser(t, ctx, service, "viewer@example.test", nil)
+	user := mustCreateUser(t, ctx, service, "viewer@example.test", false)
 
 	if _, err := service.SetUserAdmin(ctx, SetUserAdminParams{ActorUserID: user.ID, UserID: user.ID, Admin: true}); !IsValidationError(err) {
 		t.Fatalf("expected non-Admin actor rejection, got %v", err)
@@ -69,8 +71,8 @@ func TestSetUserAdminRequiresEnabledAdminActorAndExistingTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(loaded.Roles) != 0 {
-		t.Fatalf("expected rejected updates to leave zero global access, got %+v", loaded.Roles)
+	if loaded.IsAdmin {
+		t.Fatalf("expected rejected updates to leave zero global access, got %+v", loaded.User)
 	}
 }
 
@@ -79,7 +81,7 @@ func TestSetUserAdminIsVisibleThroughExistingSession(t *testing.T) {
 	database := newAuthTestDB(t, ctx)
 	service := NewService(database)
 	admin := mustCreateFirstAdmin(t, ctx, service)
-	user := mustCreateUser(t, ctx, service, "lead@example.test", nil)
+	user := mustCreateUser(t, ctx, service, "lead@example.test", false)
 	session, err := service.Login(ctx, LoginParams{Email: "lead@example.test", Password: accountTestPassword})
 	if err != nil {
 		t.Fatal(err)
@@ -92,8 +94,18 @@ func TestSetUserAdminIsVisibleThroughExistingSession(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("expected session to remain valid, found=%v err=%v", found, err)
 	}
-	if !loaded.Grants.CanManageInstallation() || !loaded.User.Roles.Contains(RoleAdmin) {
+	if !loaded.Grants.CanManageInstallation() || !loaded.User.IsAdmin {
 		t.Fatalf("expected existing session to hydrate current Admin authority, got %+v", loaded)
+	}
+	if _, err := service.SetUserAdmin(ctx, SetUserAdminParams{ActorUserID: admin.User.ID, UserID: user.ID, Admin: false}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, found, err = service.SessionByID(ctx, session.ID)
+	if err != nil || !found {
+		t.Fatalf("expected session to remain valid after demotion, found=%v err=%v", found, err)
+	}
+	if loaded.Grants.CanManageInstallation() || loaded.User.IsAdmin {
+		t.Fatalf("expected existing session to drop demoted Admin authority, got %+v", loaded)
 	}
 }
 
@@ -110,11 +122,11 @@ func TestSetUserAdminProtectsFinalEnabledAdmin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !loaded.Roles.Contains(RoleAdmin) {
-		t.Fatalf("expected admin role preserved after rejected update, got %+v", loaded.Roles)
+	if !loaded.IsAdmin {
+		t.Fatalf("expected Admin authority preserved after rejected update, got %+v", loaded.User)
 	}
 
-	secondAdmin := mustCreateUser(t, ctx, service, "second@example.test", []Role{RoleAdmin})
+	secondAdmin := mustCreateUser(t, ctx, service, "second@example.test", true)
 	if _, err := service.SetUserAdmin(ctx, SetUserAdminParams{ActorUserID: admin.User.ID, UserID: admin.User.ID, Admin: false}); err != nil {
 		t.Fatalf("expected role removal with a second enabled admin to succeed, got %v", err)
 	}
@@ -137,7 +149,7 @@ func TestDisableUserRevokesSessionsAndBlocksLogin(t *testing.T) {
 	database := newAuthTestDB(t, ctx)
 	service := NewService(database)
 	admin := mustCreateFirstAdmin(t, ctx, service)
-	user := mustCreateUser(t, ctx, service, "freezer@example.test", nil)
+	user := mustCreateUser(t, ctx, service, "freezer@example.test", false)
 	repositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "thawguard")
 	if err := service.GrantRepositoryRole(ctx, GrantRepositoryRoleParams{ActorUserID: admin.User.ID, RepositoryID: repositoryID, UserID: user.ID, Role: RoleFreezer}); err != nil {
 		t.Fatal(err)
@@ -178,7 +190,7 @@ func TestSessionByIDRejectsAndDeletesSessionsOfDisabledUsers(t *testing.T) {
 	database := newAuthTestDB(t, ctx)
 	service := NewService(database)
 	mustCreateFirstAdmin(t, ctx, service)
-	user := mustCreateUser(t, ctx, service, "freezer@example.test", []Role{RoleFreezer})
+	user := mustCreateUser(t, ctx, service, "freezer@example.test", false)
 	session, err := service.Login(ctx, LoginParams{Email: "freezer@example.test", Password: accountTestPassword})
 	if err != nil {
 		t.Fatal(err)
@@ -205,7 +217,7 @@ func TestEnableUserPermitsLoginWithoutRestoringSessions(t *testing.T) {
 	database := newAuthTestDB(t, ctx)
 	service := NewService(database)
 	admin := mustCreateFirstAdmin(t, ctx, service)
-	user := mustCreateUser(t, ctx, service, "freezer@example.test", nil)
+	user := mustCreateUser(t, ctx, service, "freezer@example.test", false)
 	repositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "thawguard")
 	if err := service.GrantRepositoryRole(ctx, GrantRepositoryRoleParams{ActorUserID: admin.User.ID, RepositoryID: repositoryID, UserID: user.ID, Role: RoleFreezer}); err != nil {
 		t.Fatal(err)
@@ -253,7 +265,7 @@ func TestDisableUserProtectsFinalEnabledAdmin(t *testing.T) {
 		t.Fatalf("expected admin to stay enabled after rejected disable, got %+v", loaded.User)
 	}
 
-	secondAdmin := mustCreateUser(t, ctx, service, "second@example.test", []Role{RoleAdmin})
+	secondAdmin := mustCreateUser(t, ctx, service, "second@example.test", true)
 	if _, err := service.DisableUser(ctx, admin.User.ID, secondAdmin.ID); err != nil {
 		t.Fatalf("expected disabling one of two enabled admins to succeed, got %v", err)
 	}
@@ -273,7 +285,7 @@ func TestConcurrentDisablesCannotCommitZeroEnabledAdmins(t *testing.T) {
 	database := newAuthTestDB(t, ctx)
 	service := NewService(database)
 	admin := mustCreateFirstAdmin(t, ctx, service)
-	secondAdmin := mustCreateUser(t, ctx, service, "second@example.test", []Role{RoleAdmin})
+	secondAdmin := mustCreateUser(t, ctx, service, "second@example.test", true)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -328,7 +340,7 @@ func TestChangePasswordRotatesSessionRevokesOthersAndClearsForcedFlag(t *testing
 	database := newAuthTestDB(t, ctx)
 	service := NewService(database)
 	admin := mustCreateFirstAdmin(t, ctx, service)
-	user := mustCreateUser(t, ctx, service, "lead@example.test", []Role{RoleFreezer})
+	user := mustCreateUser(t, ctx, service, "lead@example.test", false)
 	if err := service.ResetPassword(ctx, ResetPasswordParams{ActorUserID: admin.User.ID, UserID: user.ID, TemporaryPassword: "temporary local password"}); err != nil {
 		t.Fatal(err)
 	}
@@ -377,7 +389,7 @@ func TestResetPasswordSetsForcedFlagRevokesSessionsAndPreservesState(t *testing.
 	database := newAuthTestDB(t, ctx)
 	service := NewService(database)
 	admin := mustCreateFirstAdmin(t, ctx, service)
-	user := mustCreateUser(t, ctx, service, "lead@example.test", nil)
+	user := mustCreateUser(t, ctx, service, "lead@example.test", false)
 	repositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "thawguard")
 	if err := service.SetUserRepositoryRoles(ctx, SetUserRepositoryRolesParams{ActorUserID: admin.User.ID, RepositoryID: repositoryID, UserID: user.ID, Roles: []Role{RoleViewer, RoleFreezer}}); err != nil {
 		t.Fatal(err)
@@ -448,7 +460,7 @@ func TestAccountMutationsRollBackWhenAuditPersistenceFails(t *testing.T) {
 	database := newAuthTestDB(t, ctx)
 	service := NewService(database)
 	admin := mustCreateFirstAdmin(t, ctx, service)
-	user := mustCreateUser(t, ctx, service, "lead@example.test", []Role{RoleFreezer})
+	user := mustCreateUser(t, ctx, service, "lead@example.test", false)
 	session, err := service.Login(ctx, LoginParams{Email: "lead@example.test", Password: accountTestPassword})
 	if err != nil {
 		t.Fatal(err)
@@ -492,7 +504,7 @@ func mustCreateFirstAdmin(t *testing.T, ctx context.Context, service *Service) S
 	return session
 }
 
-func mustCreateUser(t *testing.T, ctx context.Context, service *Service, email string, roles []Role) User {
+func mustCreateUser(t *testing.T, ctx context.Context, service *Service, email string, isAdmin bool) User {
 	t.Helper()
 	var actorUserID int64
 	if err := service.db.QueryRowContext(ctx, `
@@ -508,17 +520,9 @@ LIMIT 1`).Scan(&actorUserID); err != nil {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, role := range roles {
-		if role == RoleAdmin {
-			user, err = service.SetUserAdmin(ctx, SetUserAdminParams{ActorUserID: actorUserID, UserID: user.ID, Admin: true})
-			if err != nil {
-				t.Fatal(err)
-			}
-			continue
-		}
-		// Scoped rows in user_roles are deliberately inert after cutover. A few
-		// compatibility tests seed them directly to prove they cannot authorize.
-		if _, err := service.db.ExecContext(ctx, `INSERT OR IGNORE INTO user_roles(user_id, role, created_at) VALUES (?, ?, ?)`, user.ID, role, service.now().UTC().Format(time.RFC3339Nano)); err != nil {
+	if isAdmin {
+		user, err = service.SetUserAdmin(ctx, SetUserAdminParams{ActorUserID: actorUserID, UserID: user.ID, Admin: true})
+		if err != nil {
 			t.Fatal(err)
 		}
 	}

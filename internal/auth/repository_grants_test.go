@@ -15,7 +15,7 @@ func TestGrantRepositoryRoleRoundTripWithAttribution(t *testing.T) {
 	database := newAuthTestDB(t, ctx)
 	service := NewService(database)
 	admin := mustCreateFirstAdmin(t, ctx, service)
-	user := mustCreateUser(t, ctx, service, "lead@example.test", []Role{RoleViewer})
+	user := mustCreateUser(t, ctx, service, "lead@example.test", false)
 	repositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "thawguard")
 	otherRepositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "other")
 
@@ -65,7 +65,7 @@ func TestGrantRepositoryRoleRejectsInvalidInput(t *testing.T) {
 	database := newAuthTestDB(t, ctx)
 	service := NewService(database)
 	admin := mustCreateFirstAdmin(t, ctx, service)
-	user := mustCreateUser(t, ctx, service, "lead@example.test", []Role{RoleViewer})
+	user := mustCreateUser(t, ctx, service, "lead@example.test", false)
 	repositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "thawguard")
 
 	if err := service.GrantRepositoryRole(ctx, GrantRepositoryRoleParams{ActorUserID: admin.User.ID, RepositoryID: repositoryID, UserID: user.ID, Role: RoleAdmin}); !IsValidationError(err) {
@@ -102,7 +102,7 @@ func TestDisabledTargetsRetainReceiveAndLoseGrants(t *testing.T) {
 	database := newAuthTestDB(t, ctx)
 	service := NewService(database)
 	admin := mustCreateFirstAdmin(t, ctx, service)
-	user := mustCreateUser(t, ctx, service, "lead@example.test", []Role{RoleViewer})
+	user := mustCreateUser(t, ctx, service, "lead@example.test", false)
 	repositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "thawguard")
 
 	if err := service.GrantRepositoryRole(ctx, GrantRepositoryRoleParams{ActorUserID: admin.User.ID, RepositoryID: repositoryID, UserID: user.ID, Role: RoleFreezer}); err != nil {
@@ -133,11 +133,11 @@ func TestRepositoryGrantMutationsRequireEnabledAdminActor(t *testing.T) {
 	database := newAuthTestDB(t, ctx)
 	service := NewService(database)
 	admin := mustCreateFirstAdmin(t, ctx, service)
-	viewer := mustCreateUser(t, ctx, service, "viewer@example.test", []Role{RoleViewer})
-	freezer := mustCreateUser(t, ctx, service, "freezer@example.test", []Role{RoleFreezer})
-	approver := mustCreateUser(t, ctx, service, "approver@example.test", []Role{RoleThawApprover})
-	disabledAdmin := mustCreateUser(t, ctx, service, "former-admin@example.test", []Role{RoleAdmin})
-	target := mustCreateUser(t, ctx, service, "lead@example.test", []Role{RoleViewer})
+	viewer := mustCreateUser(t, ctx, service, "viewer@example.test", false)
+	freezer := mustCreateUser(t, ctx, service, "freezer@example.test", false)
+	approver := mustCreateUser(t, ctx, service, "approver@example.test", false)
+	disabledAdmin := mustCreateUser(t, ctx, service, "former-admin@example.test", true)
+	target := mustCreateUser(t, ctx, service, "lead@example.test", false)
 	repositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "thawguard")
 
 	if _, err := service.DisableUser(ctx, admin.User.ID, disabledAdmin.ID); err != nil {
@@ -190,7 +190,7 @@ func TestRevokeRepositoryRole(t *testing.T) {
 	database := newAuthTestDB(t, ctx)
 	service := NewService(database)
 	admin := mustCreateFirstAdmin(t, ctx, service)
-	user := mustCreateUser(t, ctx, service, "lead@example.test", []Role{RoleViewer})
+	user := mustCreateUser(t, ctx, service, "lead@example.test", false)
 	repositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "thawguard")
 
 	if err := service.GrantRepositoryRole(ctx, GrantRepositoryRoleParams{ActorUserID: admin.User.ID, RepositoryID: repositoryID, UserID: user.ID, Role: RoleFreezer}); err != nil {
@@ -222,7 +222,7 @@ func TestGrantsForUserCombinesGlobalAdminAndScopedRoles(t *testing.T) {
 	database := newAuthTestDB(t, ctx)
 	service := NewService(database)
 	admin := mustCreateFirstAdmin(t, ctx, service)
-	lead := mustCreateUser(t, ctx, service, "lead@example.test", []Role{RoleFreezer, RoleThawApprover})
+	lead := mustCreateUser(t, ctx, service, "lead@example.test", false)
 	repositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "thawguard")
 	otherRepositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "other")
 
@@ -238,7 +238,7 @@ func TestGrantsForUserCombinesGlobalAdminAndScopedRoles(t *testing.T) {
 		t.Fatalf("expected lead to view and freeze only the granted repository, got %+v", leadGrants)
 	}
 	if leadGrants.CanViewRepository(otherRepositoryID) || leadGrants.CanFreezeRepository(otherRepositoryID) {
-		t.Fatalf("expected lead's legacy global roles to authorize nothing elsewhere, got %+v", leadGrants)
+		t.Fatalf("expected lead's repository grant not to authorize another repository, got %+v", leadGrants)
 	}
 
 	adminGrants, err := service.GrantsForUser(ctx, admin.User.ID)
@@ -262,8 +262,8 @@ func TestRepositoryGrantSurvivesGranterDeletionWithoutAttribution(t *testing.T) 
 	database := newAuthTestDB(t, ctx)
 	service := NewService(database)
 	mustCreateFirstAdmin(t, ctx, service)
-	granter := mustCreateUser(t, ctx, service, "granter@example.test", []Role{RoleAdmin})
-	user := mustCreateUser(t, ctx, service, "lead@example.test", []Role{RoleViewer})
+	granter := mustCreateUser(t, ctx, service, "granter@example.test", true)
+	user := mustCreateUser(t, ctx, service, "lead@example.test", false)
 	repositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "thawguard")
 
 	if err := service.GrantRepositoryRole(ctx, GrantRepositoryRoleParams{ActorUserID: granter.ID, RepositoryID: repositoryID, UserID: user.ID, Role: RoleViewer}); err != nil {
@@ -290,7 +290,7 @@ func TestRepositoryGrantMutationsRollBackWhenAuditPersistenceFails(t *testing.T)
 	database := newAuthTestDB(t, ctx)
 	service := NewService(database)
 	admin := mustCreateFirstAdmin(t, ctx, service)
-	user := mustCreateUser(t, ctx, service, "lead@example.test", []Role{RoleViewer})
+	user := mustCreateUser(t, ctx, service, "lead@example.test", false)
 	repositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "thawguard")
 
 	if err := service.GrantRepositoryRole(ctx, GrantRepositoryRoleParams{ActorUserID: admin.User.ID, RepositoryID: repositoryID, UserID: user.ID, Role: RoleThawApprover}); err != nil {

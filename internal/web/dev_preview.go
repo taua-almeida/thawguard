@@ -76,6 +76,16 @@ func devPreviewTheme(r *http.Request) string {
 	return ""
 }
 
+func devPreviewRepositoryAccessUser(email, displayName string) currentUserView {
+	return currentUserView{
+		Email:               email,
+		DisplayName:         displayName,
+		RoleLabel:           "Repository access",
+		CanChangePassword:   true,
+		HasRepositoryAccess: true,
+	}
+}
+
 func (s *Server) handleDevPreview(w http.ResponseWriter, r *http.Request) {
 	if !s.cfg.DevMode {
 		http.NotFound(w, r)
@@ -243,13 +253,7 @@ func (s *Server) handleDevPreviewRepositories(w http.ResponseWriter, r *http.Req
 		CanThaw:               true,
 	}
 	if r.URL.Query().Get("role") == "viewer" {
-		user = currentUserView{
-			Email:               "sten.hale@example.test",
-			DisplayName:         "Sten Hale",
-			RoleLabel:           "Viewer",
-			CanChangePassword:   true,
-			HasRepositoryAccess: true,
-		}
+		user = devPreviewRepositoryAccessUser("sten.hale@example.test", "Sten Hale")
 	}
 	views := devPreviewRepositoryViews()
 	filter := repositoryListFilter{}
@@ -292,12 +296,7 @@ func (s *Server) handleDevPreviewDashboard(w http.ResponseWriter, r *http.Reques
 		CanThaw:               true,
 	}
 	if r.URL.Query().Get("role") == "viewer" {
-		user = currentUserView{
-			Email:             "sten.hale@example.test",
-			DisplayName:       "Sten Hale",
-			RoleLabel:         "Viewer",
-			CanChangePassword: true,
-		}
+		user = devPreviewRepositoryAccessUser("sten.hale@example.test", "Sten Hale")
 	}
 	data := dashboardPageData{
 		AppName:     s.cfg.AppName,
@@ -527,20 +526,10 @@ func (s *Server) handleDevPreviewFreezes(w http.ResponseWriter, r *http.Request)
 		http.NotFound(w, r)
 		return
 	}
-	user := currentUserView{
-		Email:             "rana.kall@example.test",
-		DisplayName:       "Rana Kall",
-		RoleLabel:         "Freezer",
-		CanChangePassword: true,
-		CanFreeze:         true,
-	}
+	user := devPreviewRepositoryAccessUser("rana.kall@example.test", "Rana Kall")
+	user.CanFreeze = true
 	if r.URL.Query().Get("role") == "viewer" {
-		user = currentUserView{
-			Email:             "sten.hale@example.test",
-			DisplayName:       "Sten Hale",
-			RoleLabel:         "Viewer",
-			CanChangePassword: true,
-		}
+		user = devPreviewRepositoryAccessUser("sten.hale@example.test", "Sten Hale")
 	}
 	repositories := []domain.Repository{
 		{ID: 46, Forge: "forgejo", BaseURL: "https://forge.example.test", Owner: "aurora", Name: "ice-station", DefaultBranch: "main", EnforcementState: domain.EnforcementActive},
@@ -682,12 +671,7 @@ func (s *Server) handleDevPreviewDecisions(w http.ResponseWriter, r *http.Reques
 		CanThaw:           true,
 	}
 	if r.URL.Query().Get("role") == "viewer" {
-		user = currentUserView{
-			Email:             "sten.hale@example.test",
-			DisplayName:       "Sten Hale",
-			RoleLabel:         "Viewer",
-			CanChangePassword: true,
-		}
+		user = devPreviewRepositoryAccessUser("sten.hale@example.test", "Sten Hale")
 	}
 	repositories := []domain.Repository{
 		{ID: 46, Forge: "forgejo", BaseURL: "https://forge.example.test", Owner: "aurora", Name: "ice-station", DefaultBranch: "main", EnforcementState: domain.EnforcementActive},
@@ -819,12 +803,7 @@ func (s *Server) handleDevPreviewActivity(w http.ResponseWriter, r *http.Request
 		CanThaw:           true,
 	}
 	if r.URL.Query().Get("role") == "viewer" {
-		user = currentUserView{
-			Email:             "sten.hale@example.test",
-			DisplayName:       "Sten Hale",
-			RoleLabel:         "Viewer",
-			CanChangePassword: true,
-		}
+		user = devPreviewRepositoryAccessUser("sten.hale@example.test", "Sten Hale")
 	}
 	rows := []activityRowView{
 		devPreviewActivityRow(time.Date(2026, 7, 17, 9, 2, 0, 0, time.UTC), "Mira Frost", "Single-PR thaw", "Approved", "ok", "aurora/ice-station → PR #241", "Production fix needed during release freeze."),
@@ -917,12 +896,7 @@ func (s *Server) handleDevPreviewPublications(w http.ResponseWriter, r *http.Req
 		CanThaw:           true,
 	}
 	if r.URL.Query().Get("role") == "viewer" {
-		user = currentUserView{
-			Email:             "sten.hale@example.test",
-			DisplayName:       "Sten Hale",
-			RoleLabel:         "Viewer",
-			CanChangePassword: true,
-		}
+		user = devPreviewRepositoryAccessUser("sten.hale@example.test", "Sten Hale")
 	}
 	repositories := []domain.Repository{
 		{ID: 46, Forge: "forgejo", BaseURL: "https://forge.example.test", Owner: "aurora", Name: "ice-station", DefaultBranch: "main", EnforcementState: domain.EnforcementActive},
@@ -1071,12 +1045,7 @@ func (s *Server) handleDevPreviewWebhooks(w http.ResponseWriter, r *http.Request
 		CanThaw:           true,
 	}
 	if r.URL.Query().Get("role") == "viewer" {
-		user = currentUserView{
-			Email:             "sten.hale@example.test",
-			DisplayName:       "Sten Hale",
-			RoleLabel:         "Viewer",
-			CanChangePassword: true,
-		}
+		user = devPreviewRepositoryAccessUser("sten.hale@example.test", "Sten Hale")
 	}
 	repositories := []domain.Repository{
 		{ID: 46, Forge: "forgejo", BaseURL: "https://forge.example.test", Owner: "aurora", Name: "ice-station", DefaultBranch: "main", EnforcementState: domain.EnforcementActive},
@@ -1227,14 +1196,14 @@ func (s *Server) handleDevPreviewUsers(w http.ResponseWriter, r *http.Request) {
 		UserID:      &selfID,
 		Email:       "mira.frost@example.test",
 		DisplayName: "Mira Frost",
-		Grants:      auth.NewGrants(auth.RoleSet{auth.RoleAdmin}, nil),
+		Grants:      auth.NewGrants(true, nil),
 	}
 	disabledAt := time.Date(2026, 7, 2, 16, 30, 0, 0, time.UTC)
 	entries := []auth.UserDirectoryEntry{
-		{User: auth.User{ID: 1, Email: "mira.frost@example.test", DisplayName: "Mira Frost", Roles: auth.RoleSet{auth.RoleAdmin}, CreatedAt: time.Date(2026, 5, 2, 9, 12, 0, 0, time.UTC)}, IsAdmin: true, RepositoryCount: 2, HasFreezer: true},
+		{User: auth.User{ID: 1, Email: "mira.frost@example.test", DisplayName: "Mira Frost", IsAdmin: true, CreatedAt: time.Date(2026, 5, 2, 9, 12, 0, 0, time.UTC)}, RepositoryCount: 2, HasFreezer: true},
 		{User: auth.User{ID: 2, Email: "kai.merid@example.test", DisplayName: "Kai Merid", CreatedAt: time.Date(2026, 6, 11, 14, 40, 0, 0, time.UTC)}, RepositoryCount: 2, HasViewer: true, HasThawApprover: true},
 		{User: auth.User{ID: 3, Email: "sten.hale@example.test", DisplayName: "Sten Hale", MustChangePassword: true, CreatedAt: time.Date(2026, 7, 4, 8, 5, 0, 0, time.UTC)}, RepositoryCount: 1, HasViewer: true},
-		{User: auth.User{ID: 4, Email: "lena.polar@example.test", DisplayName: "Lena Polar", Roles: auth.RoleSet{auth.RoleAdmin}, DisabledAt: &disabledAt, CreatedAt: time.Date(2026, 6, 20, 11, 25, 0, 0, time.UTC)}, IsAdmin: true, RepositoryCount: 2, HasFreezer: true},
+		{User: auth.User{ID: 4, Email: "lena.polar@example.test", DisplayName: "Lena Polar", IsAdmin: true, DisabledAt: &disabledAt, CreatedAt: time.Date(2026, 6, 20, 11, 25, 0, 0, time.UTC)}, RepositoryCount: 2, HasFreezer: true},
 	}
 	repositories := []domain.Repository{
 		{ID: 46, Owner: "aurora", Name: "ice-station"},
@@ -1352,20 +1321,10 @@ func (s *Server) handleDevPreviewScheduledFreezes(w http.ResponseWriter, r *http
 		http.NotFound(w, r)
 		return
 	}
-	user := currentUserView{
-		Email:             "rana.kall@example.test",
-		DisplayName:       "Rana Kall",
-		RoleLabel:         "Freezer",
-		CanChangePassword: true,
-		CanFreeze:         true,
-	}
+	user := devPreviewRepositoryAccessUser("rana.kall@example.test", "Rana Kall")
+	user.CanFreeze = true
 	if r.URL.Query().Get("role") == "viewer" {
-		user = currentUserView{
-			Email:             "sten.hale@example.test",
-			DisplayName:       "Sten Hale",
-			RoleLabel:         "Viewer",
-			CanChangePassword: true,
-		}
+		user = devPreviewRepositoryAccessUser("sten.hale@example.test", "Sten Hale")
 	}
 	repositories := []domain.Repository{
 		{ID: 46, Forge: "forgejo", BaseURL: "https://forge.example.test", Owner: "aurora", Name: "ice-station", DefaultBranch: "main", EnforcementState: domain.EnforcementActive},
@@ -1435,20 +1394,10 @@ func (s *Server) handleDevPreviewScheduleDetail(w http.ResponseWriter, r *http.R
 		http.NotFound(w, r)
 		return
 	}
-	user := currentUserView{
-		Email:             "rana.kall@example.test",
-		DisplayName:       "Rana Kall",
-		RoleLabel:         "Freezer",
-		CanChangePassword: true,
-		CanFreeze:         true,
-	}
+	user := devPreviewRepositoryAccessUser("rana.kall@example.test", "Rana Kall")
+	user.CanFreeze = true
 	if r.URL.Query().Get("role") == "viewer" {
-		user = currentUserView{
-			Email:             "sten.hale@example.test",
-			DisplayName:       "Sten Hale",
-			RoleLabel:         "Viewer",
-			CanChangePassword: true,
-		}
+		user = devPreviewRepositoryAccessUser("sten.hale@example.test", "Sten Hale")
 	}
 	repositories := []domain.Repository{
 		{ID: 46, Forge: "forgejo", BaseURL: "https://forge.example.test", Owner: "aurora", Name: "ice-station", DefaultBranch: "main", EnforcementState: domain.EnforcementActive},

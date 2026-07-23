@@ -2,21 +2,19 @@ package auth
 
 import "github.com/taua-almeida/thawguard/internal/repositoryscope"
 
-// Grants is the live authorization model: the global role set filtered to
-// Admin plus every repository-scoped role a user holds. Its state is
-// unexported so a Grants value can only be built through NewGrants and only
-// answers authorization questions through its capability methods.
+// Grants is the live authorization model: explicit installation Admin state
+// plus every repository-scoped role a user holds. Its state is unexported so a
+// Grants value can only be built through NewGrants and only answers
+// authorization questions through its capability methods.
 type Grants struct {
-	// global carries at most the Admin role. Legacy global freezer, thaw
-	// approver, and viewer rows in user_roles authorize nothing here.
-	global RoleSet
+	isAdmin bool
 	// byRepository maps a repository ID to the roles granted on it.
 	byRepository map[int64]RoleSet
 }
 
 // RepositoryRoles returns the roles a repository grant may carry, in the
-// same relative order Roles() uses so scoped and global sets render alike.
-// Admin is deliberately absent: admin remains a global concern.
+// canonical order used by repository access views and mutations. Admin is
+// deliberately absent: Admin remains an installation concern.
 func RepositoryRoles() []Role {
 	return []Role{RoleViewer, RoleFreezer, RoleThawApprover}
 }
@@ -30,15 +28,11 @@ func (r Role) ValidForRepository() bool {
 	}
 }
 
-// NewGrants normalizes a user's global role set and scoped grants into a
-// Grants value: global roles other than Admin are dropped, scoped roles
-// that are not repository roles are dropped, and repository IDs that cannot
-// identify a repository are dropped.
-func NewGrants(global RoleSet, scoped map[int64]RoleSet) Grants {
-	grants := Grants{global: RoleSet{}, byRepository: map[int64]RoleSet{}}
-	if global.Contains(RoleAdmin) {
-		grants.global = RoleSet{RoleAdmin}
-	}
+// NewGrants copies and normalizes explicit Admin state and scoped grants into
+// a Grants value. Scoped roles that are not repository roles and repository
+// IDs that cannot identify a repository are dropped.
+func NewGrants(isAdmin bool, scoped map[int64]RoleSet) Grants {
+	grants := Grants{isAdmin: isAdmin, byRepository: map[int64]RoleSet{}}
 	for repositoryID, roles := range scoped {
 		if repositoryID <= 0 {
 			continue
@@ -56,11 +50,11 @@ func NewGrants(global RoleSet, scoped map[int64]RoleSet) Grants {
 	return grants
 }
 
-// CanManageInstallation reports whether the user holds the one global role.
+// CanManageInstallation reports whether the user is an installation Admin.
 // It grants installation/repository configuration and Users & Access
 // management, but never repository-scoped freeze or thaw actions.
 func (g Grants) CanManageInstallation() bool {
-	return g.global.Contains(RoleAdmin)
+	return g.isAdmin
 }
 
 // HasRepositoryAccess reports whether the user can read at least one
@@ -77,7 +71,7 @@ func (g Grants) CanViewRepository(repositoryID int64) bool {
 	if repositoryID <= 0 {
 		return false
 	}
-	if g.global.Contains(RoleAdmin) {
+	if g.isAdmin {
 		return true
 	}
 	return len(g.byRepository[repositoryID]) > 0
@@ -89,7 +83,7 @@ func (g Grants) CanViewRepository(repositoryID int64) bool {
 // only this Grants snapshot, so it stays as fresh as the SessionByID request
 // that produced it; callers must not rebuild it from storage.
 func (g Grants) RepositoryReadScope() repositoryscope.ReadScope {
-	if g.global.Contains(RoleAdmin) {
+	if g.isAdmin {
 		return repositoryscope.All()
 	}
 	ids := make([]int64, 0, len(g.byRepository))

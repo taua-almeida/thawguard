@@ -20,8 +20,7 @@ type User struct {
 	ID                 int64
 	Email              string
 	DisplayName        string
-	Role               Role
-	Roles              RoleSet
+	IsAdmin            bool
 	DisabledAt         *time.Time
 	MustChangePassword bool
 	CreatedAt          time.Time
@@ -36,8 +35,7 @@ type Session struct {
 	User      User
 	// Grants is the repository-aware capability set current as of when this
 	// Session value was produced. For live requests only the fresh SessionByID
-	// result is authoritative; nothing consumes Grants on an HTTP path until
-	// the authorization cutover.
+	// result is authoritative.
 	Grants    Grants
 	ExpiresAt time.Time
 	CreatedAt time.Time
@@ -59,10 +57,6 @@ type CreateUserParams struct {
 	Email       string
 	DisplayName string
 	Password    string
-	// Roles is retained only to reject callers still attempting the retired
-	// global scoped-role creation flow. New local users always start with zero
-	// access and receive Admin/repository grants through explicit operations.
-	Roles []Role
 }
 
 type ValidationError struct {
@@ -110,13 +104,11 @@ func (s *Service) CreateFirstAdmin(ctx context.Context, params CreateFirstAdminP
 	if s == nil || s.db == nil {
 		return Session{}, errors.New("auth service has no database")
 	}
-	createParams := CreateUserParams{Email: params.Email, DisplayName: params.DisplayName, Password: params.Password, Roles: []Role{RoleAdmin}}
+	createParams := CreateUserParams{Email: params.Email, DisplayName: params.DisplayName, Password: params.Password}
 	createParams = normalizeCreateUserParams(createParams)
-	if err := validateCreateUserParams(createParams); err != nil {
+	if err := validateLocalUserParams(createParams); err != nil {
 		return Session{}, err
 	}
-	roles, _ := NormalizeRoleSet(createParams.Roles)
-	createParams.Roles = []Role(roles)
 	passwordHash, err := HashPassword(createParams.Password)
 	if err != nil {
 		return Session{}, err
@@ -139,7 +131,7 @@ func (s *Service) CreateFirstAdmin(ctx context.Context, params CreateFirstAdminP
 	if count > 0 {
 		return Session{}, ValidationError{Message: "first admin is already configured"}
 	}
-	user, err := s.insertUser(ctx, tx, createParams, passwordHash, false)
+	user, err := s.insertUser(ctx, tx, createParams, passwordHash, false, true)
 	if err != nil {
 		return Session{}, err
 	}
@@ -158,9 +150,6 @@ func (s *Service) CreateUser(ctx context.Context, params CreateUserParams) (User
 		return User{}, errors.New("auth service has no database")
 	}
 	params = normalizeCreateUserParams(params)
-	if len(params.Roles) != 0 {
-		return User{}, ValidationError{Message: "new users must start with no access"}
-	}
 	if err := validateLocalUserParams(params); err != nil {
 		return User{}, err
 	}
@@ -176,7 +165,7 @@ func (s *Service) CreateUser(ctx context.Context, params CreateUserParams) (User
 	if err := s.requireEnabledAdminActor(ctx, tx, params.ActorUserID); err != nil {
 		return User{}, err
 	}
-	user, err := s.insertUser(ctx, tx, params, passwordHash, true)
+	user, err := s.insertUser(ctx, tx, params, passwordHash, true, false)
 	if err != nil {
 		return User{}, err
 	}
@@ -228,7 +217,9 @@ func (s *Service) SessionByID(ctx context.Context, id string) (Session, bool, er
 	}
 	row := s.db.QueryRowContext(ctx, `
 SELECT s.id, s.csrf_token, s.expires_at, s.created_at,
-  u.id, u.email, u.display_name, u.role, u.disabled_at, u.must_change_password, u.created_at, u.updated_at
+  u.id, u.email, u.display_name,
+  EXISTS (SELECT 1 FROM user_roles admin_role WHERE admin_role.user_id = u.id AND admin_role.role = 'admin'),
+  u.disabled_at, u.must_change_password, u.created_at, u.updated_at
 FROM sessions s
 JOIN users u ON u.id = s.user_id
 WHERE s.id = ?`, id)
@@ -257,15 +248,10 @@ WHERE s.id = ?`, id)
 		}
 		return Session{}, false, nil
 	}
-	user, err := s.hydrateUserRoles(ctx, s.db, session.User)
+	grants, err := loadGrants(ctx, s.db, session.User)
 	if err != nil {
 		return Session{}, false, err
 	}
-	grants, err := loadGrants(ctx, s.db, user)
-	if err != nil {
-		return Session{}, false, err
-	}
-	session.User = user
 	session.Grants = grants
 	return session, true, nil
 }
@@ -288,9 +274,11 @@ func (s *Service) ListUsers(ctx context.Context) ([]User, error) {
 		return nil, errors.New("auth service has no database")
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, email, display_name, role, disabled_at, must_change_password, created_at, updated_at
-FROM users
-ORDER BY created_at ASC, id ASC`)
+SELECT u.id, u.email, u.display_name,
+  EXISTS (SELECT 1 FROM user_roles admin_role WHERE admin_role.user_id = u.id AND admin_role.role = 'admin'),
+  u.disabled_at, u.must_change_password, u.created_at, u.updated_at
+FROM users u
+ORDER BY u.created_at ASC, u.id ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("list users: %w", err)
 	}
@@ -298,10 +286,6 @@ ORDER BY created_at ASC, id ASC`)
 	users := make([]User, 0)
 	for rows.Next() {
 		user, err := scanUser(rows)
-		if err != nil {
-			return nil, err
-		}
-		user, err = s.hydrateUserRoles(ctx, s.db, user)
 		if err != nil {
 			return nil, err
 		}
@@ -341,53 +325,38 @@ func (s *Service) userCount(ctx context.Context, q queryer) (int, error) {
 
 func (s *Service) userByEmail(ctx context.Context, email string) (userRecord, error) {
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, email, display_name, password_hash, role, disabled_at, must_change_password, created_at, updated_at
-FROM users
-WHERE email = ?`, email)
+SELECT u.id, u.email, u.display_name, u.password_hash,
+  EXISTS (SELECT 1 FROM user_roles admin_role WHERE admin_role.user_id = u.id AND admin_role.role = 'admin'),
+  u.disabled_at, u.must_change_password, u.created_at, u.updated_at
+FROM users u
+WHERE u.email = ?`, email)
 	record, err := scanUserRecord(row)
 	if err != nil {
 		return userRecord{}, err
 	}
-	user, err := s.hydrateUserRoles(ctx, s.db, record.User)
-	if err != nil {
-		return userRecord{}, err
-	}
-	record.User = user
 	return record, nil
 }
 
 func (s *Service) userByID(ctx context.Context, q queryer, id int64) (userRecord, error) {
 	row := q.QueryRowContext(ctx, `
-SELECT id, email, display_name, password_hash, role, disabled_at, must_change_password, created_at, updated_at
-FROM users
-WHERE id = ?`, id)
+SELECT u.id, u.email, u.display_name, u.password_hash,
+  EXISTS (SELECT 1 FROM user_roles admin_role WHERE admin_role.user_id = u.id AND admin_role.role = 'admin'),
+  u.disabled_at, u.must_change_password, u.created_at, u.updated_at
+FROM users u
+WHERE u.id = ?`, id)
 	record, err := scanUserRecord(row)
 	if err != nil {
 		return userRecord{}, err
 	}
-	user, err := s.hydrateUserRoles(ctx, q, record.User)
-	if err != nil {
-		return userRecord{}, err
-	}
-	record.User = user
 	return record, nil
 }
 
-func (s *Service) insertUser(ctx context.Context, q queryer, params CreateUserParams, passwordHash string, mustChangePassword bool) (User, error) {
+func (s *Service) insertUser(ctx context.Context, q queryer, params CreateUserParams, passwordHash string, mustChangePassword bool, isAdmin bool) (User, error) {
 	now := s.now().UTC()
 	nowText := now.Format(time.RFC3339Nano)
-	roles := RoleSet(params.Roles)
-	primaryRole := roles.Primary()
-	storedRole := primaryRole
-	if storedRole == "" {
-		// users.role is a NOT NULL legacy compatibility column. Viewer is the
-		// least-privileged valid placeholder and is never consulted by live
-		// authorization after the cutover.
-		storedRole = RoleViewer
-	}
 	result, err := q.ExecContext(ctx, `
-INSERT INTO users(email, display_name, password_hash, role, must_change_password, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?)`, params.Email, params.DisplayName, passwordHash, storedRole, boolInt(mustChangePassword), nowText, nowText)
+INSERT INTO users(email, display_name, password_hash, must_change_password, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?)`, params.Email, params.DisplayName, passwordHash, boolInt(mustChangePassword), nowText, nowText)
 	if err != nil {
 		return User{}, createUserError(err)
 	}
@@ -395,10 +364,14 @@ VALUES (?, ?, ?, ?, ?, ?, ?)`, params.Email, params.DisplayName, passwordHash, s
 	if err != nil {
 		return User{}, fmt.Errorf("created user id: %w", err)
 	}
-	if err := s.insertUserRoles(ctx, q, id, roles, nowText); err != nil {
-		return User{}, err
+	if isAdmin {
+		if _, err := q.ExecContext(ctx, `
+INSERT INTO user_roles(user_id, role, created_at)
+VALUES (?, 'admin', ?)`, id, nowText); err != nil {
+			return User{}, fmt.Errorf("create user Admin row: %w", err)
+		}
 	}
-	return User{ID: id, Email: params.Email, DisplayName: params.DisplayName, Role: primaryRole, Roles: roles, MustChangePassword: mustChangePassword, CreatedAt: now, UpdatedAt: now}, nil
+	return User{ID: id, Email: params.Email, DisplayName: params.DisplayName, IsAdmin: isAdmin, MustChangePassword: mustChangePassword, CreatedAt: now, UpdatedAt: now}, nil
 }
 
 func boolInt(value bool) int {
@@ -406,54 +379,6 @@ func boolInt(value bool) int {
 		return 1
 	}
 	return 0
-}
-
-func (s *Service) insertUserRoles(ctx context.Context, q queryer, userID int64, roles RoleSet, createdAt string) error {
-	for _, role := range roles {
-		if _, err := q.ExecContext(ctx, `
-INSERT INTO user_roles(user_id, role, created_at)
-VALUES (?, ?, ?)`, userID, role, createdAt); err != nil {
-			return fmt.Errorf("create user role: %w", err)
-		}
-	}
-	return nil
-}
-
-func (s *Service) hydrateUserRoles(ctx context.Context, q queryer, user User) (User, error) {
-	roles, err := s.rolesForUser(ctx, q, user.ID)
-	if err != nil {
-		return User{}, err
-	}
-	user.Roles = roles
-	user.Role = roles.Primary()
-	return user, nil
-}
-
-func (s *Service) rolesForUser(ctx context.Context, q queryer, userID int64) (RoleSet, error) {
-	// Only explicit Admin rows remain live global authority. Legacy scoped rows
-	// stay stored for the later cleanup migration but are deliberately inert;
-	// users.role is never used as a fallback.
-	rows, err := q.QueryContext(ctx, `SELECT role FROM user_roles WHERE user_id = ? AND role = ?`, userID, RoleAdmin)
-	if err != nil {
-		return nil, fmt.Errorf("list user roles: %w", err)
-	}
-	defer rows.Close()
-	raw := make([]Role, 0)
-	for rows.Next() {
-		var role string
-		if err := rows.Scan(&role); err != nil {
-			return nil, fmt.Errorf("scan user role: %w", err)
-		}
-		raw = append(raw, Role(role))
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list user roles rows: %w", err)
-	}
-	roles, valid := NormalizeRoleSet(raw)
-	if !valid {
-		return nil, errors.New("stored user role is invalid")
-	}
-	return roles, nil
 }
 
 func (s *Service) insertSession(ctx context.Context, q queryer, user User, sessionID string, csrfToken string) (Session, error) {
@@ -474,12 +399,12 @@ VALUES (?, ?, ?, ?, ?)`, sessionID, user.ID, csrfToken, expiresAt.Format(time.RF
 
 func scanUser(row scanner) (User, error) {
 	var user User
-	var role string
+	var isAdmin int
 	var disabledAt sql.NullString
 	var mustChangePassword int
 	var createdAt string
 	var updatedAt string
-	if err := row.Scan(&user.ID, &user.Email, &user.DisplayName, &role, &disabledAt, &mustChangePassword, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&user.ID, &user.Email, &user.DisplayName, &isAdmin, &disabledAt, &mustChangePassword, &createdAt, &updatedAt); err != nil {
 		return User{}, err
 	}
 	parsedCreatedAt, err := parseTime(createdAt)
@@ -494,10 +419,7 @@ func scanUser(row scanner) (User, error) {
 	if err != nil {
 		return User{}, fmt.Errorf("parse user disabled_at: %w", err)
 	}
-	user.Role = Role(role)
-	if user.Role.Valid() {
-		user.Roles = RoleSet{user.Role}
-	}
+	user.IsAdmin = isAdmin != 0
 	user.DisabledAt = parsedDisabledAt
 	user.MustChangePassword = mustChangePassword != 0
 	user.CreatedAt = parsedCreatedAt
@@ -507,12 +429,12 @@ func scanUser(row scanner) (User, error) {
 
 func scanUserRecord(row scanner) (userRecord, error) {
 	var record userRecord
-	var role string
+	var isAdmin int
 	var disabledAt sql.NullString
 	var mustChangePassword int
 	var createdAt string
 	var updatedAt string
-	if err := row.Scan(&record.ID, &record.Email, &record.DisplayName, &record.passwordHash, &role, &disabledAt, &mustChangePassword, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&record.ID, &record.Email, &record.DisplayName, &record.passwordHash, &isAdmin, &disabledAt, &mustChangePassword, &createdAt, &updatedAt); err != nil {
 		return userRecord{}, err
 	}
 	parsedCreatedAt, err := parseTime(createdAt)
@@ -527,10 +449,7 @@ func scanUserRecord(row scanner) (userRecord, error) {
 	if err != nil {
 		return userRecord{}, fmt.Errorf("parse user disabled_at: %w", err)
 	}
-	record.Role = Role(role)
-	if record.Role.Valid() {
-		record.Roles = RoleSet{record.Role}
-	}
+	record.IsAdmin = isAdmin != 0
 	record.DisabledAt = parsedDisabledAt
 	record.MustChangePassword = mustChangePassword != 0
 	record.CreatedAt = parsedCreatedAt
@@ -540,14 +459,14 @@ func scanUserRecord(row scanner) (userRecord, error) {
 
 func scanSession(row scanner) (Session, error) {
 	var session Session
-	var role string
+	var isAdmin int
 	var expiresAt string
 	var sessionCreatedAt string
 	var disabledAt sql.NullString
 	var mustChangePassword int
 	var userCreatedAt string
 	var userUpdatedAt string
-	if err := row.Scan(&session.ID, &session.CSRFToken, &expiresAt, &sessionCreatedAt, &session.User.ID, &session.User.Email, &session.User.DisplayName, &role, &disabledAt, &mustChangePassword, &userCreatedAt, &userUpdatedAt); err != nil {
+	if err := row.Scan(&session.ID, &session.CSRFToken, &expiresAt, &sessionCreatedAt, &session.User.ID, &session.User.Email, &session.User.DisplayName, &isAdmin, &disabledAt, &mustChangePassword, &userCreatedAt, &userUpdatedAt); err != nil {
 		return Session{}, err
 	}
 	parsedExpiresAt, err := parseTime(expiresAt)
@@ -572,10 +491,7 @@ func scanSession(row scanner) (Session, error) {
 	}
 	session.ExpiresAt = parsedExpiresAt
 	session.CreatedAt = parsedSessionCreatedAt
-	session.User.Role = Role(role)
-	if session.User.Role.Valid() {
-		session.User.Roles = RoleSet{session.User.Role}
-	}
+	session.User.IsAdmin = isAdmin != 0
 	session.User.DisabledAt = parsedDisabledAt
 	session.User.MustChangePassword = mustChangePassword != 0
 	session.User.CreatedAt = parsedUserCreatedAt
@@ -605,28 +521,11 @@ func parseOptionalTime(raw sql.NullString) (*time.Time, error) {
 func normalizeCreateUserParams(params CreateUserParams) CreateUserParams {
 	params.Email = normalizeEmail(params.Email)
 	params.DisplayName = strings.TrimSpace(params.DisplayName)
-	for i, role := range params.Roles {
-		params.Roles[i] = Role(strings.TrimSpace(string(role)))
-	}
 	return params
 }
 
 func normalizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
-}
-
-func validateCreateUserParams(params CreateUserParams) error {
-	if err := validateLocalUserParams(params); err != nil {
-		return err
-	}
-	roles, valid := NormalizeRoleSet(params.Roles)
-	if !valid {
-		return ValidationError{Message: "role is invalid"}
-	}
-	if len(roles) != 1 || !roles.Contains(RoleAdmin) {
-		return ValidationError{Message: "first user must be an admin"}
-	}
-	return nil
 }
 
 func validateLocalUserParams(params CreateUserParams) error {

@@ -51,8 +51,8 @@ func TestUsersDirectorySearchAndRepositoryFilter(t *testing.T) {
 	database := newWebTestDB(t, ctx)
 	authService := auth.NewService(database)
 	admin := mustSetupWebAdmin(t, ctx, authService)
-	kai := mustCreateWebUser(t, ctx, authService, "kai@example.test", nil)
-	mustCreateWebUser(t, ctx, authService, "sten@example.test", nil)
+	kai := mustCreateWebUser(t, ctx, authService, "kai@example.test", false)
+	mustCreateWebUser(t, ctx, authService, "sten@example.test", false)
 	mustInsertWebRepositoryID(t, ctx, database, 1, "ice-station")
 	mustInsertWebRepositoryID(t, ctx, database, 2, "frost-api")
 	if err := authService.SetUserRepositoryRoles(ctx, auth.SetUserRepositoryRolesParams{ActorUserID: admin.User.ID, UserID: kai.ID, RepositoryID: 1, Roles: []auth.Role{auth.RoleFreezer}}); err != nil {
@@ -82,7 +82,7 @@ func TestUsersCreateValidationPreservesIdentityNeverPassword(t *testing.T) {
 	database := newWebTestDB(t, ctx)
 	authService := auth.NewService(database)
 	admin := mustSetupWebAdmin(t, ctx, authService)
-	mustCreateWebUser(t, ctx, authService, "taken@example.test", nil)
+	mustCreateWebUser(t, ctx, authService, "taken@example.test", false)
 	server := NewServer(Config{AppName: "Thawguard", AuthService: authService})
 	cookie := &http.Cookie{Name: sessionCookieName, Value: admin.ID}
 
@@ -111,7 +111,7 @@ func TestUsersAccessGuardsAndMissingTargets(t *testing.T) {
 	database := newWebTestDB(t, ctx)
 	authService := auth.NewService(database)
 	mustSetupWebAdmin(t, ctx, authService)
-	mustCreateWebUser(t, ctx, authService, "viewer@example.test", nil)
+	mustCreateWebUser(t, ctx, authService, "viewer@example.test", false)
 	viewerSession, err := authService.Login(ctx, auth.LoginParams{Email: "viewer@example.test", Password: accountWebTestPassword})
 	if err != nil {
 		t.Fatal(err)
@@ -144,8 +144,8 @@ func TestUsersSelfDisableRedirectsToLogin(t *testing.T) {
 	database := newWebTestDB(t, ctx)
 	authService := auth.NewService(database)
 	mustSetupWebAdmin(t, ctx, authService)
-	second := mustCreateWebUser(t, ctx, authService, "second-admin@example.test", []auth.Role{auth.RoleAdmin})
-	mustCreateWebUser(t, ctx, authService, "third-admin@example.test", []auth.Role{auth.RoleAdmin})
+	second := mustCreateWebUser(t, ctx, authService, "second-admin@example.test", true)
+	mustCreateWebUser(t, ctx, authService, "third-admin@example.test", true)
 	server := NewServer(Config{AppName: "Thawguard", AuthService: authService})
 	secondSession, err := authService.Login(ctx, auth.LoginParams{Email: second.Email, Password: accountWebTestPassword})
 	if err != nil {
@@ -164,7 +164,7 @@ func TestUsersLastAdminDetailProtectsRecoveryInvariant(t *testing.T) {
 	database := newWebTestDB(t, ctx)
 	authService := auth.NewService(database)
 	admin := mustSetupWebAdmin(t, ctx, authService)
-	mustCreateWebUser(t, ctx, authService, "viewer@example.test", nil)
+	mustCreateWebUser(t, ctx, authService, "viewer@example.test", false)
 	server := NewServer(Config{AppName: "Thawguard", AuthService: authService})
 
 	recorder := getUsersPage(t, server, fmt.Sprintf("/users/%d", admin.User.ID), &http.Cookie{Name: sessionCookieName, Value: admin.ID}, false)

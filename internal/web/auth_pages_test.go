@@ -63,7 +63,8 @@ func TestSetupTemplateRendersFirstAdminForm(t *testing.T) {
 	})
 	for _, want := range []string{
 		"Create the first admin",
-		"This first account gets every role",
+		"This first account becomes the installation Admin",
+		"freeze and thaw actions require explicit repository grants",
 		"password must be at least 12 characters",
 		`value="mira.frost@example.test"`,
 		`value="Mira Frost"`,
@@ -76,6 +77,9 @@ func TestSetupTemplateRendersFirstAdminForm(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected setup page to contain %q, body=%q", want, body)
 		}
+	}
+	if strings.Contains(body, "gets every role") {
+		t.Fatal("setup copy must not imply Admin receives repository action grants")
 	}
 	if strings.Contains(body, "<script") {
 		t.Fatal("auth pages must not include scripts")

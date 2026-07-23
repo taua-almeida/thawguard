@@ -545,7 +545,7 @@ func TestEnforcementActionsForbiddenForNonAdmin(t *testing.T) {
 	database := newWebTestDB(t, ctx)
 	authService := auth.NewService(database)
 	admin := mustSetupWebAdmin(t, ctx, authService)
-	viewer := mustCreateWebUser(t, ctx, authService, "viewer@example.test", nil)
+	viewer := mustCreateWebUser(t, ctx, authService, "viewer@example.test", false)
 	mustInsertWebRepositoryID(t, ctx, database, 7, "thawguard")
 	mustInsertWebRepositoryID(t, ctx, database, 8, "thawguard-unhealthy")
 	for _, repositoryID := range []int64{7, 8} {

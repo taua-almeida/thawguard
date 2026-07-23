@@ -165,7 +165,7 @@ func TestBranchMutationsForbiddenForNonAdminRoles(t *testing.T) {
 	database := newWebTestDB(t, ctx)
 	authService := auth.NewService(database)
 	mustSetupWebAdmin(t, ctx, authService)
-	mustCreateWebUser(t, ctx, authService, "freezer@example.test", nil)
+	mustCreateWebUser(t, ctx, authService, "freezer@example.test", false)
 	freezerSession, err := authService.Login(ctx, auth.LoginParams{Email: "freezer@example.test", Password: "correct horse battery staple"})
 	if err != nil {
 		t.Fatal(err)

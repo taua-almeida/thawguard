@@ -30,10 +30,8 @@ type ResetPasswordParams struct {
 	TemporaryPassword string
 }
 
-// SetUserAdmin changes only the one live global role. Repository grants and
-// inert legacy scoped rows are preserved. Demotion also normalizes users.role
-// to the least-privileged compatibility placeholder so no older fallback can
-// resurrect Admin authority.
+// SetUserAdmin changes only the one live global authority row. Repository
+// grants are preserved.
 func (s *Service) SetUserAdmin(ctx context.Context, params SetUserAdminParams) (User, error) {
 	if s == nil || s.db == nil {
 		return User{}, errors.New("auth service has no database")
@@ -55,7 +53,7 @@ func (s *Service) SetUserAdmin(ctx context.Context, params SetUserAdminParams) (
 		}
 		return User{}, err
 	}
-	before := record.Roles.Contains(RoleAdmin)
+	before := record.IsAdmin
 
 	now := s.now().UTC()
 	nowText := now.Format(time.RFC3339Nano)
@@ -65,19 +63,16 @@ INSERT OR IGNORE INTO user_roles(user_id, role, created_at)
 VALUES (?, ?, ?)`, record.ID, RoleAdmin, nowText); err != nil {
 			return User{}, fmt.Errorf("grant user admin: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE users SET role = ?, updated_at = ? WHERE id = ?`, RoleAdmin, nowText, record.ID); err != nil {
-			return User{}, fmt.Errorf("update admin compatibility role: %w", err)
-		}
 	} else {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM user_roles WHERE user_id = ? AND role = ?`, record.ID, RoleAdmin); err != nil {
 			return User{}, fmt.Errorf("remove user admin: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE users SET role = ?, updated_at = ? WHERE id = ?`, RoleViewer, nowText, record.ID); err != nil {
-			return User{}, fmt.Errorf("normalize demoted user compatibility role: %w", err)
-		}
 		if err := s.ensureEnabledAdminRemains(ctx, tx, "the final enabled admin must keep the admin role"); err != nil {
 			return User{}, err
 		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE users SET updated_at = ? WHERE id = ?`, nowText, record.ID); err != nil {
+		return User{}, fmt.Errorf("update user after Admin change: %w", err)
 	}
 	if before != params.Admin {
 		beforeLabel, afterLabel := "none", "none"
@@ -99,13 +94,7 @@ VALUES (?, ?, ?)`, record.ID, RoleAdmin, nowText); err != nil {
 		return User{}, fmt.Errorf("commit admin update: %w", err)
 	}
 	user := record.User
-	if params.Admin {
-		user.Roles = RoleSet{RoleAdmin}
-		user.Role = RoleAdmin
-	} else {
-		user.Roles = nil
-		user.Role = ""
-	}
+	user.IsAdmin = params.Admin
 	user.UpdatedAt = now
 	return user, nil
 }

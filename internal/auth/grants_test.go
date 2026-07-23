@@ -7,16 +7,17 @@ import (
 	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 )
 
-func TestNewGrantsKeepsOnlyAdminGloballyAndRepositoryRolesScoped(t *testing.T) {
-	grants := NewGrants(RoleSet{RoleAdmin, RoleFreezer, RoleViewer}, map[int64]RoleSet{
+func TestNewGrantsCopiesAdminAndNormalizedRepositoryRoles(t *testing.T) {
+	scoped := map[int64]RoleSet{
 		1:  {RoleFreezer, RoleAdmin},
 		2:  {RoleAdmin},
 		0:  {RoleFreezer},
 		-3: {RoleViewer},
-	})
+	}
+	grants := NewGrants(true, scoped)
 
-	if len(grants.global) != 1 || !grants.global.Contains(RoleAdmin) {
-		t.Fatalf("expected global set filtered to admin only, got %+v", grants.global)
+	if !grants.isAdmin {
+		t.Fatal("expected explicit Admin state to be retained")
 	}
 	if len(grants.byRepository) != 1 {
 		t.Fatalf("expected only repository 1 to keep grants, got %+v", grants.byRepository)
@@ -24,6 +25,11 @@ func TestNewGrantsKeepsOnlyAdminGloballyAndRepositoryRolesScoped(t *testing.T) {
 	kept := grants.byRepository[1]
 	if len(kept) != 1 || !kept.Contains(RoleFreezer) {
 		t.Fatalf("expected repository 1 to keep only the freezer role, got %+v", kept)
+	}
+	scoped[1][0] = RoleViewer
+	scoped[3] = RoleSet{RoleThawApprover}
+	if !grants.CanFreezeRepository(1) || grants.CanThawRepository(3) {
+		t.Fatalf("expected Grants to own an immutable copy of repository roles, got %+v", grants)
 	}
 }
 
@@ -42,12 +48,12 @@ func TestRepositoryRoleValidity(t *testing.T) {
 }
 
 func TestGrantsCapabilityMatrix(t *testing.T) {
-	admin := NewGrants(RoleSet{RoleAdmin}, nil)
-	freezer := NewGrants(nil, map[int64]RoleSet{1: {RoleFreezer}})
-	approver := NewGrants(nil, map[int64]RoleSet{1: {RoleThawApprover}})
-	viewer := NewGrants(nil, map[int64]RoleSet{1: {RoleViewer}})
-	lead := NewGrants(nil, map[int64]RoleSet{1: {RoleFreezer, RoleThawApprover}})
-	nobody := NewGrants(nil, nil)
+	admin := NewGrants(true, nil)
+	freezer := NewGrants(false, map[int64]RoleSet{1: {RoleFreezer}})
+	approver := NewGrants(false, map[int64]RoleSet{1: {RoleThawApprover}})
+	viewer := NewGrants(false, map[int64]RoleSet{1: {RoleViewer}})
+	lead := NewGrants(false, map[int64]RoleSet{1: {RoleFreezer, RoleThawApprover}})
+	nobody := NewGrants(false, nil)
 
 	cases := []struct {
 		name               string
@@ -82,26 +88,18 @@ func TestGrantsCapabilityMatrix(t *testing.T) {
 	}
 }
 
-func TestGrantsGlobalRepositoryRolesAuthorizeNothing(t *testing.T) {
-	legacyLead := NewGrants(RoleSet{RoleFreezer, RoleThawApprover, RoleViewer}, nil)
-	if legacyLead.CanViewRepository(1) || legacyLead.CanFreezeRepository(1) || legacyLead.CanThawRepository(1) {
-		t.Fatalf("expected legacy global roles to authorize nothing repository-scoped, got %+v", legacyLead)
-	}
-}
-
 func TestGrantsRepositoryReadScope(t *testing.T) {
 	cases := []struct {
 		name   string
 		grants Grants
 		want   repositoryscope.ReadScope
 	}{
-		{name: "admin reads every repository", grants: NewGrants(RoleSet{RoleAdmin}, nil), want: repositoryscope.All()},
-		{name: "scoped viewer reads own repository", grants: NewGrants(nil, map[int64]RoleSet{7: {RoleViewer}}), want: repositoryscope.IDs(7)},
-		{name: "scoped freezer reads own repository", grants: NewGrants(nil, map[int64]RoleSet{7: {RoleFreezer}}), want: repositoryscope.IDs(7)},
-		{name: "scoped thaw approver reads own repository", grants: NewGrants(nil, map[int64]RoleSet{7: {RoleThawApprover}}), want: repositoryscope.IDs(7)},
-		{name: "combined roles keep one id per repository", grants: NewGrants(nil, map[int64]RoleSet{7: {RoleFreezer, RoleThawApprover}, 3: {RoleViewer}}), want: repositoryscope.IDs(3, 7)},
-		{name: "legacy global repository roles read nothing", grants: NewGrants(RoleSet{RoleFreezer, RoleThawApprover, RoleViewer}, nil), want: repositoryscope.ReadScope{}},
-		{name: "no grants reads nothing", grants: NewGrants(nil, nil), want: repositoryscope.ReadScope{}},
+		{name: "admin reads every repository", grants: NewGrants(true, nil), want: repositoryscope.All()},
+		{name: "scoped viewer reads own repository", grants: NewGrants(false, map[int64]RoleSet{7: {RoleViewer}}), want: repositoryscope.IDs(7)},
+		{name: "scoped freezer reads own repository", grants: NewGrants(false, map[int64]RoleSet{7: {RoleFreezer}}), want: repositoryscope.IDs(7)},
+		{name: "scoped thaw approver reads own repository", grants: NewGrants(false, map[int64]RoleSet{7: {RoleThawApprover}}), want: repositoryscope.IDs(7)},
+		{name: "combined roles keep one id per repository", grants: NewGrants(false, map[int64]RoleSet{7: {RoleFreezer, RoleThawApprover}, 3: {RoleViewer}}), want: repositoryscope.IDs(3, 7)},
+		{name: "no grants reads nothing", grants: NewGrants(false, nil), want: repositoryscope.ReadScope{}},
 		{name: "zero-value grants reads nothing", grants: Grants{}, want: repositoryscope.ReadScope{}},
 	}
 	for _, tc := range cases {

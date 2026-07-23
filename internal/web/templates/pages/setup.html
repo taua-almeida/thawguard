@@ -6,7 +6,7 @@
 */}}
 {{ define "pages/setup" }}
 <h1 class="m-0 text-base font-bold text-text">Create the first admin</h1>
-<p class="m-0 mt-1 mb-4 text-sm text-text-muted">This first account gets every role, so you can connect repositories and run freeze and thaw flows.</p>
+<p class="m-0 mt-1 mb-4 text-sm text-text-muted">This first account becomes the installation Admin. Admins can connect repositories and manage access; freeze and thaw actions require explicit repository grants.</p>
 {{ if .FormError }}
 <div class="mb-4">{{ template "ui/callout" dict "Tone" "danger" "Body" .FormError }}</div>
 {{ end }}

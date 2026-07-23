@@ -17,7 +17,6 @@ type UserDirectoryQuery struct {
 
 type UserDirectoryEntry struct {
 	User
-	IsAdmin         bool
 	RepositoryCount int
 	HasViewer       bool
 	HasFreezer      bool
@@ -65,7 +64,6 @@ SELECT
   u.id,
   u.email,
   u.display_name,
-  u.role,
   u.disabled_at,
   u.must_change_password,
   u.created_at,
@@ -111,13 +109,6 @@ ORDER BY lower(trim(u.display_name)), lower(u.email), u.id`, query.Search, patte
 		entry.HasViewer = hasViewer != 0
 		entry.HasFreezer = hasFreezer != 0
 		entry.HasThawApprover = hasThaw != 0
-		if entry.IsAdmin {
-			entry.Roles = RoleSet{RoleAdmin}
-			entry.Role = RoleAdmin
-		} else {
-			entry.Roles = nil
-			entry.Role = ""
-		}
 		entries = append(entries, entry)
 	}
 	if err := rows.Err(); err != nil {
@@ -127,7 +118,6 @@ ORDER BY lower(trim(u.display_name)), lower(u.email), u.id`, query.Search, patte
 }
 
 func scanDirectoryEntry(row scanner, entry *UserDirectoryEntry, isAdmin, hasViewer, hasFreezer, hasThaw *int) error {
-	var storedRole string
 	var disabledAt sql.NullString
 	var mustChange int
 	var createdAt, updatedAt string
@@ -135,7 +125,6 @@ func scanDirectoryEntry(row scanner, entry *UserDirectoryEntry, isAdmin, hasView
 		&entry.ID,
 		&entry.Email,
 		&entry.DisplayName,
-		&storedRole,
 		&disabledAt,
 		&mustChange,
 		&createdAt,

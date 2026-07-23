@@ -84,6 +84,7 @@ func TestOpenAndApplyMigrationsAgainstSQLite(t *testing.T) {
 	assertColumnExists(t, database, "sessions", "csrf_token")
 	assertIndexExists(t, database, "idx_sessions_expires_at")
 	assertTableExists(t, database, "user_roles")
+	assertColumnDoesNotExist(t, database, "users", "role")
 	assertColumnExists(t, database, "users", "disabled_at")
 	assertColumnExists(t, database, "users", "must_change_password")
 	assertColumnExists(t, database, "repositories", "enforcement_state")
@@ -114,6 +115,51 @@ func TestOpenAndApplyMigrationsAgainstSQLite(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected foreign-key violation for session with missing user")
 	}
+}
+
+func TestLegacyAuthorizationStorageCleanupFreshDatabase(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-cleanup-test.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+		t.Fatal(err)
+	}
+
+	assertColumnDoesNotExist(t, database, "users", "role")
+	const createdAt = "2026-07-23T09:00:00.000000000Z"
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO users(id, email, display_name, password_hash, created_at, updated_at)
+VALUES (1, 'admin@example.test', 'Admin', 'hash', ?, ?);
+INSERT INTO user_roles(user_id, role, created_at)
+VALUES (1, 'admin', ?);`, createdAt, createdAt, createdAt); err != nil {
+		t.Fatalf("expected Admin storage to accept an explicit row: %v", err)
+	}
+	for _, role := range []string{"viewer", "freezer", "thaw_approver"} {
+		if _, err := database.ExecContext(ctx, `INSERT INTO user_roles(user_id, role, created_at) VALUES (1, ?, ?)`, role, createdAt); err == nil {
+			t.Fatalf("expected user_roles to reject scoped role %q", role)
+		}
+	}
+
+	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+		t.Fatal(err)
+	}
+	var applied int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = '0033_legacy_authorization_storage_cleanup'`).Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected cleanup migration recorded once, got %d", applied)
+	}
+	assertUserRoles(t, database, 1, []string{"admin"})
+	assertForeignKeyCheckClean(t, database)
 }
 
 func TestApplyMigrationsAddsSetupChecksToExistingInitialDatabase(t *testing.T) {
@@ -202,6 +248,12 @@ VALUES
 	if err != nil {
 		t.Fatal(err)
 	}
+	userRolesIndex := migrationIndex(t, migrations, "0018_user_roles.sql")
+	if err := ApplyMigrations(ctx, database, migrations[:userRolesIndex+1]); err != nil {
+		t.Fatal(err)
+	}
+	assertUserRoles(t, database, 101, []string{"admin", "freezer", "thaw_approver", "viewer"})
+	assertUserRoles(t, database, 102, []string{"freezer"})
 	if err := ApplyMigrations(ctx, database, migrations); err != nil {
 		t.Fatal(err)
 	}
@@ -220,8 +272,9 @@ VALUES
 	assertColumnExists(t, database, "branch_freezes", "needs_recompute")
 	assertColumnExists(t, database, "sessions", "csrf_token")
 	assertTableExists(t, database, "user_roles")
-	assertUserRoles(t, database, 101, []string{"admin", "freezer", "thaw_approver", "viewer"})
-	assertUserRoles(t, database, 102, []string{"freezer"})
+	assertColumnDoesNotExist(t, database, "users", "role")
+	assertUserRoles(t, database, 101, []string{"admin"})
+	assertUserRoles(t, database, 102, nil)
 	assertUserEnabledWithoutForcedPasswordChange(t, database, 101)
 	assertUserEnabledWithoutForcedPasswordChange(t, database, 102)
 	var sessionCount int
@@ -786,7 +839,7 @@ VALUES (10, 6, 'viewer', 7, '2026-07-22T08:00:00.000000000Z');`,
 		t.Fatal(err)
 	}
 
-	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+	if err := ApplyMigrations(ctx, database, migrations[:cutoverIndex+1]); err != nil {
 		t.Fatal(err)
 	}
 
@@ -894,6 +947,175 @@ VALUES (12, 'forgejo', 'https://forge.example.test', 'acme', 'future', 'main', 1
 	}
 }
 
+func TestLegacyAuthorizationStorageCleanupPreserves0032Data(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-cleanup-upgrade-test.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupIndex := migrationIndex(t, migrations, "0033_legacy_authorization_storage_cleanup.sql")
+	if err := ApplyMigrations(ctx, database, migrations[:cleanupIndex]); err != nil {
+		t.Fatal(err)
+	}
+	assertColumnExists(t, database, "users", "role")
+
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO users(id, email, display_name, password_hash, role, disabled_at, must_change_password, created_at, updated_at)
+VALUES
+  (1, 'admin@example.test', 'Admin', 'hash-1', 'admin', NULL, 0, '2026-07-22T08:00:00.000000000Z', '2026-07-22T08:05:00.000000000Z'),
+  (2, 'operator@example.test', 'Operator', 'hash-2', 'viewer', NULL, 1, '2026-07-22T08:10:00.000000000Z', '2026-07-22T08:15:00.000000000Z'),
+  (3, 'second-admin@example.test', 'Second Admin', 'hash-3', 'admin', NULL, 0, '2026-07-22T08:20:00.000000000Z', '2026-07-22T08:25:00.000000000Z');
+
+INSERT INTO user_roles(user_id, role, created_at)
+VALUES
+  (1, 'admin', '2026-07-22T07:00:00.000000000Z'),
+  (1, 'viewer', '2026-07-22T07:01:00.000000000Z'),
+  (2, 'viewer', '2026-07-22T07:02:00.000000000Z'),
+  (2, 'freezer', '2026-07-22T07:03:00.000000000Z'),
+  (2, 'thaw_approver', '2026-07-22T07:04:00.000000000Z'),
+  (3, 'admin', '2026-07-22T07:05:00.000000000Z');
+
+INSERT INTO repositories(id, forge, base_url, owner, name, default_branch, active, created_at, updated_at)
+VALUES (10, 'forgejo', 'https://forge.example.test', 'acme', 'api', 'main', 1, '2026-07-22T09:00:00.000000000Z', '2026-07-22T09:00:00.000000000Z');
+
+INSERT INTO repository_grants(repository_id, user_id, role, granted_by_user_id, granted_at)
+VALUES
+  (10, 2, 'viewer', 1, '2026-07-22T09:10:00.000000000Z'),
+  (10, 2, 'freezer', 3, '2026-07-22T09:20:00.000000000Z'),
+  (10, 2, 'thaw_approver', NULL, '2026-07-22T09:30:00.000000000Z');
+
+INSERT INTO sessions(id, user_id, csrf_token, expires_at, created_at)
+VALUES ('preserved-session', 2, 'preserved-csrf', '2027-07-22T09:00:00.000000000Z', '2026-07-22T09:00:00.000000000Z');
+
+INSERT INTO branch_freezes(id, repository_id, branch, status, reason, starts_at, created_by, created_by_kind, created_at, updated_at)
+VALUES (20, 10, 'main', 'active', 'release hold', '2026-07-22T09:00:00.000000000Z', 2, 'user', '2026-07-22T09:00:00.000000000Z', '2026-07-22T09:00:00.000000000Z');
+
+INSERT INTO thaw_exceptions(id, repository_id, pull_request_index, head_sha, target_branch, status, reason, approved_by, created_at, updated_at)
+VALUES (21, 10, 42, 'abc123', 'main', 'active', 'urgent fix', 2, '2026-07-22T09:35:00.000000000Z', '2026-07-22T09:35:00.000000000Z');
+
+INSERT INTO schedules(id, repository_id, branch, name, kind, timezone, reason, active, created_by, created_by_kind, created_at, updated_at)
+VALUES (22, 10, 'main', 'release week', 'weekly', 'UTC', 'regular hold', 0, 2, 'user', '2026-07-22T09:40:00.000000000Z', '2026-07-22T09:40:00.000000000Z');
+
+INSERT INTO audit_events(id, actor_user_id, action, subject_type, subject_id, details_json, created_at)
+VALUES
+  (30, NULL, 'repository_grant.added', 'repository', '10', '{"actor_kind":"system","actor_role":"migration","provenance":"legacy_authorization_cutover","user_id":"2","role":"thaw_approver"}', '2026-07-22T09:30:00.000000000Z'),
+  (31, 2, 'branch_freeze.created', 'branch_freeze', '20', '{"actor_kind":"user"}', '2026-07-22T09:00:00.000000000Z');`); err != nil {
+		t.Fatal(err)
+	}
+
+	var usersBefore, grantsBefore, auditsBefore int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM users`).Scan(&usersBefore); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM repository_grants`).Scan(&grantsBefore); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM audit_events`).Scan(&auditsBefore); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+		t.Fatal(err)
+	}
+
+	assertColumnDoesNotExist(t, database, "users", "role")
+	assertUserRoles(t, database, 1, []string{"admin"})
+	assertUserRoles(t, database, 2, nil)
+	assertUserRoles(t, database, 3, []string{"admin"})
+	var firstAdminAt, secondAdminAt string
+	if err := database.QueryRowContext(ctx, `SELECT created_at FROM user_roles WHERE user_id = 1 AND role = 'admin'`).Scan(&firstAdminAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRowContext(ctx, `SELECT created_at FROM user_roles WHERE user_id = 3 AND role = 'admin'`).Scan(&secondAdminAt); err != nil {
+		t.Fatal(err)
+	}
+	if firstAdminAt != "2026-07-22T07:00:00.000000000Z" || secondAdminAt != "2026-07-22T07:05:00.000000000Z" {
+		t.Fatalf("expected Admin timestamps preserved, got first=%q second=%q", firstAdminAt, secondAdminAt)
+	}
+
+	var usersAfter, grantsAfter, auditsAfter int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM users`).Scan(&usersAfter); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM repository_grants`).Scan(&grantsAfter); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM audit_events`).Scan(&auditsAfter); err != nil {
+		t.Fatal(err)
+	}
+	if usersAfter != usersBefore || grantsAfter != grantsBefore || auditsAfter != auditsBefore {
+		t.Fatalf("cleanup changed unrelated row counts: users %d/%d grants %d/%d audits %d/%d", usersBefore, usersAfter, grantsBefore, grantsAfter, auditsBefore, auditsAfter)
+	}
+
+	var email, updatedAt string
+	var mustChangePassword int
+	if err := database.QueryRowContext(ctx, `SELECT email, must_change_password, updated_at FROM users WHERE id = 2`).Scan(&email, &mustChangePassword, &updatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if email != "operator@example.test" || mustChangePassword != 1 || updatedAt != "2026-07-22T08:15:00.000000000Z" {
+		t.Fatalf("expected user data preserved, email=%q must_change=%d updated_at=%q", email, mustChangePassword, updatedAt)
+	}
+
+	var grantMetadata int
+	if err := database.QueryRowContext(ctx, `
+SELECT count(*)
+FROM repository_grants
+WHERE repository_id = 10 AND user_id = 2 AND (
+  (role = 'viewer' AND granted_by_user_id = 1 AND granted_at = '2026-07-22T09:10:00.000000000Z') OR
+  (role = 'freezer' AND granted_by_user_id = 3 AND granted_at = '2026-07-22T09:20:00.000000000Z') OR
+  (role = 'thaw_approver' AND granted_by_user_id IS NULL AND granted_at = '2026-07-22T09:30:00.000000000Z')
+)`).Scan(&grantMetadata); err != nil {
+		t.Fatal(err)
+	}
+	if grantMetadata != 3 {
+		t.Fatalf("expected all repository grant metadata preserved, got %d matching rows", grantMetadata)
+	}
+
+	var sessionUser, freezeCreator, thawApprover, scheduleCreator, auditActor int64
+	if err := database.QueryRowContext(ctx, `SELECT user_id FROM sessions WHERE id = 'preserved-session' AND csrf_token = 'preserved-csrf'`).Scan(&sessionUser); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRowContext(ctx, `SELECT created_by FROM branch_freezes WHERE id = 20`).Scan(&freezeCreator); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRowContext(ctx, `SELECT approved_by FROM thaw_exceptions WHERE id = 21`).Scan(&thawApprover); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRowContext(ctx, `SELECT created_by FROM schedules WHERE id = 22`).Scan(&scheduleCreator); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRowContext(ctx, `SELECT actor_user_id FROM audit_events WHERE id = 31`).Scan(&auditActor); err != nil {
+		t.Fatal(err)
+	}
+	if sessionUser != 2 || freezeCreator != 2 || thawApprover != 2 || scheduleCreator != 2 || auditActor != 2 {
+		t.Fatalf("expected user references preserved, session=%d freeze=%d thaw=%d schedule=%d audit=%d", sessionUser, freezeCreator, thawApprover, scheduleCreator, auditActor)
+	}
+
+	var migrationAuditCount int
+	if err := database.QueryRowContext(ctx, `
+SELECT count(*)
+FROM audit_events
+WHERE id = 30
+  AND actor_user_id IS NULL
+  AND action = 'repository_grant.added'
+  AND json_extract(details_json, '$.provenance') = 'legacy_authorization_cutover'
+  AND json_extract(details_json, '$.user_id') = '2'
+  AND json_extract(details_json, '$.role') = 'thaw_approver'
+  AND created_at = '2026-07-22T09:30:00.000000000Z'`).Scan(&migrationAuditCount); err != nil {
+		t.Fatal(err)
+	}
+	if migrationAuditCount != 1 {
+		t.Fatalf("expected migration grant audit evidence preserved, got %d rows", migrationAuditCount)
+	}
+	assertForeignKeyCheckClean(t, database)
+}
+
 func TestUserAccountManagementMigrationPreservesUsersAndSessionsAndAppliesOnce(t *testing.T) {
 	ctx := context.Background()
 	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-test.db")))
@@ -919,7 +1141,7 @@ VALUES ('existing-session', 301, 'csrf-token', '2027-01-01T00:00:00.000000000Z',
 		t.Fatal(err)
 	}
 
-	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+	if err := ApplyMigrations(ctx, database, migrations[:accountIndex+1]); err != nil {
 		t.Fatal(err)
 	}
 	assertColumnExists(t, database, "users", "disabled_at")
@@ -934,7 +1156,7 @@ VALUES ('existing-session', 301, 'csrf-token', '2027-01-01T00:00:00.000000000Z',
 		t.Fatalf("expected existing session to survive account management migration, got %d", sessionCount)
 	}
 
-	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+	if err := ApplyMigrations(ctx, database, migrations[:accountIndex+1]); err != nil {
 		t.Fatal(err)
 	}
 	var applied int
@@ -1022,7 +1244,7 @@ VALUES (401, 'admin', '2026-07-20T10:00:00.000000000Z'), (401, 'freezer', '2026-
 		t.Fatal(err)
 	}
 
-	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+	if err := ApplyMigrations(ctx, database, migrations[:grantsIndex+1]); err != nil {
 		t.Fatal(err)
 	}
 	var grantCount int
@@ -1048,7 +1270,7 @@ VALUES (401, 'admin', '2026-07-20T10:00:00.000000000Z'), (401, 'freezer', '2026-
 		t.Fatalf("expected user_id index on repository_grants, got %d", indexCount)
 	}
 
-	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+	if err := ApplyMigrations(ctx, database, migrations[:grantsIndex+1]); err != nil {
 		t.Fatal(err)
 	}
 	var applied int
@@ -1075,10 +1297,10 @@ func TestRepositoryGrantsSchemaEnforcesRolesKeysAndCascades(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := database.ExecContext(ctx, `
-INSERT INTO users(id, email, display_name, password_hash, role, created_at, updated_at)
+INSERT INTO users(id, email, display_name, password_hash, created_at, updated_at)
 VALUES
-  (501, 'admin@example.test', 'Admin', 'hash', 'admin', '2026-07-20T10:00:00.000000000Z', '2026-07-20T10:00:00.000000000Z'),
-  (502, 'lead@example.test', 'Lead', 'hash', 'viewer', '2026-07-20T10:00:00.000000000Z', '2026-07-20T10:00:00.000000000Z');
+  (501, 'admin@example.test', 'Admin', 'hash', '2026-07-20T10:00:00.000000000Z', '2026-07-20T10:00:00.000000000Z'),
+  (502, 'lead@example.test', 'Lead', 'hash', '2026-07-20T10:00:00.000000000Z', '2026-07-20T10:00:00.000000000Z');
 INSERT INTO repositories(id, forge, base_url, owner, name, default_branch, created_at, updated_at)
 VALUES
   (601, 'forgejo', 'https://forge.example.test', 'taua-almeida', 'thawguard', 'main', '2026-07-20T10:00:00.000000000Z', '2026-07-20T10:00:00.000000000Z'),
@@ -1330,6 +1552,35 @@ func assertColumnExists(t *testing.T, database *sql.DB, table string, column str
 		return
 	}
 	t.Fatalf("expected column %s.%s to exist", table, column)
+}
+
+func assertColumnDoesNotExist(t *testing.T, database *sql.DB, table string, column string) {
+	t.Helper()
+	if tableHasColumn(t, database, table, column) {
+		t.Fatalf("expected column %s.%s not to exist", table, column)
+	}
+}
+
+func assertForeignKeyCheckClean(t *testing.T, database *sql.DB) {
+	t.Helper()
+	rows, err := database.Query(`PRAGMA foreign_key_check`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	if rows.Next() {
+		var table string
+		var rowID sql.NullInt64
+		var parent string
+		var foreignKeyID int
+		if err := rows.Scan(&table, &rowID, &parent, &foreignKeyID); err != nil {
+			t.Fatal(err)
+		}
+		t.Fatalf("foreign-key violation: table=%s rowid=%+v parent=%s fk=%d", table, rowID, parent, foreignKeyID)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func tableHasColumn(t *testing.T, database *sql.DB, table string, column string) bool {

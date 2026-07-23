@@ -60,7 +60,6 @@ type RepositoryGrantDetail struct {
 // gateway: it returns retained grants even for a disabled user so their
 // access stays visible and manageable. Live request authorization must
 // start from a valid enabled session, which SessionByID already enforces.
-// Nothing consumes it on a live path yet; HTTP wiring happens at cutover.
 func (s *Service) GrantsForUser(ctx context.Context, userID int64) (Grants, error) {
 	if s == nil || s.db == nil {
 		return Grants{}, errors.New("auth service has no database")
@@ -75,16 +74,15 @@ func (s *Service) GrantsForUser(ctx context.Context, userID int64) (Grants, erro
 	return loadGrants(ctx, s.db, record.User)
 }
 
-// loadGrants builds the current repository-aware Grants for an
-// already-hydrated user: the legacy role set filtered by NewGrants plus the
-// live repository_grants rows read through q, so a transaction sees its own
-// writes.
+// loadGrants builds the current repository-aware Grants from explicit Admin
+// state and live repository_grants rows read through q, so a transaction sees
+// its own writes.
 func loadGrants(ctx context.Context, q queryer, user User) (Grants, error) {
 	scoped, err := scopedGrantsForUser(ctx, q, user.ID)
 	if err != nil {
 		return Grants{}, err
 	}
-	return NewGrants(user.Roles, scoped), nil
+	return NewGrants(user.IsAdmin, scoped), nil
 }
 
 // GrantRepositoryRole atomically adds one repository-scoped role and its
@@ -428,7 +426,7 @@ func (s *Service) requireEnabledAdminActor(ctx context.Context, q queryer, actor
 		}
 		return err
 	}
-	if record.Disabled() || !record.Roles.Contains(RoleAdmin) {
+	if record.Disabled() || !record.IsAdmin {
 		return denied
 	}
 	return nil

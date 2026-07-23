@@ -356,7 +356,7 @@ func (s *Server) loadUserDetailPageData(w http.ResponseWriter, r *http.Request, 
 			enabledAdmins++
 		}
 	}
-	isAdmin := user.Roles.Contains(auth.RoleAdmin)
+	isAdmin := user.IsAdmin
 	data := userDetailPageData{
 		AppName:            s.cfg.AppName,
 		PageTitle:          user.DisplayName,

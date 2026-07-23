@@ -24,7 +24,7 @@ func TestLoginSessionCarriesCurrentRepositoryGrants(t *testing.T) {
 	database := newAuthTestDB(t, ctx)
 	service := NewService(database)
 	admin := mustCreateFirstAdmin(t, ctx, service)
-	user := mustCreateUser(t, ctx, service, "lead@example.test", []Role{RoleFreezer})
+	user := mustCreateUser(t, ctx, service, "lead@example.test", false)
 	repositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "thawguard")
 	otherRepositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "other")
 
@@ -49,7 +49,7 @@ func TestChangePasswordSessionCarriesCurrentRepositoryGrants(t *testing.T) {
 	database := newAuthTestDB(t, ctx)
 	service := NewService(database)
 	admin := mustCreateFirstAdmin(t, ctx, service)
-	user := mustCreateUser(t, ctx, service, "approver@example.test", []Role{RoleViewer})
+	user := mustCreateUser(t, ctx, service, "approver@example.test", false)
 	repositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "thawguard")
 
 	if err := service.GrantRepositoryRole(ctx, GrantRepositoryRoleParams{ActorUserID: admin.User.ID, RepositoryID: repositoryID, UserID: user.ID, Role: RoleThawApprover}); err != nil {
@@ -70,7 +70,7 @@ func TestSessionByIDRefreshesGrantsWithoutNewLogin(t *testing.T) {
 	database := newAuthTestDB(t, ctx)
 	service := NewService(database)
 	admin := mustCreateFirstAdmin(t, ctx, service)
-	user := mustCreateUser(t, ctx, service, "lead@example.test", []Role{RoleViewer})
+	user := mustCreateUser(t, ctx, service, "lead@example.test", false)
 	repositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "thawguard")
 	otherRepositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "other")
 

@@ -671,7 +671,7 @@ func TestStoreScopedListMatchesRepositoryGrants(t *testing.T) {
 	}
 
 	for _, role := range auth.RepositoryRoles() {
-		scope := auth.NewGrants(nil, map[int64]auth.RoleSet{repoA.ID: {role}}).RepositoryReadScope()
+		scope := auth.NewGrants(false, map[int64]auth.RoleSet{repoA.ID: {role}}).RepositoryReadScope()
 		listed, err := store.ListForScope(ctx, scope)
 		if err != nil {
 			t.Fatal(err)
@@ -681,7 +681,7 @@ func TestStoreScopedListMatchesRepositoryGrants(t *testing.T) {
 		}
 	}
 
-	admin, err := store.ListForScope(ctx, auth.NewGrants(auth.RoleSet{auth.RoleAdmin}, nil).RepositoryReadScope())
+	admin, err := store.ListForScope(ctx, auth.NewGrants(true, nil).RepositoryReadScope())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -689,7 +689,7 @@ func TestStoreScopedListMatchesRepositoryGrants(t *testing.T) {
 		t.Fatalf("expected admin to see both repositories, got %+v", admin)
 	}
 
-	nobody, err := store.ListForScope(ctx, auth.NewGrants(nil, nil).RepositoryReadScope())
+	nobody, err := store.ListForScope(ctx, auth.NewGrants(false, nil).RepositoryReadScope())
 	if err != nil {
 		t.Fatal(err)
 	}

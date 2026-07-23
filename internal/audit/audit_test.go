@@ -23,8 +23,8 @@ func TestStoreRecordsAndListsAuditEvents(t *testing.T) {
 	actorUserID := int64(42)
 	createdAtText := createdAt.Format(time.RFC3339Nano)
 	_, err := store.db.ExecContext(ctx, `
-INSERT INTO users(id, email, display_name, password_hash, role, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?)`, actorUserID, "admin@example.test", "Admin", "hash", "admin", createdAtText, createdAtText)
+INSERT INTO users(id, email, display_name, password_hash, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?)`, actorUserID, "admin@example.test", "Admin", "hash", createdAtText, createdAtText)
 	if err != nil {
 		t.Fatal(err)
 	}

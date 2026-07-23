@@ -20,8 +20,15 @@ func TestCreateFirstAdminBootstrapsOnlyEmptyDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if session.User.ID == 0 || session.User.Email != "admin@example.test" || session.User.Role != RoleAdmin || !session.User.Roles.Contains(RoleAdmin) || !session.Grants.CanManageInstallation() || session.Grants.CanFreezeRepository(1) || session.Grants.CanThawRepository(1) || session.ID == "" || session.CSRFToken == "" {
+	if session.User.ID == 0 || session.User.Email != "admin@example.test" || !session.User.IsAdmin || !session.Grants.CanManageInstallation() || session.Grants.CanFreezeRepository(1) || session.Grants.CanThawRepository(1) || session.ID == "" || session.CSRFToken == "" {
 		t.Fatalf("unexpected first admin session: %+v", session)
+	}
+	var adminRows int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM user_roles WHERE user_id = ?`, session.User.ID).Scan(&adminRows); err != nil {
+		t.Fatal(err)
+	}
+	if adminRows != 1 {
+		t.Fatalf("expected first account to have exactly one Admin row, got %d", adminRows)
 	}
 	hasUsers, err := service.HasUsers(ctx)
 	if err != nil {
@@ -51,23 +58,6 @@ func TestCreateFirstAdminBootstrapsOnlyEmptyDatabase(t *testing.T) {
 	}
 }
 
-func TestRoleSetRequiresExplicitActionRoles(t *testing.T) {
-	adminOnly := RoleSet{RoleAdmin}
-	if !adminOnly.CanManageRepositories() || adminOnly.CanFreeze() || adminOnly.CanThaw() || !adminOnly.CanView() {
-		t.Fatalf("expected admin-only role to manage configuration but not freeze/thaw: %+v", adminOnly)
-	}
-
-	lead := RoleSet{RoleFreezer, RoleThawApprover}
-	if lead.CanManageRepositories() || !lead.CanFreeze() || !lead.CanThaw() || !lead.CanView() {
-		t.Fatalf("expected lead roles to freeze and thaw without admin: %+v", lead)
-	}
-
-	viewer := RoleSet{RoleViewer}
-	if viewer.CanManageRepositories() || viewer.CanFreeze() || viewer.CanThaw() || !viewer.CanView() {
-		t.Fatalf("expected viewer role to remain read-only: %+v", viewer)
-	}
-}
-
 func TestLoginCreatesPersistentSession(t *testing.T) {
 	ctx := context.Background()
 	database := newAuthTestDB(t, ctx)
@@ -87,7 +77,7 @@ func TestLoginCreatesPersistentSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !found || loaded.User.Email != "admin@example.test" || !loaded.User.Roles.Contains(RoleAdmin) || loaded.CSRFToken != session.CSRFToken {
+	if !found || loaded.User.Email != "admin@example.test" || !loaded.User.IsAdmin || loaded.CSRFToken != session.CSRFToken {
 		t.Fatalf("expected persistent session, found=%v session=%+v", found, loaded)
 	}
 	if err := service.Logout(ctx, session.ID); err != nil {
@@ -111,8 +101,18 @@ func TestCreateUserStartsWithZeroAccessAndValidatesDuplicates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if user.Email != "lead@example.test" || user.Role != "" || len(user.Roles) != 0 || !user.MustChangePassword {
+	if user.Email != "lead@example.test" || user.IsAdmin || !user.MustChangePassword {
 		t.Fatalf("unexpected user: %+v", user)
+	}
+	var adminRows, repositoryRows int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM user_roles WHERE user_id = ?`, user.ID).Scan(&adminRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM repository_grants WHERE user_id = ?`, user.ID).Scan(&repositoryRows); err != nil {
+		t.Fatal(err)
+	}
+	if adminRows != 0 || repositoryRows != 0 {
+		t.Fatalf("expected ordinary user to start with no Admin or repository rows, admin=%d repository=%d", adminRows, repositoryRows)
 	}
 	session, err := service.Login(ctx, LoginParams{Email: "lead@example.test", Password: "correct horse battery staple"})
 	if err != nil {
@@ -123,9 +123,6 @@ func TestCreateUserStartsWithZeroAccessAndValidatesDuplicates(t *testing.T) {
 	}
 	if _, err := service.CreateUser(ctx, CreateUserParams{ActorUserID: admin.User.ID, Email: "lead@example.test", DisplayName: "Lead", Password: "correct horse battery staple"}); !IsValidationError(err) {
 		t.Fatalf("expected duplicate email validation error, got %v", err)
-	}
-	if _, err := service.CreateUser(ctx, CreateUserParams{ActorUserID: admin.User.ID, Email: "viewer@example.test", DisplayName: "Viewer", Password: "correct horse battery staple", Roles: []Role{RoleViewer}}); !IsValidationError(err) {
-		t.Fatalf("expected roleful creation to be rejected, got %v", err)
 	}
 	if _, err := service.CreateUser(ctx, CreateUserParams{ActorUserID: user.ID, Email: "blank@example.test", DisplayName: "Blank", Password: "correct horse battery staple"}); !IsValidationError(err) {
 		t.Fatalf("expected non-Admin actor rejection, got %v", err)

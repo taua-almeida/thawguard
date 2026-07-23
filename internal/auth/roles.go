@@ -22,36 +22,12 @@ func (roles RoleSet) Contains(want Role) bool {
 	return false
 }
 
-func (roles RoleSet) CanManageRepositories() bool { return roles.Contains(RoleAdmin) }
-func (roles RoleSet) CanFreeze() bool             { return roles.Contains(RoleFreezer) }
-func (roles RoleSet) CanThaw() bool               { return roles.Contains(RoleThawApprover) }
-func (roles RoleSet) CanView() bool {
-	return roles.Contains(RoleAdmin) || roles.Contains(RoleFreezer) || roles.Contains(RoleThawApprover) || roles.Contains(RoleViewer)
-}
-
-func (roles RoleSet) Primary() Role {
-	for _, role := range Roles() {
-		if roles.Contains(role) {
-			return role
-		}
-	}
-	return ""
-}
-
 func (roles RoleSet) Label() string {
 	labels := make([]string, 0, len(roles))
 	for _, role := range roles {
 		labels = append(labels, role.Label())
 	}
 	return strings.Join(labels, ", ")
-}
-
-func (roles RoleSet) String() string {
-	values := make([]string, 0, len(roles))
-	for _, role := range roles {
-		values = append(values, string(role))
-	}
-	return strings.Join(values, ",")
 }
 
 func (r Role) Valid() bool {

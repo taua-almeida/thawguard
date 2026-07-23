@@ -402,7 +402,7 @@ func TestAdminRoleDoesNotImplyFreezeOrThawActions(t *testing.T) {
 	if _, err := authService.CreateFirstAdmin(ctx, auth.CreateFirstAdminParams{Email: "admin@example.test", DisplayName: "Admin", Password: "correct horse battery staple"}); err != nil {
 		t.Fatal(err)
 	}
-	mustCreateWebUser(t, ctx, authService, "admin-only@example.test", []auth.Role{auth.RoleAdmin})
+	mustCreateWebUser(t, ctx, authService, "admin-only@example.test", true)
 	adminOnlySession, err := authService.Login(ctx, auth.LoginParams{Email: "admin-only@example.test", Password: "correct horse battery staple"})
 	if err != nil {
 		t.Fatal(err)
@@ -444,8 +444,8 @@ func TestFreezeCreationAuthorizesRepositoryBeforeParsingActionFields(t *testing.
 			target     string
 			wantStatus int
 		}{
-			{name: "visible repository without Freezer", grants: auth.NewGrants(nil, map[int64]auth.RoleSet{1: {auth.RoleViewer}}), target: "1", wantStatus: http.StatusForbidden},
-			{name: "hidden repository", grants: auth.NewGrants(nil, map[int64]auth.RoleSet{1: {auth.RoleFreezer}}), target: "2", wantStatus: http.StatusNotFound},
+			{name: "visible repository without Freezer", grants: auth.NewGrants(false, map[int64]auth.RoleSet{1: {auth.RoleViewer}}), target: "1", wantStatus: http.StatusForbidden},
+			{name: "hidden repository", grants: auth.NewGrants(false, map[int64]auth.RoleSet{1: {auth.RoleFreezer}}), target: "2", wantStatus: http.StatusNotFound},
 		} {
 			t.Run(strings.TrimPrefix(endpoint, "/")+"/"+test.name, func(t *testing.T) {
 				store := &fakeFreezeStore{}
@@ -928,8 +928,8 @@ func TestRunRepositorySetupCheckPassesAuthenticatedAdminActor(t *testing.T) {
 		t.Fatalf("expected one attributed readiness run, status=%d actors=%+v", recorder.Code, runner.actors)
 	}
 	actor := runner.actors[0]
-	if actor.UserID == nil || *actor.UserID != adminSession.User.ID || actor.Kind != domain.ActorKindUser || actor.Role != adminSession.User.Roles.String() {
-		t.Fatalf("readiness runner received actor %+v, want authenticated admin user %d with roles %q", actor, adminSession.User.ID, adminSession.User.Roles.String())
+	if actor.UserID == nil || *actor.UserID != adminSession.User.ID || actor.Kind != domain.ActorKindUser || actor.Role != string(auth.RoleAdmin) {
+		t.Fatalf("readiness runner received actor %+v, want authenticated Admin user %d", actor, adminSession.User.ID)
 	}
 }
 
@@ -1172,10 +1172,10 @@ func TestFreezeImpactAuthorizesExplicitRepositoryBeforePreview(t *testing.T) {
 		target     string
 		wantStatus int
 	}{
-		{name: "visible repository without Freezer", grants: auth.NewGrants(nil, map[int64]auth.RoleSet{1: {auth.RoleViewer}}), target: "1", wantStatus: http.StatusForbidden},
-		{name: "hidden repository", grants: auth.NewGrants(nil, map[int64]auth.RoleSet{1: {auth.RoleFreezer}}), target: "2", wantStatus: http.StatusNotFound},
-		{name: "nonexistent repository", grants: auth.NewGrants(nil, map[int64]auth.RoleSet{1: {auth.RoleFreezer}}), target: "99", wantStatus: http.StatusNotFound},
-		{name: "malformed repository", grants: auth.NewGrants(nil, map[int64]auth.RoleSet{1: {auth.RoleFreezer}}), target: "abc", wantStatus: http.StatusNotFound},
+		{name: "visible repository without Freezer", grants: auth.NewGrants(false, map[int64]auth.RoleSet{1: {auth.RoleViewer}}), target: "1", wantStatus: http.StatusForbidden},
+		{name: "hidden repository", grants: auth.NewGrants(false, map[int64]auth.RoleSet{1: {auth.RoleFreezer}}), target: "2", wantStatus: http.StatusNotFound},
+		{name: "nonexistent repository", grants: auth.NewGrants(false, map[int64]auth.RoleSet{1: {auth.RoleFreezer}}), target: "99", wantStatus: http.StatusNotFound},
+		{name: "malformed repository", grants: auth.NewGrants(false, map[int64]auth.RoleSet{1: {auth.RoleFreezer}}), target: "abc", wantStatus: http.StatusNotFound},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			for _, htmx := range []bool{false, true} {
@@ -2959,6 +2959,7 @@ func TestActivityMappingCoversCurrentFamilies(t *testing.T) {
 		{name: "shared thaw", action: audit.ActionThawExceptionSharedHeadApproved, subjectType: audit.SubjectTypeThawException, subjectID: "1:abcdef", details: `{"repository_id":"1","created_pull_request_indexes":"42,43","already_covered_pull_request_indexes":"","created_pull_request_count":"2","already_covered_pull_request_count":"0","head_sha":"abcdef123456","reason":"shared fix"}`, outcome: "Approved", contains: []string{"shared head abcdef123456", "New exceptions: #42, #43", "Confirmation reason: shared fix"}},
 		{name: "user created", action: audit.ActionUserCreated, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"access":"none","sign_in":"password"}`, outcome: "Created", contains: []string{"Ada Operator (User #42)", "Created with no repository access"}},
 		{name: "roles", action: audit.ActionUserRolesUpdated, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"roles_before":"viewer","roles_after":"freezer,viewer"}`, outcome: "Changed", contains: []string{"Ada Operator (User #42)", "Viewer → Freezer, Viewer"}},
+		{name: "historical combined roles", action: audit.ActionUserRolesUpdated, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"roles_before":"admin,viewer,freezer,thaw_approver","roles_after":"none"}`, outcome: "Changed", contains: []string{"Ada Operator (User #42)", "Admin, Freezer, Thaw approver, Viewer → No access"}},
 		{name: "promoted to Admin", action: audit.ActionUserRolesUpdated, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"roles_before":"none","roles_after":"admin"}`, outcome: "Changed", contains: []string{"Ada Operator (User #42)", "No access → Admin"}},
 		{name: "demoted from Admin", action: audit.ActionUserRolesUpdated, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"roles_before":"admin","roles_after":"none"}`, outcome: "Changed", contains: []string{"Ada Operator (User #42)", "Admin → No access"}},
 		{name: "disabled", action: audit.ActionUserDisabled, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{}`, outcome: "Disabled", contains: []string{"sessions revoked"}},
@@ -3280,7 +3281,7 @@ func TestActivityPageAllowsViewer(t *testing.T) {
 	database := newWebTestDB(t, ctx)
 	authService := auth.NewService(database)
 	admin := mustSetupWebAdmin(t, ctx, authService)
-	viewer := mustCreateWebUser(t, ctx, authService, "viewer@example.test", nil)
+	viewer := mustCreateWebUser(t, ctx, authService, "viewer@example.test", false)
 	repositoryID := mustInsertWebRepository(t, ctx, database)
 	if err := authService.SetUserRepositoryRoles(ctx, auth.SetUserRepositoryRolesParams{ActorUserID: admin.User.ID, UserID: viewer.ID, RepositoryID: repositoryID, Roles: []auth.Role{auth.RoleViewer}}); err != nil {
 		t.Fatal(err)
@@ -3942,7 +3943,7 @@ func setWebSessionRoles(t *testing.T, server *Server, roles auth.RoleSet) sessio
 	if err != nil {
 		t.Fatal(err)
 	}
-	global := auth.RoleSet{}
+	isAdmin := roles.Contains(auth.RoleAdmin)
 	scoped := make(map[int64]auth.RoleSet)
 	repositoryIDs := []int64{1}
 	if server.cfg.RepositoryStore != nil {
@@ -3956,14 +3957,13 @@ func setWebSessionRoles(t *testing.T, server *Server, roles auth.RoleSet) sessio
 	}
 	for _, role := range roles {
 		if role == auth.RoleAdmin {
-			global = append(global, role)
 			continue
 		}
 		for _, repositoryID := range repositoryIDs {
 			scoped[repositoryID] = append(scoped[repositoryID], role)
 		}
 	}
-	session.Grants = auth.NewGrants(global, scoped)
+	session.Grants = auth.NewGrants(isAdmin, scoped)
 	server.sessions.mu.Lock()
 	server.sessions.sessions[session.ID] = session
 	server.sessions.mu.Unlock()
@@ -4974,7 +4974,7 @@ func TestDevPreviewDashboardRequiresDevMode(t *testing.T) {
 		t.Fatalf("expected /dev/preview/dashboard to render in dev mode, got %d", recorder.Code)
 	}
 	body := recorder.Body.String()
-	for _, want := range []string{"Dashboard", "aurora/ice-station", "Repository #17", "mira.frost@example.test"} {
+	for _, want := range []string{"Dashboard", "aurora/ice-station", "Repository #17", "mira.frost@example.test", "Admin"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected dev preview dashboard to contain %q", want)
 		}
@@ -4986,7 +4986,7 @@ func TestDevPreviewDashboardRequiresDevMode(t *testing.T) {
 		t.Fatalf("expected empty-variant dev preview dashboard to render, got %d", recorder.Code)
 	}
 	body = recorder.Body.String()
-	for _, want := range []string{"No active freezes", "No recorded activity yet.", `text-text">0 of 0`} {
+	for _, want := range []string{"No active freezes", "No recorded activity yet.", `text-text">0 of 0`, "Repository access"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected empty dev preview dashboard to contain %q", want)
 		}

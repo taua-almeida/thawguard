@@ -137,7 +137,7 @@ func TestFreezesLayoutTemplateExecutesWithTypedData(t *testing.T) {
 	data := freezesPageData{
 		AppName:                 "Thawguard",
 		ActivePage:              "freezes",
-		CurrentUser:             currentUserView{Email: "taua@example.com", DisplayName: "Taua", RoleLabel: "Freezer", CanFreeze: true},
+		CurrentUser:             currentUserView{Email: "taua@example.com", DisplayName: "Taua", RoleLabel: "Repository access", HasRepositoryAccess: true, CanFreeze: true},
 		EnforceableRepositories: []domain.Repository{repo},
 		BranchOptions:           []managedBranchOption{{RepositoryID: repo.ID, Name: "main"}},
 		ActiveFreezes: []activeFreezeCard{{
@@ -198,7 +198,7 @@ func TestFreezesLayoutKeepsReadOnlyStateMutationFree(t *testing.T) {
 	data := freezesPageData{
 		AppName:                 "Thawguard",
 		ActivePage:              "freezes",
-		CurrentUser:             currentUserView{Email: "viewer@example.com", DisplayName: "Viewer", RoleLabel: "Viewer"},
+		CurrentUser:             currentUserView{Email: "viewer@example.com", DisplayName: "Viewer", RoleLabel: "Repository access", HasRepositoryAccess: true},
 		EnforceableRepositories: []domain.Repository{repo},
 		ActiveFreezes: []activeFreezeCard{{
 			freezeView: freezeView{
@@ -333,7 +333,7 @@ func TestDashboardLayoutKeepsViewerReadOnlyAndEmptyStates(t *testing.T) {
 		AppName:         "Thawguard",
 		PageTitle:       "Dashboard",
 		ActivePage:      "dashboard",
-		CurrentUser:     currentUserView{Email: "viewer@example.com", DisplayName: "Viewer", RoleLabel: "Viewer"},
+		CurrentUser:     currentUserView{Email: "viewer@example.com", DisplayName: "Viewer", RoleLabel: "Repository access", HasRepositoryAccess: true},
 		CSRFToken:       "test-token",
 		CSRFField:       csrfFormField,
 		RepositoryCount: 2,

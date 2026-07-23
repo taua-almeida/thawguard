@@ -38,7 +38,7 @@ func TestAccountAdministrationRoutesRequireAdmin(t *testing.T) {
 	database := newWebTestDB(t, ctx)
 	authService := auth.NewService(database)
 	admin := mustSetupWebAdmin(t, ctx, authService)
-	viewer := mustCreateWebUser(t, ctx, authService, "viewer@example.test", []auth.Role{auth.RoleViewer})
+	viewer := mustCreateWebUser(t, ctx, authService, "viewer@example.test", false)
 	viewerSession, err := authService.Login(ctx, auth.LoginParams{Email: "viewer@example.test", Password: accountWebTestPassword})
 	if err != nil {
 		t.Fatal(err)
@@ -116,7 +116,7 @@ func TestUsersPageShowsAccountStateAndResponsiveLabels(t *testing.T) {
 	database := newWebTestDB(t, ctx)
 	authService := auth.NewService(database)
 	admin := mustSetupWebAdmin(t, ctx, authService)
-	user := mustCreateWebUser(t, ctx, authService, "freezer@example.test", []auth.Role{auth.RoleFreezer})
+	user := mustCreateWebUser(t, ctx, authService, "freezer@example.test", false)
 	if _, err := authService.DisableUser(ctx, admin.User.ID, user.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func TestRepositoryAccessFormPreservesSubmittedRolesAfterValidationError(t *test
 	database := newWebTestDB(t, ctx)
 	authService := auth.NewService(database)
 	admin := mustSetupWebAdmin(t, ctx, authService)
-	user := mustCreateWebUser(t, ctx, authService, "viewer@example.test", nil)
+	user := mustCreateWebUser(t, ctx, authService, "viewer@example.test", false)
 	repositoryID := mustInsertWebRepository(t, ctx, database)
 	server := NewServer(Config{AppName: "Thawguard", AuthService: authService, RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{{ID: repositoryID, Owner: "taua-almeida", Name: "thawguard"}}}})
 
@@ -219,7 +219,7 @@ func TestPasswordResetNeverRendersPasswordValues(t *testing.T) {
 	database := newWebTestDB(t, ctx)
 	authService := auth.NewService(database)
 	admin := mustSetupWebAdmin(t, ctx, authService)
-	user := mustCreateWebUser(t, ctx, authService, "freezer@example.test", []auth.Role{auth.RoleFreezer})
+	user := mustCreateWebUser(t, ctx, authService, "freezer@example.test", false)
 	server := NewServer(Config{AppName: "Thawguard", AuthService: authService})
 	adminCookie := &http.Cookie{Name: sessionCookieName, Value: admin.ID}
 
@@ -265,7 +265,7 @@ func TestDisabledUserSessionRedirectsToLogin(t *testing.T) {
 	database := newWebTestDB(t, ctx)
 	authService := auth.NewService(database)
 	mustSetupWebAdmin(t, ctx, authService)
-	user := mustCreateWebUser(t, ctx, authService, "freezer@example.test", []auth.Role{auth.RoleFreezer})
+	user := mustCreateWebUser(t, ctx, authService, "freezer@example.test", false)
 	session, err := authService.Login(ctx, auth.LoginParams{Email: "freezer@example.test", Password: accountWebTestPassword})
 	if err != nil {
 		t.Fatal(err)
@@ -290,7 +290,7 @@ func TestTemporaryPasswordLoginRedirectsToForcedPasswordChange(t *testing.T) {
 	database := newWebTestDB(t, ctx)
 	authService := auth.NewService(database)
 	admin := mustSetupWebAdmin(t, ctx, authService)
-	user := mustCreateWebUser(t, ctx, authService, "freezer@example.test", []auth.Role{auth.RoleFreezer})
+	user := mustCreateWebUser(t, ctx, authService, "freezer@example.test", false)
 	if err := authService.ResetPassword(ctx, auth.ResetPasswordParams{ActorUserID: admin.User.ID, UserID: user.ID, TemporaryPassword: "temporary local password"}); err != nil {
 		t.Fatal(err)
 	}
@@ -318,7 +318,7 @@ func TestForcedPasswordSessionIsGatedToPasswordChangeAndLogout(t *testing.T) {
 	database := newWebTestDB(t, ctx)
 	authService := auth.NewService(database)
 	admin := mustSetupWebAdmin(t, ctx, authService)
-	user := mustCreateWebUser(t, ctx, authService, "freezer@example.test", []auth.Role{auth.RoleFreezer})
+	user := mustCreateWebUser(t, ctx, authService, "freezer@example.test", false)
 	if err := authService.ResetPassword(ctx, auth.ResetPasswordParams{ActorUserID: admin.User.ID, UserID: user.ID, TemporaryPassword: "temporary local password"}); err != nil {
 		t.Fatal(err)
 	}
@@ -381,7 +381,7 @@ func TestForcedPasswordChangeRotatesSessionAndRestoresAccess(t *testing.T) {
 	database := newWebTestDB(t, ctx)
 	authService := auth.NewService(database)
 	admin := mustSetupWebAdmin(t, ctx, authService)
-	user := mustCreateWebUser(t, ctx, authService, "freezer@example.test", []auth.Role{auth.RoleFreezer})
+	user := mustCreateWebUser(t, ctx, authService, "freezer@example.test", false)
 	if err := authService.ResetPassword(ctx, auth.ResetPasswordParams{ActorUserID: admin.User.ID, UserID: user.ID, TemporaryPassword: "temporary local password"}); err != nil {
 		t.Fatal(err)
 	}
@@ -439,7 +439,7 @@ func TestSelfDisableClearsSessionCookieAndRedirectsToLogin(t *testing.T) {
 	database := newWebTestDB(t, ctx)
 	authService := auth.NewService(database)
 	admin := mustSetupWebAdmin(t, ctx, authService)
-	mustCreateWebUser(t, ctx, authService, "second-admin@example.test", []auth.Role{auth.RoleAdmin})
+	mustCreateWebUser(t, ctx, authService, "second-admin@example.test", true)
 	server := NewServer(Config{AppName: "Thawguard", AuthService: authService})
 
 	form := url.Values{csrfFormField: {admin.CSRFToken}}
@@ -461,7 +461,7 @@ func TestAccountMutationInternalErrorsRemainGeneric(t *testing.T) {
 	database := newWebTestDB(t, ctx)
 	authService := auth.NewService(database)
 	admin := mustSetupWebAdmin(t, ctx, authService)
-	user := mustCreateWebUser(t, ctx, authService, "freezer@example.test", []auth.Role{auth.RoleFreezer})
+	user := mustCreateWebUser(t, ctx, authService, "freezer@example.test", false)
 	server := NewServer(Config{AppName: "Thawguard", AuthService: authService})
 	if _, err := database.ExecContext(ctx, `ALTER TABLE audit_events RENAME TO audit_events_broken`); err != nil {
 		t.Fatal(err)
@@ -484,7 +484,7 @@ func mustSetupWebAdmin(t *testing.T, ctx context.Context, authService *auth.Serv
 	return session
 }
 
-func mustCreateWebUser(t *testing.T, ctx context.Context, authService *auth.Service, email string, roles []auth.Role) auth.User {
+func mustCreateWebUser(t *testing.T, ctx context.Context, authService *auth.Service, email string, isAdmin bool) auth.User {
 	t.Helper()
 	users, err := authService.ListUsers(ctx)
 	if err != nil {
@@ -492,7 +492,7 @@ func mustCreateWebUser(t *testing.T, ctx context.Context, authService *auth.Serv
 	}
 	var actorUserID int64
 	for _, user := range users {
-		if user.Roles.Contains(auth.RoleAdmin) && !user.Disabled() {
+		if user.IsAdmin && !user.Disabled() {
 			actorUserID = user.ID
 			break
 		}
@@ -510,7 +510,7 @@ func mustCreateWebUser(t *testing.T, ctx context.Context, authService *auth.Serv
 		t.Fatal(err)
 	}
 	user = changed.User
-	if auth.RoleSet(roles).Contains(auth.RoleAdmin) {
+	if isAdmin {
 		user, err = authService.SetUserAdmin(ctx, auth.SetUserAdminParams{ActorUserID: actorUserID, UserID: user.ID, Admin: true})
 		if err != nil {
 			t.Fatal(err)
