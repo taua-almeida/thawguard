@@ -97,6 +97,203 @@ func TestGrantRepositoryRoleRejectsInvalidInput(t *testing.T) {
 	}
 }
 
+func TestSetUserRepositoryRolesIsIdempotentAndAuditsOnlyChanges(t *testing.T) {
+	ctx := context.Background()
+	database := newAuthTestDB(t, ctx)
+	service := NewService(database)
+	admin := mustCreateFirstAdmin(t, ctx, service)
+	user := mustCreateUser(t, ctx, service, "lead@example.test", false)
+	repositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "thawguard")
+
+	if _, err := service.DisableUser(ctx, admin.User.ID, user.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	assertTargetDisabled := func(stage string) {
+		t.Helper()
+		record, err := service.userByID(ctx, database, user.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !record.Disabled() {
+			t.Fatalf("expected target to remain disabled %s, got %+v", stage, record.User)
+		}
+	}
+	assertTargetDisabled("before setting repository roles")
+
+	// Advance the service clock between calls so a delete-and-reinsert bug
+	// cannot accidentally preserve metadata merely because calls ran quickly.
+	nextRoleSetTime := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	service.now = func() time.Time {
+		now := nextRoleSetTime
+		nextRoleSetTime = nextRoleSetTime.Add(time.Hour)
+		return now
+	}
+
+	grantsByRole := func() map[Role]RepositoryGrant {
+		t.Helper()
+		grants, err := service.ListRepositoryGrants(ctx, repositoryID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		byRole := make(map[Role]RepositoryGrant, len(grants))
+		for _, grant := range grants {
+			if grant.RepositoryID != repositoryID || grant.UserID != user.ID {
+				t.Fatalf("unexpected repository grant subject: %+v", grant)
+			}
+			if _, exists := byRole[grant.Role]; exists {
+				t.Fatalf("duplicate stored repository role %q", grant.Role)
+			}
+			byRole[grant.Role] = grant
+		}
+		return byRole
+	}
+
+	assertRoleSet := func(stage string, grants map[Role]RepositoryGrant, want ...Role) {
+		t.Helper()
+		if len(grants) != len(want) {
+			t.Fatalf("%s: expected roles %v, got %+v", stage, want, grants)
+		}
+		for _, role := range want {
+			if _, exists := grants[role]; !exists {
+				t.Fatalf("%s: expected role %q, got %+v", stage, role, grants)
+			}
+		}
+	}
+
+	assertAttributedGrant := func(stage string, grant RepositoryGrant) {
+		t.Helper()
+		if grant.GrantedByUserID == nil || *grant.GrantedByUserID != admin.User.ID {
+			t.Fatalf("%s: expected grant attributed to admin %d, got %+v", stage, admin.User.ID, grant)
+		}
+		if grant.GrantedAt.IsZero() {
+			t.Fatalf("%s: expected non-zero granted_at, got %+v", stage, grant)
+		}
+	}
+
+	assertMetadataUnchanged := func(stage string, before, after RepositoryGrant) {
+		t.Helper()
+		if before.GrantedByUserID == nil || after.GrantedByUserID == nil || *before.GrantedByUserID != *after.GrantedByUserID {
+			t.Fatalf("%s: granted_by_user_id changed from %+v to %+v", stage, before.GrantedByUserID, after.GrantedByUserID)
+		}
+		if !after.GrantedAt.Equal(before.GrantedAt) {
+			t.Fatalf("%s: granted_at changed from %s to %s", stage, before.GrantedAt, after.GrantedAt)
+		}
+	}
+
+	type grantAuditKey struct {
+		action string
+		role   Role
+	}
+	assertGrantAuditState := func(stage string, want map[grantAuditKey]int) {
+		t.Helper()
+		var total int
+		if err := database.QueryRowContext(ctx, `
+SELECT count(*)
+FROM audit_events
+WHERE action IN (?, ?)`, audit.ActionRepositoryGrantAdded, audit.ActionRepositoryGrantRevoked).Scan(&total); err != nil {
+			t.Fatal(err)
+		}
+		wantTotal := 0
+		for _, count := range want {
+			wantTotal += count
+		}
+		if total != wantTotal {
+			t.Fatalf("%s: expected %d repository grant audit events, got %d", stage, wantTotal, total)
+		}
+		for key, wantCount := range want {
+			var gotCount int
+			if err := database.QueryRowContext(ctx, `
+SELECT count(*)
+FROM audit_events
+WHERE action = ?
+  AND subject_type = ?
+  AND subject_id = ?
+  AND actor_user_id = ?
+  AND json_valid(details_json)
+  AND json_extract(details_json, '$.user_id') = ?
+  AND json_extract(details_json, '$.role') = ?`, key.action, audit.SubjectTypeRepository, formatID(repositoryID), admin.User.ID, formatID(user.ID), string(key.role)).Scan(&gotCount); err != nil {
+				t.Fatal(err)
+			}
+			if gotCount != wantCount {
+				t.Fatalf("%s: expected %d %s audit events for role %q, got %d", stage, wantCount, key.action, key.role, gotCount)
+			}
+		}
+	}
+
+	initialAuditState := map[grantAuditKey]int{
+		grantAuditKey{action: audit.ActionRepositoryGrantAdded, role: RoleViewer}:  1,
+		grantAuditKey{action: audit.ActionRepositoryGrantAdded, role: RoleFreezer}: 1,
+	}
+	if err := service.SetUserRepositoryRoles(ctx, SetUserRepositoryRolesParams{
+		ActorUserID:  admin.User.ID,
+		RepositoryID: repositoryID,
+		UserID:       user.ID,
+		Roles:        []Role{RoleViewer, RoleFreezer, RoleViewer},
+	}); err != nil {
+		t.Fatalf("set initial roles for disabled target: %v", err)
+	}
+	assertTargetDisabled("after the initial role set")
+	initialGrants := grantsByRole()
+	assertRoleSet("initial role set", initialGrants, RoleViewer, RoleFreezer)
+	initialViewer := initialGrants[RoleViewer]
+	initialFreezer := initialGrants[RoleFreezer]
+	assertAttributedGrant("initial viewer grant", initialViewer)
+	assertAttributedGrant("initial freezer grant", initialFreezer)
+	assertGrantAuditState("initial role set", initialAuditState)
+
+	if err := service.SetUserRepositoryRoles(ctx, SetUserRepositoryRolesParams{
+		ActorUserID:  admin.User.ID,
+		RepositoryID: repositoryID,
+		UserID:       user.ID,
+		Roles:        []Role{RoleFreezer, RoleViewer, RoleFreezer},
+	}); err != nil {
+		t.Fatalf("repeat initial logical role set: %v", err)
+	}
+	assertTargetDisabled("after the repeated initial role set")
+	repeatedInitialGrants := grantsByRole()
+	assertRoleSet("repeated initial role set", repeatedInitialGrants, RoleViewer, RoleFreezer)
+	assertMetadataUnchanged("viewer grant after initial no-op", initialViewer, repeatedInitialGrants[RoleViewer])
+	assertMetadataUnchanged("freezer grant after initial no-op", initialFreezer, repeatedInitialGrants[RoleFreezer])
+	assertGrantAuditState("repeated initial role set", initialAuditState)
+
+	replacementAuditState := map[grantAuditKey]int{
+		grantAuditKey{action: audit.ActionRepositoryGrantAdded, role: RoleViewer}:       1,
+		grantAuditKey{action: audit.ActionRepositoryGrantAdded, role: RoleFreezer}:      1,
+		grantAuditKey{action: audit.ActionRepositoryGrantAdded, role: RoleThawApprover}: 1,
+		grantAuditKey{action: audit.ActionRepositoryGrantRevoked, role: RoleViewer}:     1,
+	}
+	if err := service.SetUserRepositoryRoles(ctx, SetUserRepositoryRolesParams{
+		ActorUserID:  admin.User.ID,
+		RepositoryID: repositoryID,
+		UserID:       user.ID,
+		Roles:        []Role{RoleFreezer, RoleThawApprover, RoleThawApprover},
+	}); err != nil {
+		t.Fatalf("replace logical role set: %v", err)
+	}
+	assertTargetDisabled("after replacing the role set")
+	replacementGrants := grantsByRole()
+	assertRoleSet("replacement role set", replacementGrants, RoleFreezer, RoleThawApprover)
+	assertMetadataUnchanged("unchanged freezer grant after replacement", initialFreezer, replacementGrants[RoleFreezer])
+	assertAttributedGrant("new thaw approver grant", replacementGrants[RoleThawApprover])
+	assertGrantAuditState("replacement role set", replacementAuditState)
+
+	if err := service.SetUserRepositoryRoles(ctx, SetUserRepositoryRolesParams{
+		ActorUserID:  admin.User.ID,
+		RepositoryID: repositoryID,
+		UserID:       user.ID,
+		Roles:        []Role{RoleThawApprover, RoleFreezer, RoleThawApprover},
+	}); err != nil {
+		t.Fatalf("repeat replacement logical role set: %v", err)
+	}
+	assertTargetDisabled("after the final no-op")
+	finalGrants := grantsByRole()
+	assertRoleSet("final no-op role set", finalGrants, RoleFreezer, RoleThawApprover)
+	assertMetadataUnchanged("freezer grant after final no-op", replacementGrants[RoleFreezer], finalGrants[RoleFreezer])
+	assertMetadataUnchanged("thaw approver grant after final no-op", replacementGrants[RoleThawApprover], finalGrants[RoleThawApprover])
+	assertGrantAuditState("final no-op", replacementAuditState)
+}
+
 func TestDisabledTargetsRetainReceiveAndLoseGrants(t *testing.T) {
 	ctx := context.Background()
 	database := newAuthTestDB(t, ctx)
