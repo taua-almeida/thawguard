@@ -20,12 +20,7 @@ func wallClock(t time.Time) string {
 func TestScheduleDetailDatedShowsEmptyStateAndDisabledActivate(t *testing.T) {
 	store := &fakeScheduleStore{schedules: []domain.Schedule{{ID: 3, RepositoryID: 1, Branch: "main", Name: "Christmas maintenance", Kind: domain.ScheduleKindDated, Timezone: "UTC"}}}
 	server := scheduleTestServer(store)
-	admin := setWebSessionRoles(t, server, auth.RoleSet{auth.RoleAdmin})
-
-	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "/scheduled-freezes/schedules/3", nil)
-	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: admin.ID})
-	server.Routes().ServeHTTP(recorder, request)
+	recorder := getPageWithRoles(t, server, "/scheduled-freezes/schedules/3", auth.RoleSet{auth.RoleFreezer})
 	body := recorder.Body.String()
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected detail 200, got %d body=%q", recorder.Code, body)
@@ -62,8 +57,7 @@ func TestScheduleDetailDatedHidesPastWindowsAndMarksStarted(t *testing.T) {
 	}
 	server := scheduleTestServer(store)
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/scheduled-freezes/schedules/3", nil))
+	recorder := getPageWithRoles(t, server, "/scheduled-freezes/schedules/3", auth.RoleSet{auth.RoleFreezer})
 	body := recorder.Body.String()
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected detail 200, got %d body=%q", recorder.Code, body)
@@ -319,8 +313,7 @@ func TestScheduleDetailShowsCombinedCoverageOnlyWithActivePeers(t *testing.T) {
 	}
 	server := scheduleTestServer(store)
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/scheduled-freezes/schedules/2", nil))
+	recorder := getPageWithRoles(t, server, "/scheduled-freezes/schedules/2", auth.RoleSet{auth.RoleFreezer})
 	body := recorder.Body.String()
 	if recorder.Code != http.StatusOK || !strings.Contains(body, "Combined coverage on main") {
 		t.Fatalf("expected combined coverage with two active peers, status=%d body=%q", recorder.Code, body)
@@ -329,8 +322,7 @@ func TestScheduleDetailShowsCombinedCoverageOnlyWithActivePeers(t *testing.T) {
 	// Pause the weekly peer: with a single active schedule there is no
 	// precedence to explain, so the section disappears.
 	store.schedules[0].Active = false
-	recorder = httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/scheduled-freezes/schedules/2", nil))
+	recorder = getPageWithRoles(t, server, "/scheduled-freezes/schedules/2", auth.RoleSet{auth.RoleFreezer})
 	if recorder.Code != http.StatusOK || strings.Contains(recorder.Body.String(), "Combined coverage") {
 		t.Fatalf("expected no combined coverage with one active schedule, status=%d", recorder.Code)
 	}

@@ -54,6 +54,7 @@ const (
 	ActionScheduleSuppressed                 = "schedule.suppressed"
 	ActionThawExceptionApproved              = "thaw_exception.approved"
 	ActionThawExceptionSharedHeadApproved    = "thaw_exception.shared_head_approved"
+	ActionUserCreated                        = "user.created"
 	ActionUserRolesUpdated                   = "user.roles_updated"
 	ActionUserDisabled                       = "user.disabled"
 	ActionUserEnabled                        = "user.enabled"
@@ -113,6 +114,7 @@ func KnownActions() []string {
 		ActionScheduleSuppressed,
 		ActionThawExceptionApproved,
 		ActionThawExceptionSharedHeadApproved,
+		ActionUserCreated,
 		ActionUserRolesUpdated,
 		ActionUserDisabled,
 		ActionUserEnabled,

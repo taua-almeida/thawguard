@@ -161,6 +161,7 @@ type roleBoundarySession struct {
 	displayName   string
 	email         string
 	roleLabel     string
+	accessLabel   string
 	browser       *thawguardBrowser
 	csrfToken     string
 	sessionCookie string
@@ -1855,6 +1856,7 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 		freezerEmail            = "freezer@thawguard.test"
 		thawApproverEmail       = "thaw-approver@thawguard.test"
 		viewerEmail             = "viewer@thawguard.test"
+		hiddenRepositoryName    = "scope-hidden"
 		scheduleCReason         = "Fictional role-boundary Schedule C"
 		scheduleCEditedReason   = "Fictional role-boundary Schedule C edited"
 		roleThawReason          = "Fictional role-boundary unique-head thaw"
@@ -1903,18 +1905,23 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 		t.Fatal("role-boundary baseline did not retain the terminal release closed webhook")
 	}
 
-	createRoleBoundaryUser(t, ctx, allRoleBrowser, adminEmail, "E2E Admin Only", "admin", cfg.thawguardPassword, 1)
-	createRoleBoundaryUser(t, ctx, allRoleBrowser, freezerEmail, "E2E Freezer", "freezer", cfg.thawguardPassword, 2)
-	createRoleBoundaryUser(t, ctx, allRoleBrowser, thawApproverEmail, "E2E Thaw Approver", "thaw_approver", cfg.thawguardPassword, 3)
+	createScopeHiddenRepository(t, ctx, allRoleBrowser, cfg, hiddenRepositoryName)
+	createRoleBoundaryUser(t, ctx, allRoleBrowser, adminEmail, "E2E Admin Only", "admin", cfg.thawguardPassword, repositoryID, 1)
+	createRoleBoundaryUser(t, ctx, allRoleBrowser, freezerEmail, "E2E Freezer", "freezer", cfg.thawguardPassword, repositoryID, 2)
+	createRoleBoundaryUser(t, ctx, allRoleBrowser, thawApproverEmail, "E2E Thaw Approver", "thaw_approver", cfg.thawguardPassword, repositoryID, 3)
 
-	adminSession := loginRoleBoundaryUser(t, ctx, cfg, adminEmail, "E2E Admin Only", "Admin")
-	freezerSession := loginRoleBoundaryUser(t, ctx, cfg, freezerEmail, "E2E Freezer", "Freezer")
-	thawApproverSession := loginRoleBoundaryUser(t, ctx, cfg, thawApproverEmail, "E2E Thaw Approver", "Thaw approver")
-	viewerUserID := createRoleBoundaryUser(t, ctx, adminSession.browser, viewerEmail, "E2E Viewer", "viewer", cfg.thawguardPassword, 4)
-	viewerSession := loginRoleBoundaryUser(t, ctx, cfg, viewerEmail, "E2E Viewer", "Viewer")
-	allRoleSession := currentRoleBoundarySession(t, ctx, allRoleBrowser, "admin@thawguard.test", "E2E Admin", "Admin, Freezer, Thaw approver, Viewer")
+	adminSession := loginRoleBoundaryUser(t, ctx, cfg, adminEmail, "E2E Admin Only", "Admin only", "Admin")
+	freezerSession := loginRoleBoundaryUser(t, ctx, cfg, freezerEmail, "E2E Freezer", "Freezer", "Repository access")
+	thawApproverSession := loginRoleBoundaryUser(t, ctx, cfg, thawApproverEmail, "E2E Thaw Approver", "Thaw approver", "Repository access")
+	viewerUserID := createRoleBoundaryUser(t, ctx, adminSession.browser, viewerEmail, "E2E Viewer", "viewer", cfg.thawguardPassword, repositoryID, 4)
+	viewerSession := loginRoleBoundaryUser(t, ctx, cfg, viewerEmail, "E2E Viewer", "Viewer", "Repository access")
+	allRoleSession := currentRoleBoundarySession(t, ctx, allRoleBrowser, "admin@thawguard.test", "E2E Admin", "Admin with repository grants", "Admin")
 	roleSessions := []roleBoundarySession{adminSession, freezerSession, thawApproverSession, viewerSession}
 	requireRoleSessionsIsolated(t, ctx, append([]roleBoundarySession{allRoleSession}, roleSessions...))
+	accessActivity := requireAllActivityPages(t, ctx, allRoleBrowser)
+	viewerTarget := fmt.Sprintf("E2E Viewer (User #%d)", viewerUserID)
+	requireRoleBoundaryActivity(t, requireLatestActivityRow(t, accessActivity, "User account"), "E2E Admin Only", "User account", viewerTarget, "Created", "Created with no repository access")
+	requireRoleBoundaryActivity(t, requireLatestActivityRow(t, accessActivity, "Repository access"), "E2E Admin Only", "Repository access", fixtureOwner+"/"+fixtureRepository, "Granted", "Viewer role granted to "+viewerTarget)
 
 	adminPages := requireRoleBoundaryReadAccess(t, ctx, adminSession, true)
 	freezerPages := requireRoleBoundaryReadAccess(t, ctx, freezerSession, false)
@@ -1924,15 +1931,26 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 	requireRoleBoundaryControls(t, freezerPages, false, true, false)
 	requireRoleBoundaryControls(t, thawPages, false, false, true)
 	requireRoleBoundaryControls(t, viewerPages, false, false, false)
+	for _, pages := range []map[string]string{freezerPages, thawPages, viewerPages} {
+		for path, page := range pages {
+			if strings.Contains(page, fixtureOwner+"/"+hiddenRepositoryName) {
+				t.Fatalf("scoped session %s leaked hidden repository %s/%s", path, fixtureOwner, hiddenRepositoryName)
+			}
+		}
+	}
+	if !strings.Contains(adminPages["/repositories"], fixtureOwner+"/"+hiddenRepositoryName) {
+		t.Fatal("Admin-only repository page is missing the scope-isolation fixture")
+	}
 
 	scheduleReasons := []string{completedScheduleA.reason, cancelledScheduleB.reason}
 	trackedHeads := []string{fixture.sharedHeadSHA, fixture.releaseHeadSHA}
 	beforeDenied := collectRoleBoundaryEvidence(t, ctx, forgejo, allRoleBrowser, repositoryID, fixture.sharedHeadSHA, scheduleReasons, trackedHeads)
-	if beforeDenied.userCount != 5 || beforeDenied.repositoryCount != 1 || beforeDenied.activeFreezes != 1 || beforeDenied.scheduledCount != 2 {
+	if beforeDenied.userCount != 5 || beforeDenied.repositoryCount != 2 || beforeDenied.activeFreezes != 1 || beforeDenied.scheduledCount != 2 {
 		t.Fatalf("unexpected role-boundary baseline counts: users=%d repositories=%d active=%d schedules=%d", beforeDenied.userCount, beforeDenied.repositoryCount, beforeDenied.activeFreezes, beforeDenied.scheduledCount)
 	}
 	repositoryValue := strconv.FormatInt(repositoryID, 10)
 	viewerUserValue := strconv.FormatInt(viewerUserID, 10)
+	viewerUserPath := "/users/" + viewerUserValue
 	adminOnlyRouteProbes := []struct {
 		path   string
 		values url.Values
@@ -1948,11 +1966,12 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 		{path: "/repositories/deactivate", values: url.Values{"repository_id": {repositoryValue}}, label: "enforcement deactivation"},
 		{path: "/repositories/reconcile", values: url.Values{"repository_id": {repositoryValue}}, label: "enforcement reconciliation"},
 		{path: "/repositories/recover", values: url.Values{"repository_id": {repositoryValue}}, label: "enforcement recovery"},
-		{path: "/users/roles", values: url.Values{"user_id": {viewerUserValue}, "roles": {"freezer"}}, label: "user role update"},
-		{path: "/users/disable", values: url.Values{"user_id": {viewerUserValue}}, label: "user disable"},
-		{path: "/users/enable", values: url.Values{"user_id": {viewerUserValue}}, label: "user enable"},
-		{path: "/users/reset-password", values: url.Values{
-			"user_id":                         {viewerUserValue},
+		{path: viewerUserPath + "/admin", values: url.Values{"admin": {"1"}}, label: "Admin access update"},
+		{path: viewerUserPath + "/repository-access", values: url.Values{"repository_id": {repositoryValue}, "roles": {"freezer"}}, label: "repository access update"},
+		{path: viewerUserPath + "/repository-access/remove", values: url.Values{"repository_id": {repositoryValue}}, label: "repository access removal"},
+		{path: viewerUserPath + "/disable", values: nil, label: "user disable"},
+		{path: viewerUserPath + "/enable", values: nil, label: "user enable"},
+		{path: viewerUserPath + "/reset-password", values: url.Values{
 			"temporary_password":              {cfg.thawguardPassword},
 			"temporary_password_confirmation": {cfg.thawguardPassword},
 		}, label: "user password reset"},
@@ -1968,10 +1987,9 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 			"default_branch": {"main"},
 		}, session.roleLabel+" repository creation")
 		requireForbiddenRoleMutation(t, ctx, session, "/users", url.Values{
-			"email":        {"denied-" + slug + "@thawguard.test"},
-			"display_name": {"Denied " + session.roleLabel},
-			"password":     {cfg.thawguardPassword},
-			"roles":        {"viewer"},
+			"email":              {"denied-" + slug + "@thawguard.test"},
+			"display_name":       {"Denied " + session.roleLabel},
+			"temporary_password": {cfg.thawguardPassword},
 		}, session.roleLabel+" user creation")
 		for _, probe := range adminOnlyRouteProbes {
 			requireForbiddenRoleMutation(t, ctx, session, probe.path, probe.values, session.roleLabel+" "+probe.label)
@@ -2034,14 +2052,13 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 	requireSameScheduleEvidence(t, completedScheduleA, afterScheduleCCreate.schedules[0], "Schedule C creation changed completed Schedule A")
 	requireSameScheduleEvidence(t, cancelledScheduleB, afterScheduleCCreate.schedules[1], "Schedule C creation changed cancelled Schedule B")
 
-	requireScheduleRoleControls(t, ctx, adminSession, scheduleCReason, false, true, true, false)
+	requireScheduleRoleControls(t, ctx, adminSession, scheduleCReason, false, false, false, false)
 	requireScheduleRoleControls(t, ctx, freezerSession, scheduleCReason, true, true, true, true)
 	requireScheduleRoleControls(t, ctx, thawApproverSession, scheduleCReason, false, false, false, false)
 	requireScheduleRoleControls(t, ctx, viewerSession, scheduleCReason, false, false, false, false)
 
 	beforeDeniedScheduleActions := afterScheduleCCreate
-	requireForbiddenRoleMutation(t, ctx, adminSession, "/scheduled-freezes/cancel", url.Values{"freeze_id": {strconv.FormatInt(scheduleC.id, 10)}}, "Admin-only pending schedule cancellation")
-	for _, session := range []roleBoundarySession{thawApproverSession, viewerSession} {
+	for _, session := range []roleBoundarySession{adminSession, thawApproverSession, viewerSession} {
 		requireForbiddenRoleMutation(t, ctx, session, "/scheduled-freezes/edit", url.Values{
 			"freeze_id":               {strconv.FormatInt(scheduleC.id, 10)},
 			"reason":                  {scheduleCReason},
@@ -2058,21 +2075,21 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 	editedScheduleCStartsAt := scheduleCBase.Add(25 * time.Minute)
 	editedScheduleCPlannedEndsAt := scheduleCBase.Add(35 * time.Minute)
 	beforeScheduleCEdit := afterDeniedScheduleActions
-	requireRawScheduledFreezeMutation(t, ctx, adminSession.browser, "/scheduled-freezes/edit", url.Values{
+	requireRawScheduledFreezeMutation(t, ctx, freezerSession.browser, "/scheduled-freezes/edit", url.Values{
 		"freeze_id":               {strconv.FormatInt(scheduleC.id, 10)},
 		"reason":                  {scheduleCEditedReason},
 		"starts_at":               {editedScheduleCStartsAt.Format(time.RFC3339)},
 		"planned_ends_at":         {editedScheduleCPlannedEndsAt.Format(time.RFC3339)},
 		"timezone_offset_minutes": {"0"},
-	}, "Admin-only edits Schedule C")
-	editedScheduleC := requireScheduledFreezeRow(t, requirePage(t, ctx, adminSession.browser, "/scheduled-freezes"), scheduleC.id, scheduleCEditedReason)
+	}, "Freezer edits Schedule C")
+	editedScheduleC := requireScheduledFreezeRow(t, requirePage(t, ctx, freezerSession.browser, "/scheduled-freezes"), scheduleC.id, scheduleCEditedReason)
 	if editedScheduleC.id != scheduleC.id || editedScheduleC.branch != fixtureReleaseBranch || editedScheduleC.status != "Upcoming" || editedScheduleC.startsAt != scheduleTime(editedScheduleCStartsAt) || editedScheduleC.plannedEndsAt != scheduleTime(editedScheduleCPlannedEndsAt) || editedScheduleC.endedAt != "—" {
 		t.Fatalf("Schedule C has unexpected edit evidence: before=%+v after=%+v", scheduleC, editedScheduleC)
 	}
-	requireScheduleRoleControls(t, ctx, adminSession, scheduleCEditedReason, false, true, true, false)
+	requireScheduleRoleControls(t, ctx, adminSession, scheduleCEditedReason, false, false, false, false)
 	scheduleCEditedActivity := requireLatestActivityRow(t, requireAllActivityPages(t, ctx, allRoleBrowser), "Freeze schedule")
 	wantScheduleCEdit := "Reason " + scheduleCReason + " → " + scheduleCEditedReason + "; starts " + scheduleTime(scheduleCStartsAt) + " → " + scheduleTime(editedScheduleCStartsAt) + "; planned unfreeze " + scheduleTime(scheduleCPlannedEndsAt) + " → " + scheduleTime(editedScheduleCPlannedEndsAt) + "."
-	requireRoleBoundaryActivity(t, scheduleCEditedActivity, "E2E Admin Only", "Freeze schedule", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Changed", scheduleCEditedReason, wantScheduleCEdit)
+	requireRoleBoundaryActivity(t, scheduleCEditedActivity, "E2E Freezer", "Freeze schedule", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Changed", scheduleCEditedReason, wantScheduleCEdit)
 	afterScheduleCEdit := collectRoleBoundaryEvidence(t, ctx, forgejo, allRoleBrowser, repositoryID, fixture.sharedHeadSHA, []string{completedScheduleA.reason, cancelledScheduleB.reason, scheduleCEditedReason}, trackedHeads)
 	requireScheduleOnlyActivityDelta(t, beforeScheduleCEdit.sideEffects, afterScheduleCEdit.sideEffects, 1, "Schedule C edit")
 	if afterScheduleCEdit.userCount != beforeScheduleCEdit.userCount || afterScheduleCEdit.repositoryCount != beforeScheduleCEdit.repositoryCount || afterScheduleCEdit.activeFreezes != beforeScheduleCEdit.activeFreezes || afterScheduleCEdit.scheduledCount != beforeScheduleCEdit.scheduledCount || afterScheduleCEdit.mainFreeze != beforeScheduleCEdit.mainFreeze {
@@ -2086,7 +2103,7 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 	activityBeforeStartNow := requireAllActivityPages(t, ctx, allRoleBrowser)
 	startNowEventsBefore := countActivityEvents(activityBeforeStartNow, "Scheduled freeze Start Now")
 	openSyncsBeforeStartNow := countOpenPullRequestSyncEvents(activityBeforeStartNow)
-	requireRawScheduledFreezeMutation(t, ctx, adminSession.browser, "/scheduled-freezes/start-now", url.Values{"freeze_id": {strconv.FormatInt(scheduleC.id, 10)}}, "Admin-only starts Schedule C now")
+	requireRawScheduledFreezeMutation(t, ctx, freezerSession.browser, "/scheduled-freezes/start-now", url.Values{"freeze_id": {strconv.FormatInt(scheduleC.id, 10)}}, "Freezer starts Schedule C now")
 	afterStartNow := collectRoleBoundaryEvidence(t, ctx, forgejo, allRoleBrowser, repositoryID, fixture.sharedHeadSHA, []string{completedScheduleA.reason, cancelledScheduleB.reason, scheduleCEditedReason}, trackedHeads)
 	if afterStartNow.activeFreezes != beforeStartNow.activeFreezes+1 || afterStartNow.scheduledCount != beforeStartNow.scheduledCount || afterStartNow.userCount != beforeStartNow.userCount || afterStartNow.repositoryCount != beforeStartNow.repositoryCount || afterStartNow.mainFreeze != beforeStartNow.mainFreeze {
 		t.Fatal("Schedule C Start Now changed unrelated state or the wrong active-freeze count")
@@ -2113,7 +2130,7 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 		t.Fatal("Schedule C Start Now did not add exactly one Start Now and one open-PR sync activity")
 	}
 	scheduleCStartedActivity := requireLatestActivityRow(t, activityAfterStartNow, "Scheduled freeze Start Now")
-	requireRoleBoundaryActivity(t, scheduleCStartedActivity, "E2E Admin Only", "Scheduled freeze Start Now", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Started", scheduleCEditedReason, "planned unfreeze "+scheduleTime(editedScheduleCPlannedEndsAt))
+	requireRoleBoundaryActivity(t, scheduleCStartedActivity, "E2E Freezer", "Scheduled freeze Start Now", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Started", scheduleCEditedReason, "planned unfreeze "+scheduleTime(editedScheduleCPlannedEndsAt))
 	requireLatestOpenPullRequestSync(t, activityAfterStartNow, 2)
 	requireMergedForgejoPullRequest(t, ctx, forgejo, fixture.releasePullRequestIndex, fixtureReleaseBranch, fixtureScheduledPRTitle, fixture.releaseHeadSHA)
 	requireOpenForgejoPullRequest(t, ctx, forgejo, fixture.primaryPullRequestIndex, "main", fixturePrimaryPRTitle, fixture.sharedHeadSHA)
@@ -2374,7 +2391,7 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 	}
 	_ = requirePage(t, ctx, adminSession.browser, "/users")
 	requireRoleSessionsIsolated(t, ctx, append([]roleBoundarySession{allRoleSession}, roleSessions...))
-	t.Logf("role-boundary slice passed in %s: four isolated single-role sessions, Schedule C lifecycle, and unique-head thaw", time.Since(sliceStartedAt).Round(time.Millisecond))
+	t.Logf("role-boundary slice passed in %s: repository isolation, four scoped sessions, Schedule C lifecycle, and unique-head thaw", time.Since(sliceStartedAt).Round(time.Millisecond))
 	return terminalDiagnosticsFixture{
 		uniqueHeadSHA:       uniqueHeadSHA,
 		roleSessions:        append([]roleBoundarySession{allRoleSession}, roleSessions...),
@@ -2411,7 +2428,7 @@ func proveAuditAndDiagnosticsEvidence(t *testing.T, ctx context.Context, forgejo
 	}
 
 	before := collectTerminalReadOnlySnapshot(t, ctx, forgejo, repositoryID, lifecycle, fixture)
-	if before.evidence.userCount != 5 || before.evidence.repositoryCount != 1 || before.evidence.activeFreezes != 1 || before.evidence.scheduledCount != 3 {
+	if before.evidence.userCount != 5 || before.evidence.repositoryCount != 2 || before.evidence.activeFreezes != 1 || before.evidence.scheduledCount != 3 {
 		t.Fatalf("terminal diagnostics baseline has unexpected durable counts: users=%d repositories=%d active=%d schedules=%d", before.evidence.userCount, before.evidence.repositoryCount, before.evidence.activeFreezes, before.evidence.scheduledCount)
 	}
 	if before.evidence.mainFreeze != lifecycle.activeMainFreeze {
@@ -2448,8 +2465,8 @@ func proveAuditAndDiagnosticsEvidence(t *testing.T, ctx context.Context, forgejo
 	requireRoleBoundaryActivity(t, fixture.activity.sharedHeadThaw, "E2E Admin", "Shared-head thaw", fixtureOwner+"/"+fixtureRepository+" → shared head "+lifecycle.sharedHeadSHA[:12], "Approved", "New exceptions: #"+strconv.Itoa(lifecycle.primaryPullRequestIndex)+", #"+strconv.Itoa(lifecycle.sharedHeadPullRequestIndex), "Confirmation reason: Fictional shared-head thaw confirmation.")
 	requireRoleBoundaryActivity(t, fixture.activity.plannedUnfreeze, "Scheduler", "Scheduled planned unfreeze", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Completed", "Planned unfreeze "+scheduleTime(lifecycle.plannedEndsAt)+". Reason: "+lifecycle.activeScheduleA.reason+".")
 	requireRoleBoundaryActivity(t, fixture.activity.scheduleCCreated, "E2E Freezer", "Freeze schedule", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Scheduled", "Fictional role-boundary Schedule C")
-	requireRoleBoundaryActivity(t, fixture.activity.scheduleCEdited, "E2E Admin Only", "Freeze schedule", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Changed", "Reason Fictional role-boundary Schedule C → Fictional role-boundary Schedule C edited")
-	requireRoleBoundaryActivity(t, fixture.activity.scheduleCStarted, "E2E Admin Only", "Scheduled freeze Start Now", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Started", "Fictional role-boundary Schedule C edited")
+	requireRoleBoundaryActivity(t, fixture.activity.scheduleCEdited, "E2E Freezer", "Freeze schedule", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Changed", "Reason Fictional role-boundary Schedule C → Fictional role-boundary Schedule C edited")
+	requireRoleBoundaryActivity(t, fixture.activity.scheduleCStarted, "E2E Freezer", "Scheduled freeze Start Now", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Started", "Fictional role-boundary Schedule C edited")
 	requireRoleBoundaryActivity(t, fixture.activity.scheduleCCancelled, "E2E Freezer", "Branch freeze", fixtureOwner+"/"+fixtureRepository+" → "+fixtureReleaseBranch, "Cancelled", "Reason: Fictional role-boundary Schedule C edited.")
 	requireRoleBoundaryActivity(t, fixture.activity.roleBoundaryThaw, "E2E Thaw Approver", "Single-PR thaw", fixtureOwner+"/"+fixtureRepository+" → PR #"+strconv.Itoa(lifecycle.primaryPullRequestIndex), "Approved", "Branch main; head "+fixture.uniqueHeadSHA[:12]+". Reason: Fictional role-boundary unique-head thaw.")
 	for _, retained := range []struct {
@@ -2698,7 +2715,7 @@ func collectTerminalReadOnlySnapshot(t *testing.T, ctx context.Context, forgejo 
 		},
 	}
 	for _, session := range fixture.roleSessions {
-		snapshot.roleSessions = append(snapshot.roleSessions, currentRoleBoundarySession(t, ctx, session.browser, session.email, session.displayName, session.roleLabel))
+		snapshot.roleSessions = append(snapshot.roleSessions, currentRoleBoundarySession(t, ctx, session.browser, session.email, session.displayName, session.roleLabel, session.accessLabel))
 	}
 	snapshot.diagnosticPages = [4]string{
 		requireAllActivityPages(t, ctx, fixture.roleSessions[0].browser),
@@ -3180,6 +3197,9 @@ func configureThawguard(t *testing.T, ctx context.Context, browser *thawguardBro
 	if err != nil || repositoryID <= 0 {
 		t.Fatalf("parse configured Thawguard repository ID: %v", err)
 	}
+	usersPage := requirePage(t, ctx, browser, "/users")
+	adminID := requireRoleBoundaryUserID(t, requireRoleBoundaryUserRow(t, usersPage, "admin@thawguard.test"), "admin@thawguard.test")
+	setRoleBoundaryUserRepositoryAccess(t, ctx, browser, adminID, repositoryID, []string{"viewer", "freezer", "thaw_approver"}, "grant the bootstrap admin repository actions")
 	csrf = requireHiddenInput(t, repositoriesPage, "csrf_token")
 	requirePostForm(t, ctx, browser, "/repositories/branches", url.Values{
 		"csrf_token":    {csrf},
@@ -3730,57 +3750,103 @@ func waitForRecoveredEnforcement(t *testing.T, ctx context.Context, forgejo *for
 	})
 }
 
-func createRoleBoundaryUser(t *testing.T, ctx context.Context, browser *thawguardBrowser, email, displayName, role, password string, expectedUsersBefore int) int64 {
+func createRoleBoundaryUser(t *testing.T, ctx context.Context, browser *thawguardBrowser, email, displayName, role, password string, repositoryID int64, expectedUsersBefore int) int64 {
 	t.Helper()
 	page := requirePage(t, ctx, browser, "/users")
-	if count := requirePageCount(t, page, userCountPattern, "users"); count != expectedUsersBefore {
+	if count := requirePageCount(t, page, userCountPattern, "people"); count != expectedUsersBefore {
 		t.Fatalf("user creation baseline has %d users, want %d", count, expectedUsersBefore)
 	}
 	if strings.Contains(page, html.EscapeString(email)) || strings.Contains(page, html.EscapeString(displayName)) {
 		t.Fatalf("fictional user %q already exists before creation", email)
 	}
+	temporaryPassword := roleBoundaryTemporaryPassword(password)
 	response, err := browser.postFormNoRedirect(ctx, "/users", url.Values{
-		"csrf_token":   {requireHiddenInput(t, page, "csrf_token")},
-		"email":        {email},
-		"display_name": {displayName},
-		"password":     {password},
-		"roles":        {role},
+		"csrf_token":         {requireHiddenInput(t, page, "csrf_token")},
+		"email":              {email},
+		"display_name":       {displayName},
+		"temporary_password": {temporaryPassword},
 	})
 	if err != nil {
 		t.Fatalf("create fictional role-boundary user %q: %v", email, err)
 	}
-	if response.statusCode != http.StatusSeeOther || response.location != "/users" {
-		t.Fatalf("create fictional role-boundary user %q returned HTTP %d with Location %q, want 303 to /users", email, response.statusCode, response.location)
+	if response.statusCode != http.StatusSeeOther || !strings.HasPrefix(response.location, "/users/") || !strings.HasSuffix(response.location, "?notice=created") {
+		t.Fatalf("create fictional role-boundary user %q returned HTTP %d with Location %q, want 303 to its detail page", email, response.statusCode, response.location)
+	}
+	createdURL, err := url.Parse(response.location)
+	if err != nil {
+		t.Fatalf("parse created user redirect %q: %v", response.location, err)
+	}
+	userID, err := strconv.ParseInt(strings.TrimPrefix(createdURL.Path, "/users/"), 10, 64)
+	if err != nil || userID <= 0 {
+		t.Fatalf("created user %q redirect has an invalid user ID: %q", email, response.location)
+	}
+	detail := requirePage(t, ctx, browser, response.location)
+	for _, want := range []string{html.EscapeString(displayName), ">" + html.EscapeString(email) + "</code>", ">Active</span>", ">Must change password</span>", "No repository access"} {
+		if !strings.Contains(detail, want) {
+			t.Fatalf("new zero-access user %q detail is missing %q", email, want)
+		}
 	}
 	page = requirePage(t, ctx, browser, "/users")
-	if count := requirePageCount(t, page, userCountPattern, "users"); count != expectedUsersBefore+1 {
+	if count := requirePageCount(t, page, userCountPattern, "people"); count != expectedUsersBefore+1 {
 		t.Fatalf("user creation changed configured users from %d to %d, want %d", expectedUsersBefore, count, expectedUsersBefore+1)
 	}
 	row := requireRoleBoundaryUserRow(t, page, email)
-	for _, want := range []string{html.EscapeString(displayName), ">" + html.EscapeString(email) + "</code>", ">Enabled</span>"} {
+	for _, want := range []string{html.EscapeString(displayName), ">" + html.EscapeString(email) + "</code>", ">Active</span>", "No repository access"} {
 		if !strings.Contains(row, want) {
 			t.Fatalf("created user %q row is missing %q", email, want)
 		}
 	}
-	for _, candidate := range []string{"admin", "freezer", "thaw_approver", "viewer"} {
-		checkboxIndex := strings.Index(row, `value="`+candidate+`"`)
-		if checkboxIndex < 0 {
-			t.Fatalf("created user %q row is missing the %q role checkbox", email, candidate)
-		}
-		tagEnd := strings.Index(row[checkboxIndex:], ">")
-		if tagEnd < 0 {
-			t.Fatalf("created user %q row has an unterminated %q role checkbox", email, candidate)
-		}
-		selected := strings.Contains(row[checkboxIndex:checkboxIndex+tagEnd], " checked")
-		if selected != (candidate == role) {
-			t.Fatalf("created user %q role %q selected=%v, want %v", email, candidate, selected, candidate == role)
+	if listedID := requireRoleBoundaryUserID(t, row, email); listedID != userID {
+		t.Fatalf("created user %q row links to user %d, redirect created user %d", email, listedID, userID)
+	}
+
+	switch role {
+	case "admin":
+		setRoleBoundaryUserAdmin(t, ctx, browser, userID, true, "grant Admin access to "+displayName)
+	case "viewer", "freezer", "thaw_approver":
+		setRoleBoundaryUserRepositoryAccess(t, ctx, browser, userID, repositoryID, []string{role}, "grant "+role+" access to "+displayName)
+	default:
+		t.Fatalf("unsupported role-boundary role %q", role)
+	}
+
+	detail = requirePage(t, ctx, browser, fmt.Sprintf("/users/%d", userID))
+	if role == "admin" {
+		requireCheckedInput(t, detail, "admin", "1", true)
+	} else {
+		repositoryForm := requireRepositoryAccessForm(t, detail, repositoryID)
+		for _, candidate := range []string{"viewer", "freezer", "thaw_approver"} {
+			requireCheckedInput(t, repositoryForm, "roles", candidate, candidate == role)
 		}
 	}
-	userID, err := strconv.ParseInt(requireHiddenInput(t, row, "user_id"), 10, 64)
-	if err != nil || userID <= 0 {
-		t.Fatalf("created user %q has an invalid rendered user ID", email)
+	page = requirePage(t, ctx, browser, "/users")
+	row = requireRoleBoundaryUserRow(t, page, email)
+	wantAccess := authRoleLabel(role)
+	if role != "admin" {
+		wantAccess = "1 repositories"
+	}
+	if !strings.Contains(row, ">"+html.EscapeString(wantAccess)+"<") || (role != "admin" && !strings.Contains(row, ">"+html.EscapeString(authRoleLabel(role))+"</span>")) {
+		t.Fatalf("created user %q row is missing saved %s access", email, role)
 	}
 	return userID
+}
+
+func roleBoundaryTemporaryPassword(password string) string {
+	return password + "-temporary"
+}
+
+func authRoleLabel(role string) string {
+	switch role {
+	case "admin":
+		return "Admin"
+	case "viewer":
+		return "Viewer"
+	case "freezer":
+		return "Freezer"
+	case "thaw_approver":
+		return "Thaw approver"
+	default:
+		return role
+	}
 }
 
 func requireRoleBoundaryUserRow(t *testing.T, page, email string) string {
@@ -3798,7 +3864,128 @@ func requireRoleBoundaryUserRow(t *testing.T, page, email string) string {
 	return page[rowStart : markerIndex+rowEndOffset+len("</tr>")]
 }
 
-func loginRoleBoundaryUser(t *testing.T, ctx context.Context, cfg e2eConfig, email, displayName, roleLabel string) roleBoundarySession {
+func requireRoleBoundaryUserID(t *testing.T, row, email string) int64 {
+	t.Helper()
+	const marker = `href="/users/`
+	start := strings.Index(row, marker)
+	if start < 0 {
+		t.Fatalf("fictional user %q row has no detail link", email)
+	}
+	start += len(marker)
+	end := strings.Index(row[start:], `"`)
+	if end < 0 {
+		t.Fatalf("fictional user %q detail link is unterminated", email)
+	}
+	userID, err := strconv.ParseInt(row[start:start+end], 10, 64)
+	if err != nil || userID <= 0 {
+		t.Fatalf("fictional user %q detail link has invalid ID %q", email, row[start:start+end])
+	}
+	return userID
+}
+
+func requireRepositoryAccessForm(t *testing.T, page string, repositoryID int64) string {
+	t.Helper()
+	marker := `name="repository_id" value="` + strconv.FormatInt(repositoryID, 10) + `"`
+	markerIndex := strings.Index(page, marker)
+	if markerIndex < 0 {
+		t.Fatalf("user detail is missing repository access form for repository %d", repositoryID)
+	}
+	formStart := strings.LastIndex(page[:markerIndex], "<form ")
+	formEndOffset := strings.Index(page[markerIndex:], "</form>")
+	if formStart < 0 || formEndOffset < 0 {
+		t.Fatalf("repository %d access controls are missing their form boundary", repositoryID)
+	}
+	return page[formStart : markerIndex+formEndOffset+len("</form>")]
+}
+
+func requireCheckedInput(t *testing.T, page, name, value string, want bool) {
+	t.Helper()
+	for remaining := page; ; {
+		start := strings.Index(remaining, "<input")
+		if start < 0 {
+			break
+		}
+		remaining = remaining[start:]
+		end := strings.Index(remaining, ">")
+		if end < 0 {
+			break
+		}
+		tag := remaining[:end]
+		remaining = remaining[end+1:]
+		if !strings.Contains(tag, `name="`+name+`"`) || !strings.Contains(tag, `value="`+value+`"`) {
+			continue
+		}
+		if got := strings.Contains(tag, " checked"); got != want {
+			t.Fatalf("input %s=%s checked=%v, want %v", name, value, got, want)
+		}
+		return
+	}
+	t.Fatalf("page is missing input %s=%s", name, value)
+}
+
+func setRoleBoundaryUserAdmin(t *testing.T, ctx context.Context, browser *thawguardBrowser, userID int64, enabled bool, operation string) {
+	t.Helper()
+	path := fmt.Sprintf("/users/%d", userID)
+	page := requirePage(t, ctx, browser, path)
+	form := url.Values{"csrf_token": {requireHiddenInput(t, page, "csrf_token")}}
+	if enabled {
+		form.Set("admin", "1")
+	}
+	response, err := browser.postFormNoRedirect(ctx, path+"/admin", form)
+	if err != nil {
+		t.Fatalf("%s: %v", operation, err)
+	}
+	wantLocation := path + "?notice=admin-saved"
+	if response.statusCode != http.StatusSeeOther || response.location != wantLocation {
+		t.Fatalf("%s returned HTTP %d with Location %q, want 303 to %s", operation, response.statusCode, response.location, wantLocation)
+	}
+}
+
+func setRoleBoundaryUserRepositoryAccess(t *testing.T, ctx context.Context, browser *thawguardBrowser, userID, repositoryID int64, roles []string, operation string) {
+	t.Helper()
+	path := fmt.Sprintf("/users/%d", userID)
+	page := requirePage(t, ctx, browser, path)
+	form := url.Values{
+		"csrf_token":    {requireHiddenInput(t, page, "csrf_token")},
+		"repository_id": {strconv.FormatInt(repositoryID, 10)},
+		"roles":         slices.Clone(roles),
+	}
+	response, err := browser.postFormNoRedirect(ctx, path+"/repository-access", form)
+	if err != nil {
+		t.Fatalf("%s: %v", operation, err)
+	}
+	wantLocation := path + "?notice=access-saved"
+	if response.statusCode != http.StatusSeeOther || response.location != wantLocation {
+		t.Fatalf("%s returned HTTP %d with Location %q, want 303 to %s", operation, response.statusCode, response.location, wantLocation)
+	}
+}
+
+func createScopeHiddenRepository(t *testing.T, ctx context.Context, browser *thawguardBrowser, cfg e2eConfig, name string) {
+	t.Helper()
+	page := requirePage(t, ctx, browser, "/repositories")
+	if strings.Contains(page, fixtureOwner+"/"+name) {
+		t.Fatalf("scope-isolation repository %s/%s already exists", fixtureOwner, name)
+	}
+	response, err := browser.postFormNoRedirect(ctx, "/repositories", url.Values{
+		"csrf_token":     {requireHiddenInput(t, page, "csrf_token")},
+		"forge":          {"forgejo"},
+		"base_url":       {cfg.forgejoURL},
+		"owner":          {fixtureOwner},
+		"name":           {name},
+		"default_branch": {"main"},
+	})
+	if err != nil {
+		t.Fatalf("create scope-isolation repository: %v", err)
+	}
+	if response.statusCode != http.StatusSeeOther || response.location != "/repositories" {
+		t.Fatalf("create scope-isolation repository returned HTTP %d with Location %q", response.statusCode, response.location)
+	}
+	if page = requirePage(t, ctx, browser, "/repositories"); !strings.Contains(page, fixtureOwner+"/"+name) {
+		t.Fatalf("Admin repository page is missing scope-isolation repository %s/%s", fixtureOwner, name)
+	}
+}
+
+func loginRoleBoundaryUser(t *testing.T, ctx context.Context, cfg e2eConfig, email, displayName, roleLabel, accessLabel string) roleBoundarySession {
 	t.Helper()
 	browser := newThawguardBrowser(t, cfg.thawguardURL, cfg.sensitiveValues())
 	loginPage, err := browser.getResponseNoRedirect(ctx, "/login")
@@ -3815,22 +4002,36 @@ func loginRoleBoundaryUser(t *testing.T, ctx context.Context, cfg e2eConfig, ema
 	response, err := browser.postFormNoRedirect(ctx, "/login", url.Values{
 		"csrf_token": {loginCSRF},
 		"email":      {email},
-		"password":   {cfg.thawguardPassword},
+		"password":   {roleBoundaryTemporaryPassword(cfg.thawguardPassword)},
 	})
 	if err != nil {
 		t.Fatalf("POST /login for %s: %v", roleLabel, err)
 	}
-	if response.statusCode != http.StatusSeeOther || response.location != "/" {
-		t.Fatalf("POST /login for %s returned HTTP %d with Location %q, want 303 to /", roleLabel, response.statusCode, response.location)
+	if response.statusCode != http.StatusSeeOther || response.location != "/account/password" {
+		t.Fatalf("POST /login for %s returned HTTP %d with Location %q, want 303 to forced password change", roleLabel, response.statusCode, response.location)
 	}
-	session := currentRoleBoundarySession(t, ctx, browser, email, displayName, roleLabel)
-	if session.csrfToken == loginCSRF {
+	passwordPage := requirePage(t, ctx, browser, "/account/password")
+	passwordCSRF := requireHiddenInput(t, passwordPage, "csrf_token")
+	response, err = browser.postFormNoRedirect(ctx, "/account/password", url.Values{
+		"csrf_token":                {passwordCSRF},
+		"current_password":          {roleBoundaryTemporaryPassword(cfg.thawguardPassword)},
+		"new_password":              {cfg.thawguardPassword},
+		"new_password_confirmation": {cfg.thawguardPassword},
+	})
+	if err != nil {
+		t.Fatalf("POST /account/password for %s: %v", roleLabel, err)
+	}
+	if response.statusCode != http.StatusSeeOther || response.location != "/" {
+		t.Fatalf("POST /account/password for %s returned HTTP %d with Location %q, want 303 to /", roleLabel, response.statusCode, response.location)
+	}
+	session := currentRoleBoundarySession(t, ctx, browser, email, displayName, roleLabel, accessLabel)
+	if session.csrfToken == loginCSRF || session.csrfToken == passwordCSRF {
 		t.Fatalf("%s login reused its pre-auth CSRF token as the authenticated session token", roleLabel)
 	}
 	return session
 }
 
-func currentRoleBoundarySession(t *testing.T, ctx context.Context, browser *thawguardBrowser, email, displayName, roleLabel string) roleBoundarySession {
+func currentRoleBoundarySession(t *testing.T, ctx context.Context, browser *thawguardBrowser, email, displayName, roleLabel, accessLabel string) roleBoundarySession {
 	t.Helper()
 	response, err := browser.getResponseNoRedirect(ctx, "/")
 	if err != nil {
@@ -3843,7 +4044,7 @@ func currentRoleBoundarySession(t *testing.T, ctx context.Context, browser *thaw
 	for _, want := range []string{
 		">" + html.EscapeString(displayName) + "</p>",
 		">" + html.EscapeString(email) + "</p>",
-		">" + html.EscapeString(roleLabel) + "</span>",
+		">" + html.EscapeString(accessLabel) + "</span>",
 	} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("%s dashboard identity is missing %q", roleLabel, want)
@@ -3854,7 +4055,7 @@ func currentRoleBoundarySession(t *testing.T, ctx context.Context, browser *thaw
 		t.Fatalf("%s session has an empty CSRF token", roleLabel)
 	}
 	cookie := roleBoundarySessionCookie(t, browser)
-	return roleBoundarySession{displayName: displayName, email: email, roleLabel: roleLabel, browser: browser, csrfToken: csrf, sessionCookie: cookie}
+	return roleBoundarySession{displayName: displayName, email: email, roleLabel: roleLabel, accessLabel: accessLabel, browser: browser, csrfToken: csrf, sessionCookie: cookie}
 }
 
 func roleBoundarySessionCookie(t *testing.T, browser *thawguardBrowser) string {
@@ -3875,7 +4076,7 @@ func roleBoundarySessionCookie(t *testing.T, browser *thawguardBrowser) string {
 func requireRoleSessionsIsolated(t *testing.T, ctx context.Context, sessions []roleBoundarySession) {
 	t.Helper()
 	for i, session := range sessions {
-		current := currentRoleBoundarySession(t, ctx, session.browser, session.email, session.displayName, session.roleLabel)
+		current := currentRoleBoundarySession(t, ctx, session.browser, session.email, session.displayName, session.roleLabel, session.accessLabel)
 		if current.csrfToken != session.csrfToken || current.sessionCookie != session.sessionCookie {
 			t.Fatalf("%s session identity changed while proving isolation", session.roleLabel)
 		}
@@ -3922,9 +4123,7 @@ func requireRoleBoundaryReadAccess(t *testing.T, ctx context.Context, session ro
 		pages["/users"] = string(response.body)
 		return pages
 	}
-	if response.statusCode != http.StatusForbidden || response.location != "" || string(response.body) != "forbidden\n" {
-		t.Fatalf("%s GET /users returned HTTP %d with Location %q, want exact 403", session.roleLabel, response.statusCode, response.location)
-	}
+	requireStyledForbiddenResponse(t, response, session.roleLabel+" GET /users")
 	return pages
 }
 
@@ -3933,7 +4132,7 @@ func requireRoleBoundaryControls(t *testing.T, pages map[string]string, canAdmin
 	for path, page := range pages {
 		hasUsersNav := strings.Contains(page, `href="/users"`)
 		if hasUsersNav != canAdmin {
-			t.Fatalf("%s Users & Roles nav visibility=%v, want %v", path, hasUsersNav, canAdmin)
+			t.Fatalf("%s Users & Access nav visibility=%v, want %v", path, hasUsersNav, canAdmin)
 		}
 	}
 	repositoryPage := pages["/repositories"]
@@ -3984,6 +4183,7 @@ func roleBoundarySlug(roleLabel string) string {
 
 func requireForbiddenRoleMutation(t *testing.T, ctx context.Context, session roleBoundarySession, path string, values url.Values, operation string) {
 	t.Helper()
+	allowed := false
 	switch path {
 	case "/repositories",
 		"/repositories/branches",
@@ -3997,10 +4197,6 @@ func requireForbiddenRoleMutation(t *testing.T, ctx context.Context, session rol
 		"/repositories/reconcile",
 		"/repositories/recover",
 		"/users",
-		"/users/roles",
-		"/users/disable",
-		"/users/enable",
-		"/users/reset-password",
 		"/freezes",
 		"/freezes/end",
 		"/freezes/cancel",
@@ -4009,7 +4205,19 @@ func requireForbiddenRoleMutation(t *testing.T, ctx context.Context, session rol
 		"/scheduled-freezes/start-now",
 		"/scheduled-freezes/cancel",
 		"/decisions":
+		allowed = true
 	default:
+		parts := strings.Split(strings.TrimPrefix(path, "/users/"), "/")
+		if len(parts) == 2 {
+			userID, err := strconv.ParseInt(parts[0], 10, 64)
+			allowed = err == nil && userID > 0 && slices.Contains([]string{"admin", "repository-access", "disable", "enable", "reset-password"}, parts[1])
+		}
+		if len(parts) == 3 {
+			userID, err := strconv.ParseInt(parts[0], 10, 64)
+			allowed = err == nil && userID > 0 && parts[1] == "repository-access" && parts[2] == "remove"
+		}
+	}
+	if !allowed {
 		t.Fatalf("wrong-role mutation path %q is not allowlisted", path)
 	}
 	form := make(url.Values, len(values)+1)
@@ -4021,8 +4229,14 @@ func requireForbiddenRoleMutation(t *testing.T, ctx context.Context, session rol
 	if err != nil {
 		t.Fatalf("%s: %v", operation, err)
 	}
-	if response.statusCode != http.StatusForbidden || response.location != "" || string(response.body) != "forbidden\n" {
-		t.Fatalf("%s returned HTTP %d with Location %q, want exact 403", operation, response.statusCode, response.location)
+	requireStyledForbiddenResponse(t, response, operation)
+}
+
+func requireStyledForbiddenResponse(t *testing.T, response apiResponse, operation string) {
+	t.Helper()
+	body := string(response.body)
+	if response.statusCode != http.StatusForbidden || response.location != "" || !strings.Contains(body, "HTTP 403") || !strings.Contains(body, "Back to dashboard") {
+		t.Fatalf("%s returned HTTP %d with Location %q, want styled 403", operation, response.statusCode, response.location)
 	}
 }
 
@@ -4070,7 +4284,7 @@ func requireUnchangedRoleBoundaryEvidence(t *testing.T, before, after roleBounda
 			before.mainFreeze, after.mainFreeze)
 	}
 	if before.usersPage != after.usersPage {
-		t.Fatalf("%s changed the full admin Users & Roles state snapshot", operation)
+		t.Fatalf("%s changed the full admin Users & Access state snapshot", operation)
 	}
 	if before.repositoriesPage != after.repositoriesPage {
 		t.Fatalf("%s changed the full admin repository setup/readiness/lifecycle snapshot", operation)
@@ -4307,7 +4521,7 @@ func collectWebhookSideEffectEvidence(t *testing.T, ctx context.Context, forgejo
 func requirePageCount(t *testing.T, page string, pattern *regexp.Regexp, label string) int {
 	t.Helper()
 	match := pattern.FindStringSubmatch(page)
-	if len(match) != 2 {
+	if len(match) < 2 {
 		t.Fatalf("could not read %s count from rendered page", label)
 	}
 	count, err := strconv.Atoi(match[1])
@@ -5736,7 +5950,7 @@ func requireOnlyFormInputNames(t *testing.T, form string, expected []string) {
 // restyles. Row-field patterns anchor on visible text or the small stable
 // markers the templates emit (branch <code> elements, <time> cells, badges).
 var (
-	userCountPattern             = regexp.MustCompile(`>([0-9]+) users?</span>`)
+	userCountPattern             = regexp.MustCompile(`>([0-9]+) (person|people)</span>`)
 	repositoryCountPattern       = regexp.MustCompile(`(?s)>Enforcing</p>\s*<p[^>]*>[0-9]+ of ([0-9]+)</p>`)
 	activeFreezeCountPattern     = regexp.MustCompile(`>([0-9]+) active</span>`)
 	scheduledFreezeCountPattern  = regexp.MustCompile(`>([0-9]+) windows?</span>`)

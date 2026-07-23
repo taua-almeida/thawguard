@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 )
 
 // scheduledFreezesPageSize caps one page of the scheduled windows table; the
@@ -187,9 +188,9 @@ func scheduledFreezeFormStateFromRequest(r *http.Request) scheduledFreezeFormSta
 // scheduledFreezeToastMessage resolves the repository name for the mutation
 // toasts ("Freeze scheduled for taua/thawguard main."). Falls back to the
 // repository id when the lookup fails; the toast is informational only.
-func (s *Server) scheduledFreezeToastMessage(ctx context.Context, prefix string, scheduled domain.BranchFreeze) string {
+func (s *Server) scheduledFreezeToastMessage(ctx context.Context, scope repositoryscope.ReadScope, prefix string, scheduled domain.BranchFreeze) string {
 	repoName := fmt.Sprintf("repository #%d", scheduled.RepositoryID)
-	if repositories, err := s.repositories(ctx); err == nil {
+	if repositories, err := s.repositories(ctx, scope); err == nil {
 		if repo, ok := repositoriesByID(repositories)[scheduled.RepositoryID]; ok && repo.ID != 0 {
 			repoName = repo.FullName()
 		}
@@ -203,7 +204,7 @@ func (s *Server) scheduledFreezesPageData(repositories []domain.Repository, wind
 		PageTitle:               "Scheduled Freezes",
 		ActivePage:              "scheduled",
 		CurrentUser:             currentUser,
-		EnforceableRepositories: enforcementActiveRepositories(repositories),
+		EnforceableRepositories: repositories,
 		BranchOptions:           branchOptions,
 		Total:                   total,
 		Filter:                  state.Query.Filter,
@@ -222,8 +223,8 @@ func (s *Server) scheduledFreezesPageData(repositories []domain.Repository, wind
 			scheduledFreezeView: view,
 			CSRFToken:           csrfToken,
 			CSRFField:           csrfFormField,
-			CanFreeze:           currentUser.CanFreeze,
-			CanManage:           currentUser.CanManageRepositories || currentUser.CanFreeze,
+			CanFreeze:           false,
+			CanManage:           false,
 			Query:               state.Query,
 		})
 	}
@@ -268,13 +269,14 @@ func (s *Server) scheduledFreezesPageData(repositories []domain.Repository, wind
 // and returns ok=false on load failure.
 func (s *Server) loadScheduledFreezesPageData(w http.ResponseWriter, r *http.Request, state scheduledFreezePageState, session sessionState, withSchedules bool) (scheduledFreezesPageData, bool) {
 	ctx := r.Context()
-	repositories, err := s.repositories(ctx)
+	scope := session.Grants.RepositoryReadScope()
+	repositories, err := s.repositories(ctx, scope)
 	if err != nil {
 		internalServerError(w)
 		return scheduledFreezesPageData{}, false
 	}
 	_, status := scheduledFilterStatus(state.Query.Filter)
-	windows, total, err := s.cfg.ScheduledFreezeStore.ListScheduledPage(ctx, status, (state.Query.Page-1)*scheduledFreezesPageSize, scheduledFreezesPageSize)
+	windows, total, err := s.cfg.ScheduledFreezeStore.ListScheduledPageForScope(ctx, scope, status, (state.Query.Page-1)*scheduledFreezesPageSize, scheduledFreezesPageSize)
 	if err != nil {
 		internalServerError(w)
 		return scheduledFreezesPageData{}, false
@@ -282,22 +284,29 @@ func (s *Server) loadScheduledFreezesPageData(w http.ResponseWriter, r *http.Req
 	if len(windows) == 0 && total > 0 && state.Query.Page > 1 {
 		lastPage := (total + scheduledFreezesPageSize - 1) / scheduledFreezesPageSize
 		state.Query.Page = lastPage
-		windows, total, err = s.cfg.ScheduledFreezeStore.ListScheduledPage(ctx, status, (lastPage-1)*scheduledFreezesPageSize, scheduledFreezesPageSize)
+		windows, total, err = s.cfg.ScheduledFreezeStore.ListScheduledPageForScope(ctx, scope, status, (lastPage-1)*scheduledFreezesPageSize, scheduledFreezesPageSize)
 		if err != nil {
 			internalServerError(w)
 			return scheduledFreezesPageData{}, false
 		}
 	}
-	branchOptions, err := s.managedBranchOptions(ctx, repositories)
+	freezerRepositories := freezeRepositories(repositories, session.Grants)
+	branchOptions, err := s.managedBranchOptions(ctx, freezerRepositories)
 	if err != nil {
 		internalServerError(w)
 		return scheduledFreezesPageData{}, false
 	}
 	currentUser := currentUserFromSession(session)
+	currentUser.CanFreeze = len(freezerRepositories) > 0
 	views := scheduledFreezeViews(repositories, windows, state)
-	data := s.scheduledFreezesPageData(repositories, views, branchOptions, total, state, session.CSRFToken, currentUser)
+	data := s.scheduledFreezesPageData(enforcementActiveRepositories(freezerRepositories), views, branchOptions, total, state, session.CSRFToken, currentUser)
+	for i := range data.Windows {
+		allowed := session.Grants.CanFreezeRepository(data.Windows[i].Freeze.RepositoryID)
+		data.Windows[i].CanFreeze = allowed
+		data.Windows[i].CanManage = allowed
+	}
 	if withSchedules && s.cfg.ScheduleStore != nil {
-		schedules, err := s.cfg.ScheduleStore.List(ctx)
+		schedules, err := s.cfg.ScheduleStore.ListForScope(ctx, scope)
 		if err != nil {
 			internalServerError(w)
 			return scheduledFreezesPageData{}, false

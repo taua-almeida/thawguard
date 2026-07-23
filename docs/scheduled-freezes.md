@@ -60,7 +60,7 @@ One-time scheduled freezes remain pending until their start time. While pending,
 
 ## Roles
 
-Creating recurring schedules, adding or removing rules and windows, activating, pausing, and deleting them requires the Administrator or Freezer role. For one-time scheduled freezes, creation and cancellation require Freezer, while editing a pending schedule and Start Now allow Administrator or Freezer. Viewers see everything read-only.
+Creating or changing recurring schedules, one-time scheduled freezes, rules, and dated windows requires a Freezer grant for that repository. The same repository-scoped Freezer grant controls pending edits, cancellation, and **Start Now**. Admin can manage the installation and view every repository, but Admin alone does not imply schedule actions. Repository-scoped Viewer and Thaw approver access remains read-only on schedule surfaces.
 
 ## Boundary
 

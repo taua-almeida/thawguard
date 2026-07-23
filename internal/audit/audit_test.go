@@ -337,6 +337,7 @@ func TestScopedActionClassificationCoversEveryKnownAction(t *testing.T) {
 		"schedule.suppressed":                        "schedule",
 		"thaw_exception.approved":                    "thaw_exception",
 		"thaw_exception.shared_head_approved":        "thaw_exception",
+		"user.created":                               adminOnly,
 		"user.roles_updated":                         adminOnly,
 		"user.disabled":                              adminOnly,
 		"user.enabled":                               adminOnly,

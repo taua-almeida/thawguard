@@ -23,7 +23,7 @@
         </div>
         <p class="m-0 mt-1 font-mono text-sm text-text-muted">{{ .Schedule.RepositoryLabel }} &middot; {{ .Schedule.Branch }}</p>
       </div>
-      {{ if or .CurrentUser.CanManageRepositories .CurrentUser.CanFreeze }}
+      {{ if .CanManage }}
       <div class="flex flex-wrap items-center gap-2">
         {{ if .Schedule.Active }}
         <form method="post" action="{{ .Schedule.PauseAction }}" class="m-0">
@@ -87,7 +87,7 @@
         {{ range .Rules }}
         <li class="flex flex-wrap items-center justify-between gap-3 border-t border-border py-2.5 first:border-t-0">
           <span class="font-mono text-sm text-text">{{ .Label }}<span class="ml-2 font-sans text-xs text-text-muted">{{ .RelationLabel }}</span></span>
-          {{ if or $.CurrentUser.CanManageRepositories $.CurrentUser.CanFreeze }}
+          {{ if $.CanManage }}
           <form method="post" action="{{ .DeleteAction }}" class="m-0">
             <input type="hidden" name="{{ $.CSRFField }}" value="{{ $.CSRFToken }}">
             {{ template "ui/button" dict "Label" (printf "Remove rule %s" .Label) "Variant" "ghost" "Size" "sm" "Type" "submit" "Icon" "tg-i-close" "IconOnly" true }}
@@ -102,7 +102,7 @@
       </div>
       {{ end }}
 
-      {{ if or .CurrentUser.CanManageRepositories .CurrentUser.CanFreeze }}
+      {{ if .CanManage }}
       <form method="post" action="{{ .RuleAddAction }}" class="mt-4 flex flex-col gap-4 border-t border-border pt-4">
         <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
         <h4 class="m-0 text-sm font-bold text-text">Add rules</h4>
@@ -152,7 +152,7 @@
             <span class="block text-sm font-semibold text-text">{{ .Name }}{{ if .InProgress }}<span class="ml-2 text-xs font-normal text-accent-strong">already started</span>{{ end }}</span>
             <span class="block font-mono text-xs text-text-muted">{{ .RangeLabel }}</span>
           </span>
-          {{ if or $.CurrentUser.CanManageRepositories $.CurrentUser.CanFreeze }}
+          {{ if $.CanManage }}
           <form method="post" action="{{ .DeleteAction }}" class="m-0">
             <input type="hidden" name="{{ $.CSRFField }}" value="{{ $.CSRFToken }}">
             {{ template "ui/button" dict "Label" (printf "Remove window %s" .Name) "Variant" "ghost" "Size" "sm" "Type" "submit" "Icon" "tg-i-close" "IconOnly" true }}
@@ -167,7 +167,7 @@
       </div>
       {{ end }}
 
-      {{ if or .CurrentUser.CanManageRepositories .CurrentUser.CanFreeze }}
+      {{ if .CanManage }}
       <form method="post" action="{{ .WindowAddAction }}" class="mt-4 flex flex-col gap-4 border-t border-border pt-4">
         <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
         <h4 class="m-0 text-sm font-bold text-text">Add a window</h4>
@@ -276,7 +276,7 @@
     {{ end }}
   </section>
 
-  {{ if or .CurrentUser.CanManageRepositories .CurrentUser.CanFreeze }}
+  {{ if .CanManage }}
   {{ template "ui/modal" dict
     "ID" "schedule-delete-dialog"
     "Title" "Delete this schedule?"

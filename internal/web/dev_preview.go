@@ -92,7 +92,7 @@ func (s *Server) handleDevPreview(w http.ResponseWriter, r *http.Request) {
 			RoleLabel:             "Admin",
 			CanChangePassword:     true,
 			IsAdmin:               true,
-			CanManageRepositories: true,
+			CanManageInstallation: true,
 			CanFreeze:             true,
 			CanThaw:               true,
 		},
@@ -237,16 +237,18 @@ func (s *Server) handleDevPreviewRepositories(w http.ResponseWriter, r *http.Req
 		RoleLabel:             "Admin",
 		CanChangePassword:     true,
 		IsAdmin:               true,
-		CanManageRepositories: true,
+		CanManageInstallation: true,
+		HasRepositoryAccess:   true,
 		CanFreeze:             true,
 		CanThaw:               true,
 	}
 	if r.URL.Query().Get("role") == "viewer" {
 		user = currentUserView{
-			Email:             "sten.hale@example.test",
-			DisplayName:       "Sten Hale",
-			RoleLabel:         "Viewer",
-			CanChangePassword: true,
+			Email:               "sten.hale@example.test",
+			DisplayName:         "Sten Hale",
+			RoleLabel:           "Viewer",
+			CanChangePassword:   true,
+			HasRepositoryAccess: true,
 		}
 	}
 	views := devPreviewRepositoryViews()
@@ -285,7 +287,7 @@ func (s *Server) handleDevPreviewDashboard(w http.ResponseWriter, r *http.Reques
 		RoleLabel:             "Admin",
 		CanChangePassword:     true,
 		IsAdmin:               true,
-		CanManageRepositories: true,
+		CanManageInstallation: true,
 		CanFreeze:             true,
 		CanThaw:               true,
 	}
@@ -1207,16 +1209,9 @@ func (s *Server) handleDevPreviewWebhooks(w http.ResponseWriter, r *http.Request
 	s.renderPage(w, "layouts/webhooks", data)
 }
 
-// handleDevPreviewUsers renders the users & roles page from fictional
-// fixtures through the real view-model builders (GET /dev/preview/users).
-// Query knobs: ?variant=empty|create-error|role-error|reset-error|form-error,
-// ?role=viewer (the real route's 403 guard response), ?theme=dark|light.
-// The default view holds four users: the signed-in admin — also the final
-// enabled admin, so their row carries both guards — a plain multi-role row,
-// a must-change-password row, and a disabled admin row (which is why the
-// signed-in admin is final). The error variants re-render the matching
-// dialog or row form open with its message, the way a real validation
-// failure would.
+// handleDevPreviewUsers renders the Users & Access directory from fictional
+// fixtures (GET /dev/preview/users). Query knobs: ?variant=empty|create-error,
+// ?role=viewer (the real route's 403 state), ?theme=dark|light.
 func (s *Server) handleDevPreviewUsers(w http.ResponseWriter, r *http.Request) {
 	if !s.cfg.DevMode {
 		http.NotFound(w, r)
@@ -1232,36 +1227,51 @@ func (s *Server) handleDevPreviewUsers(w http.ResponseWriter, r *http.Request) {
 		UserID:      &selfID,
 		Email:       "mira.frost@example.test",
 		DisplayName: "Mira Frost",
-		Roles:       auth.RoleSet{auth.RoleAdmin, auth.RoleFreezer},
+		Grants:      auth.NewGrants(auth.RoleSet{auth.RoleAdmin}, nil),
 	}
 	disabledAt := time.Date(2026, 7, 2, 16, 30, 0, 0, time.UTC)
-	users := []auth.User{
-		{ID: 1, Email: "mira.frost@example.test", DisplayName: "Mira Frost", Roles: auth.RoleSet{auth.RoleAdmin, auth.RoleFreezer}, CreatedAt: time.Date(2026, 5, 2, 9, 12, 0, 0, time.UTC)},
-		{ID: 2, Email: "kai.merid@example.test", DisplayName: "Kai Merid", Roles: auth.RoleSet{auth.RoleThawApprover, auth.RoleViewer}, CreatedAt: time.Date(2026, 6, 11, 14, 40, 0, 0, time.UTC)},
-		{ID: 3, Email: "sten.hale@example.test", DisplayName: "Sten Hale", Roles: auth.RoleSet{auth.RoleViewer}, MustChangePassword: true, CreatedAt: time.Date(2026, 7, 4, 8, 5, 0, 0, time.UTC)},
-		{ID: 4, Email: "lena.polar@example.test", DisplayName: "Lena Polar", Roles: auth.RoleSet{auth.RoleAdmin, auth.RoleFreezer}, DisabledAt: &disabledAt, CreatedAt: time.Date(2026, 6, 20, 11, 25, 0, 0, time.UTC)},
+	entries := []auth.UserDirectoryEntry{
+		{User: auth.User{ID: 1, Email: "mira.frost@example.test", DisplayName: "Mira Frost", Roles: auth.RoleSet{auth.RoleAdmin}, CreatedAt: time.Date(2026, 5, 2, 9, 12, 0, 0, time.UTC)}, IsAdmin: true, RepositoryCount: 2, HasFreezer: true},
+		{User: auth.User{ID: 2, Email: "kai.merid@example.test", DisplayName: "Kai Merid", CreatedAt: time.Date(2026, 6, 11, 14, 40, 0, 0, time.UTC)}, RepositoryCount: 2, HasViewer: true, HasThawApprover: true},
+		{User: auth.User{ID: 3, Email: "sten.hale@example.test", DisplayName: "Sten Hale", MustChangePassword: true, CreatedAt: time.Date(2026, 7, 4, 8, 5, 0, 0, time.UTC)}, RepositoryCount: 1, HasViewer: true},
+		{User: auth.User{ID: 4, Email: "lena.polar@example.test", DisplayName: "Lena Polar", Roles: auth.RoleSet{auth.RoleAdmin}, DisabledAt: &disabledAt, CreatedAt: time.Date(2026, 6, 20, 11, 25, 0, 0, time.UTC)}, IsAdmin: true, RepositoryCount: 2, HasFreezer: true},
 	}
-	state := defaultUsersPageState()
+	repositories := []domain.Repository{
+		{ID: 46, Owner: "aurora", Name: "ice-station"},
+		{ID: 47, Owner: "borealis", Name: "frost-api"},
+	}
+	state := usersPageState{}
 	switch r.URL.Query().Get("variant") {
 	case "empty":
-		users = nil
+		entries = nil
 	case "create-error":
 		state = usersPageState{
 			FormError:         "a user with this email already exists",
 			CreateOpen:        true,
 			CreateEmail:       "sten.hale@example.test",
 			CreateDisplayName: "Sten Hale",
-			CreateRoles:       auth.RoleSet{auth.RoleFreezer, auth.RoleViewer},
 		}
-	case "role-error":
-		state = usersPageState{FormError: "at least one role is required", RoleFormUserID: 2}
-	case "reset-error":
-		state = usersPageState{FormError: "temporary passwords do not match", ResetFormUserID: 2}
 	case "form-error":
-		state = usersPageState{FormError: "cannot disable the final enabled admin"}
+		state = usersPageState{FormError: "search is too long"}
 	}
-	data := usersPageDataFor(s.cfg.AppName, users, state, session)
-	data.Theme = devPreviewTheme(r)
+	data := usersPageData{
+		AppName:           s.cfg.AppName,
+		PageTitle:         "Users & Access",
+		Theme:             devPreviewTheme(r),
+		ActivePage:        "users",
+		CurrentUser:       currentUserFromSession(session),
+		CSRFToken:         session.CSRFToken,
+		CSRFField:         csrfFormField,
+		Users:             usersDirectoryViews(entries, session),
+		UserCount:         len(entries),
+		RepositoryOptions: usersRepositoryOptions(repositories, 0),
+		NoRepositories:    len(repositories) == 0,
+		FormError:         state.FormError,
+		CreateOpen:        state.CreateOpen,
+		CreateError:       state.FormError,
+		CreateEmail:       state.CreateEmail,
+		CreateDisplayName: state.CreateDisplayName,
+	}
 	s.renderPage(w, "layouts/users", data)
 }
 
@@ -1489,6 +1499,7 @@ func (s *Server) handleDevPreviewScheduleDetail(w http.ResponseWriter, r *http.R
 		Theme:             devPreviewTheme(r),
 		ActivePage:        "scheduled",
 		CurrentUser:       user,
+		CanManage:         user.CanFreeze,
 		Schedule:          view,
 		RuleAddAction:     fmt.Sprintf("%s/%d/rules", schedulesBasePath, sched.ID),
 		RuleDayOptions:    scheduleRuleDayOptions(forms.RuleForm),

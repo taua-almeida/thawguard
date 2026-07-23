@@ -70,9 +70,9 @@ func activityFilterActions(filter string) []string {
 		// double-count the "freeze_schedule." one-time window actions.
 		return activityActionsWithPrefix("branch_freeze.", "freeze_schedule.", "schedule.", "thaw_exception.")
 	case "repositories":
-		return activityActionsWithPrefix("repository.")
+		return activityActionsWithPrefix("repository.", "repository_grant.")
 	case "users":
-		return activityActionsWithPrefix("user.")
+		return activityActionsWithPrefix("user.", "repository_grant.")
 	default:
 		return nil
 	}
@@ -184,6 +184,7 @@ type activityPageData struct {
 // already handled the nil-AuditStore 503 guard.
 func (s *Server) loadActivityPageData(w http.ResponseWriter, r *http.Request, query activityQuery, session sessionState) (activityPageData, bool) {
 	ctx := r.Context()
+	scope := session.Grants.RepositoryReadScope()
 	actions := activityFilterActions(query.Filter)
 	var events []audit.Event
 	var total int
@@ -191,7 +192,7 @@ func (s *Server) loadActivityPageData(w http.ResponseWriter, r *http.Request, qu
 	// store reads an empty action list as "all actions", so never hand it one.
 	if actions == nil || len(actions) > 0 {
 		var err error
-		events, total, err = s.cfg.AuditStore.ListPage(ctx, actions, (query.Page-1)*activityPageSize, activityPageSize)
+		events, total, err = s.cfg.AuditStore.ListPageForScope(ctx, scope, actions, (query.Page-1)*activityPageSize, activityPageSize)
 		if err != nil {
 			internalServerError(w)
 			return activityPageData{}, false
@@ -199,14 +200,14 @@ func (s *Server) loadActivityPageData(w http.ResponseWriter, r *http.Request, qu
 		if len(events) == 0 && total > 0 && query.Page > 1 {
 			lastPage := (total + activityPageSize - 1) / activityPageSize
 			query.Page = lastPage
-			events, total, err = s.cfg.AuditStore.ListPage(ctx, actions, (lastPage-1)*activityPageSize, activityPageSize)
+			events, total, err = s.cfg.AuditStore.ListPageForScope(ctx, scope, actions, (lastPage-1)*activityPageSize, activityPageSize)
 			if err != nil {
 				internalServerError(w)
 				return activityPageData{}, false
 			}
 		}
 	}
-	repositories, err := s.repositories(ctx)
+	repositories, err := s.repositories(ctx, scope)
 	if err != nil {
 		internalServerError(w)
 		return activityPageData{}, false

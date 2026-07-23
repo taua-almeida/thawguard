@@ -5,7 +5,7 @@
       <h1 class="m-0 text-page-title font-bold text-text">Repositories</h1>
       <p class="m-0 mt-1 text-sm text-text-muted">Connect Forgejo/Codeberg repositories and verify freeze setup.</p>
     </div>
-    {{ if .CurrentUser.CanManageRepositories }}
+    {{ if .CurrentUser.CanManageInstallation }}
     {{ template "ui/button" dict "Label" "Add Repository" "Variant" "primary" "Icon" "tg-i-plus" "DialogTarget" "connect-repository" }}
     {{ end }}
   </header>
@@ -27,7 +27,7 @@
     {{ template "ui/stat-card" dict "Label" "Status tokens" "Value" (printf "%d of %d" .Overview.StatusTokenConfiguredCount .Overview.RepositoryCount) "Tone" $tokenTone }}
   </section>
 
-  {{ if .CurrentUser.CanManageRepositories }}
+  {{ if .CurrentUser.CanManageInstallation }}
   <dialog id="connect-repository" class="m-auto w-[min(28rem,90vw)] rounded-panel border border-border bg-surface p-6 text-text shadow-card" aria-labelledby="connect-repository-title">
     <h2 id="connect-repository-title" class="m-0 text-base font-bold">Add repository</h2>
     <p class="mt-2 mb-0 text-sm text-text-muted">Add the Forgejo or Codeberg repository Thawguard should watch. The required status context stays fixed as <code>{{ .RequiredContext }}</code>.</p>
@@ -48,7 +48,11 @@
     <p class="mt-4 mb-0 text-xs text-text-muted">Repository credentials are write-only and restricted to admins.</p>
   </dialog>
   {{ else }}
-  {{ template "ui/callout" dict "Tone" "warning" "Body" "Your role can view repository readiness evidence. Admin role is required to add repositories, rotate credentials, or run readiness checks." }}
+  {{ if .CurrentUser.HasRepositoryAccess }}
+  {{ template "ui/callout" dict "Tone" "warning" "Body" "Your repository access permits read-only readiness evidence. Admin is required to add repositories, rotate credentials, or run readiness checks." }}
+  {{ else }}
+  {{ template "ui/callout" dict "Tone" "info" "Body" "No repository access is assigned to this account. An Admin can grant Viewer, Freezer, or Thaw approver access from Users & Access." }}
+  {{ end }}
   {{ end }}
 
   <div>
@@ -66,8 +70,12 @@
     {{ template "components/repository-card" . }}
     {{ end }}
   </section>
+  {{ else if and (not .CurrentUser.CanManageInstallation) (not .CurrentUser.HasRepositoryAccess) }}
+  {{ template "ui/empty-state" dict "Title" "No repository access assigned" "Hint" "Ask an Admin to grant access to a repository. Repositories outside your access are not listed." "Icon" "tg-i-repositories" }}
   {{ else if .Filter.Active }}
   {{ template "ui/empty-state" dict "Title" "No repositories match this filter" "Hint" "Adjust the search or lifecycle-state filter, or clear it to see every configured repository." "Icon" "tg-i-search" "ActionLabel" "Clear filter" "ActionHref" "/repositories" }}
+  {{ else if not .CurrentUser.CanManageInstallation }}
+  {{ template "ui/empty-state" dict "Title" "No accessible repositories" "Hint" "No repository covered by this account's current grants is available." "Icon" "tg-i-repositories" }}
   {{ else }}
   {{ template "ui/empty-state" dict "Title" "No repositories configured yet" "Hint" "Add your first Forgejo or Codeberg repository to start setup." "Icon" "tg-i-repositories" }}
   {{ end }}

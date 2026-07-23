@@ -202,6 +202,7 @@ type scheduleDetailPageData struct {
 	Theme             string
 	ActivePage        string
 	CurrentUser       currentUserView
+	CanManage         bool
 	Schedule          scheduleDetailView
 	Rules             []scheduleRuleView
 	RuleAddAction     string
@@ -270,22 +271,25 @@ func scheduleDetailViewFrom(repositories []domain.Repository, sched domain.Sched
 // 500 and returns ok=false on load failure.
 func (s *Server) scheduleNewPageData(w http.ResponseWriter, r *http.Request, form scheduleFormState, formError string, session sessionState) (scheduleNewPageData, bool) {
 	ctx := r.Context()
-	repositories, err := s.repositories(ctx)
+	repositories, err := s.repositories(ctx, session.Grants.RepositoryReadScope())
 	if err != nil {
 		internalServerError(w)
 		return scheduleNewPageData{}, false
 	}
-	branchOptions, err := s.managedBranchOptions(ctx, repositories)
+	freezerRepositories := freezeRepositories(repositories, session.Grants)
+	branchOptions, err := s.managedBranchOptions(ctx, freezerRepositories)
 	if err != nil {
 		internalServerError(w)
 		return scheduleNewPageData{}, false
 	}
+	currentUser := currentUserFromSession(session)
+	currentUser.CanFreeze = len(freezerRepositories) > 0
 	return scheduleNewPageData{
 		AppName:                 s.cfg.AppName,
 		PageTitle:               "New schedule",
 		ActivePage:              "scheduled",
-		CurrentUser:             currentUserFromSession(session),
-		EnforceableRepositories: enforcementActiveRepositories(repositories),
+		CurrentUser:             currentUser,
+		EnforceableRepositories: enforcementActiveRepositories(freezerRepositories),
 		BranchOptions:           branchOptions,
 		TimezoneOptions:         scheduleTimezoneOptions(form.Timezone),
 		Form:                    form,
@@ -324,11 +328,14 @@ func (s *Server) handleScheduleCreate(w http.ResponseWriter, r *http.Request) {
 	if !s.requireScheduleStore(w) {
 		return
 	}
-	session, ok := s.requireScheduleManagerForm(w, r)
+	session, ok := s.requireActionForm(w, r)
 	if !ok {
 		return
 	}
 	form := scheduleFormStateFromRequest(r)
+	if _, authorized := s.requireFreezeRepository(w, r, session, form.RepositoryID); !authorized {
+		return
+	}
 	created, err := s.cfg.ScheduleStore.Create(r.Context(), schedule.CreateParams{
 		RepositoryID: form.RepositoryID,
 		Branch:       form.Branch,
@@ -365,7 +372,7 @@ func (s *Server) handleScheduleDetail(w http.ResponseWriter, r *http.Request) {
 		s.renderErrorPage(w, http.StatusNotFound, false)
 		return
 	}
-	sched, err := s.cfg.ScheduleStore.Get(r.Context(), id)
+	sched, err := s.cfg.ScheduleStore.GetForScope(r.Context(), session.Grants.RepositoryReadScope(), id)
 	if errors.Is(err, schedule.ErrNotFound) {
 		s.renderErrorPage(w, http.StatusNotFound, false)
 		return
@@ -404,18 +411,21 @@ func (s *Server) handleScheduleDetail(w http.ResponseWriter, r *http.Request) {
 // date-windows card by kind, the coverage preview, and the branch's combined
 // coverage context. Writes a 500 and returns ok=false on load failure.
 func (s *Server) scheduleDetailPageData(w http.ResponseWriter, r *http.Request, sched domain.Schedule, forms scheduleDetailForms, session sessionState) (scheduleDetailPageData, bool) {
-	repositories, err := s.repositories(r.Context())
+	repositories, err := s.repositories(r.Context(), session.Grants.RepositoryReadScope())
 	if err != nil {
 		internalServerError(w)
 		return scheduleDetailPageData{}, false
 	}
 	now := time.Now()
 	view := scheduleDetailViewFrom(repositories, sched)
+	currentUser := currentUserFromSession(session)
+	currentUser.CanFreeze = session.Grants.CanFreezeRepository(sched.RepositoryID)
 	data := scheduleDetailPageData{
 		AppName:           s.cfg.AppName,
 		PageTitle:         view.Name,
 		ActivePage:        "scheduled",
-		CurrentUser:       currentUserFromSession(session),
+		CurrentUser:       currentUser,
+		CanManage:         currentUser.CanFreeze,
 		Schedule:          view,
 		RuleAddAction:     fmt.Sprintf("%s/%d/rules", schedulesBasePath, sched.ID),
 		RuleDayOptions:    scheduleRuleDayOptions(forms.RuleForm),
@@ -472,7 +482,7 @@ func (s *Server) scheduleDetailPageData(w http.ResponseWriter, r *http.Request, 
 			data.Preview = preview
 		}
 	}
-	context, hasContext, err := s.scheduleContext(r.Context(), repositories, sched, now)
+	context, hasContext, err := s.scheduleContext(r.Context(), session.Grants.RepositoryReadScope(), repositories, sched, now)
 	if err != nil {
 		internalServerError(w)
 		return scheduleDetailPageData{}, false
@@ -486,13 +496,17 @@ func (s *Server) handleScheduleRuleAdd(w http.ResponseWriter, r *http.Request) {
 	if !s.requireScheduleStore(w) {
 		return
 	}
-	session, ok := s.requireScheduleManagerForm(w, r)
+	session, ok := s.requireActionForm(w, r)
 	if !ok {
 		return
 	}
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil || id <= 0 {
 		s.renderErrorPage(w, http.StatusNotFound, false)
+		return
+	}
+	sched, authorized := s.authorizeSchedule(w, r, session, id)
+	if !authorized {
 		return
 	}
 	form := scheduleRuleFormStateFromRequest(r)
@@ -506,15 +520,6 @@ func (s *Server) handleScheduleRuleAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !schedule.IsValidationError(err) {
-		internalServerError(w)
-		return
-	}
-	sched, getErr := s.cfg.ScheduleStore.Get(r.Context(), id)
-	if errors.Is(getErr, schedule.ErrNotFound) {
-		s.renderErrorPage(w, http.StatusNotFound, false)
-		return
-	}
-	if getErr != nil {
 		internalServerError(w)
 		return
 	}
@@ -532,13 +537,16 @@ func (s *Server) handleScheduleRuleDelete(w http.ResponseWriter, r *http.Request
 	if !s.requireScheduleStore(w) {
 		return
 	}
-	session, ok := s.requireScheduleManagerForm(w, r)
+	session, ok := s.requireActionForm(w, r)
 	if !ok {
 		return
 	}
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil || id <= 0 {
 		s.renderErrorPage(w, http.StatusNotFound, false)
+		return
+	}
+	if _, authorized := s.authorizeSchedule(w, r, session, id); !authorized {
 		return
 	}
 	ruleID, err := strconv.ParseInt(r.PathValue("ruleID"), 10, 64)
@@ -561,13 +569,16 @@ func (s *Server) handleScheduleDelete(w http.ResponseWriter, r *http.Request) {
 	if !s.requireScheduleStore(w) {
 		return
 	}
-	session, ok := s.requireScheduleManagerForm(w, r)
+	session, ok := s.requireActionForm(w, r)
 	if !ok {
 		return
 	}
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil || id <= 0 {
 		s.renderErrorPage(w, http.StatusNotFound, false)
+		return
+	}
+	if _, authorized := s.authorizeSchedule(w, r, session, id); !authorized {
 		return
 	}
 	if _, err := s.cfg.ScheduleStore.Delete(r.Context(), id, session.auditActor()); err != nil {
@@ -599,13 +610,16 @@ func (s *Server) handleSchedulePause(w http.ResponseWriter, r *http.Request) {
 // validation error here only means a double submit (already active/paused),
 // so it redirects back to the detail page without a notice.
 func (s *Server) handleScheduleActivation(w http.ResponseWriter, r *http.Request, transition func(context.Context, int64, domain.Actor) (domain.Schedule, error), notice string) {
-	session, ok := s.requireScheduleManagerForm(w, r)
+	session, ok := s.requireActionForm(w, r)
 	if !ok {
 		return
 	}
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil || id <= 0 {
 		s.renderErrorPage(w, http.StatusNotFound, false)
+		return
+	}
+	if _, authorized := s.authorizeSchedule(w, r, session, id); !authorized {
 		return
 	}
 	if _, err := transition(r.Context(), id, session.auditActor()); err != nil {
@@ -621,6 +635,23 @@ func (s *Server) handleScheduleActivation(w http.ResponseWriter, r *http.Request
 		return
 	}
 	http.Redirect(w, r, fmt.Sprintf("%s/%d?notice=%s", schedulesBasePath, id, notice), http.StatusSeeOther)
+}
+
+func (s *Server) authorizeSchedule(w http.ResponseWriter, r *http.Request, session sessionState, id int64) (domain.Schedule, bool) {
+	sched, err := s.cfg.ScheduleStore.GetForScope(r.Context(), session.Grants.RepositoryReadScope(), id)
+	if errors.Is(err, schedule.ErrNotFound) {
+		s.renderErrorPage(w, http.StatusNotFound, false)
+		return domain.Schedule{}, false
+	}
+	if err != nil {
+		internalServerError(w)
+		return domain.Schedule{}, false
+	}
+	if !session.Grants.CanFreezeRepository(sched.RepositoryID) {
+		s.renderErrorPage(w, http.StatusForbidden, false)
+		return domain.Schedule{}, false
+	}
+	return sched, true
 }
 
 // scheduleRuleFormState mirrors the add-rules form so a validation error

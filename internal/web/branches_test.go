@@ -35,8 +35,7 @@ func TestRepositoriesPageShowsManagedBranches(t *testing.T) {
 	store := newBranchTestRepositoryStore(domain.EnforcementSetupIncomplete)
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: store})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+	recorder := getPageWithRoles(t, server, "/repositories", auth.RoleSet{auth.RoleAdmin})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
@@ -60,8 +59,7 @@ func TestRepositoriesPageLocksBranchEditingWhileEnforcementActive(t *testing.T) 
 	store := newBranchTestRepositoryStore(domain.EnforcementActive)
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: store})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+	recorder := getPageWithRoles(t, server, "/repositories", auth.RoleSet{auth.RoleAdmin})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
@@ -166,12 +164,8 @@ func TestBranchMutationsForbiddenForNonAdminRoles(t *testing.T) {
 	ctx := context.Background()
 	database := newWebTestDB(t, ctx)
 	authService := auth.NewService(database)
-	if _, err := authService.CreateFirstAdmin(ctx, auth.CreateFirstAdminParams{Email: "admin@example.test", DisplayName: "Admin", Password: "correct horse battery staple"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := authService.CreateUser(ctx, auth.CreateUserParams{Email: "freezer@example.test", DisplayName: "Freezer", Password: "correct horse battery staple", Roles: []auth.Role{auth.RoleFreezer}}); err != nil {
-		t.Fatal(err)
-	}
+	mustSetupWebAdmin(t, ctx, authService)
+	mustCreateWebUser(t, ctx, authService, "freezer@example.test", nil)
 	freezerSession, err := authService.Login(ctx, auth.LoginParams{Email: "freezer@example.test", Password: "correct horse battery staple"})
 	if err != nil {
 		t.Fatal(err)
@@ -250,8 +244,7 @@ func TestFreezeFormsUseManagedBranchOptions(t *testing.T) {
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: store, FreezeStore: &fakeFreezeStore{}, ScheduledFreezeStore: &fakeFreezeStore{}})
 
 	for _, path := range []string{"/freezes", "/scheduled-freezes"} {
-		recorder := httptest.NewRecorder()
-		server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		recorder := getPageWithRoles(t, server, path, auth.RoleSet{auth.RoleFreezer})
 		if recorder.Code != http.StatusOK {
 			t.Fatalf("expected status 200 for %s, got %d", path, recorder.Code)
 		}

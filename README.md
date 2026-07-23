@@ -45,7 +45,7 @@ Each repository has an explicit list of managed branches: the exact branch names
 
 Thawguard freezes branches on a schedule in two ways: one-time scheduled freezes and named recurring schedules. Recurring schedules freeze an exact managed branch repeatedly on weekly rules or manually entered dated windows, with an explicit persisted IANA timezone, defined daylight-saving behavior, optional reasons, and truthful scheduler attribution in forge status descriptions. Coverage is additive: a branch is frozen while any manual freeze, one-time schedule, or recurring schedule covers the current moment. See [`docs/scheduled-freezes.md`](docs/scheduled-freezes.md) for the full contract.
 
-One-time scheduled freezes are pending windows for an exact repository and managed branch. Admins and Freezers can edit a pending schedule's reason, future start time, and optional planned unfreeze; repository and branch remain immutable. Clearing the planned-unfreeze field removes it.
+One-time scheduled freezes are pending windows for an exact repository and managed branch. A Freezer for that repository can edit a pending schedule's reason, future start time, and optional planned unfreeze; repository and branch remain immutable. Clearing the planned-unfreeze field removes it.
 
 **Start Now** activates a still-pending future schedule immediately when repository enforcement is active. It preserves any future planned unfreeze, synchronizes current open pull requests, evaluates shared heads across the repository, and publishes real `thawguard/freeze` statuses through the same durable convergence path as automatic due activation. A post-commit failure leaves the schedule active, marks enforcement unhealthy, and retains one bounded-backoff reconciliation job for current-state recovery.
 
@@ -89,7 +89,7 @@ The local signed webhook receiver is `POST /webhooks/forgejo`. It verifies confi
 Current local pages:
 
 - `/` dashboard
-- `/setup` first local admin setup when no users exist; the first account starts with all MVP roles for local bootstrap
+- `/setup` first local admin setup when no users exist; the first account starts as Admin with no implicit Freeze or Thaw action grants
 - `/login` and `/logout` local user session flow
 - `/repositories` repository setup form, enforcement state, managed branch scope, and read-only readiness evidence
 - `/freezes` immediate branch-freeze form and active list, with an optional planned unfreeze time (requires an enforcement-active repository)
@@ -98,9 +98,9 @@ Current local pages:
 - `/activity` primary chronological audit history for recent operator and system changes, with actor, action, affected target, outcome, timestamp, and curated sanitized details
 - `/webhooks` secondary webhook delivery diagnostics with filters, verification state, and sanitized local processing outcomes
 - `/publications` secondary status-publication diagnostics for latest desired statuses and recent posted or failed attempts
-- `/users` admin-only local user and multi-role management
+- `/users` admin-only Users & Access directory; `/users/{id}` manages account state, global Admin access, and per-repository Viewer, Freezer, and Thaw-approver grants
 
-Local users can hold one or more explicit role flags. Admin configures repositories/users/secrets, freezer performs freeze actions, thaw approver approves PR exceptions, and viewer is read-only. Admin or Freezer may edit a pending one-time schedule, use Start Now, or manage recurring schedules; Admin still does not implicitly receive general freeze, cancellation, or thaw capability. If you bind beyond loopback after first-admin setup, keep Thawguard behind the network controls appropriate for your trusted team.
+Admin is global installation management and can view every repository. Viewer, Freezer, and Thaw approver are granted per repository; any scoped grant permits reading that repository, while Freezer and Thaw approver permit only their matching actions. Admin does not imply either action role, including scheduled-freeze editing or Start Now. New local users begin active but with zero repository access and must replace their temporary password at first sign-in. If you bind beyond loopback after first-admin setup, keep Thawguard behind the network controls appropriate for your trusted team.
 
 Activity and diagnostic pages render allowlisted, sanitized metadata only. They never display raw webhook payloads, request signatures or headers, secrets, tokens, passwords or hashes, raw forge response bodies, or session IDs. Activity retention, deep-history pagination, export, and deletion remain deferred.
 

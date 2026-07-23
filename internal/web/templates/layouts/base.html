@@ -31,7 +31,7 @@
         {{ template "shell/nav-item" dict "Href" "/webhooks" "Icon" "tg-i-health-check" "Label" "Webhook Log" "Key" "webhooks" "Active" .ActivePage }}
         {{ if .CurrentUser.IsAdmin }}
         <p class="shell-nav-group-title">Admin</p>
-        {{ template "shell/nav-item" dict "Href" "/users" "Icon" "tg-i-users" "Label" "Users & Roles" "Key" "users" "Active" .ActivePage }}
+        {{ template "shell/nav-item" dict "Href" "/users" "Icon" "tg-i-users" "Label" "Users & Access" "Key" "users" "Active" .ActivePage }}
         {{ end }}
 {{ end }}
 

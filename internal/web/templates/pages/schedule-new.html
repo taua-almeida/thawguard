@@ -18,9 +18,9 @@
   <section class="grid grid-cols-1 items-start gap-4 lg:grid-cols-[minmax(0,1fr)_22rem]" aria-label="Create a recurring schedule and how schedules work">
     <section class="rounded-panel border border-border bg-surface p-(--card-spacing) shadow-card">
       <h2 class="m-0 text-lg font-bold text-text">Schedule details</h2>
-      {{ if not (or .CurrentUser.CanManageRepositories .CurrentUser.CanFreeze) }}
+      {{ if not .CurrentUser.CanFreeze }}
       <div class="mt-4">
-        {{ template "ui/callout" dict "Tone" "warning" "Title" "Read-only schedule access" "Body" "Your role can view recurring schedules. A freezer or repository-manager role is required to create or delete them." }}
+        {{ template "ui/callout" dict "Tone" "warning" "Title" "Read-only schedule access" "Body" "Your role can view recurring schedules. A Freezer grant on a repository is required to create or manage them." }}
       </div>
       {{ else if .EnforceableRepositories }}
       <form method="post" action="/scheduled-freezes/schedules/new" class="mt-4 flex flex-col gap-4">

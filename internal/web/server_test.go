@@ -29,6 +29,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/freeze"
 	"github.com/taua-almeida/thawguard/internal/pullrequest"
 	"github.com/taua-almeida/thawguard/internal/repository"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 	"github.com/taua-almeida/thawguard/internal/repositorysetup"
 	"github.com/taua-almeida/thawguard/internal/secrets"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
@@ -40,8 +41,7 @@ import (
 
 func TestRepositoriesPageShowsManualSetupContext(t *testing.T) {
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{{Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", HasWebhookSecret: true, HasStatusToken: true}}}, RepositorySecretEncryptionConfigured: true})
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+	recorder := getPageWithRoles(t, server, "/repositories", auth.RoleSet{auth.RoleAdmin})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
@@ -324,6 +324,7 @@ func TestUsersPageCreatesUsersAndViewerCannotManageRepositories(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner := &fakeSetupCheckRunner{}
+	mustInsertWebRepositoryID(t, ctx, database, 1, "thawguard")
 	repositoryStore := &fakeRepositoryStore{repositories: []domain.Repository{{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main"}}}
 	server := NewServer(Config{AppName: "Thawguard", AuthService: authService, RepositoryStore: repositoryStore, SetupCheckRunner: runner})
 	adminCookie := &http.Cookie{Name: sessionCookieName, Value: adminSession.ID}
@@ -332,12 +333,12 @@ func TestUsersPageCreatesUsersAndViewerCannotManageRepositories(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/users", nil)
 	request.AddCookie(adminCookie)
 	server.Routes().ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "Users &amp; Roles") {
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "Users &amp; Access") {
 		t.Fatalf("expected users page for admin, status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
 	csrfToken := csrfTokenFromBody(t, recorder.Body.String())
 
-	form := url.Values{"email": {"viewer@example.test"}, "display_name": {"Viewer"}, "password": {"correct horse battery staple"}, "roles": {string(auth.RoleViewer)}, csrfFormField: {csrfToken}}
+	form := url.Values{"email": {"viewer@example.test"}, "display_name": {"Viewer"}, "temporary_password": {"temporary local password"}, csrfFormField: {csrfToken}}
 	recorder = httptest.NewRecorder()
 	request = httptest.NewRequest(http.MethodPost, "/users", strings.NewReader(form.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -345,6 +346,17 @@ func TestUsersPageCreatesUsersAndViewerCannotManageRepositories(t *testing.T) {
 	server.Routes().ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusSeeOther {
 		t.Fatalf("expected user create redirect, got %d body=%q", recorder.Code, recorder.Body.String())
+	}
+	users, err := authService.ListUsers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	viewer := users[len(users)-1]
+	if _, err := authService.ChangePassword(ctx, auth.ChangePasswordParams{UserID: viewer.ID, CurrentPassword: "temporary local password", NewPassword: "correct horse battery staple"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := authService.SetUserRepositoryRoles(ctx, auth.SetUserRepositoryRolesParams{ActorUserID: adminSession.User.ID, UserID: viewer.ID, RepositoryID: 1, Roles: []auth.Role{auth.RoleViewer}}); err != nil {
+		t.Fatal(err)
 	}
 
 	viewerSession, err := authService.Login(ctx, auth.LoginParams{Email: "viewer@example.test", Password: "correct horse battery staple"})
@@ -356,7 +368,7 @@ func TestUsersPageCreatesUsersAndViewerCannotManageRepositories(t *testing.T) {
 	request = httptest.NewRequest(http.MethodGet, "/repositories", nil)
 	request.AddCookie(viewerCookie)
 	server.Routes().ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusOK || strings.Contains(recorder.Body.String(), "Users &amp; Roles") {
+	if recorder.Code != http.StatusOK || strings.Contains(recorder.Body.String(), "Users &amp; Access") {
 		t.Fatalf("expected viewer to read repositories without admin nav, status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
 	if strings.Contains(recorder.Body.String(), "Run readiness checks") {
@@ -390,14 +402,13 @@ func TestAdminRoleDoesNotImplyFreezeOrThawActions(t *testing.T) {
 	if _, err := authService.CreateFirstAdmin(ctx, auth.CreateFirstAdminParams{Email: "admin@example.test", DisplayName: "Admin", Password: "correct horse battery staple"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := authService.CreateUser(ctx, auth.CreateUserParams{Email: "admin-only@example.test", DisplayName: "Admin only", Password: "correct horse battery staple", Roles: []auth.Role{auth.RoleAdmin}}); err != nil {
-		t.Fatal(err)
-	}
+	mustCreateWebUser(t, ctx, authService, "admin-only@example.test", []auth.Role{auth.RoleAdmin})
 	adminOnlySession, err := authService.Login(ctx, auth.LoginParams{Email: "admin-only@example.test", Password: "correct horse battery staple"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewServer(Config{AppName: "Thawguard", AuthService: authService, FreezeStore: &fakeFreezeStore{}, StatusDecisionStore: &fakeStatusDecisionStore{}})
+	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
+	server := NewServer(Config{AppName: "Thawguard", AuthService: authService, RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, FreezeStore: &fakeFreezeStore{}, StatusDecisionStore: &fakeStatusDecisionStore{}})
 	adminOnlyCookie := &http.Cookie{Name: sessionCookieName, Value: adminOnlySession.ID}
 
 	form := url.Values{"repository_id": {"1"}, "branch": {"main"}, "reason": {"release"}, csrfFormField: {adminOnlySession.CSRFToken}}
@@ -421,11 +432,60 @@ func TestAdminRoleDoesNotImplyFreezeOrThawActions(t *testing.T) {
 	}
 }
 
+func TestFreezeCreationAuthorizesRepositoryBeforeParsingActionFields(t *testing.T) {
+	repositories := []domain.Repository{
+		{ID: 1, Owner: "taua-almeida", Name: "visible", DefaultBranch: "main", EnforcementState: domain.EnforcementActive},
+		{ID: 2, Owner: "taua-almeida", Name: "hidden", DefaultBranch: "main", EnforcementState: domain.EnforcementActive},
+	}
+	for _, endpoint := range []string{"/freezes", "/scheduled-freezes"} {
+		for _, test := range []struct {
+			name       string
+			grants     auth.Grants
+			target     string
+			wantStatus int
+		}{
+			{name: "visible repository without Freezer", grants: auth.NewGrants(nil, map[int64]auth.RoleSet{1: {auth.RoleViewer}}), target: "1", wantStatus: http.StatusForbidden},
+			{name: "hidden repository", grants: auth.NewGrants(nil, map[int64]auth.RoleSet{1: {auth.RoleFreezer}}), target: "2", wantStatus: http.StatusNotFound},
+		} {
+			t.Run(strings.TrimPrefix(endpoint, "/")+"/"+test.name, func(t *testing.T) {
+				store := &fakeFreezeStore{}
+				server := NewServer(Config{
+					AppName:              "Thawguard",
+					RepositoryStore:      &fakeRepositoryStore{repositories: repositories},
+					FreezeStore:          store,
+					ScheduledFreezeStore: store,
+				})
+				session := setWebSessionGrants(t, server, test.grants)
+				form := url.Values{
+					"repository_id":           {test.target},
+					"branch":                  {"main"},
+					"reason":                  {"must not be parsed first"},
+					"starts_at":               {"not-a-time"},
+					"planned_ends_at":         {"not-a-time"},
+					"timezone_offset_minutes": {"not-an-offset"},
+					csrfFormField:             {session.CSRFToken},
+				}
+				recorder := httptest.NewRecorder()
+				request := httptest.NewRequest(http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+				request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.ID})
+				server.Routes().ServeHTTP(recorder, request)
+
+				if recorder.Code != test.wantStatus {
+					t.Fatalf("expected status %d before field validation, got %d body=%q", test.wantStatus, recorder.Code, recorder.Body.String())
+				}
+				if len(store.created) != 0 || len(store.scheduledCreated) != 0 {
+					t.Fatalf("unauthorized request reached a mutation: active=%d scheduled=%d", len(store.created), len(store.scheduledCreated))
+				}
+			})
+		}
+	}
+}
+
 func TestRepositoriesPageKeepsConfiguredCredentialsHiddenByDefault(t *testing.T) {
 	repo := domain.Repository{ID: 7, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", HasWebhookSecret: true, HasStatusToken: true}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, RepositorySecretEncryptionConfigured: true})
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+	recorder := getPageWithRoles(t, server, "/repositories", auth.RoleSet{auth.RoleAdmin})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
@@ -452,8 +512,7 @@ func TestRepositoriesPageKeepsConfiguredCredentialsHiddenByDefault(t *testing.T)
 
 func TestRepositoriesPageShowsSetTokenActionWithoutStoredToken(t *testing.T) {
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{{Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", HasWebhookSecret: true}}}, RepositorySecretEncryptionConfigured: true})
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+	recorder := getPageWithRoles(t, server, "/repositories", auth.RoleSet{auth.RoleAdmin})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
@@ -468,8 +527,7 @@ func TestRepositoriesPageShowsSetTokenActionWithoutStoredToken(t *testing.T) {
 
 func TestRepositoriesPageDisablesWebhookSecretFormWithoutEncryptionKey(t *testing.T) {
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{{Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main"}}}})
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+	recorder := getPageWithRoles(t, server, "/repositories", auth.RoleSet{auth.RoleAdmin})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
@@ -482,6 +540,29 @@ func TestRepositoriesPageDisablesWebhookSecretFormWithoutEncryptionKey(t *testin
 	}
 	if strings.Contains(body, "Set secret") || strings.Contains(body, "Rotate secret") || strings.Contains(body, `name="webhook_secret"`) || strings.Contains(body, "Set token") || strings.Contains(body, "Rotate token") || strings.Contains(body, `name="status_token"`) {
 		t.Fatalf("expected secret/token forms to be hidden, got %q", body)
+	}
+}
+
+func TestRepositoriesPageShowsScopeSafeZeroAccessState(t *testing.T) {
+	hidden := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "hidden", Forge: "forgejo", DefaultBranch: "main"}
+	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{hidden}}})
+	for _, path := range []string{"/repositories", "/repositories?state=active&q=hidden"} {
+		recorder := getPageWithRoles(t, server, path, nil)
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("%s: expected zero-access repositories page status 200, got %d", path, recorder.Code)
+		}
+		body := recorder.Body.String()
+		for _, want := range []string{"No repository access is assigned to this account", "No repository access assigned", "Repositories outside your access are not listed"} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("%s: expected zero-access page to contain %q, got %q", path, want, body)
+			}
+		}
+		for _, leaked := range []string{"taua-almeida/hidden", "No repositories configured yet", "No repositories match this filter", "Your repository access permits"} {
+			if strings.Contains(body, leaked) {
+				t.Fatalf("%s: zero-access repositories page leaked or misstated %q", path, leaked)
+			}
+		}
 	}
 }
 
@@ -763,8 +844,7 @@ func TestRepositoriesPageShowsSetupHealthResults(t *testing.T) {
 		}},
 	})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+	recorder := getPageWithRoles(t, server, "/repositories", auth.RoleSet{auth.RoleAdmin})
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
 	}
@@ -789,8 +869,7 @@ func TestRepositoriesPageKeepsHistoricalPlaceholderChecksReadable(t *testing.T) 
 			repo.ID: {{RepositoryID: repo.ID, Branch: "main", Result: setupcheck.Result{Name: "Bot status permission not verified locally", Status: setupcheck.StatusWarning, Description: "Historical placeholder evidence."}, CheckedAt: checkedAt}},
 		}},
 	})
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+	recorder := getPageWithRoles(t, server, "/repositories", auth.RoleSet{auth.RoleAdmin})
 	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "Historical placeholder evidence") {
 		t.Fatalf("expected historical checks to remain readable, status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
@@ -928,8 +1007,7 @@ func TestFreezesPageShowsRepositoriesAndActiveFreezes(t *testing.T) {
 		FreezeStore:     &fakeFreezeStore{freezes: []domain.BranchFreeze{activeFreeze, manualFreeze}},
 	})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/freezes", nil))
+	recorder := getPageWithRoles(t, server, "/freezes", auth.RoleSet{auth.RoleFreezer})
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
 	}
@@ -1032,7 +1110,7 @@ func TestFreezeImpactFragmentListsOpenPullRequestsWithOverflow(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/freezes/impact?repository_id=1&branch=main", nil)
 	request.Header.Set("HX-Request", "true")
-	server.Routes().ServeHTTP(recorder, request)
+	serveRequestWithRoles(t, server, recorder, request, auth.RoleSet{auth.RoleFreezer})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
@@ -1069,7 +1147,7 @@ func TestFreezeImpactFragmentRendersZeroStateForUnknownBranch(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/freezes/impact?repository_id=1&branch=ghost", nil)
 	request.Header.Set("HX-Request", "true")
-	server.Routes().ServeHTTP(recorder, request)
+	serveRequestWithRoles(t, server, recorder, request, auth.RoleSet{auth.RoleFreezer})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
@@ -1083,11 +1161,53 @@ func TestFreezeImpactFragmentRendersZeroStateForUnknownBranch(t *testing.T) {
 	}
 }
 
+func TestFreezeImpactAuthorizesExplicitRepositoryBeforePreview(t *testing.T) {
+	repositories := []domain.Repository{
+		{ID: 1, Owner: "taua-almeida", Name: "visible", DefaultBranch: "main", EnforcementState: domain.EnforcementActive},
+		{ID: 2, Owner: "taua-almeida", Name: "hidden", DefaultBranch: "main", EnforcementState: domain.EnforcementActive},
+	}
+	for _, test := range []struct {
+		name       string
+		grants     auth.Grants
+		target     string
+		wantStatus int
+	}{
+		{name: "visible repository without Freezer", grants: auth.NewGrants(nil, map[int64]auth.RoleSet{1: {auth.RoleViewer}}), target: "1", wantStatus: http.StatusForbidden},
+		{name: "hidden repository", grants: auth.NewGrants(nil, map[int64]auth.RoleSet{1: {auth.RoleFreezer}}), target: "2", wantStatus: http.StatusNotFound},
+		{name: "nonexistent repository", grants: auth.NewGrants(nil, map[int64]auth.RoleSet{1: {auth.RoleFreezer}}), target: "99", wantStatus: http.StatusNotFound},
+		{name: "malformed repository", grants: auth.NewGrants(nil, map[int64]auth.RoleSet{1: {auth.RoleFreezer}}), target: "abc", wantStatus: http.StatusNotFound},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for _, htmx := range []bool{false, true} {
+				server := NewServer(Config{
+					AppName:          "Thawguard",
+					RepositoryStore:  &fakeRepositoryStore{repositories: repositories},
+					PullRequestStore: &fakePullRequestStore{pullRequests: []domain.PullRequest{{RepositoryID: 1, Index: 200, State: "open", TargetBranch: "main", Title: "must not be substituted"}}},
+				})
+				session := setWebSessionGrants(t, server, test.grants)
+				recorder := httptest.NewRecorder()
+				request := httptest.NewRequest(http.MethodGet, "/freezes/impact?repository_id="+test.target+"&branch=main", nil)
+				if htmx {
+					request.Header.Set("HX-Request", "true")
+				}
+				request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.ID})
+				server.Routes().ServeHTTP(recorder, request)
+
+				if recorder.Code != test.wantStatus {
+					t.Fatalf("htmx=%v: expected status %d, got %d body=%q", htmx, test.wantStatus, recorder.Code, recorder.Body.String())
+				}
+				if strings.Contains(recorder.Body.String(), "must not be substituted") {
+					t.Fatalf("htmx=%v: explicit target failure rendered an unrelated repository preview: %q", htmx, recorder.Body.String())
+				}
+			}
+		})
+	}
+}
+
 func TestFreezeImpactRedirectsNonHXRequestsToFreezes(t *testing.T) {
 	server := newFreezeImpactTestServer(nil)
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/freezes/impact?repository_id=1&branch=main", nil))
+	recorder := getPageWithRoles(t, server, "/freezes/impact?repository_id=1&branch=main", auth.RoleSet{auth.RoleFreezer})
 
 	if recorder.Code != http.StatusSeeOther {
 		t.Fatalf("expected status 303, got %d", recorder.Code)
@@ -1107,8 +1227,7 @@ func TestRepositoriesPageShowsEnforcementState(t *testing.T) {
 		RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}},
 	})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+	recorder := getPageWithRoles(t, server, "/repositories", auth.RoleSet{auth.RoleAdmin})
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
 	}
@@ -1140,8 +1259,7 @@ func newRepositoriesFindabilityServer() *Server {
 func TestRepositoriesPageOrdersByAttentionAndShowsFilters(t *testing.T) {
 	server := newRepositoriesFindabilityServer()
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+	recorder := getPageWithRoles(t, server, "/repositories", auth.RoleSet{auth.RoleAdmin})
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
 	}
@@ -1179,8 +1297,7 @@ func TestRepositoriesPageOrdersByAttentionAndShowsFilters(t *testing.T) {
 func TestRepositoriesPageCollapsesHealthyRepositoriesToSummaryRows(t *testing.T) {
 	server := newRepositoriesFindabilityServer()
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+	recorder := getPageWithRoles(t, server, "/repositories", auth.RoleSet{auth.RoleAdmin})
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
 	}
@@ -1198,8 +1315,7 @@ func TestRepositoriesPageCollapsesHealthyRepositoriesToSummaryRows(t *testing.T)
 func TestRepositoriesPageFiltersByState(t *testing.T) {
 	server := newRepositoriesFindabilityServer()
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories?state=unhealthy", nil))
+	recorder := getPageWithRoles(t, server, "/repositories?state=unhealthy", auth.RoleSet{auth.RoleAdmin})
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
 	}
@@ -1219,8 +1335,7 @@ func TestRepositoriesPageFiltersByState(t *testing.T) {
 func TestRepositoriesPageIgnoresUnknownStateFilter(t *testing.T) {
 	server := newRepositoriesFindabilityServer()
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories?state=bogus", nil))
+	recorder := getPageWithRoles(t, server, "/repositories?state=bogus", auth.RoleSet{auth.RoleAdmin})
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
 	}
@@ -1238,8 +1353,7 @@ func TestRepositoriesPageIgnoresUnknownStateFilter(t *testing.T) {
 func TestRepositoriesPageFiltersBySearchQuery(t *testing.T) {
 	server := newRepositoriesFindabilityServer()
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories?q=DELTA", nil))
+	recorder := getPageWithRoles(t, server, "/repositories?q=DELTA", auth.RoleSet{auth.RoleAdmin})
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
 	}
@@ -1266,8 +1380,7 @@ func TestRepositoriesPageFiltersBySearchQuery(t *testing.T) {
 func TestRepositoriesPageShowsFilteredEmptyState(t *testing.T) {
 	server := newRepositoriesFindabilityServer()
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories?q=no-such-repository", nil))
+	recorder := getPageWithRoles(t, server, "/repositories?q=no-such-repository", auth.RoleSet{auth.RoleAdmin})
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
 	}
@@ -1298,8 +1411,7 @@ func TestMutationPagesShowSetupRequiredWithoutEnforceableRepositories(t *testing
 		"/scheduled-freezes": {`<form method="post" action="/scheduled-freezes" `, "Repository enforcement is not active"},
 		"/decisions":         {`<form method="post" action="/decisions" `, "Repository enforcement is not active"},
 	} {
-		recorder := httptest.NewRecorder()
-		server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		recorder := getPageWithRoles(t, server, path, auth.RoleSet{auth.RoleFreezer, auth.RoleThawApprover})
 		if recorder.Code != http.StatusOK {
 			t.Fatalf("%s: expected status 200, got %d", path, recorder.Code)
 		}
@@ -1324,8 +1436,7 @@ func TestFreezesPageHidesNonFreezeAuditEvents(t *testing.T) {
 		}},
 	})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/freezes", nil))
+	recorder := getPageWithRoles(t, server, "/freezes", auth.RoleSet{auth.RoleFreezer})
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
 	}
@@ -1345,8 +1456,7 @@ func TestFreezesPageDoesNotDependOnOrPresentAuditHistory(t *testing.T) {
 		AuditStore:  &fakeAuditStore{err: errors.New("audit unavailable")},
 	})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/freezes", nil))
+	recorder := getPageWithRoles(t, server, "/freezes", auth.RoleSet{auth.RoleFreezer})
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
 	}
@@ -1370,8 +1480,7 @@ func TestFreezesPageDoesNotRenderRawAuditJSON(t *testing.T) {
 		}},
 	})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/freezes", nil))
+	recorder := getPageWithRoles(t, server, "/freezes", auth.RoleSet{auth.RoleFreezer})
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
 	}
@@ -1692,7 +1801,10 @@ func TestCancelFreezeRejectsInvalidCSRFToken(t *testing.T) {
 
 func TestEndFreezeShowsValidationError(t *testing.T) {
 	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
-	store := &fakeFreezeStore{err: freeze.ValidationError{Message: "freeze is not active"}}
+	store := &fakeFreezeStore{
+		freezes: []domain.BranchFreeze{{ID: 9, RepositoryID: repo.ID, Branch: "main", Status: domain.BranchFreezeStatusActive, Active: true}},
+		err:     freeze.ValidationError{Message: "freeze is not active"},
+	}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, FreezeStore: store})
 	form := freezeCloseForm(9)
 	cookie, csrfToken := getFreezeForm(t, server)
@@ -1714,7 +1826,10 @@ func TestEndFreezeShowsValidationError(t *testing.T) {
 
 func TestEndFreezeHidesInternalErrorDetails(t *testing.T) {
 	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", Forge: "forgejo", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
-	store := &fakeFreezeStore{err: errors.New("database failed with secret-token")}
+	store := &fakeFreezeStore{
+		freezes: []domain.BranchFreeze{{ID: 9, RepositoryID: repo.ID, Branch: "main", Status: domain.BranchFreezeStatusActive, Active: true}},
+		err:     errors.New("database failed with secret-token"),
+	}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, FreezeStore: store})
 	form := freezeCloseForm(9)
 	cookie, csrfToken := getFreezeForm(t, server)
@@ -1745,8 +1860,7 @@ func TestScheduledFreezesPageShowsFormAndWindows(t *testing.T) {
 	}}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, ScheduledFreezeStore: store})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/scheduled-freezes", nil))
+	recorder := getPageWithRoles(t, server, "/scheduled-freezes", auth.RoleSet{auth.RoleFreezer})
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
 	}
@@ -1777,7 +1891,7 @@ func TestScheduledFreezeActionsRespectRepositoryEnforcementAndRoles(t *testing.T
 		wantStart         bool
 		wantBlockedReason bool
 	}{
-		{name: "admin", roles: auth.RoleSet{auth.RoleAdmin}, enforcement: domain.EnforcementActive, wantEdit: true, wantStart: true},
+		{name: "admin", roles: auth.RoleSet{auth.RoleAdmin}, enforcement: domain.EnforcementActive},
 		{name: "freezer", roles: auth.RoleSet{auth.RoleFreezer}, enforcement: domain.EnforcementActive, wantEdit: true, wantStart: true},
 		{name: "viewer", roles: auth.RoleSet{auth.RoleViewer}, enforcement: domain.EnforcementActive},
 		{name: "unhealthy", roles: auth.RoleSet{auth.RoleFreezer}, enforcement: domain.EnforcementUnhealthy, wantEdit: true, wantBlockedReason: true},
@@ -1805,19 +1919,20 @@ func TestScheduledFreezeActionsRespectRepositoryEnforcementAndRoles(t *testing.T
 	}
 }
 
-func TestEditAndStartNowAllowAdminOrFreezerButRejectViewer(t *testing.T) {
+func TestEditAndStartNowRequireRepositoryFreezer(t *testing.T) {
 	for _, test := range []struct {
 		name    string
 		roles   auth.RoleSet
 		allowed bool
 	}{
-		{name: "admin", roles: auth.RoleSet{auth.RoleAdmin}, allowed: true},
+		{name: "admin", roles: auth.RoleSet{auth.RoleAdmin}},
 		{name: "freezer", roles: auth.RoleSet{auth.RoleFreezer}, allowed: true},
 		{name: "viewer", roles: auth.RoleSet{auth.RoleViewer}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
-			store := &fakeFreezeStore{}
+			startsAt := time.Now().UTC().Add(2 * time.Hour)
+			store := &fakeFreezeStore{scheduled: []domain.BranchFreeze{{ID: 9, RepositoryID: repo.ID, Branch: "main", Status: domain.BranchFreezeStatusScheduled, Scheduled: true, StartsAt: &startsAt}}}
 			server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, ScheduledFreezeStore: store})
 			session := setWebSessionRoles(t, server, test.roles)
 			cookie := &http.Cookie{Name: sessionCookieName, Value: session.ID}
@@ -1841,7 +1956,8 @@ func TestEditAndStartNowAllowAdminOrFreezerButRejectViewer(t *testing.T) {
 
 func TestEditScheduledFreezeUsesBrowserTimezoneClearsPlannedEndAndIgnoresTamperedTarget(t *testing.T) {
 	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
-	store := &fakeFreezeStore{}
+	startsAt := time.Now().UTC().Add(2 * time.Hour)
+	store := &fakeFreezeStore{scheduled: []domain.BranchFreeze{{ID: 9, RepositoryID: repo.ID, Branch: "main", Status: domain.BranchFreezeStatusScheduled, Scheduled: true, StartsAt: &startsAt}}}
 	server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, ScheduledFreezeStore: store})
 	form := scheduledFreezeEditForm(9)
 	form.Set("starts_at", "2099-07-08T16:50")
@@ -1912,7 +2028,11 @@ func TestScheduledFreezeEditAndStartNowRejectMissingCSRF(t *testing.T) {
 func TestScheduledFreezeEditAndStartNowHideInternalErrors(t *testing.T) {
 	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	for _, path := range []string{"/scheduled-freezes/edit", "/scheduled-freezes/start-now"} {
-		store := &fakeFreezeStore{err: errors.New("database failed with secret-token")}
+		startsAt := time.Now().UTC().Add(2 * time.Hour)
+		store := &fakeFreezeStore{
+			scheduled: []domain.BranchFreeze{{ID: 9, RepositoryID: repo.ID, Branch: "main", Status: domain.BranchFreezeStatusScheduled, Scheduled: true, StartsAt: &startsAt}},
+			err:       errors.New("database failed with secret-token"),
+		}
 		server := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, ScheduledFreezeStore: store})
 		cookie, csrfToken := getScheduledFreezeForm(t, server)
 		form := scheduledFreezeEditForm(9)
@@ -1998,8 +2118,7 @@ func TestDecisionsPageShowsFormAndRecentResults(t *testing.T) {
 		StatusDecisionStore: &fakeStatusDecisionStore{results: []statusresult.Result{result}},
 	})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/decisions", nil))
+	recorder := getPageWithRoles(t, server, "/decisions", auth.RoleSet{auth.RoleThawApprover})
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
 	}
@@ -2020,8 +2139,7 @@ func TestDecisionsPageShowsFormAndRecentResults(t *testing.T) {
 func TestDecisionsPageRequiresStatusDecisionStore(t *testing.T) {
 	server := NewServer(Config{AppName: "Thawguard"})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/decisions", nil))
+	recorder := getPageWithRoles(t, server, "/decisions", auth.RoleSet{auth.RoleThawApprover})
 
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected service unavailable status, got %d", recorder.Code)
@@ -2051,7 +2169,7 @@ func TestThawEligibilityFragmentShowsFrozenTargetAndCompanions(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/decisions/eligibility?repository_id=1&pull_request_index=241", nil)
 	request.Header.Set("HX-Request", "true")
-	server.Routes().ServeHTTP(recorder, request)
+	serveRequestWithRoles(t, server, recorder, request, auth.RoleSet{auth.RoleThawApprover})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
@@ -2091,7 +2209,7 @@ func TestThawEligibilityFragmentShowsNotFrozenWithoutCompanions(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/decisions/eligibility?repository_id=1&pull_request_index=241", nil)
 	request.Header.Set("HX-Request", "true")
-	server.Routes().ServeHTTP(recorder, request)
+	serveRequestWithRoles(t, server, recorder, request, auth.RoleSet{auth.RoleThawApprover})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
@@ -2116,7 +2234,7 @@ func TestThawEligibilityFragmentShowsCacheMissForUnknownIndex(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/decisions/eligibility?repository_id=1&pull_request_index=977", nil)
 	request.Header.Set("HX-Request", "true")
-	server.Routes().ServeHTTP(recorder, request)
+	serveRequestWithRoles(t, server, recorder, request, auth.RoleSet{auth.RoleThawApprover})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
@@ -2132,17 +2250,33 @@ func TestThawEligibilityFragmentShowsCacheMissForUnknownIndex(t *testing.T) {
 func TestThawEligibilityFragmentPromptsWhenIncomplete(t *testing.T) {
 	server := newThawEligibilityTestServer(nil, nil)
 
-	for _, query := range []string{"", "?repository_id=1", "?pull_request_index=241", "?repository_id=99&pull_request_index=241", "?repository_id=abc&pull_request_index=-3"} {
+	for _, query := range []string{"", "?repository_id=1", "?pull_request_index=241", "?repository_id=abc&pull_request_index=-3"} {
 		recorder := httptest.NewRecorder()
 		request := httptest.NewRequest(http.MethodGet, "/decisions/eligibility"+query, nil)
 		request.Header.Set("HX-Request", "true")
-		server.Routes().ServeHTTP(recorder, request)
+		serveRequestWithRoles(t, server, recorder, request, auth.RoleSet{auth.RoleThawApprover})
 
 		if recorder.Code != http.StatusOK {
 			t.Fatalf("expected status 200 for query %q, got %d", query, recorder.Code)
 		}
 		if body := recorder.Body.String(); !strings.Contains(body, "Pick a repository and enter a pull request number") {
 			t.Fatalf("expected prompt state for query %q, got %q", query, body)
+		}
+	}
+}
+
+func TestThawEligibilityHidesUnknownRepository(t *testing.T) {
+	server := newThawEligibilityTestServer(nil, nil)
+	for _, htmx := range []bool{false, true} {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/decisions/eligibility?repository_id=99&pull_request_index=241", nil)
+		if htmx {
+			request.Header.Set("HX-Request", "true")
+		}
+		serveRequestWithRoles(t, server, recorder, request, auth.RoleSet{auth.RoleThawApprover})
+
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("htmx=%v: expected an unknown repository to return 404, got %d", htmx, recorder.Code)
 		}
 	}
 }
@@ -2162,8 +2296,7 @@ func TestDecisionsTableFiltersAndPaginates(t *testing.T) {
 		StatusDecisionStore: &fakeStatusDecisionStore{results: results},
 	})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/decisions?state=blocked&repo=1&page=2", nil))
+	recorder := getPageWithRoles(t, server, "/decisions?state=blocked&repo=1&page=2", auth.RoleSet{auth.RoleThawApprover})
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
 	}
@@ -2179,8 +2312,7 @@ func TestDecisionsTableFiltersAndPaginates(t *testing.T) {
 		}
 	}
 
-	recorder = httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/decisions?state=blocked&repo=1&page=99", nil))
+	recorder = getPageWithRoles(t, server, "/decisions?state=blocked&repo=1&page=99", auth.RoleSet{auth.RoleThawApprover})
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200 for out-of-range page, got %d", recorder.Code)
 	}
@@ -2191,7 +2323,7 @@ func TestDecisionsTableFiltersAndPaginates(t *testing.T) {
 	recorder = httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/decisions?state=blocked&repo=1&page=2", nil)
 	request.Header.Set("HX-Request", "true")
-	server.Routes().ServeHTTP(recorder, request)
+	serveRequestWithRoles(t, server, recorder, request, auth.RoleSet{auth.RoleThawApprover})
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200 for HX request, got %d", recorder.Code)
 	}
@@ -2207,8 +2339,7 @@ func TestDecisionsTableFiltersAndPaginates(t *testing.T) {
 func TestThawEligibilityRedirectsNonHXRequestsToDecisions(t *testing.T) {
 	server := newThawEligibilityTestServer(nil, nil)
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/decisions/eligibility?repository_id=1&pull_request_index=241", nil))
+	recorder := getPageWithRoles(t, server, "/decisions/eligibility?repository_id=1&pull_request_index=241", auth.RoleSet{auth.RoleThawApprover})
 
 	if recorder.Code != http.StatusSeeOther {
 		t.Fatalf("expected status 303, got %d", recorder.Code)
@@ -2507,8 +2638,7 @@ func TestPublicationsPageShowsRecentPublicationIntents(t *testing.T) {
 		StatusPublicationStore: &fakeStatusPublicationStore{publications: []statuspublication.Publication{publication}, attempts: []statuspublication.Attempt{attempt}},
 	})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/publications", nil))
+	recorder := getPageWithRoles(t, server, "/publications", auth.RoleSet{auth.RoleViewer})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
@@ -2536,8 +2666,7 @@ func TestPublicationsPageShowsEmptyStatesPerTable(t *testing.T) {
 		StatusPublicationStore: &fakeStatusPublicationStore{},
 	})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/publications", nil))
+	recorder := getPageWithRoles(t, server, "/publications", auth.RoleSet{auth.RoleViewer})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
@@ -2563,8 +2692,7 @@ func TestPublicationsPageShowsAttemptsEmptyStateAlone(t *testing.T) {
 		StatusPublicationStore: &fakeStatusPublicationStore{publications: []statuspublication.Publication{publication}},
 	})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/publications", nil))
+	recorder := getPageWithRoles(t, server, "/publications", auth.RoleSet{auth.RoleViewer})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
@@ -2583,8 +2711,7 @@ func TestPublicationsPageShowsAttemptsEmptyStateAlone(t *testing.T) {
 func TestPublicationsPageRequiresStatusPublicationStore(t *testing.T) {
 	server := NewServer(Config{AppName: "Thawguard"})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/publications", nil))
+	recorder := getPageWithRoles(t, server, "/publications", auth.RoleSet{auth.RoleViewer})
 
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected service unavailable status, got %d", recorder.Code)
@@ -2615,8 +2742,7 @@ func TestPublicationsPageFiltersAndPaginates(t *testing.T) {
 	})
 
 	get := func(target string) (int, string) {
-		recorder := httptest.NewRecorder()
-		server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, target, nil))
+		recorder := getPageWithRoles(t, server, target, auth.RoleSet{auth.RoleViewer})
 		return recorder.Code, recorder.Body.String()
 	}
 
@@ -2685,7 +2811,7 @@ func TestPublicationsPageServesHtmxFragment(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/publications?dstate=failure", nil)
 	request.Header.Set("HX-Request", "true")
 	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, request)
+	serveRequestWithRoles(t, server, recorder, request, auth.RoleSet{auth.RoleViewer})
 	body := recorder.Body.String()
 	if recorder.Code != http.StatusOK || !strings.Contains(body, `id="publications-live"`) {
 		t.Fatalf("expected htmx fragment, status=%d body=%q", recorder.Code, body)
@@ -2702,8 +2828,7 @@ func TestPublicationsPageHidesInternalErrorDetails(t *testing.T) {
 	store := &fakeStatusPublicationStore{err: errors.New("database failed with secret-token")}
 	server := NewServer(Config{AppName: "Thawguard", StatusPublicationStore: store})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/publications", nil))
+	recorder := getPageWithRoles(t, server, "/publications", auth.RoleSet{auth.RoleViewer})
 
 	if recorder.Code != http.StatusInternalServerError {
 		t.Fatalf("expected internal server error status, got %d", recorder.Code)
@@ -2729,8 +2854,7 @@ func TestWebhooksPageShowsRecentDeliveries(t *testing.T) {
 		WebhookDeliveryStore: &fakeWebhookDeliveryStore{listed: deliveries},
 	})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/webhooks", nil))
+	recorder := getPageWithRoles(t, server, "/webhooks", auth.RoleSet{auth.RoleViewer})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
@@ -2767,8 +2891,7 @@ func TestWebhooksPageExcludesActivityAndStatusAttempts(t *testing.T) {
 		StatusPublicationStore: &fakeStatusPublicationStore{attempts: []statuspublication.Attempt{attempt}},
 	})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/webhooks", nil))
+	recorder := getPageWithRoles(t, server, "/webhooks", auth.RoleSet{auth.RoleViewer})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
@@ -2834,7 +2957,10 @@ func TestActivityMappingCoversCurrentFamilies(t *testing.T) {
 		{name: "recurring schedule rule removed", action: audit.ActionScheduleRuleRemoved, subjectType: audit.SubjectTypeSchedule, subjectID: "3", details: `{"repository_id":"1","branch":"main","name":"Nightly release lock","days":"Mon","start_time":"18:00","end_time":"08:00","end_day":"next day"}`, outcome: "Rule removed", contains: []string{"Nightly release lock", "Mon", "18:00"}},
 		{name: "single thaw", action: audit.ActionThawExceptionApproved, subjectType: audit.SubjectTypeThawException, subjectID: "9", details: `{"repository_id":"1","pull_request_index":"42","target_branch":"main","head_sha":"abcdef1234567890","reason":"production fix"}`, outcome: "Approved", contains: []string{"PR #42", "abcdef123456", "production fix"}},
 		{name: "shared thaw", action: audit.ActionThawExceptionSharedHeadApproved, subjectType: audit.SubjectTypeThawException, subjectID: "1:abcdef", details: `{"repository_id":"1","created_pull_request_indexes":"42,43","already_covered_pull_request_indexes":"","created_pull_request_count":"2","already_covered_pull_request_count":"0","head_sha":"abcdef123456","reason":"shared fix"}`, outcome: "Approved", contains: []string{"shared head abcdef123456", "New exceptions: #42, #43", "Confirmation reason: shared fix"}},
+		{name: "user created", action: audit.ActionUserCreated, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"access":"none","sign_in":"password"}`, outcome: "Created", contains: []string{"Ada Operator (User #42)", "Created with no repository access"}},
 		{name: "roles", action: audit.ActionUserRolesUpdated, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"roles_before":"viewer","roles_after":"freezer,viewer"}`, outcome: "Changed", contains: []string{"Ada Operator (User #42)", "Viewer → Freezer, Viewer"}},
+		{name: "promoted to Admin", action: audit.ActionUserRolesUpdated, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"roles_before":"none","roles_after":"admin"}`, outcome: "Changed", contains: []string{"Ada Operator (User #42)", "No access → Admin"}},
+		{name: "demoted from Admin", action: audit.ActionUserRolesUpdated, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"roles_before":"admin","roles_after":"none"}`, outcome: "Changed", contains: []string{"Ada Operator (User #42)", "Admin → No access"}},
 		{name: "disabled", action: audit.ActionUserDisabled, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{}`, outcome: "Disabled", contains: []string{"sessions revoked"}},
 		{name: "enabled", action: audit.ActionUserEnabled, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{}`, outcome: "Enabled", contains: []string{"sessions were not restored"}},
 		{name: "password changed", action: audit.ActionUserPasswordChanged, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{}`, outcome: "Changed", contains: []string{"Self-service password change"}},
@@ -2884,6 +3010,7 @@ func TestActivityActorAndMissingTargetResolution(t *testing.T) {
 		{details: `{"actor_kind":"user"}`, actor: "Deleted user"},
 		{details: `{"actor_kind":"bootstrap_admin"}`, actor: "Bootstrap admin"},
 		{details: `{"actor_kind":"system","actor_role":"scheduler"}`, actor: "Scheduler"},
+		{details: `{"actor_kind":"system","actor_role":"migration"}`, actor: "Authorization migration"},
 		{details: `{"actor_kind":"system","actor_role":"reconciliation_runner"}`, actor: "Reconciliation runner"},
 		{details: `{"actor_kind":"system","actor_role":"runtime"}`, actor: "Runtime process"},
 		{details: `{"actor_kind":"untrusted-actor","actor_role":"secret-token"}`, actor: "Unknown system actor"},
@@ -2892,6 +3019,21 @@ func TestActivityActorAndMissingTargetResolution(t *testing.T) {
 		if view.Actor != test.actor || strings.Contains(view.Actor, "secret-token") {
 			t.Fatalf("unexpected actor resolution for %s: %+v", test.details, view)
 		}
+	}
+}
+
+func TestActivityRendersRepositoryGrantCutoverProvenance(t *testing.T) {
+	repositories := map[int64]domain.Repository{1: {ID: 1, Owner: "taua-almeida", Name: "thawguard"}}
+	users := map[int64]auth.User{42: {ID: 42, DisplayName: "Ada Operator"}}
+	event := audit.Event{
+		Action:      audit.ActionRepositoryGrantAdded,
+		SubjectType: audit.SubjectTypeRepository,
+		SubjectID:   "1",
+		DetailsJSON: `{"actor_kind":"system","actor_role":"migration","provenance":"legacy_authorization_cutover","user_id":"42","role":"freezer"}`,
+	}
+	view := activityEventViewForEvent(repositories, users, event)
+	if view.Actor != "Authorization migration" || view.Target != "taua-almeida/thawguard" || view.Outcome != "Granted" || !strings.Contains(view.Detail, "Freezer role granted to Ada Operator (User #42)") {
+		t.Fatalf("unexpected cutover grant activity: %+v", view)
 	}
 }
 
@@ -2925,8 +3067,7 @@ func TestActivityPageRendersPrimaryChronologicalFeedWithoutDiagnostics(t *testin
 		AuditStore:      auditStore,
 	})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/activity", nil))
+	recorder := getPageWithRoles(t, server, "/activity", auth.RoleSet{auth.RoleViewer})
 	body := recorder.Body.String()
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected activity without diagnostic stores, status=%d body=%q", recorder.Code, body)
@@ -2964,8 +3105,8 @@ func TestActivityFilterActionsGroupKnownActions(t *testing.T) {
 	}
 	prefixes := map[string][]string{
 		"freeze":       {"branch_freeze.", "freeze_schedule.", "schedule.", "thaw_exception."},
-		"repositories": {"repository."},
-		"users":        {"user."},
+		"repositories": {"repository.", "repository_grant."},
+		"users":        {"user.", "repository_grant."},
 	}
 	for filter, allowed := range prefixes {
 		actions := activityFilterActions(filter)
@@ -3002,8 +3143,7 @@ func TestActivityPageFiltersAndPaginates(t *testing.T) {
 	})
 
 	get := func(target string) (int, string) {
-		recorder := httptest.NewRecorder()
-		server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, target, nil))
+		recorder := getPageWithRoles(t, server, target, auth.RoleSet{auth.RoleViewer})
 		return recorder.Code, recorder.Body.String()
 	}
 
@@ -3050,7 +3190,7 @@ func TestActivityPageServesHtmxFragment(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/activity?filter=freeze", nil)
 	request.Header.Set("HX-Request", "true")
 	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, request)
+	serveRequestWithRoles(t, server, recorder, request, auth.RoleSet{auth.RoleViewer})
 	body := recorder.Body.String()
 	if recorder.Code != http.StatusOK || !strings.Contains(body, `id="activity-live"`) {
 		t.Fatalf("expected htmx fragment, status=%d body=%q", recorder.Code, body)
@@ -3065,8 +3205,7 @@ func TestActivityPageServesHtmxFragment(t *testing.T) {
 
 func TestPrimaryNavigationAndDashboardLinkToActivity(t *testing.T) {
 	server := NewServer(Config{AppName: "Thawguard"})
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	recorder := getPageWithRoles(t, server, "/", auth.RoleSet{auth.RoleViewer})
 	body := recorder.Body.String()
 	if recorder.Code != http.StatusOK || !strings.Contains(body, `<a class="shell-nav-item" href="/activity"`) || !strings.Contains(body, `href="/activity">View all →</a>`) {
 		t.Fatalf("expected primary navigation and dashboard activity rail to link to activity, status=%d body=%q", recorder.Code, body)
@@ -3076,21 +3215,18 @@ func TestPrimaryNavigationAndDashboardLinkToActivity(t *testing.T) {
 func TestUnknownPathsRenderStyled404InsteadOfDashboard(t *testing.T) {
 	server := NewServer(Config{AppName: "Thawguard", FreezeStore: &fakeFreezeStore{}})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	recorder := getPageWithRoles(t, server, "/", auth.RoleSet{auth.RoleFreezer})
 	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `aria-label="Dashboard summary"`) {
 		t.Fatalf("expected the root path to keep rendering the dashboard, status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
 
-	recorder = httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/freezes", nil))
+	recorder = getPageWithRoles(t, server, "/freezes", auth.RoleSet{auth.RoleFreezer})
 	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "Start a freeze") {
 		t.Fatalf("expected known routes to keep working, status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
 
 	for _, path := range []string{"/nope", "/freezes/"} {
-		recorder = httptest.NewRecorder()
-		server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		recorder = getPageWithRoles(t, server, path, auth.RoleSet{auth.RoleFreezer})
 		body := recorder.Body.String()
 		if recorder.Code != http.StatusNotFound {
 			t.Fatalf("expected GET %s to return 404, got %d", path, recorder.Code)
@@ -3121,22 +3257,19 @@ func TestUnknownPathsReturn404WithSignInActionWhenSignedOut(t *testing.T) {
 
 func TestActivityPageRequiresAuditStoreAndHandlesEmptyAndFailureStates(t *testing.T) {
 	server := NewServer(Config{AppName: "Thawguard"})
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/activity", nil))
+	recorder := getPageWithRoles(t, server, "/activity", auth.RoleSet{auth.RoleViewer})
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected missing audit store to return 503, got %d", recorder.Code)
 	}
 
 	server = NewServer(Config{AppName: "Thawguard", AuditStore: &fakeAuditStore{}})
-	recorder = httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/activity", nil))
+	recorder = getPageWithRoles(t, server, "/activity", auth.RoleSet{auth.RoleViewer})
 	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "No activity yet") {
 		t.Fatalf("expected clear empty state, status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
 
 	server = NewServer(Config{AppName: "Thawguard", AuditStore: &fakeAuditStore{err: errors.New("database failed with secret-token")}})
-	recorder = httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/activity", nil))
+	recorder = getPageWithRoles(t, server, "/activity", auth.RoleSet{auth.RoleViewer})
 	if recorder.Code != http.StatusInternalServerError || strings.Contains(recorder.Body.String(), "secret-token") {
 		t.Fatalf("expected generic activity failure, status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
@@ -3146,8 +3279,10 @@ func TestActivityPageAllowsViewer(t *testing.T) {
 	ctx := context.Background()
 	database := newWebTestDB(t, ctx)
 	authService := auth.NewService(database)
-	mustSetupWebAdmin(t, ctx, authService)
-	if _, err := authService.CreateUser(ctx, auth.CreateUserParams{Email: "viewer@example.test", DisplayName: "Viewer", Password: "correct horse battery staple", Roles: []auth.Role{auth.RoleViewer}}); err != nil {
+	admin := mustSetupWebAdmin(t, ctx, authService)
+	viewer := mustCreateWebUser(t, ctx, authService, "viewer@example.test", nil)
+	repositoryID := mustInsertWebRepository(t, ctx, database)
+	if err := authService.SetUserRepositoryRoles(ctx, auth.SetUserRepositoryRolesParams{ActorUserID: admin.User.ID, UserID: viewer.ID, RepositoryID: repositoryID, Roles: []auth.Role{auth.RoleViewer}}); err != nil {
 		t.Fatal(err)
 	}
 	viewerSession, err := authService.Login(ctx, auth.LoginParams{Email: "viewer@example.test", Password: "correct horse battery staple"})
@@ -3178,8 +3313,7 @@ func TestWebhooksPageFiltersAndSortsDeliveries(t *testing.T) {
 		WebhookDeliveryStore: &fakeWebhookDeliveryStore{listed: deliveries},
 	})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/webhooks?processing=retryable_failure&sort=processed&dir=asc", nil))
+	recorder := getPageWithRoles(t, server, "/webhooks?processing=retryable_failure&sort=processed&dir=asc", auth.RoleSet{auth.RoleViewer})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
@@ -3198,8 +3332,7 @@ func TestWebhooksPageFiltersAndSortsDeliveries(t *testing.T) {
 func TestWebhooksPageRequiresDeliveryStore(t *testing.T) {
 	server := NewServer(Config{AppName: "Thawguard"})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/webhooks", nil))
+	recorder := getPageWithRoles(t, server, "/webhooks", auth.RoleSet{auth.RoleViewer})
 
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected service unavailable status, got %d", recorder.Code)
@@ -3210,8 +3343,7 @@ func TestWebhooksPageHidesInternalErrorDetails(t *testing.T) {
 	store := &fakeWebhookDeliveryStore{listErr: errors.New("database failed with secret-token")}
 	server := NewServer(Config{AppName: "Thawguard", WebhookDeliveryStore: store})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/webhooks", nil))
+	recorder := getPageWithRoles(t, server, "/webhooks", auth.RoleSet{auth.RoleViewer})
 
 	if recorder.Code != http.StatusInternalServerError {
 		t.Fatalf("expected internal server error status, got %d", recorder.Code)
@@ -3227,7 +3359,7 @@ func TestWebhooksPageServesHtmxFragment(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/webhooks?processing=received", nil)
 	request.Header.Set("HX-Request", "true")
 	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, request)
+	serveRequestWithRoles(t, server, recorder, request, auth.RoleSet{auth.RoleViewer})
 	body := recorder.Body.String()
 	if recorder.Code != http.StatusOK || !strings.Contains(body, `id="webhooks-live"`) {
 		t.Fatalf("expected htmx fragment, status=%d body=%q", recorder.Code, body)
@@ -3265,9 +3397,12 @@ func TestWebhooksPageQueryMapsToStoreArguments(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			store := &fakeWebhookDeliveryStore{}
-			server := NewServer(Config{AppName: "Thawguard", WebhookDeliveryStore: store})
-			recorder := httptest.NewRecorder()
-			server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, tc.url, nil))
+			server := NewServer(Config{
+				AppName:              "Thawguard",
+				RepositoryStore:      &fakeRepositoryStore{repositories: []domain.Repository{{ID: 7, Owner: "taua-almeida", Name: "thawguard"}}},
+				WebhookDeliveryStore: store,
+			})
+			recorder := getPageWithRoles(t, server, tc.url, auth.RoleSet{auth.RoleViewer})
 			if recorder.Code != http.StatusOK {
 				t.Fatalf("expected status 200, got %d", recorder.Code)
 			}
@@ -3299,8 +3434,7 @@ func TestWebhooksPageClampsOutOfRangePageToLastPage(t *testing.T) {
 		WebhookDeliveryStore: &fakeWebhookDeliveryStore{listed: deliveries},
 	})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/webhooks?page=9", nil))
+	recorder := getPageWithRoles(t, server, "/webhooks?page=9", auth.RoleSet{auth.RoleViewer})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
@@ -3324,8 +3458,7 @@ func TestWebhooksPageRepositoryFilterFormPreservesSort(t *testing.T) {
 		WebhookDeliveryStore: &fakeWebhookDeliveryStore{},
 	})
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/webhooks?processing=processed&sort=processed&dir=asc", nil))
+	recorder := getPageWithRoles(t, server, "/webhooks?processing=processed&sort=processed&dir=asc", auth.RoleSet{auth.RoleViewer})
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", recorder.Code)
@@ -3341,8 +3474,7 @@ func TestWebhooksPageRepositoryFilterFormPreservesSort(t *testing.T) {
 		}
 	}
 
-	recorder = httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/webhooks", nil))
+	recorder = getPageWithRoles(t, server, "/webhooks", auth.RoleSet{auth.RoleViewer})
 	body = recorder.Body.String()
 	if strings.Contains(body, `name="sort"`) || strings.Contains(body, `name="dir"`) {
 		t.Fatalf("expected default sort to stay out of the repository filter form, got %q", body)
@@ -3499,13 +3631,11 @@ func TestForgejoWebhookSmokeWithSQLiteStoresPostsLiveStatus(t *testing.T) {
 		t.Fatalf("expected live forge status post, auth=%q path=%q", postedAuth, postedPath)
 	}
 
-	webhooksPage := httptest.NewRecorder()
-	server.Routes().ServeHTTP(webhooksPage, httptest.NewRequest(http.MethodGet, "/webhooks", nil))
+	webhooksPage := getPageWithRoles(t, server, "/webhooks", auth.RoleSet{auth.RoleViewer})
 	if webhooksPage.Code != http.StatusOK || !strings.Contains(webhooksPage.Body.String(), "delivery-smoke") || !strings.Contains(webhooksPage.Body.String(), "processed") {
 		t.Fatalf("expected webhook delivery page to show processed delivery, status=%d body=%q", webhooksPage.Code, webhooksPage.Body.String())
 	}
-	publicationsPage := httptest.NewRecorder()
-	server.Routes().ServeHTTP(publicationsPage, httptest.NewRequest(http.MethodGet, "/publications", nil))
+	publicationsPage := getPageWithRoles(t, server, "/publications", auth.RoleSet{auth.RoleViewer})
 	if publicationsPage.Code != http.StatusOK || !strings.Contains(publicationsPage.Body.String(), "posted") || !strings.Contains(publicationsPage.Body.String(), "Branch is frozen") {
 		t.Fatalf("expected publications page to show posted attempt, status=%d body=%q", publicationsPage.Code, publicationsPage.Body.String())
 	}
@@ -3812,14 +3942,57 @@ func setWebSessionRoles(t *testing.T, server *Server, roles auth.RoleSet) sessio
 	if err != nil {
 		t.Fatal(err)
 	}
-	session.Roles = roles
-	if len(roles) > 0 {
-		session.Role = roles[0]
+	global := auth.RoleSet{}
+	scoped := make(map[int64]auth.RoleSet)
+	repositoryIDs := []int64{1}
+	if server.cfg.RepositoryStore != nil {
+		if repositories, listErr := server.cfg.RepositoryStore.ListForScope(context.Background(), repositoryscope.All()); listErr == nil {
+			for _, repo := range repositories {
+				if repo.ID > 0 && !slices.Contains(repositoryIDs, repo.ID) {
+					repositoryIDs = append(repositoryIDs, repo.ID)
+				}
+			}
+		}
 	}
+	for _, role := range roles {
+		if role == auth.RoleAdmin {
+			global = append(global, role)
+			continue
+		}
+		for _, repositoryID := range repositoryIDs {
+			scoped[repositoryID] = append(scoped[repositoryID], role)
+		}
+	}
+	session.Grants = auth.NewGrants(global, scoped)
 	server.sessions.mu.Lock()
 	server.sessions.sessions[session.ID] = session
 	server.sessions.mu.Unlock()
 	return session
+}
+
+func setWebSessionGrants(t *testing.T, server *Server, grants auth.Grants) sessionState {
+	t.Helper()
+	session := setWebSessionRoles(t, server, nil)
+	session.Grants = grants
+	server.sessions.mu.Lock()
+	server.sessions.sessions[session.ID] = session
+	server.sessions.mu.Unlock()
+	return session
+}
+
+func getPageWithRoles(t *testing.T, server *Server, path string, roles auth.RoleSet) *httptest.ResponseRecorder {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, path, nil)
+	serveRequestWithRoles(t, server, recorder, request, roles)
+	return recorder
+}
+
+func serveRequestWithRoles(t *testing.T, server *Server, recorder *httptest.ResponseRecorder, request *http.Request, roles auth.RoleSet) {
+	t.Helper()
+	session := setWebSessionRoles(t, server, roles)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.ID})
+	server.Routes().ServeHTTP(recorder, request)
 }
 
 func postScheduledFreezeForm(t *testing.T, server *Server, cookie *http.Cookie, path string, form url.Values, wantStatus int) *httptest.ResponseRecorder {
@@ -3847,8 +4020,11 @@ func repositoryCreateForm() url.Values {
 
 func getRepositoryForm(t *testing.T, server *Server) (*http.Cookie, string) {
 	t.Helper()
+	session := setWebSessionRoles(t, server, auth.RoleSet{auth.RoleAdmin, auth.RoleFreezer, auth.RoleThawApprover})
 	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+	request := httptest.NewRequest(http.MethodGet, "/repositories", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.ID})
+	server.Routes().ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected repository form status 200, got %d", recorder.Code)
 	}
@@ -3857,8 +4033,11 @@ func getRepositoryForm(t *testing.T, server *Server) (*http.Cookie, string) {
 
 func getFreezeForm(t *testing.T, server *Server) (*http.Cookie, string) {
 	t.Helper()
+	session := setWebSessionRoles(t, server, auth.RoleSet{auth.RoleAdmin, auth.RoleFreezer, auth.RoleThawApprover})
 	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/freezes", nil))
+	request := httptest.NewRequest(http.MethodGet, "/freezes", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.ID})
+	server.Routes().ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected freeze form status 200, got %d", recorder.Code)
 	}
@@ -3867,8 +4046,11 @@ func getFreezeForm(t *testing.T, server *Server) (*http.Cookie, string) {
 
 func getScheduledFreezeForm(t *testing.T, server *Server) (*http.Cookie, string) {
 	t.Helper()
+	session := setWebSessionRoles(t, server, auth.RoleSet{auth.RoleAdmin, auth.RoleFreezer, auth.RoleThawApprover})
 	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/scheduled-freezes", nil))
+	request := httptest.NewRequest(http.MethodGet, "/scheduled-freezes", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.ID})
+	server.Routes().ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected scheduled freeze form status 200, got %d", recorder.Code)
 	}
@@ -3877,8 +4059,11 @@ func getScheduledFreezeForm(t *testing.T, server *Server) (*http.Cookie, string)
 
 func getDecisionForm(t *testing.T, server *Server) (*http.Cookie, string) {
 	t.Helper()
+	session := setWebSessionRoles(t, server, auth.RoleSet{auth.RoleAdmin, auth.RoleFreezer, auth.RoleThawApprover})
 	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/decisions", nil))
+	request := httptest.NewRequest(http.MethodGet, "/decisions", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.ID})
+	server.Routes().ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected decision form status 200, got %d", recorder.Code)
 	}
@@ -4069,12 +4254,19 @@ func fakeWebhookDeliveryProcessing(delivery webhook.Delivery) string {
 }
 
 func (s *fakeWebhookDeliveryStore) ListPage(ctx context.Context, processing string, repositoryID int64, order webhook.DeliveryOrder, offset, limit int) ([]webhook.Delivery, int, error) {
+	return s.ListPageForScope(ctx, repositoryscope.All(), processing, repositoryID, order, offset, limit)
+}
+
+func (s *fakeWebhookDeliveryStore) ListPageForScope(ctx context.Context, scope repositoryscope.ReadScope, processing string, repositoryID int64, order webhook.DeliveryOrder, offset, limit int) ([]webhook.Delivery, int, error) {
 	s.listCalls = append(s.listCalls, fakeWebhookListCall{processing: processing, repositoryID: repositoryID, order: order, offset: offset, limit: limit})
 	if s.listErr != nil {
 		return nil, 0, s.listErr
 	}
 	matches := make([]webhook.Delivery, 0, len(s.listed))
 	for _, delivery := range s.listed {
+		if !fakeScopeAllows(scope, delivery.RepositoryID) {
+			continue
+		}
 		if repositoryID > 0 && delivery.RepositoryID != repositoryID {
 			continue
 		}
@@ -4251,11 +4443,18 @@ func (s *fakeStatusDecisionStore) ListRecent(ctx context.Context, limit int) ([]
 }
 
 func (s *fakeStatusDecisionStore) ListDecisionsPage(ctx context.Context, state domain.CommitStatusState, repositoryID int64, offset, limit int) ([]statusresult.Result, int, error) {
+	return s.ListDecisionsPageForScope(ctx, repositoryscope.All(), state, repositoryID, offset, limit)
+}
+
+func (s *fakeStatusDecisionStore) ListDecisionsPageForScope(ctx context.Context, scope repositoryscope.ReadScope, state domain.CommitStatusState, repositoryID int64, offset, limit int) ([]statusresult.Result, int, error) {
 	if s.listErr != nil {
 		return nil, 0, s.listErr
 	}
 	var matched []statusresult.Result
 	for _, result := range s.results {
+		if !fakeScopeAllows(scope, result.RepositoryID) {
+			continue
+		}
 		if state != "" && result.State != state {
 			continue
 		}
@@ -4301,11 +4500,18 @@ type fakeStatusPublicationStore struct {
 }
 
 func (s *fakeStatusPublicationStore) ListPage(ctx context.Context, state string, repositoryID int64, offset, limit int) ([]statuspublication.Publication, int, error) {
+	return s.ListPageForScope(ctx, repositoryscope.All(), state, repositoryID, offset, limit)
+}
+
+func (s *fakeStatusPublicationStore) ListPageForScope(ctx context.Context, scope repositoryscope.ReadScope, state string, repositoryID int64, offset, limit int) ([]statuspublication.Publication, int, error) {
 	if s.err != nil {
 		return nil, 0, s.err
 	}
 	filtered := make([]statuspublication.Publication, 0, len(s.publications))
 	for _, publication := range s.publications {
+		if !fakeScopeAllows(scope, publication.RepositoryID) {
+			continue
+		}
 		if state != "" && string(publication.State) != state {
 			continue
 		}
@@ -4318,6 +4524,10 @@ func (s *fakeStatusPublicationStore) ListPage(ctx context.Context, state string,
 }
 
 func (s *fakeStatusPublicationStore) ListAttemptsPage(ctx context.Context, result string, repositoryID int64, offset, limit int) ([]statuspublication.Attempt, int, error) {
+	return s.ListAttemptsPageForScope(ctx, repositoryscope.All(), result, repositoryID, offset, limit)
+}
+
+func (s *fakeStatusPublicationStore) ListAttemptsPageForScope(ctx context.Context, scope repositoryscope.ReadScope, result string, repositoryID int64, offset, limit int) ([]statuspublication.Attempt, int, error) {
 	if s.attemptErr != nil {
 		return nil, 0, s.attemptErr
 	}
@@ -4326,6 +4536,9 @@ func (s *fakeStatusPublicationStore) ListAttemptsPage(ctx context.Context, resul
 	}
 	filtered := make([]statuspublication.Attempt, 0, len(s.attempts))
 	for _, attempt := range s.attempts {
+		if !fakeScopeAllows(scope, attempt.RepositoryID) {
+			continue
+		}
 		if result != "" && attempt.Result != result {
 			continue
 		}
@@ -4353,6 +4566,19 @@ func pageSlice[T any](items []T, offset, limit int) []T {
 	return items
 }
 
+func fakeScopeAllows(scope repositoryscope.ReadScope, repositoryID int64) bool {
+	predicate, args := scope.SQLPredicate("repository_id")
+	if predicate == "1 = 1" {
+		return true
+	}
+	for _, arg := range args {
+		if id, ok := arg.(int64); ok && id == repositoryID {
+			return true
+		}
+	}
+	return false
+}
+
 type fakeAuditStore struct {
 	events         []audit.Event
 	err            error
@@ -4360,6 +4586,10 @@ type fakeAuditStore struct {
 }
 
 func (s *fakeAuditStore) List(ctx context.Context, limit int) ([]audit.Event, error) {
+	return s.ListForScope(ctx, repositoryscope.All(), limit)
+}
+
+func (s *fakeAuditStore) ListForScope(ctx context.Context, scope repositoryscope.ReadScope, limit int) ([]audit.Event, error) {
 	s.requestedLimit = limit
 	if s.err != nil {
 		return nil, s.err
@@ -4371,6 +4601,10 @@ func (s *fakeAuditStore) List(ctx context.Context, limit int) ([]audit.Event, er
 }
 
 func (s *fakeAuditStore) ListPage(ctx context.Context, actions []string, offset, limit int) ([]audit.Event, int, error) {
+	return s.ListPageForScope(ctx, repositoryscope.All(), actions, offset, limit)
+}
+
+func (s *fakeAuditStore) ListPageForScope(ctx context.Context, scope repositoryscope.ReadScope, actions []string, offset, limit int) ([]audit.Event, int, error) {
 	s.requestedLimit = limit
 	if s.err != nil {
 		return nil, 0, s.err
@@ -4454,7 +4688,28 @@ type fakeFreezeStore struct {
 }
 
 func (s *fakeFreezeStore) ListActive(ctx context.Context) ([]domain.BranchFreeze, error) {
-	return s.freezes, nil
+	return s.ListActiveForScope(ctx, repositoryscope.All())
+}
+
+func (s *fakeFreezeStore) ListActiveForScope(ctx context.Context, scope repositoryscope.ReadScope) ([]domain.BranchFreeze, error) {
+	var visible []domain.BranchFreeze
+	for _, item := range s.freezes {
+		if fakeScopeAllows(scope, item.RepositoryID) {
+			visible = append(visible, item)
+		}
+	}
+	return visible, nil
+}
+
+func (s *fakeFreezeStore) GetForScope(ctx context.Context, scope repositoryscope.ReadScope, id int64) (domain.BranchFreeze, error) {
+	for _, group := range [][]domain.BranchFreeze{s.freezes, s.scheduled} {
+		for _, item := range group {
+			if item.ID == id && fakeScopeAllows(scope, item.RepositoryID) {
+				return item, nil
+			}
+		}
+	}
+	return domain.BranchFreeze{}, sql.ErrNoRows
 }
 
 func (s *fakeFreezeStore) CreateActive(ctx context.Context, params freeze.CreateParams, actor domain.Actor) (domain.BranchFreeze, error) {
@@ -4498,15 +4753,32 @@ func (s *fakeFreezeStore) Cancel(ctx context.Context, id int64, actor domain.Act
 }
 
 func (s *fakeFreezeStore) ListScheduled(ctx context.Context, limit int) ([]domain.BranchFreeze, error) {
-	if limit > 0 && len(s.scheduled) > limit {
-		return s.scheduled[:limit], nil
+	return s.ListScheduledForScope(ctx, repositoryscope.All(), limit)
+}
+
+func (s *fakeFreezeStore) ListScheduledForScope(ctx context.Context, scope repositoryscope.ReadScope, limit int) ([]domain.BranchFreeze, error) {
+	visible := make([]domain.BranchFreeze, 0, len(s.scheduled))
+	for _, item := range s.scheduled {
+		if fakeScopeAllows(scope, item.RepositoryID) {
+			visible = append(visible, item)
+		}
 	}
-	return s.scheduled, nil
+	if limit > 0 && len(visible) > limit {
+		return visible[:limit], nil
+	}
+	return visible, nil
 }
 
 func (s *fakeFreezeStore) ListScheduledPage(ctx context.Context, status domain.BranchFreezeStatus, offset, limit int) ([]domain.BranchFreeze, int, error) {
+	return s.ListScheduledPageForScope(ctx, repositoryscope.All(), status, offset, limit)
+}
+
+func (s *fakeFreezeStore) ListScheduledPageForScope(ctx context.Context, scope repositoryscope.ReadScope, status domain.BranchFreezeStatus, offset, limit int) ([]domain.BranchFreeze, int, error) {
 	matched := make([]domain.BranchFreeze, 0, len(s.scheduled))
 	for _, freeze := range s.scheduled {
+		if !fakeScopeAllows(scope, freeze.RepositoryID) {
+			continue
+		}
 		if status == "" || freeze.Status == status {
 			matched = append(matched, freeze)
 		}
@@ -4523,6 +4795,16 @@ func (s *fakeFreezeStore) ListScheduledPage(ctx context.Context, status domain.B
 		matched = matched[:limit]
 	}
 	return matched, total, nil
+}
+
+func (s *fakeFreezeStore) PendingScheduledCountsForScope(ctx context.Context, scope repositoryscope.ReadScope) (map[int64]int, error) {
+	counts := make(map[int64]int)
+	for _, item := range s.scheduled {
+		if item.Scheduled && item.Status == domain.BranchFreezeStatusScheduled && fakeScopeAllows(scope, item.RepositoryID) {
+			counts[item.RepositoryID]++
+		}
+	}
+	return counts, nil
 }
 
 func (s *fakeFreezeStore) CreateScheduled(ctx context.Context, params freeze.ScheduleParams, actor domain.Actor) (domain.BranchFreeze, error) {
@@ -4573,7 +4855,26 @@ func (r *fakeSetupCheckRunner) Run(ctx context.Context, repo domain.Repository, 
 }
 
 func (s *fakeRepositoryStore) List(ctx context.Context) ([]domain.Repository, error) {
-	return s.repositories, nil
+	return s.ListForScope(ctx, repositoryscope.All())
+}
+
+func (s *fakeRepositoryStore) ListForScope(ctx context.Context, scope repositoryscope.ReadScope) ([]domain.Repository, error) {
+	visible := make([]domain.Repository, 0, len(s.repositories))
+	for _, repo := range s.repositories {
+		if fakeScopeAllows(scope, repo.ID) {
+			visible = append(visible, repo)
+		}
+	}
+	return visible, nil
+}
+
+func (s *fakeRepositoryStore) GetForScope(ctx context.Context, scope repositoryscope.ReadScope, id int64) (domain.Repository, error) {
+	for _, repo := range s.repositories {
+		if repo.ID == id && fakeScopeAllows(scope, repo.ID) {
+			return repo, nil
+		}
+	}
+	return domain.Repository{}, sql.ErrNoRows
 }
 
 func (s *fakeRepositoryStore) Create(ctx context.Context, params repository.CreateParams, actor domain.Actor) (domain.Repository, error) {

@@ -73,7 +73,7 @@
         {{ template "components/managed-branches" . }}
       </div>
     </details>
-    {{ if .CurrentUser.CanManageRepositories }}
+    {{ if .CurrentUser.CanManageInstallation }}
     <details class="rounded-card border border-border">
       <summary class="cursor-pointer px-3.5 py-2.5 text-sm font-semibold text-text select-none">Credentials</summary>
       <div class="flex flex-col gap-3 border-t border-border px-3.5 py-3">
@@ -83,7 +83,7 @@
     {{ end }}
   </div>
 
-  {{ if .CurrentUser.CanManageRepositories }}
+  {{ if .CurrentUser.CanManageInstallation }}
   {{ template "components/maintenance" . }}
   {{ else }}
   <p class="m-0 text-sm text-text-muted"><strong class="text-text">Read-only readiness evidence.</strong> Ask an admin to change repository credentials or run readiness checks.</p>

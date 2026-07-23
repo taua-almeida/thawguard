@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/taua-almeida/thawguard/internal/audit"
@@ -35,6 +36,23 @@ type RevokeRepositoryRoleParams struct {
 	RepositoryID int64
 	UserID       int64
 	Role         Role
+}
+
+type SetUserRepositoryRolesParams struct {
+	ActorUserID  int64
+	RepositoryID int64
+	UserID       int64
+	Roles        []Role
+}
+
+// RepositoryGrantDetail adds the attribution needed by Users & Access without
+// changing repository_grants storage. Migrated is proven from the matching
+// migration audit evidence; a null granter without that evidence is presented
+// as deleted/unavailable attribution instead of being guessed as migration.
+type RepositoryGrantDetail struct {
+	RepositoryGrant
+	GranterDisplayName string
+	Migrated           bool
 }
 
 // GrantsForUser loads the repository-aware authorization model for one
@@ -171,6 +189,111 @@ WHERE repository_id = ? AND user_id = ? AND role = ?`, params.RepositoryID, para
 	return nil
 }
 
+// SetUserRepositoryRoles atomically replaces the desired scoped role set for
+// one user and repository. Unchanged rows keep their attribution and timestamp;
+// only actual additions/removals are audited.
+func (s *Service) SetUserRepositoryRoles(ctx context.Context, params SetUserRepositoryRolesParams) error {
+	if s == nil || s.db == nil {
+		return errors.New("auth service has no database")
+	}
+	desired, err := normalizeRepositoryRoleSet(params.Roles)
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin repository role set: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := s.requireEnabledAdminActor(ctx, tx, params.ActorUserID); err != nil {
+		return err
+	}
+	if err := ensureRepositoryExists(ctx, tx, params.RepositoryID); err != nil {
+		return err
+	}
+	if _, err := s.userByID(ctx, tx, params.UserID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ValidationError{Message: "user was not found"}
+		}
+		return err
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+SELECT role
+FROM repository_grants
+WHERE repository_id = ? AND user_id = ?`, params.RepositoryID, params.UserID)
+	if err != nil {
+		return fmt.Errorf("list current repository roles: %w", err)
+	}
+	current := RoleSet{}
+	for rows.Next() {
+		var role Role
+		if err := rows.Scan(&role); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan current repository role: %w", err)
+		}
+		current = append(current, role)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close current repository roles: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("list current repository role rows: %w", err)
+	}
+
+	nowText := s.now().UTC().Format(time.RFC3339Nano)
+	for _, role := range RepositoryRoles() {
+		wasPresent := current.Contains(role)
+		wantPresent := desired.Contains(role)
+		switch {
+		case !wasPresent && wantPresent:
+			if _, err := tx.ExecContext(ctx, `
+INSERT INTO repository_grants(repository_id, user_id, role, granted_by_user_id, granted_at)
+VALUES (?, ?, ?, ?, ?)`, params.RepositoryID, params.UserID, role, params.ActorUserID, nowText); err != nil {
+				return fmt.Errorf("add repository role: %w", err)
+			}
+			if err := audit.NewStoreTx(tx).Record(ctx, repositoryGrantAuditEvent(audit.ActionRepositoryGrantAdded, params.ActorUserID, params.RepositoryID, params.UserID, role)); err != nil {
+				return fmt.Errorf("record repository role addition: %w", err)
+			}
+		case wasPresent && !wantPresent:
+			if _, err := tx.ExecContext(ctx, `
+DELETE FROM repository_grants
+WHERE repository_id = ? AND user_id = ? AND role = ?`, params.RepositoryID, params.UserID, role); err != nil {
+				return fmt.Errorf("remove repository role: %w", err)
+			}
+			if err := audit.NewStoreTx(tx).Record(ctx, repositoryGrantAuditEvent(audit.ActionRepositoryGrantRevoked, params.ActorUserID, params.RepositoryID, params.UserID, role)); err != nil {
+				return fmt.Errorf("record repository role removal: %w", err)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit repository role set: %w", err)
+	}
+	return nil
+}
+
+func normalizeRepositoryRoleSet(raw []Role) (RoleSet, error) {
+	seen := make(map[Role]bool, len(raw))
+	for _, role := range raw {
+		role = Role(strings.TrimSpace(string(role)))
+		if role == "" {
+			continue
+		}
+		if !role.ValidForRepository() {
+			return nil, ValidationError{Message: "repository role is invalid"}
+		}
+		seen[role] = true
+	}
+	roles := make(RoleSet, 0, len(seen))
+	for _, role := range RepositoryRoles() {
+		if seen[role] {
+			roles = append(roles, role)
+		}
+	}
+	return roles, nil
+}
+
 // ListRepositoryGrants returns every grant on one repository.
 func (s *Service) ListRepositoryGrants(ctx context.Context, repositoryID int64) ([]RepositoryGrant, error) {
 	if s == nil || s.db == nil {
@@ -211,6 +334,81 @@ ORDER BY user_id, role`, repositoryID)
 		return nil, fmt.Errorf("list repository grants rows: %w", err)
 	}
 	return grants, nil
+}
+
+// ListUserRepositoryGrants returns retained grants and honest attribution for
+// one user, including disabled users.
+func (s *Service) ListUserRepositoryGrants(ctx context.Context, userID int64) ([]RepositoryGrantDetail, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("auth service has no database")
+	}
+	if _, err := s.userByID(ctx, s.db, userID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ValidationError{Message: "user was not found"}
+		}
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT
+  rg.repository_id,
+  rg.user_id,
+  rg.role,
+  rg.granted_by_user_id,
+  rg.granted_at,
+  COALESCE(granter.display_name, ''),
+  CASE WHEN rg.granted_by_user_id IS NULL AND EXISTS (
+    SELECT 1
+    FROM audit_events event
+    WHERE event.action = 'repository_grant.added'
+      AND event.subject_type = 'repository'
+      AND event.subject_id = CAST(rg.repository_id AS TEXT)
+      AND event.actor_user_id IS NULL
+      AND event.created_at = rg.granted_at
+      AND CASE WHEN json_valid(event.details_json)
+        THEN json_extract(event.details_json, '$.provenance')
+        ELSE NULL END = 'legacy_authorization_cutover'
+      AND CASE WHEN json_valid(event.details_json)
+        THEN json_extract(event.details_json, '$.user_id')
+        ELSE NULL END = CAST(rg.user_id AS TEXT)
+      AND CASE WHEN json_valid(event.details_json)
+        THEN json_extract(event.details_json, '$.role')
+        ELSE NULL END = rg.role
+  ) THEN 1 ELSE 0 END
+FROM repository_grants rg
+LEFT JOIN users granter ON granter.id = rg.granted_by_user_id
+WHERE rg.user_id = ?
+ORDER BY rg.repository_id, rg.role`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("list user repository grants: %w", err)
+	}
+	defer rows.Close()
+	details := make([]RepositoryGrantDetail, 0)
+	for rows.Next() {
+		var detail RepositoryGrantDetail
+		var role string
+		var grantedBy sql.NullInt64
+		var grantedAt string
+		var migrated int
+		if err := rows.Scan(&detail.RepositoryID, &detail.UserID, &role, &grantedBy, &grantedAt, &detail.GranterDisplayName, &migrated); err != nil {
+			return nil, fmt.Errorf("scan user repository grant: %w", err)
+		}
+		detail.Role = Role(role)
+		if grantedBy.Valid {
+			id := grantedBy.Int64
+			detail.GrantedByUserID = &id
+		}
+		parsed, err := time.Parse(time.RFC3339Nano, grantedAt)
+		if err != nil {
+			return nil, fmt.Errorf("parse user repository grant granted_at: %w", err)
+		}
+		detail.GrantedAt = parsed
+		detail.Migrated = migrated != 0
+		details = append(details, detail)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list user repository grant rows: %w", err)
+	}
+	return details, nil
 }
 
 // requireEnabledAdminActor guards manual access mutations: the actor must

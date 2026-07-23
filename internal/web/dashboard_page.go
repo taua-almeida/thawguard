@@ -6,6 +6,7 @@ import (
 
 	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/auth"
+	"github.com/taua-almeida/thawguard/internal/domain"
 )
 
 const (
@@ -14,9 +15,6 @@ const (
 	dashboardActiveFreezePreviewLimit = 5
 	dashboardScheduledPreviewLimit    = 3
 	dashboardActivityPreviewLimit     = 6
-	// dashboardScheduledCountLimit matches the /scheduled-freezes page cap so
-	// the stat and the page the card links to agree.
-	dashboardScheduledCountLimit = 100
 )
 
 type dashboardPageData struct {
@@ -39,6 +37,8 @@ type dashboardPageData struct {
 	ActiveFreezes    []freezeView
 	ScheduledFreezes []scheduledFreezeView
 	RecentActivity   []activityEventView
+	CanStartFreeze   bool
+	CanReviewThaws   bool
 }
 
 // dashboardPageData assembles the read-only overview: real counts for every
@@ -46,17 +46,22 @@ type dashboardPageData struct {
 // audit events through the same curated view mapping /activity uses. Optional
 // stores (audit, thaw exceptions) degrade to empty panels and zero stats.
 func (s *Server) dashboardPageData(ctx context.Context, session sessionState) (dashboardPageData, error) {
-	repositories, err := s.repositories(ctx)
+	scope := session.Grants.RepositoryReadScope()
+	repositories, err := s.repositories(ctx, scope)
 	if err != nil {
 		return dashboardPageData{}, err
 	}
-	freezes, err := s.activeFreezes(ctx)
+	freezes, err := s.activeFreezes(ctx, scope)
 	if err != nil {
 		return dashboardPageData{}, err
 	}
-	scheduled, err := s.scheduledFreezes(ctx, dashboardScheduledCountLimit)
-	if err != nil {
-		return dashboardPageData{}, err
+	var scheduled []domain.BranchFreeze
+	scheduledTotal := 0
+	if s.cfg.ScheduledFreezeStore != nil {
+		scheduled, scheduledTotal, err = s.cfg.ScheduledFreezeStore.ListScheduledPageForScope(ctx, scope, domain.BranchFreezeStatusScheduled, 0, dashboardScheduledPreviewLimit)
+		if err != nil {
+			return dashboardPageData{}, err
+		}
 	}
 	var users []auth.User
 	if s.cfg.AuthService != nil {
@@ -67,23 +72,26 @@ func (s *Server) dashboardPageData(ctx context.Context, session sessionState) (d
 	}
 	var events []audit.Event
 	if s.cfg.AuditStore != nil {
-		events, err = s.cfg.AuditStore.List(ctx, dashboardActivityPreviewLimit)
+		events, err = s.cfg.AuditStore.ListForScope(ctx, scope, dashboardActivityPreviewLimit)
 		if err != nil {
 			return dashboardPageData{}, err
 		}
 	}
 	activeThawCount := 0
 	if s.cfg.ThawExceptionStore != nil {
-		activeThawCount, err = s.cfg.ThawExceptionStore.CountActive(ctx)
+		activeThawCount, err = s.cfg.ThawExceptionStore.CountActiveForScope(ctx, scope)
 		if err != nil {
 			return dashboardPageData{}, err
 		}
 	}
 
 	enforcingCount := 0
+	canStartFreeze, canReviewThaws := false, false
 	for _, repo := range repositories {
 		if repo.EnforcementActive() {
 			enforcingCount++
+			canStartFreeze = canStartFreeze || session.Grants.CanFreezeRepository(repo.ID)
+			canReviewThaws = canReviewThaws || session.Grants.CanThawRepository(repo.ID)
 		}
 	}
 
@@ -100,21 +108,26 @@ func (s *Server) dashboardPageData(ctx context.Context, session sessionState) (d
 		scheduledViews = scheduledViews[:dashboardScheduledPreviewLimit]
 	}
 
+	currentUser := currentUserFromSession(session)
+	currentUser.CanFreeze = canStartFreeze
+	currentUser.CanThaw = canReviewThaws
 	return dashboardPageData{
 		AppName:              s.cfg.AppName,
 		PageTitle:            "Dashboard",
 		ActivePage:           "dashboard",
-		CurrentUser:          currentUserFromSession(session),
+		CurrentUser:          currentUser,
 		CSRFToken:            session.CSRFToken,
 		CSRFField:            csrfFormField,
 		RepositoryCount:      len(repositories),
 		EnforcingCount:       enforcingCount,
 		SetupIncompleteCount: len(repositories) - enforcingCount,
 		ActiveFreezeCount:    len(freezes),
-		ScheduledFreezeCount: len(scheduled),
+		ScheduledFreezeCount: scheduledTotal,
 		ActiveThawCount:      activeThawCount,
 		ActiveFreezes:        freezeViews,
 		ScheduledFreezes:     scheduledViews,
 		RecentActivity:       activityEventViews(repositories, users, events),
+		CanStartFreeze:       canStartFreeze,
+		CanReviewThaws:       canReviewThaws,
 	}, nil
 }

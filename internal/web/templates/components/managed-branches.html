@@ -13,7 +13,7 @@
       {{ if $branch.IsDefault }}{{ template "ui/badge" dict "Label" "default" "Tone" "info" }}{{ end }}
       {{ template "ui/badge" dict "Label" $branch.SetupLabel "Tone" $branch.SetupTone }}
       {{ if $branch.LastCheckedAt }}<small class="text-xs text-text-muted">checked {{ $branch.LastCheckedAt }}</small>{{ end }}
-      {{ if and $.CurrentUser.CanManageRepositories (not $branch.IsDefault) (not $.Repository.EnforcementActive) }}
+      {{ if and $.CurrentUser.CanManageInstallation (not $branch.IsDefault) (not $.Repository.EnforcementActive) }}
       <span class="ml-auto">{{ template "ui/button" dict "Label" "Remove" "Variant" "secondary" "Size" "sm" "Icon" "tg-i-close" "DialogTarget" (printf "repo-%d-remove-branch-%d" $.Repository.ID $i) }}</span>
       {{ template "ui/modal" dict
            "ID" (printf "repo-%d-remove-branch-%d" $.Repository.ID $i)
@@ -42,7 +42,7 @@
 {{ else }}
 <p class="m-0 text-sm text-text-muted">No managed branches are recorded for this repository. Add the exact branch names Thawguard should manage.</p>
 {{ end }}
-{{ if .CurrentUser.CanManageRepositories }}
+{{ if .CurrentUser.CanManageInstallation }}
   {{ if .Repository.EnforcementActive }}
 <p class="m-0 text-sm text-text-muted">Branch editing is disabled while enforcement is active. Deactivate repository enforcement before changing managed branches.</p>
   {{ else }}

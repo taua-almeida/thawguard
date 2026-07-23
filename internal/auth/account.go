@@ -12,10 +12,10 @@ import (
 	"github.com/taua-almeida/thawguard/internal/audit"
 )
 
-type UpdateUserRolesParams struct {
+type SetUserAdminParams struct {
 	ActorUserID int64
 	UserID      int64
-	Roles       []Role
+	Admin       bool
 }
 
 type ChangePasswordParams struct {
@@ -30,28 +30,24 @@ type ResetPasswordParams struct {
 	TemporaryPassword string
 }
 
-// UpdateUserRoles atomically replaces a user's explicit role set, keeps the
-// legacy primary-role column synchronized, and refuses to strip admin from
-// the final enabled admin. Sessions pick the change up on their next request
-// because SessionByID hydrates roles from the user record.
-func (s *Service) UpdateUserRoles(ctx context.Context, params UpdateUserRolesParams) (User, error) {
+// SetUserAdmin changes only the one live global role. Repository grants and
+// inert legacy scoped rows are preserved. Demotion also normalizes users.role
+// to the least-privileged compatibility placeholder so no older fallback can
+// resurrect Admin authority.
+func (s *Service) SetUserAdmin(ctx context.Context, params SetUserAdminParams) (User, error) {
 	if s == nil || s.db == nil {
 		return User{}, errors.New("auth service has no database")
-	}
-	roles, valid := NormalizeRoleSet(params.Roles)
-	if !valid {
-		return User{}, ValidationError{Message: "role is invalid"}
-	}
-	if len(roles) == 0 {
-		return User{}, ValidationError{Message: "at least one role is required"}
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return User{}, fmt.Errorf("begin role update: %w", err)
+		return User{}, fmt.Errorf("begin admin update: %w", err)
 	}
 	defer tx.Rollback()
 
+	if err := s.requireEnabledAdminActor(ctx, tx, params.ActorUserID); err != nil {
+		return User{}, err
+	}
 	record, err := s.userByID(ctx, tx, params.UserID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -59,35 +55,57 @@ func (s *Service) UpdateUserRoles(ctx context.Context, params UpdateUserRolesPar
 		}
 		return User{}, err
 	}
-	before := record.Roles
+	before := record.Roles.Contains(RoleAdmin)
 
 	now := s.now().UTC()
 	nowText := now.Format(time.RFC3339Nano)
-	if _, err := tx.ExecContext(ctx, `DELETE FROM user_roles WHERE user_id = ?`, record.ID); err != nil {
-		return User{}, fmt.Errorf("clear user roles: %w", err)
+	if params.Admin {
+		if _, err := tx.ExecContext(ctx, `
+INSERT OR IGNORE INTO user_roles(user_id, role, created_at)
+VALUES (?, ?, ?)`, record.ID, RoleAdmin, nowText); err != nil {
+			return User{}, fmt.Errorf("grant user admin: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE users SET role = ?, updated_at = ? WHERE id = ?`, RoleAdmin, nowText, record.ID); err != nil {
+			return User{}, fmt.Errorf("update admin compatibility role: %w", err)
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM user_roles WHERE user_id = ? AND role = ?`, record.ID, RoleAdmin); err != nil {
+			return User{}, fmt.Errorf("remove user admin: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE users SET role = ?, updated_at = ? WHERE id = ?`, RoleViewer, nowText, record.ID); err != nil {
+			return User{}, fmt.Errorf("normalize demoted user compatibility role: %w", err)
+		}
+		if err := s.ensureEnabledAdminRemains(ctx, tx, "the final enabled admin must keep the admin role"); err != nil {
+			return User{}, err
+		}
 	}
-	if err := s.insertUserRoles(ctx, tx, record.ID, roles, nowText); err != nil {
-		return User{}, err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE users SET role = ?, updated_at = ? WHERE id = ?`, roles.Primary(), nowText, record.ID); err != nil {
-		return User{}, fmt.Errorf("update user primary role: %w", err)
-	}
-	if err := s.ensureEnabledAdminRemains(ctx, tx, "the final enabled admin must keep the admin role"); err != nil {
-		return User{}, err
-	}
-	event := userAuditEvent(audit.ActionUserRolesUpdated, params.ActorUserID, record.ID, map[string]string{
-		"roles_before": before.String(),
-		"roles_after":  roles.String(),
-	})
-	if err := audit.NewStoreTx(tx).Record(ctx, event); err != nil {
-		return User{}, fmt.Errorf("record role update audit event: %w", err)
+	if before != params.Admin {
+		beforeLabel, afterLabel := "none", "none"
+		if before {
+			beforeLabel = string(RoleAdmin)
+		}
+		if params.Admin {
+			afterLabel = string(RoleAdmin)
+		}
+		event := userAuditEvent(audit.ActionUserRolesUpdated, params.ActorUserID, record.ID, map[string]string{
+			"roles_before": beforeLabel,
+			"roles_after":  afterLabel,
+		})
+		if err := audit.NewStoreTx(tx).Record(ctx, event); err != nil {
+			return User{}, fmt.Errorf("record admin update audit event: %w", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
-		return User{}, fmt.Errorf("commit role update: %w", err)
+		return User{}, fmt.Errorf("commit admin update: %w", err)
 	}
 	user := record.User
-	user.Roles = roles
-	user.Role = roles.Primary()
+	if params.Admin {
+		user.Roles = RoleSet{RoleAdmin}
+		user.Role = RoleAdmin
+	} else {
+		user.Roles = nil
+		user.Role = ""
+	}
 	user.UpdatedAt = now
 	return user, nil
 }
@@ -103,6 +121,9 @@ func (s *Service) DisableUser(ctx context.Context, actorUserID int64, userID int
 		return User{}, fmt.Errorf("begin user disable: %w", err)
 	}
 	defer tx.Rollback()
+	if err := s.requireEnabledAdminActor(ctx, tx, actorUserID); err != nil {
+		return User{}, err
+	}
 
 	record, err := s.userByID(ctx, tx, userID)
 	if err != nil {
@@ -150,6 +171,9 @@ func (s *Service) EnableUser(ctx context.Context, actorUserID int64, userID int6
 		return User{}, fmt.Errorf("begin user enable: %w", err)
 	}
 	defer tx.Rollback()
+	if err := s.requireEnabledAdminActor(ctx, tx, actorUserID); err != nil {
+		return User{}, err
+	}
 
 	record, err := s.userByID(ctx, tx, userID)
 	if err != nil {
@@ -267,6 +291,9 @@ func (s *Service) ResetPassword(ctx context.Context, params ResetPasswordParams)
 		return fmt.Errorf("begin password reset: %w", err)
 	}
 	defer tx.Rollback()
+	if err := s.requireEnabledAdminActor(ctx, tx, params.ActorUserID); err != nil {
+		return err
+	}
 
 	record, err := s.userByID(ctx, tx, params.UserID)
 	if err != nil {

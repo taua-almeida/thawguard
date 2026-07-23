@@ -10,6 +10,7 @@ import (
 
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/jobs"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
 )
 
@@ -152,12 +153,12 @@ type repositoriesPageData struct {
 	WebhookSecretEncryptionConfigured bool
 }
 
-func (s *Server) repositoryViews(ctx context.Context, repositories []domain.Repository) ([]repositoryView, error) {
+func (s *Server) repositoryViews(ctx context.Context, scope repositoryscope.ReadScope, repositories []domain.Repository) ([]repositoryView, error) {
 	jobsByRepository := make(map[int64]jobs.Job)
 	activeFreezesByRepository := make(map[int64]int)
 	pendingSchedulesByRepository := make(map[int64]int)
 	if s.cfg.ReconciliationJobStore != nil {
-		pending, err := s.cfg.ReconciliationJobStore.ListReconciliations(ctx)
+		pending, err := s.cfg.ReconciliationJobStore.ListReconciliationsForScope(ctx, scope)
 		if err != nil {
 			return nil, err
 		}
@@ -165,20 +166,17 @@ func (s *Server) repositoryViews(ctx context.Context, repositories []domain.Repo
 			jobsByRepository[job.RepositoryID] = job
 		}
 	}
-	activeFreezes, err := s.activeFreezes(ctx)
+	activeFreezes, err := s.activeFreezes(ctx, scope)
 	if err != nil {
 		return nil, err
 	}
 	for _, activeFreeze := range activeFreezes {
 		activeFreezesByRepository[activeFreeze.RepositoryID]++
 	}
-	scheduled, err := s.scheduledFreezes(ctx, 500)
-	if err != nil {
-		return nil, err
-	}
-	for _, scheduledFreeze := range scheduled {
-		if scheduledFreeze.Status == domain.BranchFreezeStatusScheduled {
-			pendingSchedulesByRepository[scheduledFreeze.RepositoryID]++
+	if s.cfg.ScheduledFreezeStore != nil {
+		pendingSchedulesByRepository, err = s.cfg.ScheduledFreezeStore.PendingScheduledCountsForScope(ctx, scope)
+		if err != nil {
+			return nil, err
 		}
 	}
 	views := make([]repositoryView, 0, len(repositories))
@@ -544,11 +542,12 @@ func (s *Server) repositoriesPageData(views []repositoryView, formError, notice,
 // repositoryCardByID rebuilds the current repository views and returns the
 // fully prepared card for one repository, for htmx fragment responses.
 func (s *Server) repositoryCardByID(ctx context.Context, repositoryID int64, session sessionState) (repositoryCard, bool, error) {
-	repositories, err := s.repositories(ctx)
+	scope := session.Grants.RepositoryReadScope()
+	repositories, err := s.repositories(ctx, scope)
 	if err != nil {
 		return repositoryCard{}, false, err
 	}
-	views, err := s.repositoryViews(ctx, repositories)
+	views, err := s.repositoryViews(ctx, scope, repositories)
 	if err != nil {
 		return repositoryCard{}, false, err
 	}

@@ -12,10 +12,10 @@
       <h1 class="m-0 text-page-title font-bold text-text">Dashboard</h1>
       <p class="m-0 mt-1 text-sm text-text-muted">What is frozen, what is scheduled, and what changed — at a glance.</p>
     </div>
-    {{ if or .CurrentUser.CanFreeze .CurrentUser.CanThaw }}
+    {{ if or .CanStartFreeze .CanReviewThaws }}
     <div class="flex flex-wrap gap-2">
-      {{ if .CurrentUser.CanFreeze }}{{ template "ui/button" dict "Label" "Start freeze" "Variant" "primary" "Icon" "tg-i-freeze-branch" "Href" "/freezes" }}{{ end }}
-      {{ if .CurrentUser.CanThaw }}{{ template "ui/button" dict "Label" "Review thaws" "Variant" "secondary" "Icon" "tg-i-thaw-drop" "Href" "/decisions" }}{{ end }}
+      {{ if .CanStartFreeze }}{{ template "ui/button" dict "Label" "Start freeze" "Variant" "primary" "Icon" "tg-i-freeze-branch" "Href" "/freezes" }}{{ end }}
+      {{ if .CanReviewThaws }}{{ template "ui/button" dict "Label" "Review thaws" "Variant" "secondary" "Icon" "tg-i-thaw-drop" "Href" "/decisions" }}{{ end }}
     </div>
     {{ end }}
   </header>

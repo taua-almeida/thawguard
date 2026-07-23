@@ -119,16 +119,17 @@ func freezeFormStateFromRequest(r *http.Request) freezeFormState {
 	}
 }
 
-func (s *Server) freezePageData(ctx context.Context) ([]domain.Repository, []domain.BranchFreeze, []managedBranchOption, map[int64]auth.User, error) {
-	repositories, err := s.repositories(ctx)
+func (s *Server) freezePageData(ctx context.Context, session sessionState) ([]domain.Repository, []domain.BranchFreeze, []managedBranchOption, map[int64]auth.User, error) {
+	scope := session.Grants.RepositoryReadScope()
+	repositories, err := s.repositories(ctx, scope)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	freezes, err := s.activeFreezes(ctx)
+	freezes, err := s.activeFreezes(ctx, scope)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	branchOptions, err := s.managedBranchOptions(ctx, repositories)
+	branchOptions, err := s.managedBranchOptions(ctx, freezeRepositories(repositories, session.Grants))
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -268,7 +269,7 @@ func (s *Server) freezesPageData(repositories []domain.Repository, freezes []fre
 		PageTitle:               "Freezes",
 		ActivePage:              "freezes",
 		CurrentUser:             currentUser,
-		EnforceableRepositories: enforcementActiveRepositories(repositories),
+		EnforceableRepositories: repositories,
 		BranchOptions:           branchOptions,
 		FormError:               state.FormError,
 		ActionError:             state.ActionError,
@@ -290,7 +291,7 @@ func (s *Server) freezesPageData(repositories []domain.Repository, freezes []fre
 			freezeView: view,
 			CSRFToken:  csrfToken,
 			CSRFField:  csrfFormField,
-			CanFreeze:  currentUser.CanFreeze,
+			CanFreeze:  false,
 		})
 	}
 	return data
@@ -324,37 +325,40 @@ func (s *Server) renderFreezesFragment(w http.ResponseWriter, r *http.Request, n
 // handleFreezeImpact refreshes the #freeze-impact panel when the form's
 // repository or branch selection changes. GET-only enhancement endpoint: no
 // CSRF, htmx requests get the fragment, everything else goes back to the full
-// page. An unknown pair simply previews zero pull requests.
+// page. Repository authorization happens before either response so hidden and
+// nonexistent targets stay indistinguishable; an unknown branch on an
+// authorized repository simply previews zero pull requests.
 func (s *Server) handleFreezeImpact(w http.ResponseWriter, r *http.Request) {
 	w.Header().Add("Vary", "HX-Request")
 	session, ok := s.requireView(w, r)
 	if !ok {
 		return
 	}
+	repositoryID, err := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("repository_id")), 10, 64)
+	if err != nil || repositoryID <= 0 {
+		s.renderErrorPage(w, http.StatusNotFound, false)
+		return
+	}
+	repository, authorized := s.requireFreezeRepository(w, r, session, repositoryID)
+	if !authorized {
+		return
+	}
 	if !isHXRequest(r) {
 		http.Redirect(w, r, "/freezes", http.StatusSeeOther)
 		return
-	}
-	repositoryID, err := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("repository_id")), 10, 64)
-	if err != nil {
-		repositoryID = 0
 	}
 	form := freezeFormState{
 		Submitted:    true,
 		RepositoryID: repositoryID,
 		Branch:       r.URL.Query().Get("branch"),
 	}
-	repositories, err := s.repositories(r.Context())
+	freezerRepositories := []domain.Repository{repository}
+	branchOptions, err := s.managedBranchOptions(r.Context(), freezerRepositories)
 	if err != nil {
 		internalServerError(w)
 		return
 	}
-	branchOptions, err := s.managedBranchOptions(r.Context(), repositories)
-	if err != nil {
-		internalServerError(w)
-		return
-	}
-	impact, err := s.freezeImpact(r.Context(), repositories, branchOptions, form, currentUserFromSession(session).CanFreeze)
+	impact, err := s.freezeImpact(r.Context(), freezerRepositories, branchOptions, form, len(freezerRepositories) > 0)
 	if err != nil {
 		internalServerError(w)
 		return
@@ -366,18 +370,23 @@ func (s *Server) handleFreezeImpact(w http.ResponseWriter, r *http.Request) {
 // freeze-impact preview for the submitted (or default) repository/branch
 // pair. Writes a 500 and returns ok=false on load failure.
 func (s *Server) loadFreezesPageData(w http.ResponseWriter, r *http.Request, state freezesPageState, session sessionState) (freezesPageData, bool) {
-	repositories, freezes, branchOptions, usersByID, err := s.freezePageData(r.Context())
+	repositories, freezes, branchOptions, usersByID, err := s.freezePageData(r.Context(), session)
 	if err != nil {
 		internalServerError(w)
 		return freezesPageData{}, false
 	}
 	currentUser := currentUserFromSession(session)
-	impact, err := s.freezeImpact(r.Context(), repositories, branchOptions, state.FreezeForm, currentUser.CanFreeze)
+	freezerRepositories := freezeRepositories(repositories, session.Grants)
+	currentUser.CanFreeze = len(freezerRepositories) > 0
+	impact, err := s.freezeImpact(r.Context(), freezerRepositories, branchOptions, state.FreezeForm, len(freezerRepositories) > 0)
 	if err != nil {
 		internalServerError(w)
 		return freezesPageData{}, false
 	}
-	data := s.freezesPageData(repositories, s.freezeViews(repositories, freezes, usersByID), branchOptions, state, session.CSRFToken, currentUser)
+	data := s.freezesPageData(enforcementActiveRepositories(freezerRepositories), s.freezeViews(repositories, freezes, usersByID), branchOptions, state, session.CSRFToken, currentUser)
+	for i := range data.ActiveFreezes {
+		data.ActiveFreezes[i].CanFreeze = session.Grants.CanFreezeRepository(data.ActiveFreezes[i].Freeze.RepositoryID)
+	}
 	data.Impact = impact
 	return data, true
 }

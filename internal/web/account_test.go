@@ -2,22 +2,28 @@ package web
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/taua-almeida/thawguard/internal/auth"
+	"github.com/taua-almeida/thawguard/internal/domain"
 )
 
 const accountWebTestPassword = "correct horse battery staple"
 
 func TestLegacyInMemorySessionHidesUnavailableChangePasswordAction(t *testing.T) {
 	server := NewServer(Config{AppName: "Thawguard"})
+	session := setWebSessionRoles(t, server, auth.RoleSet{auth.RoleAdmin})
 	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.ID})
+	server.Routes().ServeHTTP(recorder, request)
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected dashboard, got %d", recorder.Code)
@@ -39,9 +45,14 @@ func TestAccountAdministrationRoutesRequireAdmin(t *testing.T) {
 	}
 	server := NewServer(Config{AppName: "Thawguard", AuthService: authService})
 
-	routes := []string{"/users/roles", "/users/disable", "/users/enable", "/users/reset-password"}
+	routes := []string{
+		fmt.Sprintf("/users/%d/admin", admin.User.ID),
+		fmt.Sprintf("/users/%d/disable", admin.User.ID),
+		fmt.Sprintf("/users/%d/enable", admin.User.ID),
+		fmt.Sprintf("/users/%d/reset-password", admin.User.ID),
+	}
 	for _, route := range routes {
-		form := url.Values{"user_id": {fmt.Sprint(admin.User.ID)}, "roles": {"viewer"}, csrfFormField: {viewerSession.CSRFToken}}
+		form := url.Values{"admin": {"1"}, csrfFormField: {viewerSession.CSRFToken}}
 		recorder := postAccountForm(t, server, route, &http.Cookie{Name: sessionCookieName, Value: viewerSession.ID}, form)
 		if recorder.Code != http.StatusForbidden {
 			t.Fatalf("expected viewer POST %s to be forbidden, got %d", route, recorder.Code)
@@ -58,10 +69,16 @@ func TestAccountMutationsRejectMissingAndInvalidCSRF(t *testing.T) {
 	server := NewServer(Config{AppName: "Thawguard", AuthService: authService})
 	adminCookie := &http.Cookie{Name: sessionCookieName, Value: admin.ID}
 
-	routes := []string{"/users/roles", "/users/disable", "/users/enable", "/users/reset-password", "/account/password"}
+	routes := []string{
+		fmt.Sprintf("/users/%d/admin", admin.User.ID),
+		fmt.Sprintf("/users/%d/disable", admin.User.ID),
+		fmt.Sprintf("/users/%d/enable", admin.User.ID),
+		fmt.Sprintf("/users/%d/reset-password", admin.User.ID),
+		"/account/password",
+	}
 	for _, route := range routes {
 		for _, token := range []string{"", "invalid-token"} {
-			form := url.Values{"user_id": {"1"}}
+			form := url.Values{}
 			if token != "" {
 				form.Set(csrfFormField, token)
 			}
@@ -81,14 +98,14 @@ func TestFinalEnabledAdminValidationIsRenderedSafely(t *testing.T) {
 	server := NewServer(Config{AppName: "Thawguard", AuthService: authService})
 	adminCookie := &http.Cookie{Name: sessionCookieName, Value: admin.ID}
 
-	form := url.Values{"user_id": {fmt.Sprint(admin.User.ID)}, csrfFormField: {admin.CSRFToken}}
-	recorder := postAccountForm(t, server, "/users/disable", adminCookie, form)
+	form := url.Values{csrfFormField: {admin.CSRFToken}}
+	recorder := postAccountForm(t, server, fmt.Sprintf("/users/%d/disable", admin.User.ID), adminCookie, form)
 	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "the final enabled admin cannot be disabled") {
 		t.Fatalf("expected final admin disable validation, status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
 
-	form = url.Values{"user_id": {fmt.Sprint(admin.User.ID)}, "roles": {"viewer"}, csrfFormField: {admin.CSRFToken}}
-	recorder = postAccountForm(t, server, "/users/roles", adminCookie, form)
+	form = url.Values{csrfFormField: {admin.CSRFToken}}
+	recorder = postAccountForm(t, server, fmt.Sprintf("/users/%d/admin", admin.User.ID), adminCookie, form)
 	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "the final enabled admin must keep the admin role") {
 		t.Fatalf("expected final admin role validation, status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
@@ -115,13 +132,10 @@ func TestUsersPageShowsAccountStateAndResponsiveLabels(t *testing.T) {
 	}
 	for _, want := range []string{
 		`<use href="#tg-i-warning"></use></svg>Disabled</span>`,
-		`<use href="#tg-i-check"></use></svg>Enabled</span>`,
-		`action="/users/enable"`,
-		`action="/users/reset-password"`,
-		`Re-enabling does not restore old sessions.`,
-		`the final enabled admin cannot be disabled or lose the admin role`,
-		`The final enabled admin cannot be disabled.`,
-		`<caption class="sr-only">Local users with status, roles, creation date, and account actions</caption>`,
+		`<use href="#tg-i-check"></use></svg>Active</span>`,
+		fmt.Sprintf(`href="/users/%d"`, user.ID),
+		`No repository access`,
+		`<caption class="sr-only">Users, sign-in method, account status, and access summary</caption>`,
 		`hidden overflow-x-auto md:block`,
 		`md:hidden`,
 		`href="/account/password"`,
@@ -130,41 +144,53 @@ func TestUsersPageShowsAccountStateAndResponsiveLabels(t *testing.T) {
 			t.Fatalf("expected users page to contain %q", want)
 		}
 	}
-	// The final enabled admin is guarded and the only other user is already
-	// disabled, so no row may offer a disable action.
-	if strings.Contains(body, `action="/users/disable"`) {
-		t.Fatal("expected no disable form when every row is guarded or already disabled")
+	if strings.Contains(body, `action="/users/`) {
+		t.Fatal("expected directory rows to remain navigation-only")
 	}
-	if strings.Contains(body, fmt.Sprintf(`id="users-reset-%d"`, admin.User.ID)) {
-		t.Fatal("expected no reset-password dialog for the signed-in admin's own row")
+
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, fmt.Sprintf("/users/%d", user.ID), nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: admin.ID})
+	server.Routes().ServeHTTP(recorder, request)
+	body = recorder.Body.String()
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected user detail page, got %d", recorder.Code)
+	}
+	for _, want := range []string{
+		fmt.Sprintf(`action="/users/%d/enable"`, user.ID),
+		fmt.Sprintf(`action="/users/%d/reset-password"`, user.ID),
+		`It does not re-enable a disabled account.`,
+		`Repository access`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected user detail page to contain %q", want)
+		}
 	}
 }
 
-func TestRoleEditFormPreservesSubmittedRolesAfterValidationError(t *testing.T) {
+func TestRepositoryAccessFormPreservesSubmittedRolesAfterValidationError(t *testing.T) {
 	ctx := context.Background()
 	database := newWebTestDB(t, ctx)
 	authService := auth.NewService(database)
 	admin := mustSetupWebAdmin(t, ctx, authService)
-	user := mustCreateWebUser(t, ctx, authService, "viewer@example.test", []auth.Role{auth.RoleViewer})
-	server := NewServer(Config{AppName: "Thawguard", AuthService: authService})
+	user := mustCreateWebUser(t, ctx, authService, "viewer@example.test", nil)
+	repositoryID := mustInsertWebRepository(t, ctx, database)
+	server := NewServer(Config{AppName: "Thawguard", AuthService: authService, RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{{ID: repositoryID, Owner: "taua-almeida", Name: "thawguard"}}}})
 
 	form := url.Values{
-		"user_id":     {fmt.Sprint(user.ID)},
-		"roles":       {"freezer", "owner"},
-		csrfFormField: {admin.CSRFToken},
+		"repository_id": {fmt.Sprint(repositoryID)},
+		"roles":         {"freezer", "owner"},
+		csrfFormField:   {admin.CSRFToken},
 	}
-	recorder := postAccountForm(t, server, "/users/roles", &http.Cookie{Name: sessionCookieName, Value: admin.ID}, form)
+	recorder := postAccountForm(t, server, fmt.Sprintf("/users/%d/repository-access", user.ID), &http.Cookie{Name: sessionCookieName, Value: admin.ID}, form)
 	body := recorder.Body.String()
-	if recorder.Code != http.StatusBadRequest || !strings.Contains(body, "role is invalid") {
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(body, "repository role is invalid") {
 		t.Fatalf("expected role validation error, status=%d body=%q", recorder.Code, body)
 	}
-	if !strings.Contains(renderedControlTag(t, body, fmt.Sprintf("u%d-role-freezer", user.ID)), " checked") {
+	if !strings.Contains(renderedControlTag(t, body, fmt.Sprintf("repo-%d-freezer", repositoryID)), " checked") {
 		t.Fatal("expected submitted freezer role to stay selected after validation error")
 	}
-	if !strings.Contains(renderedControlTag(t, body, fmt.Sprintf("m-u%d-role-freezer", user.ID)), " checked") {
-		t.Fatal("expected submitted freezer role to stay selected on the mobile card after validation error")
-	}
-	if strings.Contains(renderedControlTag(t, body, fmt.Sprintf("u%d-role-viewer", user.ID)), " checked") {
+	if strings.Contains(renderedControlTag(t, body, fmt.Sprintf("repo-%d-viewer", repositoryID)), " checked") {
 		t.Fatal("expected unsubmitted viewer role to be unselected after validation error")
 	}
 }
@@ -204,17 +230,17 @@ func TestPasswordResetNeverRendersPasswordValues(t *testing.T) {
 		"temporary_password_confirmation": {secretValue + "-mismatch"},
 		csrfFormField:                     {admin.CSRFToken},
 	}
-	recorder := postAccountForm(t, server, "/users/reset-password", adminCookie, form)
+	recorder := postAccountForm(t, server, fmt.Sprintf("/users/%d/reset-password", user.ID), adminCookie, form)
 	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "temporary passwords do not match") {
 		t.Fatalf("expected mismatch validation, status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
 	if strings.Contains(recorder.Body.String(), secretValue) {
 		t.Fatal("expected temporary password to never be re-rendered")
 	}
-	if !strings.Contains(recorder.Body.String(), fmt.Sprintf(`<dialog id="users-reset-%d" open`, user.ID)) {
+	if !strings.Contains(recorder.Body.String(), `<dialog id="user-reset-password" open`) {
 		t.Fatal("expected failed reset dialog to re-open on its row")
 	}
-	passwordTag := renderedControlTag(t, recorder.Body.String(), fmt.Sprintf("reset-%d-password", user.ID))
+	passwordTag := renderedControlTag(t, recorder.Body.String(), "reset-temporary-password")
 	// A bare " disabled" attribute, not the class's disabled: variant prefixes.
 	if !strings.Contains(passwordTag, `minlength="12"`) || strings.Contains(passwordTag, " disabled ") || strings.HasSuffix(passwordTag, " disabled") {
 		t.Fatalf("expected re-opened reset password input to stay enabled, got %q", passwordTag)
@@ -224,8 +250,9 @@ func TestPasswordResetNeverRendersPasswordValues(t *testing.T) {
 	}
 
 	form.Set("temporary_password_confirmation", secretValue)
-	recorder = postAccountForm(t, server, "/users/reset-password", adminCookie, form)
-	if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != "/users" {
+	recorder = postAccountForm(t, server, fmt.Sprintf("/users/%d/reset-password", user.ID), adminCookie, form)
+	wantLocation := fmt.Sprintf("/users/%d?notice=password-reset", user.ID)
+	if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != wantLocation {
 		t.Fatalf("expected reset redirect, status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
 	if strings.Contains(recorder.Body.String(), secretValue) {
@@ -323,7 +350,7 @@ func TestForcedPasswordSessionIsGatedToPasswordChangeAndLogout(t *testing.T) {
 		}
 	}
 
-	for _, path := range []string{"/freezes", "/users/roles", "/users/reset-password", "/repositories"} {
+	for _, path := range []string{"/freezes", fmt.Sprintf("/users/%d/admin", user.ID), fmt.Sprintf("/users/%d/reset-password", user.ID), "/repositories"} {
 		form := url.Values{"user_id": {"1"}, "repository_id": {"1"}, "branch": {"main"}, "reason": {"release"}, csrfFormField: {forcedSession.CSRFToken}}
 		recorder := postAccountForm(t, server, path, forcedCookie, form)
 		if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != "/account/password" {
@@ -415,8 +442,8 @@ func TestSelfDisableClearsSessionCookieAndRedirectsToLogin(t *testing.T) {
 	mustCreateWebUser(t, ctx, authService, "second-admin@example.test", []auth.Role{auth.RoleAdmin})
 	server := NewServer(Config{AppName: "Thawguard", AuthService: authService})
 
-	form := url.Values{"user_id": {fmt.Sprint(admin.User.ID)}, csrfFormField: {admin.CSRFToken}}
-	recorder := postAccountForm(t, server, "/users/disable", &http.Cookie{Name: sessionCookieName, Value: admin.ID}, form)
+	form := url.Values{csrfFormField: {admin.CSRFToken}}
+	recorder := postAccountForm(t, server, fmt.Sprintf("/users/%d/disable", admin.User.ID), &http.Cookie{Name: sessionCookieName, Value: admin.ID}, form)
 	if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != "/login" {
 		t.Fatalf("expected self-disable redirect to login, status=%d location=%q", recorder.Code, recorder.Header().Get("Location"))
 	}
@@ -440,10 +467,10 @@ func TestAccountMutationInternalErrorsRemainGeneric(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	form := url.Values{"user_id": {fmt.Sprint(user.ID)}, csrfFormField: {admin.CSRFToken}}
-	recorder := postAccountForm(t, server, "/users/disable", &http.Cookie{Name: sessionCookieName, Value: admin.ID}, form)
-	body := strings.TrimSpace(recorder.Body.String())
-	if recorder.Code != http.StatusInternalServerError || body != "internal server error" {
+	form := url.Values{csrfFormField: {admin.CSRFToken}}
+	recorder := postAccountForm(t, server, fmt.Sprintf("/users/%d/disable", user.ID), &http.Cookie{Name: sessionCookieName, Value: admin.ID}, form)
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusInternalServerError || !strings.Contains(body, "Something went wrong") || strings.Contains(body, "audit_events") {
 		t.Fatalf("expected generic internal error, status=%d body=%q", recorder.Code, body)
 	}
 }
@@ -459,11 +486,67 @@ func mustSetupWebAdmin(t *testing.T, ctx context.Context, authService *auth.Serv
 
 func mustCreateWebUser(t *testing.T, ctx context.Context, authService *auth.Service, email string, roles []auth.Role) auth.User {
 	t.Helper()
-	user, err := authService.CreateUser(ctx, auth.CreateUserParams{Email: email, DisplayName: "User " + email, Password: accountWebTestPassword, Roles: roles})
+	users, err := authService.ListUsers(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
+	var actorUserID int64
+	for _, user := range users {
+		if user.Roles.Contains(auth.RoleAdmin) && !user.Disabled() {
+			actorUserID = user.ID
+			break
+		}
+	}
+	if actorUserID == 0 {
+		t.Fatal("expected an enabled Admin fixture")
+	}
+	const temporaryPassword = "temporary initial password"
+	user, err := authService.CreateUser(ctx, auth.CreateUserParams{ActorUserID: actorUserID, Email: email, DisplayName: "User " + email, Password: temporaryPassword})
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err := authService.ChangePassword(ctx, auth.ChangePasswordParams{UserID: user.ID, CurrentPassword: temporaryPassword, NewPassword: accountWebTestPassword})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user = changed.User
+	if auth.RoleSet(roles).Contains(auth.RoleAdmin) {
+		user, err = authService.SetUserAdmin(ctx, auth.SetUserAdminParams{ActorUserID: actorUserID, UserID: user.ID, Admin: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	return user
+}
+
+func mustInsertWebRepository(t *testing.T, ctx context.Context, database interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}) int64 {
+	t.Helper()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := database.ExecContext(ctx, `
+INSERT INTO repositories(forge, base_url, owner, name, default_branch, created_at, updated_at)
+VALUES ('forgejo', 'https://forge.example.test', 'taua-almeida', 'thawguard', 'main', ?, ?)`, now, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func mustInsertWebRepositoryID(t *testing.T, ctx context.Context, database interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, id int64, name string) {
+	t.Helper()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO repositories(id, forge, base_url, owner, name, default_branch, created_at, updated_at)
+VALUES (?, 'forgejo', 'https://forge.example.test', 'taua-almeida', ?, 'main', ?, ?)`, id, name, now, now); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func postAccountForm(t *testing.T, server *Server, path string, cookie *http.Cookie, form url.Values) *httptest.ResponseRecorder {

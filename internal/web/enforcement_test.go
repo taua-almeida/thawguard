@@ -15,6 +15,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/jobs"
 	"github.com/taua-almeida/thawguard/internal/repository"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
 )
 
@@ -111,8 +112,7 @@ func newEnforcementTestServer(repo domain.Repository, checks []setupcheck.Check,
 
 func TestRepositoriesPageOffersVerifyActionWhenReadinessPasses(t *testing.T) {
 	server := newEnforcementTestServer(enforcementTestRepository(domain.EnforcementSetupIncomplete), passingReadinessChecks(time.Now().UTC()), &fakeEnforcementService{})
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+	recorder := getPageWithRoles(t, server, "/repositories", auth.RoleSet{auth.RoleAdmin})
 
 	body := recorder.Body.String()
 	if !strings.Contains(body, `action="/repositories/status-verification"`) || !strings.Contains(body, "Verify status posting") {
@@ -130,8 +130,7 @@ func TestRepositoriesPageDisablesVerifyActionWhenReadinessIncomplete(t *testing.
 	checkedAt := time.Now().UTC()
 	failing := append(passingReadinessChecks(checkedAt), setupcheck.Check{RepositoryID: 7, Branch: "main", Result: setupcheck.Result{Name: setupcheck.CheckRequiredStatusChecksEnabled, Status: setupcheck.StatusFailed, Description: "missing"}, CheckedAt: checkedAt})
 	server := newEnforcementTestServer(enforcementTestRepository(domain.EnforcementSetupIncomplete), failing, &fakeEnforcementService{})
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+	recorder := getPageWithRoles(t, server, "/repositories", auth.RoleSet{auth.RoleAdmin})
 
 	body := recorder.Body.String()
 	if strings.Contains(body, `action="/repositories/status-verification"`) {
@@ -142,8 +141,7 @@ func TestRepositoriesPageDisablesVerifyActionWhenReadinessIncomplete(t *testing.
 	}
 
 	server = newEnforcementTestServer(enforcementTestRepository(domain.EnforcementSetupIncomplete), nil, &fakeEnforcementService{})
-	recorder = httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+	recorder = getPageWithRoles(t, server, "/repositories", auth.RoleSet{auth.RoleAdmin})
 	if !strings.Contains(recorder.Body.String(), "Run the read-only readiness checks first") {
 		t.Fatalf("expected no-evidence remediation copy, got %q", recorder.Body.String())
 	}
@@ -151,8 +149,7 @@ func TestRepositoriesPageDisablesVerifyActionWhenReadinessIncomplete(t *testing.
 
 func TestRepositoriesPageShowsActivateActionOnlyWhenReady(t *testing.T) {
 	server := newEnforcementTestServer(enforcementTestRepository(domain.EnforcementReady), passingReadinessChecks(time.Now().UTC()), &fakeEnforcementService{})
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+	recorder := getPageWithRoles(t, server, "/repositories", auth.RoleSet{auth.RoleAdmin})
 
 	body := recorder.Body.String()
 	if !strings.Contains(body, `action="/repositories/activate"`) || !strings.Contains(body, "Activate enforcement") {
@@ -171,8 +168,7 @@ func TestRepositoriesPageShowsActivateActionOnlyWhenReady(t *testing.T) {
 
 func TestRepositoriesPageOffersReconcileActionForActiveRepository(t *testing.T) {
 	server := newEnforcementTestServer(enforcementTestRepository(domain.EnforcementActive), passingReadinessChecks(time.Now().UTC()), &fakeEnforcementService{})
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+	recorder := getPageWithRoles(t, server, "/repositories", auth.RoleSet{auth.RoleAdmin})
 
 	body := recorder.Body.String()
 	if !strings.Contains(body, `action="/repositories/reconcile"`) || !strings.Contains(body, "Reconcile now") {
@@ -201,8 +197,7 @@ func TestRepositoriesPageOffersReconcileActionForActiveRepository(t *testing.T) 
 
 func TestRepositoriesPageOffersRecoveryForUnhealthyRepository(t *testing.T) {
 	server := newEnforcementTestServer(enforcementTestRepository(domain.EnforcementUnhealthy), passingReadinessChecks(time.Now().UTC()), &fakeEnforcementService{})
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+	recorder := getPageWithRoles(t, server, "/repositories", auth.RoleSet{auth.RoleAdmin})
 
 	body := recorder.Body.String()
 	if !strings.Contains(body, `action="/repositories/recover"`) || !strings.Contains(body, "Retry enforcement recovery") {
@@ -244,8 +239,7 @@ func TestRepositoriesPageShowsSafeAutomaticRecoveryState(t *testing.T) {
 				EnforcementService:     &fakeEnforcementService{},
 				ReconciliationJobStore: fakeReconciliationJobStore{jobs: []jobs.Job{test.job}},
 			})
-			recorder := httptest.NewRecorder()
-			server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+			recorder := getPageWithRoles(t, server, "/repositories", auth.RoleSet{auth.RoleAdmin})
 			body := recorder.Body.String()
 			for _, want := range test.want {
 				if !strings.Contains(body, want) {
@@ -265,8 +259,7 @@ func TestRepositoriesPageEscapesStoredFailureReason(t *testing.T) {
 	repo := enforcementTestRepository(domain.EnforcementUnhealthy)
 	repo.EnforcementFailureReason = `<script>alert("x")</script>`
 	server := newEnforcementTestServer(repo, nil, &fakeEnforcementService{})
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+	recorder := getPageWithRoles(t, server, "/repositories", auth.RoleSet{auth.RoleAdmin})
 
 	body := recorder.Body.String()
 	if strings.Contains(body, `<script>alert`) {
@@ -280,8 +273,7 @@ func TestRepositoriesPageEscapesStoredFailureReason(t *testing.T) {
 func TestRepositoriesPageHidesReconcileAndRecoveryBeforeActivation(t *testing.T) {
 	for _, state := range []domain.EnforcementState{domain.EnforcementSetupIncomplete, domain.EnforcementReady} {
 		server := newEnforcementTestServer(enforcementTestRepository(state), passingReadinessChecks(time.Now().UTC()), &fakeEnforcementService{})
-		recorder := httptest.NewRecorder()
-		server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+		recorder := getPageWithRoles(t, server, "/repositories", auth.RoleSet{auth.RoleAdmin})
 
 		body := recorder.Body.String()
 		if strings.Contains(body, `action="/repositories/reconcile"`) || strings.Contains(body, `action="/repositories/recover"`) || strings.Contains(body, `action="/repositories/deactivate"`) {
@@ -293,8 +285,7 @@ func TestRepositoriesPageHidesReconcileAndRecoveryBeforeActivation(t *testing.T)
 func TestRepositoriesPageHidesEnforcementActionsForActiveAndUnhealthy(t *testing.T) {
 	for _, state := range []domain.EnforcementState{domain.EnforcementActive, domain.EnforcementUnhealthy} {
 		server := newEnforcementTestServer(enforcementTestRepository(state), passingReadinessChecks(time.Now().UTC()), &fakeEnforcementService{})
-		recorder := httptest.NewRecorder()
-		server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+		recorder := getPageWithRoles(t, server, "/repositories", auth.RoleSet{auth.RoleAdmin})
 
 		body := recorder.Body.String()
 		if strings.Contains(body, `action="/repositories/status-verification"`) || strings.Contains(body, `action="/repositories/activate"`) {
@@ -395,8 +386,7 @@ func TestRepositoriesPageShowsDeactivationBlockerLinks(t *testing.T) {
 				ScheduledFreezeStore: freezeStore,
 				EnforcementService:   &fakeEnforcementService{},
 			})
-			recorder := httptest.NewRecorder()
-			server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/repositories", nil))
+			recorder := getPageWithRoles(t, server, "/repositories", auth.RoleSet{auth.RoleAdmin})
 			body := recorder.Body.String()
 			if !strings.Contains(body, test.want) || !strings.Contains(body, `href="`+test.link+`"`) || strings.Contains(body, `action="/repositories/deactivate"`) {
 				t.Fatalf("expected blocker guidance without action, got %q", body)
@@ -554,11 +544,14 @@ func TestEnforcementActionsForbiddenForNonAdmin(t *testing.T) {
 	ctx := context.Background()
 	database := newWebTestDB(t, ctx)
 	authService := auth.NewService(database)
-	if _, err := authService.CreateFirstAdmin(ctx, auth.CreateFirstAdminParams{Email: "admin@example.test", DisplayName: "Admin", Password: "correct horse battery staple"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := authService.CreateUser(ctx, auth.CreateUserParams{Email: "viewer@example.test", DisplayName: "Viewer", Password: "correct horse battery staple", Roles: []auth.Role{auth.RoleViewer}}); err != nil {
-		t.Fatal(err)
+	admin := mustSetupWebAdmin(t, ctx, authService)
+	viewer := mustCreateWebUser(t, ctx, authService, "viewer@example.test", nil)
+	mustInsertWebRepositoryID(t, ctx, database, 7, "thawguard")
+	mustInsertWebRepositoryID(t, ctx, database, 8, "thawguard-unhealthy")
+	for _, repositoryID := range []int64{7, 8} {
+		if err := authService.SetUserRepositoryRoles(ctx, auth.SetUserRepositoryRolesParams{ActorUserID: admin.User.ID, UserID: viewer.ID, RepositoryID: repositoryID, Roles: []auth.Role{auth.RoleViewer}}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	viewerSession, err := authService.Login(ctx, auth.LoginParams{Email: "viewer@example.test", Password: "correct horse battery staple"})
 	if err != nil {
@@ -634,6 +627,19 @@ type fakeReconciliationJobStore struct {
 
 func (s fakeReconciliationJobStore) ListReconciliations(context.Context) ([]jobs.Job, error) {
 	return s.jobs, s.err
+}
+
+func (s fakeReconciliationJobStore) ListReconciliationsForScope(_ context.Context, scope repositoryscope.ReadScope) ([]jobs.Job, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	visible := make([]jobs.Job, 0, len(s.jobs))
+	for _, job := range s.jobs {
+		if fakeScopeAllows(scope, job.RepositoryID) {
+			visible = append(visible, job)
+		}
+	}
+	return visible, nil
 }
 
 func timePointerForWeb(value time.Time) *time.Time { return &value }

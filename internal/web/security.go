@@ -34,34 +34,27 @@ const (
 )
 
 type sessionState struct {
-	ID          string
-	CSRFToken   string
-	UserID      *int64
-	Email       string
-	DisplayName string
-	Role        auth.Role
-	Roles       auth.RoleSet
-	// Grants carries the repository-aware capabilities loaded with the auth
-	// session. No guard, handler, or template consumes it until the
-	// authorization cutover; guards stay on the global Roles set.
+	ID                 string
+	CSRFToken          string
+	UserID             *int64
+	Email              string
+	DisplayName        string
 	Grants             auth.Grants
 	MustChangePassword bool
 	ExpiresAt          time.Time
 }
 
 func (s sessionState) auditActor() domain.Actor {
-	role := s.Roles.String()
-	if role == "" {
-		role = string(s.Role)
+	role := "no_repository_access"
+	if s.Grants.CanManageInstallation() {
+		role = string(auth.RoleAdmin)
+	} else if s.Grants.HasRepositoryAccess() {
+		role = "repository_access"
 	}
 	if s.UserID != nil {
 		return domain.Actor{UserID: s.UserID, Kind: domain.ActorKindUser, Role: role}
 	}
-	bootstrapRole := string(s.Role)
-	if bootstrapRole == "" {
-		bootstrapRole = role
-	}
-	return domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: bootstrapRole}
+	return domain.Actor{Kind: domain.ActorKindBootstrapAdmin, Role: role}
 }
 
 type sessionStore struct {
@@ -131,8 +124,6 @@ func (s *sessionStore) create() (sessionState, error) {
 		session := sessionState{
 			ID:        id,
 			CSRFToken: csrfToken,
-			Role:      auth.RoleAdmin,
-			Roles:     auth.RoleSet(auth.Roles()),
 			ExpiresAt: s.now().Add(s.ttl),
 		}
 

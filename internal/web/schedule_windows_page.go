@@ -93,13 +93,17 @@ func (s *Server) handleScheduleWindowAdd(w http.ResponseWriter, r *http.Request)
 	if !s.requireScheduleStore(w) {
 		return
 	}
-	session, ok := s.requireScheduleManagerForm(w, r)
+	session, ok := s.requireActionForm(w, r)
 	if !ok {
 		return
 	}
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil || id <= 0 {
 		s.renderErrorPage(w, http.StatusNotFound, false)
+		return
+	}
+	sched, authorized := s.authorizeSchedule(w, r, session, id)
+	if !authorized {
 		return
 	}
 	form := scheduleWindowFormStateFromRequest(r)
@@ -129,15 +133,6 @@ func (s *Server) handleScheduleWindowAdd(w http.ResponseWriter, r *http.Request)
 		internalServerError(w)
 		return
 	}
-	sched, getErr := s.cfg.ScheduleStore.Get(r.Context(), id)
-	if errors.Is(getErr, schedule.ErrNotFound) {
-		s.renderErrorPage(w, http.StatusNotFound, false)
-		return
-	}
-	if getErr != nil {
-		internalServerError(w)
-		return
-	}
 	forms := defaultScheduleDetailForms()
 	forms.WindowForm = form
 	forms.WindowFormError = err.Error()
@@ -152,13 +147,16 @@ func (s *Server) handleScheduleWindowDelete(w http.ResponseWriter, r *http.Reque
 	if !s.requireScheduleStore(w) {
 		return
 	}
-	session, ok := s.requireScheduleManagerForm(w, r)
+	session, ok := s.requireActionForm(w, r)
 	if !ok {
 		return
 	}
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil || id <= 0 {
 		s.renderErrorPage(w, http.StatusNotFound, false)
+		return
+	}
+	if _, authorized := s.authorizeSchedule(w, r, session, id); !authorized {
 		return
 	}
 	windowID, err := strconv.ParseInt(r.PathValue("windowID"), 10, 64)

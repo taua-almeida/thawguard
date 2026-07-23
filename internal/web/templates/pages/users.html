@@ -2,11 +2,16 @@
 <div class="flex flex-col gap-6">
   <header class="flex flex-wrap items-start justify-between gap-3">
     <div>
-      <h1 class="m-0 text-page-title font-bold text-text">Users &amp; Roles</h1>
-      <p class="m-0 mt-1 text-sm text-text-muted">Create local users and assign one or more narrow MVP roles used by Thawguard route gates.</p>
+      <h1 class="m-0 text-page-title font-bold text-text">Users &amp; Access</h1>
+      <p class="m-0 mt-1 text-sm text-text-muted">Who can sign in to Thawguard and what they can reach.</p>
     </div>
-    {{ template "ui/button" dict "Label" "Add user" "Variant" "primary" "Icon" "tg-i-plus" "DialogTarget" "users-create-dialog" }}
+    {{ template "ui/button" dict "Label" "Add local user" "Variant" "primary" "Icon" "tg-i-plus" "DialogTarget" "users-create-dialog" }}
   </header>
+
+  {{ if .FormError }}<div role="alert">{{ template "ui/callout" dict "Tone" "danger" "Body" .FormError }}</div>{{ end }}
+  {{ template "ui/callout" dict "Tone" "info" "Body" "Admin manages installation setup, repositories, people, and access, and can view every repository. Viewer, Freezer, and Thaw approver are granted per repository. Admin does not imply Freeze or Thaw actions. Every access change is recorded in Activity." }}
+  {{ if .NoRepositories }}{{ template "ui/callout" dict "Tone" "warning" "Body" "No repositories are configured yet. Users can still be created, but repository access cannot be granted until an Admin adds a repository." }}{{ end }}
+
   {{ template "components/users-live" . }}
 </div>
 {{ end }}

@@ -2,12 +2,10 @@ package auth
 
 import "github.com/taua-almeida/thawguard/internal/repositoryscope"
 
-// Grants is the repository-aware authorization model: the global role set
-// filtered to Admin plus every repository-scoped role a user holds. It is
-// pure and has no HTTP callers yet; session hydration and handler wiring
-// stay on the global RoleSet until cutover. Its state is unexported so a
-// Grants value can only be built through NewGrants and only answers
-// authorization questions through its capability methods.
+// Grants is the live authorization model: the global role set filtered to
+// Admin plus every repository-scoped role a user holds. Its state is
+// unexported so a Grants value can only be built through NewGrants and only
+// answers authorization questions through its capability methods.
 type Grants struct {
 	// global carries at most the Admin role. Legacy global freezer, thaw
 	// approver, and viewer rows in user_roles authorize nothing here.
@@ -20,7 +18,7 @@ type Grants struct {
 // same relative order Roles() uses so scoped and global sets render alike.
 // Admin is deliberately absent: admin remains a global concern.
 func RepositoryRoles() []Role {
-	return []Role{RoleFreezer, RoleThawApprover, RoleViewer}
+	return []Role{RoleViewer, RoleFreezer, RoleThawApprover}
 }
 
 func (r Role) ValidForRepository() bool {
@@ -56,6 +54,20 @@ func NewGrants(global RoleSet, scoped map[int64]RoleSet) Grants {
 		}
 	}
 	return grants
+}
+
+// CanManageInstallation reports whether the user holds the one global role.
+// It grants installation/repository configuration and Users & Access
+// management, but never repository-scoped freeze or thaw actions.
+func (g Grants) CanManageInstallation() bool {
+	return g.global.Contains(RoleAdmin)
+}
+
+// HasRepositoryAccess reports whether the user can read at least one
+// repository. Admin read-all authority qualifies even when no scoped grants
+// exist; a zero-access user does not.
+func (g Grants) HasRepositoryAccess() bool {
+	return g.CanManageInstallation() || len(g.byRepository) > 0
 }
 
 // CanViewRepository reports whether the user may view the repository: Admin

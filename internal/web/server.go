@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/freeze"
 	"github.com/taua-almeida/thawguard/internal/jobs"
 	"github.com/taua-almeida/thawguard/internal/repository"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 	"github.com/taua-almeida/thawguard/internal/repositorysetup"
 	"github.com/taua-almeida/thawguard/internal/schedule"
 	"github.com/taua-almeida/thawguard/internal/setupcheck"
@@ -79,7 +81,7 @@ type EnforcementService interface {
 }
 
 type ReconciliationJobStore interface {
-	ListReconciliations(ctx context.Context) ([]jobs.Job, error)
+	ListReconciliationsForScope(ctx context.Context, scope repositoryscope.ReadScope) ([]jobs.Job, error)
 }
 
 type AuthService interface {
@@ -89,8 +91,12 @@ type AuthService interface {
 	SessionByID(ctx context.Context, id string) (auth.Session, bool, error)
 	Logout(ctx context.Context, id string) error
 	ListUsers(ctx context.Context) ([]auth.User, error)
+	ListUsersDirectory(ctx context.Context, query auth.UserDirectoryQuery) ([]auth.UserDirectoryEntry, error)
+	GetUser(ctx context.Context, userID int64) (auth.User, error)
+	ListUserRepositoryGrants(ctx context.Context, userID int64) ([]auth.RepositoryGrantDetail, error)
 	CreateUser(ctx context.Context, params auth.CreateUserParams) (auth.User, error)
-	UpdateUserRoles(ctx context.Context, params auth.UpdateUserRolesParams) (auth.User, error)
+	SetUserAdmin(ctx context.Context, params auth.SetUserAdminParams) (auth.User, error)
+	SetUserRepositoryRoles(ctx context.Context, params auth.SetUserRepositoryRolesParams) error
 	DisableUser(ctx context.Context, actorUserID int64, userID int64) (auth.User, error)
 	EnableUser(ctx context.Context, actorUserID int64, userID int64) (auth.User, error)
 	ChangePassword(ctx context.Context, params auth.ChangePasswordParams) (auth.Session, error)
@@ -98,7 +104,8 @@ type AuthService interface {
 }
 
 type RepositoryStore interface {
-	List(ctx context.Context) ([]domain.Repository, error)
+	ListForScope(ctx context.Context, scope repositoryscope.ReadScope) ([]domain.Repository, error)
+	GetForScope(ctx context.Context, scope repositoryscope.ReadScope, id int64) (domain.Repository, error)
 	Create(ctx context.Context, params repository.CreateParams, actor domain.Actor) (domain.Repository, error)
 	SetWebhookSecret(ctx context.Context, repositoryID int64, secret string, actor domain.Actor) (domain.Repository, error)
 	SetStatusToken(ctx context.Context, repositoryID int64, token string, actor domain.Actor) (domain.Repository, error)
@@ -126,15 +133,18 @@ type PullRequestStore interface {
 }
 
 type FreezeStore interface {
-	ListActive(ctx context.Context) ([]domain.BranchFreeze, error)
+	ListActiveForScope(ctx context.Context, scope repositoryscope.ReadScope) ([]domain.BranchFreeze, error)
+	GetForScope(ctx context.Context, scope repositoryscope.ReadScope, id int64) (domain.BranchFreeze, error)
 	CreateActive(ctx context.Context, params freeze.CreateParams, actor domain.Actor) (domain.BranchFreeze, error)
 	End(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error)
 	Cancel(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error)
 }
 
 type ScheduledFreezeStore interface {
-	ListScheduled(ctx context.Context, limit int) ([]domain.BranchFreeze, error)
-	ListScheduledPage(ctx context.Context, status domain.BranchFreezeStatus, offset, limit int) ([]domain.BranchFreeze, int, error)
+	ListScheduledForScope(ctx context.Context, scope repositoryscope.ReadScope, limit int) ([]domain.BranchFreeze, error)
+	ListScheduledPageForScope(ctx context.Context, scope repositoryscope.ReadScope, status domain.BranchFreezeStatus, offset, limit int) ([]domain.BranchFreeze, int, error)
+	PendingScheduledCountsForScope(ctx context.Context, scope repositoryscope.ReadScope) (map[int64]int, error)
+	GetForScope(ctx context.Context, scope repositoryscope.ReadScope, id int64) (domain.BranchFreeze, error)
 	CreateScheduled(ctx context.Context, params freeze.ScheduleParams, actor domain.Actor) (domain.BranchFreeze, error)
 	EditScheduled(ctx context.Context, params freeze.EditScheduleParams, actor domain.Actor) (domain.BranchFreeze, error)
 	CancelScheduled(ctx context.Context, id int64, actor domain.Actor) (domain.BranchFreeze, error)
@@ -146,8 +156,8 @@ type ScheduledFreezeStore interface {
 // background runner), Pause stops coverage and ends the schedule's live
 // freeze if one exists.
 type ScheduleStore interface {
-	List(ctx context.Context) ([]domain.Schedule, error)
-	Get(ctx context.Context, id int64) (domain.Schedule, error)
+	ListForScope(ctx context.Context, scope repositoryscope.ReadScope) ([]domain.Schedule, error)
+	GetForScope(ctx context.Context, scope repositoryscope.ReadScope, id int64) (domain.Schedule, error)
 	Create(ctx context.Context, params schedule.CreateParams, actor domain.Actor) (domain.Schedule, error)
 	Delete(ctx context.Context, id int64, actor domain.Actor) (domain.Schedule, error)
 	Activate(ctx context.Context, id int64, actor domain.Actor) (domain.Schedule, error)
@@ -161,23 +171,23 @@ type ScheduleStore interface {
 }
 
 type AuditStore interface {
-	List(ctx context.Context, limit int) ([]audit.Event, error)
-	ListPage(ctx context.Context, actions []string, offset, limit int) ([]audit.Event, int, error)
+	ListForScope(ctx context.Context, scope repositoryscope.ReadScope, limit int) ([]audit.Event, error)
+	ListPageForScope(ctx context.Context, scope repositoryscope.ReadScope, actions []string, offset, limit int) ([]audit.Event, int, error)
 }
 
 type ThawExceptionStore interface {
-	CountActive(ctx context.Context) (int, error)
+	CountActiveForScope(ctx context.Context, scope repositoryscope.ReadScope) (int, error)
 }
 
 type StatusDecisionStore interface {
 	ListRecent(ctx context.Context, limit int) ([]statusresult.Result, error)
-	ListDecisionsPage(ctx context.Context, state domain.CommitStatusState, repositoryID int64, offset, limit int) ([]statusresult.Result, int, error)
+	ListDecisionsPageForScope(ctx context.Context, scope repositoryscope.ReadScope, state domain.CommitStatusState, repositoryID int64, offset, limit int) ([]statusresult.Result, int, error)
 	ApproveThaw(ctx context.Context, params statusresult.ThawApprovalParams, actor domain.Actor) (statusresult.ThawApprovalOutcome, error)
 }
 
 type StatusPublicationStore interface {
-	ListPage(ctx context.Context, state string, repositoryID int64, offset, limit int) ([]statuspublication.Publication, int, error)
-	ListAttemptsPage(ctx context.Context, result string, repositoryID int64, offset, limit int) ([]statuspublication.Attempt, int, error)
+	ListPageForScope(ctx context.Context, scope repositoryscope.ReadScope, state string, repositoryID int64, offset, limit int) ([]statuspublication.Publication, int, error)
+	ListAttemptsPageForScope(ctx context.Context, scope repositoryscope.ReadScope, result string, repositoryID int64, offset, limit int) ([]statuspublication.Attempt, int, error)
 }
 
 type WebhookRepositoryStore interface {
@@ -186,7 +196,7 @@ type WebhookRepositoryStore interface {
 }
 
 type WebhookDeliveryStore interface {
-	ListPage(ctx context.Context, processing string, repositoryID int64, order webhook.DeliveryOrder, offset, limit int) ([]webhook.Delivery, int, error)
+	ListPageForScope(ctx context.Context, scope repositoryscope.ReadScope, processing string, repositoryID int64, order webhook.DeliveryOrder, offset, limit int) ([]webhook.Delivery, int, error)
 	Record(ctx context.Context, params webhook.DeliveryRecordParams) (webhook.Delivery, error)
 	ClaimForProcessing(ctx context.Context, id int64) (webhook.Delivery, bool, error)
 	MarkProcessed(ctx context.Context, id int64, params webhook.DeliveryProcessParams) (webhook.Delivery, error)
@@ -268,9 +278,13 @@ type currentUserView struct {
 	RoleLabel             string
 	CanChangePassword     bool
 	IsAdmin               bool
-	CanManageRepositories bool
-	CanFreeze             bool
-	CanThaw               bool
+	CanManageInstallation bool
+	HasRepositoryAccess   bool
+	// CanFreeze and CanThaw are page-local presentation flags. Loaders set
+	// them only after intersecting fresh session grants with the repositories
+	// relevant to that page; handlers never authorize from this view model.
+	CanFreeze bool
+	CanThaw   bool
 }
 
 type Server struct {
@@ -347,10 +361,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /webhooks/forgejo", s.handleForgejoWebhook)
 	s.mux.HandleFunc("GET /users", s.handleUsers)
 	s.mux.HandleFunc("POST /users", s.handleCreateUser)
-	s.mux.HandleFunc("POST /users/roles", s.handleUpdateUserRoles)
-	s.mux.HandleFunc("POST /users/disable", s.handleDisableUser)
-	s.mux.HandleFunc("POST /users/enable", s.handleEnableUser)
-	s.mux.HandleFunc("POST /users/reset-password", s.handleResetUserPassword)
+	s.mux.HandleFunc("GET /users/{id}", s.handleUserDetail)
+	s.mux.HandleFunc("POST /users/{id}/admin", s.handleSetUserAdmin)
+	s.mux.HandleFunc("POST /users/{id}/repository-access", s.handleSetUserRepositoryAccess)
+	s.mux.HandleFunc("POST /users/{id}/repository-access/remove", s.handleRemoveUserRepositoryAccess)
+	s.mux.HandleFunc("POST /users/{id}/disable", s.handleDisableUser)
+	s.mux.HandleFunc("POST /users/{id}/enable", s.handleEnableUser)
+	s.mux.HandleFunc("POST /users/{id}/reset-password", s.handleResetUserPassword)
 	s.mux.HandleFunc("GET /account/password", s.handleAccountPassword)
 	s.mux.HandleFunc("POST /account/password", s.handleAccountPasswordPost)
 	s.mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(webassets.StaticFS()))))
@@ -510,8 +527,6 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 			s.renderErrorPage(w, http.StatusInternalServerError, false)
 			return
 		}
-	} else {
-		s.sessions.delete(session.ID)
 	}
 	clearSessionCookie(w, r)
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
@@ -522,11 +537,8 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 // there is nothing to sign in for; the card's single action still switches to
 // "Sign in" when the visitor has no viewing session.
 func (s *Server) handleUnknownPath(w http.ResponseWriter, r *http.Request) {
-	signedOut := false
-	if s.cfg.AuthService != nil {
-		session, ok, err := s.currentSession(r)
-		signedOut = err != nil || !ok || !session.Roles.CanView()
-	}
+	_, ok, err := s.currentSession(r)
+	signedOut := err != nil || !ok
 	s.renderErrorPage(w, http.StatusNotFound, signedOut)
 }
 
@@ -576,7 +588,7 @@ func (s *Server) handleCreateDecision(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "status decision store is not configured", http.StatusServiceUnavailable)
 		return
 	}
-	session, ok := s.requireThawApproverForm(w, r)
+	session, ok := s.requireActionForm(w, r)
 	if !ok {
 		return
 	}
@@ -587,6 +599,9 @@ func (s *Server) handleCreateDecision(w http.ResponseWriter, r *http.Request) {
 		pullRequestIndex = 0
 	}
 	confirmation := thawApprovalConfirmationFromForm(r)
+	if _, authorized := s.requireThawRepository(w, r, session, form.RepositoryID); !authorized {
+		return
+	}
 	outcome, err := s.cfg.StatusDecisionStore.ApproveThaw(r.Context(), statusresult.ThawApprovalParams{
 		RepositoryID:     form.RepositoryID,
 		PullRequestIndex: pullRequestIndex,
@@ -978,12 +993,13 @@ func (s *Server) handleRepositories(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	repositories, err := s.repositories(r.Context())
+	scope := session.Grants.RepositoryReadScope()
+	repositories, err := s.repositories(r.Context(), scope)
 	if err != nil {
 		internalServerError(w)
 		return
 	}
-	views, err := s.repositoryViews(r.Context(), repositories)
+	views, err := s.repositoryViews(r.Context(), scope, repositories)
 	if err != nil {
 		internalServerError(w)
 		return
@@ -1017,12 +1033,13 @@ func (s *Server) handleCreateRepository(w http.ResponseWriter, r *http.Request) 
 			internalServerError(w)
 			return
 		}
-		repositories, listErr := s.repositories(r.Context())
+		scope := session.Grants.RepositoryReadScope()
+		repositories, listErr := s.repositories(r.Context(), scope)
 		if listErr != nil {
 			internalServerError(w)
 			return
 		}
-		views, viewErr := s.repositoryViews(r.Context(), repositories)
+		views, viewErr := s.repositoryViews(r.Context(), scope, repositories)
 		if viewErr != nil {
 			internalServerError(w)
 			return
@@ -1125,12 +1142,13 @@ func (s *Server) renderRepositoryMutationError(w http.ResponseWriter, r *http.Re
 		s.renderPage(w, "components/repository-card-fragment", repositoryCardFragment{Card: card})
 		return
 	}
-	repositories, listErr := s.repositories(r.Context())
+	scope := session.Grants.RepositoryReadScope()
+	repositories, listErr := s.repositories(r.Context(), scope)
 	if listErr != nil {
 		internalServerError(w)
 		return
 	}
-	views, viewErr := s.repositoryViews(r.Context(), repositories)
+	views, viewErr := s.repositoryViews(r.Context(), scope, repositories)
 	if viewErr != nil {
 		internalServerError(w)
 		return
@@ -1296,11 +1314,14 @@ func (s *Server) handleCreateFreeze(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "freeze store is not configured", http.StatusServiceUnavailable)
 		return
 	}
-	session, ok := s.requireFreezerForm(w, r)
+	session, ok := s.requireActionForm(w, r)
 	if !ok {
 		return
 	}
-
+	repositoryID := repositoryIDFromForm(r)
+	if _, authorized := s.requireFreezeRepository(w, r, session, repositoryID); !authorized {
+		return
+	}
 	params, err := freezeCreateParamsFromForm(r)
 	if err == nil {
 		_, err = s.cfg.FreezeStore.CreateActive(r.Context(), params, session.auditActor())
@@ -1367,7 +1388,7 @@ func (s *Server) handleCloseFreeze(w http.ResponseWriter, r *http.Request, close
 		http.Error(w, "freeze store is not configured", http.StatusServiceUnavailable)
 		return
 	}
-	session, ok := s.requireFreezerForm(w, r)
+	session, ok := s.requireActionForm(w, r)
 	if !ok {
 		return
 	}
@@ -1375,6 +1396,19 @@ func (s *Server) handleCloseFreeze(w http.ResponseWriter, r *http.Request, close
 	freezeID, err := strconv.ParseInt(strings.TrimSpace(r.PostFormValue("freeze_id")), 10, 64)
 	if err != nil {
 		freezeID = 0
+	}
+	target, err := s.cfg.FreezeStore.GetForScope(r.Context(), session.Grants.RepositoryReadScope(), freezeID)
+	if errors.Is(err, sql.ErrNoRows) {
+		s.renderErrorPage(w, http.StatusNotFound, false)
+		return
+	}
+	if err != nil {
+		internalServerError(w)
+		return
+	}
+	if !session.Grants.CanFreezeRepository(target.RepositoryID) {
+		s.renderErrorPage(w, http.StatusForbidden, false)
+		return
 	}
 	closed, err := closeFreeze(r.Context(), freezeID, session.auditActor())
 	if err != nil {
@@ -1448,11 +1482,15 @@ func (s *Server) handleCreateScheduledFreeze(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "scheduled freeze store is not configured", http.StatusServiceUnavailable)
 		return
 	}
-	session, ok := s.requireFreezerForm(w, r)
+	session, ok := s.requireActionForm(w, r)
 	if !ok {
 		return
 	}
 	query := scheduledFreezesQueryFromValues(r.PostForm)
+	repositoryID := repositoryIDFromForm(r)
+	if _, authorized := s.requireFreezeRepository(w, r, session, repositoryID); !authorized {
+		return
+	}
 	params, err := scheduledFreezeParamsFromForm(r)
 	var created domain.BranchFreeze
 	if err == nil {
@@ -1479,7 +1517,7 @@ func (s *Server) handleCreateScheduledFreeze(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if isHXRequest(r) {
-		toast := toastView{Message: s.scheduledFreezeToastMessage(r.Context(), "Freeze scheduled", created), Tone: "success"}
+		toast := toastView{Message: s.scheduledFreezeToastMessage(r.Context(), session.Grants.RepositoryReadScope(), "Freeze scheduled", created), Tone: "success"}
 		s.renderScheduledFreezesFragment(w, r, "components/scheduled-live-fragment", scheduledFreezePageState{Query: query}, session, &toast)
 		return
 	}
@@ -1492,7 +1530,7 @@ func (s *Server) handleEditScheduledFreeze(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "scheduled freeze store is not configured", http.StatusServiceUnavailable)
 		return
 	}
-	session, ok := s.requireScheduleManagerForm(w, r)
+	session, ok := s.requireActionForm(w, r)
 	if !ok {
 		return
 	}
@@ -1502,6 +1540,9 @@ func (s *Server) handleEditScheduledFreeze(w http.ResponseWriter, r *http.Reques
 		EditReason:        strings.TrimSpace(r.PostFormValue("reason")),
 		EditStartsAt:      strings.TrimSpace(r.PostFormValue("starts_at")),
 		EditPlannedEndsAt: strings.TrimSpace(r.PostFormValue("planned_ends_at")),
+	}
+	if !s.authorizeScheduledFreeze(w, r, session, state.EditScheduleID) {
+		return
 	}
 	params, err := scheduledFreezeEditParamsFromForm(r)
 	if err == nil {
@@ -1534,12 +1575,16 @@ func (s *Server) handleStartScheduledFreezeNow(w http.ResponseWriter, r *http.Re
 		http.Error(w, "scheduled freeze store is not configured", http.StatusServiceUnavailable)
 		return
 	}
-	session, ok := s.requireScheduleManagerForm(w, r)
+	session, ok := s.requireActionForm(w, r)
 	if !ok {
 		return
 	}
 	query := scheduledFreezesQueryFromValues(r.PostForm)
-	started, err := s.cfg.ScheduledFreezeStore.StartScheduledNow(r.Context(), scheduledFreezeIDFromForm(r), session.auditActor())
+	freezeID := scheduledFreezeIDFromForm(r)
+	if !s.authorizeScheduledFreeze(w, r, session, freezeID) {
+		return
+	}
+	started, err := s.cfg.ScheduledFreezeStore.StartScheduledNow(r.Context(), freezeID, session.auditActor())
 	if err != nil {
 		if !freeze.IsValidationError(err) {
 			internalServerError(w)
@@ -1554,7 +1599,7 @@ func (s *Server) handleStartScheduledFreezeNow(w http.ResponseWriter, r *http.Re
 		return
 	}
 	if isHXRequest(r) {
-		toast := toastView{Message: s.scheduledFreezeToastMessage(r.Context(), "Freeze started", started), Tone: "success"}
+		toast := toastView{Message: s.scheduledFreezeToastMessage(r.Context(), session.Grants.RepositoryReadScope(), "Freeze started", started), Tone: "success"}
 		s.renderScheduledFreezesFragment(w, r, "components/scheduled-windows-fragment", scheduledFreezePageState{Query: query}, session, &toast)
 		return
 	}
@@ -1567,12 +1612,15 @@ func (s *Server) handleCancelScheduledFreeze(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "scheduled freeze store is not configured", http.StatusServiceUnavailable)
 		return
 	}
-	session, ok := s.requireFreezerForm(w, r)
+	session, ok := s.requireActionForm(w, r)
 	if !ok {
 		return
 	}
 	query := scheduledFreezesQueryFromValues(r.PostForm)
 	freezeID := scheduledFreezeIDFromForm(r)
+	if !s.authorizeScheduledFreeze(w, r, session, freezeID) {
+		return
+	}
 	_, err := s.cfg.ScheduledFreezeStore.CancelScheduled(r.Context(), freezeID, session.auditActor())
 	if err != nil {
 		if !freeze.IsValidationError(err) {
@@ -1601,6 +1649,23 @@ func scheduledFreezeIDFromForm(r *http.Request) int64 {
 		return 0
 	}
 	return id
+}
+
+func (s *Server) authorizeScheduledFreeze(w http.ResponseWriter, r *http.Request, session sessionState, freezeID int64) bool {
+	target, err := s.cfg.ScheduledFreezeStore.GetForScope(r.Context(), session.Grants.RepositoryReadScope(), freezeID)
+	if errors.Is(err, sql.ErrNoRows) {
+		s.renderErrorPage(w, http.StatusNotFound, false)
+		return false
+	}
+	if err != nil {
+		internalServerError(w)
+		return false
+	}
+	if !session.Grants.CanFreezeRepository(target.RepositoryID) {
+		s.renderErrorPage(w, http.StatusForbidden, false)
+		return false
+	}
+	return true
 }
 
 func scheduledFreezeParamsFromForm(r *http.Request) (freeze.ScheduleParams, error) {
@@ -1722,7 +1787,7 @@ func (s *Server) handleRunRepositorySetupCheck(w http.ResponseWriter, r *http.Re
 		http.Error(w, "invalid repository id", http.StatusBadRequest)
 		return
 	}
-	repo, found, err := s.repositoryByID(r.Context(), repositoryID)
+	repo, found, err := s.repositoryByID(r.Context(), session.Grants.RepositoryReadScope(), repositoryID)
 	if err != nil {
 		internalServerError(w)
 		return
@@ -1797,35 +1862,67 @@ func (s *Server) renderAccountPassword(w http.ResponseWriter, formError string, 
 }
 
 func (s *Server) requireRepositoryManagerForm(w http.ResponseWriter, r *http.Request) (sessionState, bool) {
-	return s.requireRoleForm(w, r, func(roles auth.RoleSet) bool { return roles.CanManageRepositories() })
-}
-
-func (s *Server) requireFreezerForm(w http.ResponseWriter, r *http.Request) (sessionState, bool) {
-	return s.requireRoleForm(w, r, func(roles auth.RoleSet) bool { return roles.CanFreeze() })
-}
-
-func (s *Server) requireScheduleManagerForm(w http.ResponseWriter, r *http.Request) (sessionState, bool) {
-	return s.requireRoleForm(w, r, func(roles auth.RoleSet) bool {
-		return roles.CanManageRepositories() || roles.CanFreeze()
-	})
-}
-
-func (s *Server) requireThawApproverForm(w http.ResponseWriter, r *http.Request) (sessionState, bool) {
-	return s.requireRoleForm(w, r, func(roles auth.RoleSet) bool { return roles.CanThaw() })
+	return s.requireAdminForm(w, r)
 }
 
 func (s *Server) requireAuthenticatedForm(w http.ResponseWriter, r *http.Request) (sessionState, bool) {
-	return s.requireRoleFormWithGate(w, r, func(roles auth.RoleSet) bool { return roles.CanView() }, true)
+	return s.requireFormWithGate(w, r, true, false)
 }
 
-func (s *Server) requireRoleForm(w http.ResponseWriter, r *http.Request, allowed func(auth.RoleSet) bool) (sessionState, bool) {
-	return s.requireRoleFormWithGate(w, r, allowed, false)
+func (s *Server) requireActionForm(w http.ResponseWriter, r *http.Request) (sessionState, bool) {
+	return s.requireFormWithGate(w, r, false, false)
 }
 
-// requireRoleFormWithGate guards authenticated POST mutations. Unless
-// allowForced is set, a session in forced password-change state is redirected
-// to /account/password before role authorization or any domain work.
-func (s *Server) requireRoleFormWithGate(w http.ResponseWriter, r *http.Request, allowed func(auth.RoleSet) bool, allowForced bool) (sessionState, bool) {
+func (s *Server) requireAdminForm(w http.ResponseWriter, r *http.Request) (sessionState, bool) {
+	return s.requireFormWithGate(w, r, false, true)
+}
+
+func (s *Server) visibleRepository(w http.ResponseWriter, r *http.Request, session sessionState, repositoryID int64) (domain.Repository, bool) {
+	if s.cfg.RepositoryStore == nil {
+		http.Error(w, "repository store is not configured", http.StatusServiceUnavailable)
+		return domain.Repository{}, false
+	}
+	repo, found, err := s.repositoryByID(r.Context(), session.Grants.RepositoryReadScope(), repositoryID)
+	if err != nil {
+		internalServerError(w)
+		return domain.Repository{}, false
+	}
+	if !found {
+		s.renderErrorPage(w, http.StatusNotFound, false)
+		return domain.Repository{}, false
+	}
+	return repo, true
+}
+
+func (s *Server) requireFreezeRepository(w http.ResponseWriter, r *http.Request, session sessionState, repositoryID int64) (domain.Repository, bool) {
+	repo, ok := s.visibleRepository(w, r, session, repositoryID)
+	if !ok {
+		return domain.Repository{}, false
+	}
+	if !session.Grants.CanFreezeRepository(repo.ID) {
+		s.renderErrorPage(w, http.StatusForbidden, false)
+		return domain.Repository{}, false
+	}
+	return repo, true
+}
+
+func (s *Server) requireThawRepository(w http.ResponseWriter, r *http.Request, session sessionState, repositoryID int64) (domain.Repository, bool) {
+	repo, ok := s.visibleRepository(w, r, session, repositoryID)
+	if !ok {
+		return domain.Repository{}, false
+	}
+	if !session.Grants.CanThawRepository(repo.ID) {
+		s.renderErrorPage(w, http.StatusForbidden, false)
+		return domain.Repository{}, false
+	}
+	return repo, true
+}
+
+// requireFormWithGate authenticates, enforces forced-password routing, parses
+// and verifies CSRF before any target lookup or mutation. Target-aware action
+// authorization is deliberately performed by each handler after resolving the
+// repository (or its scoped parent).
+func (s *Server) requireFormWithGate(w http.ResponseWriter, r *http.Request, allowForced, requireAdmin bool) (sessionState, bool) {
 	session, ok, err := s.currentSession(r)
 	if err != nil {
 		internalServerError(w)
@@ -1839,8 +1936,8 @@ func (s *Server) requireRoleFormWithGate(w http.ResponseWriter, r *http.Request,
 		http.Redirect(w, r, "/account/password", http.StatusSeeOther)
 		return sessionState{}, false
 	}
-	if !allowed(session.Roles) {
-		http.Error(w, "forbidden", http.StatusForbidden)
+	if requireAdmin && !session.Grants.CanManageInstallation() {
+		s.renderErrorPage(w, http.StatusForbidden, false)
 		return sessionState{}, false
 	}
 	if err := r.ParseForm(); err != nil {
@@ -1859,15 +1956,6 @@ func (s *Server) requireView(w http.ResponseWriter, r *http.Request) (sessionSta
 }
 
 func (s *Server) requireViewWithGate(w http.ResponseWriter, r *http.Request, allowForced bool) (sessionState, bool) {
-	if s.cfg.AuthService == nil {
-		session, err := s.sessions.getOrCreate(w, r)
-		if err != nil {
-			http.Error(w, "create session", http.StatusInternalServerError)
-			return sessionState{}, false
-		}
-		return session, true
-	}
-
 	session, ok, err := s.currentSession(r)
 	if err != nil {
 		internalServerError(w)
@@ -1877,12 +1965,12 @@ func (s *Server) requireViewWithGate(w http.ResponseWriter, r *http.Request, all
 		http.Redirect(w, r, "/account/password", http.StatusSeeOther)
 		return sessionState{}, false
 	}
-	if ok && session.Roles.CanView() {
+	if ok {
 		setSessionCookie(w, r, session)
 		return session, true
 	}
-	if ok {
-		http.Error(w, "forbidden", http.StatusForbidden)
+	if s.cfg.AuthService == nil {
+		http.Error(w, "auth service is not configured", http.StatusServiceUnavailable)
 		return sessionState{}, false
 	}
 	hasUsers, err := s.cfg.AuthService.HasUsers(r.Context())
@@ -1926,8 +2014,6 @@ func sessionStateFromAuth(session auth.Session) sessionState {
 		UserID:             &userID,
 		Email:              session.User.Email,
 		DisplayName:        session.User.DisplayName,
-		Role:               session.User.Role,
-		Roles:              session.User.Roles,
 		Grants:             session.Grants,
 		MustChangePassword: session.User.MustChangePassword,
 		ExpiresAt:          session.ExpiresAt,
@@ -1935,27 +2021,28 @@ func sessionStateFromAuth(session auth.Session) sessionState {
 }
 
 func currentUserFromSession(session sessionState) currentUserView {
-	roles := session.Roles
-	if len(roles) == 0 && session.Role.Valid() {
-		roles = auth.RoleSet{session.Role}
+	roleLabel := "No repository access"
+	if session.Grants.CanManageInstallation() {
+		roleLabel = "Admin"
+	} else if session.Grants.HasRepositoryAccess() {
+		roleLabel = "Repository access"
 	}
 	return currentUserView{
 		Email:                 session.Email,
 		DisplayName:           session.DisplayName,
-		RoleLabel:             roles.Label(),
+		RoleLabel:             roleLabel,
 		CanChangePassword:     session.UserID != nil,
-		IsAdmin:               session.UserID != nil && roles.CanManageRepositories(),
-		CanManageRepositories: roles.CanManageRepositories(),
-		CanFreeze:             roles.CanFreeze(),
-		CanThaw:               roles.CanThaw(),
+		IsAdmin:               session.UserID != nil && session.Grants.CanManageInstallation(),
+		CanManageInstallation: session.Grants.CanManageInstallation(),
+		HasRepositoryAccess:   session.Grants.HasRepositoryAccess(),
 	}
 }
 
-func (s *Server) repositories(ctx context.Context) ([]domain.Repository, error) {
+func (s *Server) repositories(ctx context.Context, scope repositoryscope.ReadScope) ([]domain.Repository, error) {
 	if s.cfg.RepositoryStore == nil {
 		return nil, nil
 	}
-	return s.cfg.RepositoryStore.List(ctx)
+	return s.cfg.RepositoryStore.ListForScope(ctx, scope)
 }
 
 type activityDetails map[string]json.RawMessage
@@ -2008,6 +2095,7 @@ var activityActionDefinitions = map[string]activityActionDefinition{
 	audit.ActionScheduleWindowRemoved:              {Label: "Recurring schedule", Outcome: "Window removed", OutcomeClass: "warning"},
 	audit.ActionThawExceptionApproved:              {Label: "Single-PR thaw", Outcome: "Approved", OutcomeClass: "ok"},
 	audit.ActionThawExceptionSharedHeadApproved:    {Label: "Shared-head thaw", Outcome: "Approved", OutcomeClass: "ok"},
+	audit.ActionUserCreated:                        {Label: "User account", Outcome: "Created", OutcomeClass: "ok"},
 	audit.ActionUserRolesUpdated:                   {Label: "User roles", Outcome: "Changed", OutcomeClass: "frozen"},
 	audit.ActionUserDisabled:                       {Label: "User access", Outcome: "Disabled", OutcomeClass: "warning"},
 	audit.ActionUserEnabled:                        {Label: "User access", Outcome: "Enabled", OutcomeClass: "ok"},
@@ -2122,6 +2210,9 @@ func activityEventViewForEvent(repositories map[int64]domain.Repository, users m
 	case audit.ActionThawExceptionSharedHeadApproved:
 		view.Target = activitySharedHeadTarget(repositories, event, details)
 		view.Detail = activitySharedHeadDetail(details)
+	case audit.ActionUserCreated:
+		view.Target = activityUserTarget(users, event.SubjectID)
+		view.Detail = "Created with no repository access; password sign-in requires a change after first login."
 	case audit.ActionUserRolesUpdated:
 		view.Target = activityUserTarget(users, event.SubjectID)
 		view.Detail = "Roles " + activityRolesOrUnavailable(details, "roles_before") + " → " + activityRolesOrUnavailable(details, "roles_after") + "."
@@ -2202,6 +2293,8 @@ func activityActor(users map[int64]auth.User, event audit.Event, details activit
 		return "Bootstrap admin"
 	case domain.ActorKindSystem:
 		switch role {
+		case "migration":
+			return "Authorization migration"
 		case "scheduler":
 			return "Scheduler"
 		case "reconciliation_runner":
@@ -2542,6 +2635,9 @@ func activityRolesOrUnavailable(details activityDetails, key string) string {
 	if !ok {
 		return "unavailable"
 	}
+	if value == "none" {
+		return "No access"
+	}
 	parts := strings.Split(value, ",")
 	rawRoles := make([]auth.Role, 0, len(parts))
 	for _, part := range parts {
@@ -2554,18 +2650,18 @@ func activityRolesOrUnavailable(details activityDetails, key string) string {
 	return roles.Label()
 }
 
-func (s *Server) activeFreezes(ctx context.Context) ([]domain.BranchFreeze, error) {
+func (s *Server) activeFreezes(ctx context.Context, scope repositoryscope.ReadScope) ([]domain.BranchFreeze, error) {
 	if s.cfg.FreezeStore == nil {
 		return nil, nil
 	}
-	return s.cfg.FreezeStore.ListActive(ctx)
+	return s.cfg.FreezeStore.ListActiveForScope(ctx, scope)
 }
 
-func (s *Server) scheduledFreezes(ctx context.Context, limit int) ([]domain.BranchFreeze, error) {
+func (s *Server) scheduledFreezes(ctx context.Context, scope repositoryscope.ReadScope, limit int) ([]domain.BranchFreeze, error) {
 	if s.cfg.ScheduledFreezeStore == nil {
 		return nil, nil
 	}
-	return s.cfg.ScheduledFreezeStore.ListScheduled(ctx, limit)
+	return s.cfg.ScheduledFreezeStore.ListScheduledForScope(ctx, scope, limit)
 }
 
 func scheduledFreezeViews(repositories []domain.Repository, freezes []domain.BranchFreeze, state scheduledFreezePageState) []scheduledFreezeView {
@@ -2682,17 +2778,18 @@ func repositoriesByID(repositories []domain.Repository) map[int64]domain.Reposit
 	return byID
 }
 
-func (s *Server) repositoryByID(ctx context.Context, id int64) (domain.Repository, bool, error) {
-	repositories, err := s.repositories(ctx)
+func (s *Server) repositoryByID(ctx context.Context, scope repositoryscope.ReadScope, id int64) (domain.Repository, bool, error) {
+	if s.cfg.RepositoryStore == nil {
+		return domain.Repository{}, false, nil
+	}
+	repo, err := s.cfg.RepositoryStore.GetForScope(ctx, scope, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.Repository{}, false, nil
+	}
 	if err != nil {
 		return domain.Repository{}, false, err
 	}
-	for _, repo := range repositories {
-		if repo.ID == id {
-			return repo, true, nil
-		}
-	}
-	return domain.Repository{}, false, nil
+	return repo, true, nil
 }
 
 func (s *Server) managedBranches(ctx context.Context, repositoryID int64) ([]domain.RepositoryBranch, error) {
@@ -2731,6 +2828,26 @@ func enforcementActiveRepositories(repositories []domain.Repository) []domain.Re
 		}
 	}
 	return enforceable
+}
+
+func freezeRepositories(repositories []domain.Repository, grants auth.Grants) []domain.Repository {
+	allowed := make([]domain.Repository, 0, len(repositories))
+	for _, repo := range repositories {
+		if grants.CanFreezeRepository(repo.ID) {
+			allowed = append(allowed, repo)
+		}
+	}
+	return allowed
+}
+
+func thawRepositories(repositories []domain.Repository, grants auth.Grants) []domain.Repository {
+	allowed := make([]domain.Repository, 0, len(repositories))
+	for _, repo := range repositories {
+		if grants.CanThawRepository(repo.ID) {
+			allowed = append(allowed, repo)
+		}
+	}
+	return allowed
 }
 
 func (s *Server) renderSetupStatus(w http.ResponseWriter, r *http.Request, email, displayName, formError string, status int) {

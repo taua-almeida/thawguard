@@ -10,6 +10,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/freeze"
 	"github.com/taua-almeida/thawguard/internal/jobs"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 	"github.com/taua-almeida/thawguard/internal/statuspublication"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
 )
@@ -62,6 +63,14 @@ type freezeGetter interface {
 	Get(ctx context.Context, id int64) (domain.BranchFreeze, error)
 }
 
+type scopedFreezeReads interface {
+	GetForScope(ctx context.Context, scope repositoryscope.ReadScope, id int64) (domain.BranchFreeze, error)
+	ListActiveForScope(ctx context.Context, scope repositoryscope.ReadScope) ([]domain.BranchFreeze, error)
+	ListScheduledForScope(ctx context.Context, scope repositoryscope.ReadScope, limit int) ([]domain.BranchFreeze, error)
+	ListScheduledPageForScope(ctx context.Context, scope repositoryscope.ReadScope, status domain.BranchFreezeStatus, offset, limit int) ([]domain.BranchFreeze, int, error)
+	PendingScheduledCountsForScope(ctx context.Context, scope repositoryscope.ReadScope) (map[int64]int, error)
+}
+
 type openPullRequestBranchLister interface {
 	ListOpenByTargetBranch(ctx context.Context, repositoryID int64, targetBranch string) ([]domain.PullRequest, error)
 }
@@ -111,6 +120,22 @@ func (s *freezeRecomputingStore) ListActive(ctx context.Context) ([]domain.Branc
 		return nil, errors.New("freeze recomputing store has no freeze store")
 	}
 	return s.freezes.ListActive(ctx)
+}
+
+func (s *freezeRecomputingStore) ListActiveForScope(ctx context.Context, scope repositoryscope.ReadScope) ([]domain.BranchFreeze, error) {
+	reads, err := s.scopedReads()
+	if err != nil {
+		return nil, err
+	}
+	return reads.ListActiveForScope(ctx, scope)
+}
+
+func (s *freezeRecomputingStore) GetForScope(ctx context.Context, scope repositoryscope.ReadScope, id int64) (domain.BranchFreeze, error) {
+	reads, err := s.scopedReads()
+	if err != nil {
+		return domain.BranchFreeze{}, err
+	}
+	return reads.GetForScope(ctx, scope, id)
 }
 
 func (s *freezeRecomputingStore) CreateActive(ctx context.Context, params freeze.CreateParams, actor domain.Actor) (domain.BranchFreeze, error) {
@@ -263,12 +288,47 @@ func (s *freezeRecomputingStore) ListScheduled(ctx context.Context, limit int) (
 	return lifecycle.ListScheduled(ctx, limit)
 }
 
+func (s *freezeRecomputingStore) ListScheduledForScope(ctx context.Context, scope repositoryscope.ReadScope, limit int) ([]domain.BranchFreeze, error) {
+	reads, err := s.scopedReads()
+	if err != nil {
+		return nil, err
+	}
+	return reads.ListScheduledForScope(ctx, scope, limit)
+}
+
 func (s *freezeRecomputingStore) ListScheduledPage(ctx context.Context, status domain.BranchFreezeStatus, offset, limit int) ([]domain.BranchFreeze, int, error) {
 	lifecycle, err := s.freezeLifecycle()
 	if err != nil {
 		return nil, 0, err
 	}
 	return lifecycle.ListScheduledPage(ctx, status, offset, limit)
+}
+
+func (s *freezeRecomputingStore) ListScheduledPageForScope(ctx context.Context, scope repositoryscope.ReadScope, status domain.BranchFreezeStatus, offset, limit int) ([]domain.BranchFreeze, int, error) {
+	reads, err := s.scopedReads()
+	if err != nil {
+		return nil, 0, err
+	}
+	return reads.ListScheduledPageForScope(ctx, scope, status, offset, limit)
+}
+
+func (s *freezeRecomputingStore) PendingScheduledCountsForScope(ctx context.Context, scope repositoryscope.ReadScope) (map[int64]int, error) {
+	reads, err := s.scopedReads()
+	if err != nil {
+		return nil, err
+	}
+	return reads.PendingScheduledCountsForScope(ctx, scope)
+}
+
+func (s *freezeRecomputingStore) scopedReads() (scopedFreezeReads, error) {
+	if s == nil || s.freezes == nil {
+		return nil, errors.New("freeze recomputing store has no freeze store")
+	}
+	reads, ok := s.freezes.(scopedFreezeReads)
+	if !ok {
+		return nil, errors.New("freeze store does not support scoped reads")
+	}
+	return reads, nil
 }
 
 func (s *freezeRecomputingStore) CreateScheduled(ctx context.Context, params freeze.ScheduleParams, actor domain.Actor) (domain.BranchFreeze, error) {

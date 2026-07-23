@@ -280,9 +280,10 @@ type publicationsPageData struct {
 // 503 guard.
 func (s *Server) loadPublicationsPageData(w http.ResponseWriter, r *http.Request, query publicationsQuery, session sessionState) (publicationsPageData, bool) {
 	ctx := r.Context()
+	scope := session.Grants.RepositoryReadScope()
 	store := s.cfg.StatusPublicationStore
 	desiredState := publicationStoreFilter(query.DesiredState)
-	publications, publicationsTotal, err := store.ListPage(ctx, desiredState, query.RepositoryID, (query.DesiredPage-1)*publicationsPageSize, publicationsPageSize)
+	publications, publicationsTotal, err := store.ListPageForScope(ctx, scope, desiredState, query.RepositoryID, (query.DesiredPage-1)*publicationsPageSize, publicationsPageSize)
 	if err != nil {
 		internalServerError(w)
 		return publicationsPageData{}, false
@@ -290,14 +291,14 @@ func (s *Server) loadPublicationsPageData(w http.ResponseWriter, r *http.Request
 	if len(publications) == 0 && publicationsTotal > 0 && query.DesiredPage > 1 {
 		lastPage := (publicationsTotal + publicationsPageSize - 1) / publicationsPageSize
 		query.DesiredPage = lastPage
-		publications, publicationsTotal, err = store.ListPage(ctx, desiredState, query.RepositoryID, (lastPage-1)*publicationsPageSize, publicationsPageSize)
+		publications, publicationsTotal, err = store.ListPageForScope(ctx, scope, desiredState, query.RepositoryID, (lastPage-1)*publicationsPageSize, publicationsPageSize)
 		if err != nil {
 			internalServerError(w)
 			return publicationsPageData{}, false
 		}
 	}
 	attemptResult := publicationStoreFilter(query.AttemptResult)
-	attempts, attemptsTotal, err := store.ListAttemptsPage(ctx, attemptResult, query.RepositoryID, (query.AttemptPage-1)*publicationsPageSize, publicationsPageSize)
+	attempts, attemptsTotal, err := store.ListAttemptsPageForScope(ctx, scope, attemptResult, query.RepositoryID, (query.AttemptPage-1)*publicationsPageSize, publicationsPageSize)
 	if err != nil {
 		internalServerError(w)
 		return publicationsPageData{}, false
@@ -305,13 +306,13 @@ func (s *Server) loadPublicationsPageData(w http.ResponseWriter, r *http.Request
 	if len(attempts) == 0 && attemptsTotal > 0 && query.AttemptPage > 1 {
 		lastPage := (attemptsTotal + publicationsPageSize - 1) / publicationsPageSize
 		query.AttemptPage = lastPage
-		attempts, attemptsTotal, err = store.ListAttemptsPage(ctx, attemptResult, query.RepositoryID, (lastPage-1)*publicationsPageSize, publicationsPageSize)
+		attempts, attemptsTotal, err = store.ListAttemptsPageForScope(ctx, scope, attemptResult, query.RepositoryID, (lastPage-1)*publicationsPageSize, publicationsPageSize)
 		if err != nil {
 			internalServerError(w)
 			return publicationsPageData{}, false
 		}
 	}
-	repositories, err := s.repositories(ctx)
+	repositories, err := s.repositories(ctx, scope)
 	if err != nil {
 		internalServerError(w)
 		return publicationsPageData{}, false

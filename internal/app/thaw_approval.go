@@ -11,6 +11,7 @@ import (
 
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/jobs"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
 	"github.com/taua-almeida/thawguard/internal/thawexception"
 )
@@ -41,6 +42,10 @@ type thawApprovalStatusRunner interface {
 	ListRecent(ctx context.Context, limit int) ([]statusresult.Result, error)
 	ListDecisionsPage(ctx context.Context, state domain.CommitStatusState, repositoryID int64, offset, limit int) ([]statusresult.Result, int, error)
 	RunForSharedHead(ctx context.Context, prs []domain.PullRequest, preferredIndex int) (statusresult.Result, error)
+}
+
+type scopedThawApprovalStatusReader interface {
+	ListDecisionsPageForScope(ctx context.Context, scope repositoryscope.ReadScope, state domain.CommitStatusState, repositoryID int64, offset, limit int) ([]statusresult.Result, int, error)
 }
 
 type thawApprovalForgeClient interface {
@@ -78,6 +83,17 @@ func (s *thawApprovalService) ListDecisionsPage(ctx context.Context, state domai
 		return nil, 0, errors.New("thaw approval service has no status runner")
 	}
 	return s.statuses.ListDecisionsPage(ctx, state, repositoryID, offset, limit)
+}
+
+func (s *thawApprovalService) ListDecisionsPageForScope(ctx context.Context, scope repositoryscope.ReadScope, state domain.CommitStatusState, repositoryID int64, offset, limit int) ([]statusresult.Result, int, error) {
+	if s == nil || s.statuses == nil {
+		return nil, 0, errors.New("thaw approval service has no status runner")
+	}
+	reader, ok := s.statuses.(scopedThawApprovalStatusReader)
+	if !ok {
+		return nil, 0, errors.New("status runner does not support scoped reads")
+	}
+	return reader.ListDecisionsPageForScope(ctx, scope, state, repositoryID, offset, limit)
 }
 
 func (s *thawApprovalService) ApproveThaw(ctx context.Context, params statusresult.ThawApprovalParams, actor domain.Actor) (statusresult.ThawApprovalOutcome, error) {

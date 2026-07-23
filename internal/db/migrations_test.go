@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -733,6 +734,163 @@ VALUES (790, 79, 'main', 'ended', 'pending convergence', '2026-07-13T08:00:00.00
 	}
 	if applied != 1 {
 		t.Fatalf("expected reconciliation migration applied once, got %d", applied)
+	}
+}
+
+func TestRepositoryGrantsCutoverSnapshotsEffectiveLegacyAuthorityWithAuditEvidence(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-cutover-test.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cutoverIndex := migrationIndex(t, migrations, "0032_repository_grants_cutover.sql")
+	if err := ApplyMigrations(ctx, database, migrations[:cutoverIndex]); err != nil {
+		t.Fatal(err)
+	}
+
+	const createdAt = "2026-07-22T09:00:00.000000000Z"
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO users(id, email, display_name, password_hash, role, disabled_at, must_change_password, created_at, updated_at)
+VALUES
+  (1, 'override@example.test', 'Explicit Override', 'hash', 'admin', NULL, 0, ?, ?),
+  (2, 'fallback-freezer@example.test', 'Fallback Freezer', 'hash', 'freezer', NULL, 0, ?, ?),
+  (3, 'fallback-admin@example.test', 'Fallback Admin', 'hash', 'admin', NULL, 0, ?, ?),
+  (4, 'admin-approver@example.test', 'Admin Approver', 'hash', 'viewer', NULL, 0, ?, ?),
+  (5, 'disabled@example.test', 'Disabled Freezer', 'hash', 'viewer', ?, 0, ?, ?),
+  (6, 'manual@example.test', 'Manual Existing', 'hash', 'viewer', NULL, 0, ?, ?),
+  (7, 'admin-only@example.test', 'Admin Only', 'hash', 'admin', NULL, 0, ?, ?);
+INSERT INTO user_roles(user_id, role, created_at) VALUES
+  (1, 'viewer', ?),
+  (4, 'admin', ?),
+  (4, 'thaw_approver', ?),
+  (5, 'freezer', ?),
+  (6, 'viewer', ?),
+  (6, 'freezer', ?),
+  (7, 'admin', ?);
+INSERT INTO repositories(id, forge, base_url, owner, name, default_branch, active, created_at, updated_at)
+VALUES
+  (10, 'forgejo', 'https://forge.example.test', 'acme', 'api', 'main', 1, ?, ?),
+  (11, 'forgejo', 'https://forge.example.test', 'acme', 'web', 'main', 1, ?, ?);
+INSERT INTO repository_grants(repository_id, user_id, role, granted_by_user_id, granted_at)
+VALUES (10, 6, 'viewer', 7, '2026-07-22T08:00:00.000000000Z');`,
+		createdAt, createdAt, createdAt, createdAt, createdAt, createdAt, createdAt, createdAt,
+		"2026-07-22T08:30:00.000000000Z", createdAt, createdAt, createdAt, createdAt, createdAt,
+		createdAt, createdAt, createdAt, createdAt, createdAt, createdAt, createdAt,
+		createdAt, createdAt, createdAt, createdAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+		t.Fatal(err)
+	}
+
+	// Any explicit role row suppresses users.role fallback. User 1 therefore
+	// keeps Viewer only and must not regain Admin from users.role.
+	assertUserRoles(t, database, 1, []string{"viewer"})
+	assertUserRoles(t, database, 3, []string{"admin"})
+	assertUserRoles(t, database, 4, []string{"admin", "thaw_approver"})
+
+	expected := map[string]bool{
+		"10/1/viewer": true, "11/1/viewer": true,
+		"10/2/freezer": true, "11/2/freezer": true,
+		"10/4/thaw_approver": true, "11/4/thaw_approver": true,
+		"10/5/freezer": true, "11/5/freezer": true,
+		"10/6/viewer": true, "11/6/viewer": true,
+		"10/6/freezer": true, "11/6/freezer": true,
+	}
+	rows, err := database.QueryContext(ctx, `SELECT repository_id, user_id, role FROM repository_grants`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for rows.Next() {
+		var repositoryID, userID int64
+		var role string
+		if err := rows.Scan(&repositoryID, &userID, &role); err != nil {
+			t.Fatal(err)
+		}
+		got[fmt.Sprintf("%d/%d/%s", repositoryID, userID, role)] = true
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(expected) {
+		t.Fatalf("expected %d grants, got %d: %v", len(expected), len(got), got)
+	}
+	for key := range expected {
+		if !got[key] {
+			t.Fatalf("missing snapshotted grant %s: %v", key, got)
+		}
+	}
+
+	var manualActor sql.NullInt64
+	var manualAt string
+	if err := database.QueryRowContext(ctx, `
+SELECT granted_by_user_id, granted_at
+FROM repository_grants
+WHERE repository_id = 10 AND user_id = 6 AND role = 'viewer'`).Scan(&manualActor, &manualAt); err != nil {
+		t.Fatal(err)
+	}
+	if !manualActor.Valid || manualActor.Int64 != 7 || manualAt != "2026-07-22T08:00:00.000000000Z" {
+		t.Fatalf("expected existing manual metadata preserved, actor=%+v at=%q", manualActor, manualAt)
+	}
+
+	var timestampCount, migratedCount int
+	if err := database.QueryRowContext(ctx, `
+SELECT count(DISTINCT granted_at), count(*)
+FROM repository_grants
+WHERE NOT (repository_id = 10 AND user_id = 6 AND role = 'viewer')`).Scan(&timestampCount, &migratedCount); err != nil {
+		t.Fatal(err)
+	}
+	if timestampCount != 1 || migratedCount != 11 {
+		t.Fatalf("expected 11 migrated rows sharing one timestamp, rows=%d timestamps=%d", migratedCount, timestampCount)
+	}
+	var auditCount, badActorCount, matchingTimestampCount int
+	if err := database.QueryRowContext(ctx, `
+SELECT
+  count(*),
+  count(actor_user_id),
+  sum(CASE WHEN created_at IN (
+    SELECT granted_at FROM repository_grants
+    WHERE NOT (repository_id = 10 AND user_id = 6 AND role = 'viewer')
+  ) THEN 1 ELSE 0 END)
+FROM audit_events
+WHERE action = 'repository_grant.added'
+  AND subject_type = 'repository'
+  AND json_valid(details_json)
+  AND json_extract(details_json, '$.actor_kind') = 'system'
+  AND json_extract(details_json, '$.actor_role') = 'migration'
+  AND json_extract(details_json, '$.provenance') = 'legacy_authorization_cutover'`).Scan(&auditCount, &badActorCount, &matchingTimestampCount); err != nil {
+		t.Fatal(err)
+	}
+	if auditCount != 11 || badActorCount != 0 || matchingTimestampCount != 11 {
+		t.Fatalf("expected one system audit per migrated grant, count=%d actors=%d timestamps=%d", auditCount, badActorCount, matchingTimestampCount)
+	}
+
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO repositories(id, forge, base_url, owner, name, default_branch, active, created_at, updated_at)
+VALUES (12, 'forgejo', 'https://forge.example.test', 'acme', 'future', 'main', 1, ?, ?)`, createdAt, createdAt); err != nil {
+		t.Fatal(err)
+	}
+	var futureGrants int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM repository_grants WHERE repository_id = 12`).Scan(&futureGrants); err != nil {
+		t.Fatal(err)
+	}
+	if futureGrants != 0 {
+		t.Fatalf("expected a post-cutover repository to receive no implicit grants, got %d", futureGrants)
+	}
+	var adminScoped int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM repository_grants WHERE user_id IN (3, 7)`).Scan(&adminScoped); err != nil {
+		t.Fatal(err)
+	}
+	if adminScoped != 0 {
+		t.Fatalf("expected admin-only users to receive no scoped grants, got %d", adminScoped)
 	}
 }
 

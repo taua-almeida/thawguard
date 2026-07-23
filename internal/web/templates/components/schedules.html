@@ -13,7 +13,7 @@
       <h2 class="m-0 text-lg font-bold text-text">Recurring schedules</h2>
       <p class="m-0 mt-1 text-sm text-text-muted">Named repeating freeze coverage per branch. A paused schedule never freezes anything.</p>
     </div>
-    {{ if or .CurrentUser.CanManageRepositories .CurrentUser.CanFreeze }}
+    {{ if .CurrentUser.CanFreeze }}
     {{ template "ui/button" dict "Label" "New schedule" "Href" "/scheduled-freezes/schedules/new" "Variant" "secondary" "Icon" "tg-i-schedule" }}
     {{ end }}
   </div>

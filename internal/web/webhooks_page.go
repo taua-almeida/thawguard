@@ -233,10 +233,11 @@ type webhooksPageData struct {
 // already handled the nil-WebhookDeliveryStore 503 guard.
 func (s *Server) loadWebhooksPageData(w http.ResponseWriter, r *http.Request, query webhooksQuery, session sessionState) (webhooksPageData, bool) {
 	ctx := r.Context()
+	scope := session.Grants.RepositoryReadScope()
 	store := s.cfg.WebhookDeliveryStore
 	processing := publicationStoreFilter(query.Processing)
 	order := webhookDeliveryOrder(query.Sort)
-	deliveries, total, err := store.ListPage(ctx, processing, query.RepositoryID, order, (query.Page-1)*webhooksPageSize, webhooksPageSize)
+	deliveries, total, err := store.ListPageForScope(ctx, scope, processing, query.RepositoryID, order, (query.Page-1)*webhooksPageSize, webhooksPageSize)
 	if err != nil {
 		internalServerError(w)
 		return webhooksPageData{}, false
@@ -244,13 +245,13 @@ func (s *Server) loadWebhooksPageData(w http.ResponseWriter, r *http.Request, qu
 	if len(deliveries) == 0 && total > 0 && query.Page > 1 {
 		lastPage := (total + webhooksPageSize - 1) / webhooksPageSize
 		query.Page = lastPage
-		deliveries, total, err = store.ListPage(ctx, processing, query.RepositoryID, order, (lastPage-1)*webhooksPageSize, webhooksPageSize)
+		deliveries, total, err = store.ListPageForScope(ctx, scope, processing, query.RepositoryID, order, (lastPage-1)*webhooksPageSize, webhooksPageSize)
 		if err != nil {
 			internalServerError(w)
 			return webhooksPageData{}, false
 		}
 	}
-	repositories, err := s.repositories(ctx)
+	repositories, err := s.repositories(ctx, scope)
 	if err != nil {
 		internalServerError(w)
 		return webhooksPageData{}, false

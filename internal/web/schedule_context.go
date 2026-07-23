@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 	"github.com/taua-almeida/thawguard/internal/schedule"
 	"github.com/taua-almeida/thawguard/internal/scheduler"
 )
@@ -50,8 +51,8 @@ type scheduleContextSpanView struct {
 // branch. It only appears when at least two active schedules cover the same
 // repository and branch: with a single source there is no precedence to
 // explain and the preview already tells the whole story.
-func (s *Server) scheduleContext(ctx context.Context, repositories []domain.Repository, current domain.Schedule, now time.Time) (scheduleContextView, bool, error) {
-	all, err := s.cfg.ScheduleStore.List(ctx)
+func (s *Server) scheduleContext(ctx context.Context, scope repositoryscope.ReadScope, repositories []domain.Repository, current domain.Schedule, now time.Time) (scheduleContextView, bool, error) {
+	all, err := s.cfg.ScheduleStore.ListForScope(ctx, scope)
 	if err != nil {
 		return scheduleContextView{}, false, err
 	}

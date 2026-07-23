@@ -256,7 +256,10 @@ func TestEndAndCancelFreezeHXRequestsReturnActiveFreezesFragmentWithToast(t *tes
 }
 
 func TestCloseFreezeHXValidationErrorReturnsActiveFreezesFragment(t *testing.T) {
-	store := &fakeFreezeStore{err: freeze.ValidationError{Message: "freeze is not active"}}
+	store := &fakeFreezeStore{
+		freezes: []domain.BranchFreeze{{ID: 9, RepositoryID: 1, Branch: "main", Status: domain.BranchFreezeStatusActive, Active: true}},
+		err:     freeze.ValidationError{Message: "freeze is not active"},
+	}
 	server := freezeHXTestServer(store)
 
 	recorder := postHXFreezeForm(t, server, "/freezes/end", freezeCloseForm(9))

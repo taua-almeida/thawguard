@@ -11,6 +11,7 @@ import (
 
 	"github.com/taua-almeida/thawguard/internal/auth"
 	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 	"github.com/taua-almeida/thawguard/internal/schedule"
 )
 
@@ -33,12 +34,26 @@ type fakeScheduleStore struct {
 }
 
 func (s *fakeScheduleStore) List(ctx context.Context) ([]domain.Schedule, error) {
-	return s.schedules, nil
+	return s.ListForScope(ctx, repositoryscope.All())
+}
+
+func (s *fakeScheduleStore) ListForScope(ctx context.Context, scope repositoryscope.ReadScope) ([]domain.Schedule, error) {
+	visible := make([]domain.Schedule, 0, len(s.schedules))
+	for _, item := range s.schedules {
+		if fakeScopeAllows(scope, item.RepositoryID) {
+			visible = append(visible, item)
+		}
+	}
+	return visible, nil
 }
 
 func (s *fakeScheduleStore) Get(ctx context.Context, id int64) (domain.Schedule, error) {
+	return s.GetForScope(ctx, repositoryscope.All(), id)
+}
+
+func (s *fakeScheduleStore) GetForScope(ctx context.Context, scope repositoryscope.ReadScope, id int64) (domain.Schedule, error) {
 	for _, item := range s.schedules {
-		if item.ID == id {
+		if item.ID == id && fakeScopeAllows(scope, item.RepositoryID) {
 			return item, nil
 		}
 	}
@@ -193,15 +208,14 @@ func scheduleTestServer(store *fakeScheduleStore) *Server {
 func TestScheduledFreezesPageShowsScheduleRegionOnlyWhenStoreConfigured(t *testing.T) {
 	repo := domain.Repository{ID: 1, Owner: "taua-almeida", Name: "thawguard", DefaultBranch: "main", EnforcementState: domain.EnforcementActive}
 	withoutStore := NewServer(Config{AppName: "Thawguard", RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{repo}}, ScheduledFreezeStore: &fakeFreezeStore{}})
-	recorder := httptest.NewRecorder()
-	withoutStore.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/scheduled-freezes", nil))
+	recorder := getPageWithRoles(t, withoutStore, "/scheduled-freezes", auth.RoleSet{auth.RoleFreezer})
 	if recorder.Code != http.StatusOK || strings.Contains(recorder.Body.String(), "Recurring schedules") {
 		t.Fatalf("expected schedules region hidden without a store, status=%d", recorder.Code)
 	}
 
 	store := &fakeScheduleStore{schedules: []domain.Schedule{{ID: 3, RepositoryID: 1, Branch: "main", Name: "Nightly release lock", Kind: domain.ScheduleKindWeekly, Timezone: "America/Sao_Paulo"}}}
-	recorder = httptest.NewRecorder()
-	scheduleTestServer(store).Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/scheduled-freezes", nil))
+	server := scheduleTestServer(store)
+	recorder = getPageWithRoles(t, server, "/scheduled-freezes", auth.RoleSet{auth.RoleFreezer})
 	body := recorder.Body.String()
 	for _, want := range []string{"Recurring schedules", "Nightly release lock", "Paused", "taua-almeida/thawguard", "America/Sao_Paulo", `href="/scheduled-freezes/schedules/3"`} {
 		if !strings.Contains(body, want) {
@@ -261,8 +275,7 @@ func TestScheduleDetailRendersPausedTruthAndUnknownIDIs404(t *testing.T) {
 	store := &fakeScheduleStore{schedules: []domain.Schedule{{ID: 3, RepositoryID: 1, Branch: "main", Name: "Nightly release lock", Kind: domain.ScheduleKindWeekly, Timezone: "America/Sao_Paulo", Reason: "quiet hours", CreatedAt: created}}}
 	server := scheduleTestServer(store)
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/scheduled-freezes/schedules/3", nil))
+	recorder := getPageWithRoles(t, server, "/scheduled-freezes/schedules/3", auth.RoleSet{auth.RoleFreezer})
 	body := recorder.Body.String()
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected detail 200, got %d body=%q", recorder.Code, body)
@@ -274,8 +287,7 @@ func TestScheduleDetailRendersPausedTruthAndUnknownIDIs404(t *testing.T) {
 	}
 
 	for _, path := range []string{"/scheduled-freezes/schedules/999", "/scheduled-freezes/schedules/not-a-number"} {
-		recorder = httptest.NewRecorder()
-		server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		recorder = getPageWithRoles(t, server, path, auth.RoleSet{auth.RoleFreezer})
 		if recorder.Code != http.StatusNotFound {
 			t.Fatalf("expected 404 for %s, got %d", path, recorder.Code)
 		}
@@ -371,8 +383,7 @@ func TestScheduleDetailRendersActiveBadgeAndSuppressionCallout(t *testing.T) {
 	store := &fakeScheduleStore{schedules: []domain.Schedule{{ID: 3, RepositoryID: 1, Branch: "main", Name: "Nightly release lock", Kind: domain.ScheduleKindWeekly, Timezone: "UTC", Active: true, SuppressedUntil: &suppressedUntil, CreatedAt: time.Date(2026, 7, 18, 9, 30, 0, 0, time.UTC)}}}
 	server := scheduleTestServer(store)
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/scheduled-freezes/schedules/3", nil))
+	recorder := getPageWithRoles(t, server, "/scheduled-freezes/schedules/3", auth.RoleSet{auth.RoleFreezer})
 	body := recorder.Body.String()
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected detail 200, got %d", recorder.Code)
@@ -387,7 +398,7 @@ func TestScheduleDetailRendersActiveBadgeAndSuppressionCallout(t *testing.T) {
 	}
 }
 
-func TestScheduleMutationsAllowAdminWithoutFreezerRole(t *testing.T) {
+func TestScheduleMutationsRejectAdminWithoutFreezerRole(t *testing.T) {
 	store := &fakeScheduleStore{schedules: []domain.Schedule{{ID: 3, RepositoryID: 1, Branch: "main", Name: "Nightly release lock", Kind: domain.ScheduleKindWeekly, Timezone: "UTC"}}}
 	server := scheduleTestServer(store)
 	admin := setWebSessionRoles(t, server, auth.RoleSet{auth.RoleAdmin})
@@ -398,8 +409,8 @@ func TestScheduleMutationsAllowAdminWithoutFreezerRole(t *testing.T) {
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: admin.ID})
 	server.Routes().ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusSeeOther || len(store.created) != 1 {
-		t.Fatalf("expected admin create to succeed, status=%d created=%d", recorder.Code, len(store.created))
+	if recorder.Code != http.StatusForbidden || len(store.created) != 0 {
+		t.Fatalf("expected Admin without scoped Freezer to be rejected, status=%d created=%d", recorder.Code, len(store.created))
 	}
 
 	form = url.Values{csrfFormField: {admin.CSRFToken}}
@@ -408,8 +419,8 @@ func TestScheduleMutationsAllowAdminWithoutFreezerRole(t *testing.T) {
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: admin.ID})
 	server.Routes().ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusSeeOther || len(store.deleted) != 1 || store.deleted[0] != 3 {
-		t.Fatalf("expected admin delete to succeed, status=%d deleted=%+v", recorder.Code, store.deleted)
+	if recorder.Code != http.StatusForbidden || len(store.deleted) != 0 {
+		t.Fatalf("expected Admin without scoped Freezer to be rejected, status=%d deleted=%+v", recorder.Code, store.deleted)
 	}
 }
 
@@ -482,8 +493,7 @@ func TestScheduleDetailRendersRulesAndPreview(t *testing.T) {
 	}
 	server := scheduleTestServer(store)
 
-	recorder := httptest.NewRecorder()
-	server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/scheduled-freezes/schedules/3", nil))
+	recorder := getPageWithRoles(t, server, "/scheduled-freezes/schedules/3", auth.RoleSet{auth.RoleFreezer})
 	body := recorder.Body.String()
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected detail 200, got %d body=%q", recorder.Code, body)

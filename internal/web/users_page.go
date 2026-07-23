@@ -1,38 +1,30 @@
 package web
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/taua-almeida/thawguard/internal/auth"
+	"github.com/taua-almeida/thawguard/internal/domain"
 )
 
-// usersPageState carries which dialog re-opens and the preserved non-secret
-// values across a validation re-render. Password values are intentionally
-// never part of this state.
+type usersQuery struct {
+	Search       string
+	RepositoryID int64
+}
+
 type usersPageState struct {
 	FormError         string
 	CreateOpen        bool
 	CreateEmail       string
 	CreateDisplayName string
-	CreateRoles       auth.RoleSet
-	RoleFormUserID    int64
-	RoleFormRoles     auth.RoleSet
-	ResetFormUserID   int64
 }
 
-// defaultUsersPageState seeds the create-user form with the least-privileged
-// role preselected.
-func defaultUsersPageState() usersPageState {
-	return usersPageState{CreateRoles: auth.RoleSet{auth.RoleViewer}}
-}
-
-type roleOption struct {
+type usersRepositoryOption struct {
 	Value    string
 	Label    string
-	Hint     string
 	Selected bool
 }
 
@@ -43,13 +35,11 @@ type usersUserView struct {
 	Disabled           bool
 	MustChangePassword bool
 	IsSelf             bool
-	IsLastEnabledAdmin bool
-	CreatedAt          string
-	CreatedAtISO       string
-	RoleOptions        []roleOption
-	RoleFormError      string
-	ResetFormOpen      bool
-	ResetFormError     string
+	IsAdmin            bool
+	RepositoryCount    int
+	ScopedRoleLabels   []string
+	AccessTitle        string
+	AccessDetail       string
 }
 
 type usersPageData struct {
@@ -62,28 +52,65 @@ type usersPageData struct {
 	CSRFField   string
 	Toasts      []toastView
 
-	Users     []usersUserView
-	UserCount int
-
-	// FormError is the page-level fallback for a validation failure no
-	// rendered dialog claims (e.g. a raced last-admin disable).
+	Users             []usersUserView
+	UserCount         int
+	RepositoryOptions []usersRepositoryOption
+	Query             usersQuery
+	Filtered          bool
+	NoRepositories    bool
 	FormError         string
 	CreateOpen        bool
 	CreateError       string
 	CreateEmail       string
 	CreateDisplayName string
-	CreateRoleOptions []roleOption
 }
 
-// usersFragment is the htmx swap payload for #users-live plus an optional
-// out-of-band #toasts toast.
-type usersFragment struct {
-	Data  usersPageData
-	Toast *toastView
+type userGrantEvidenceView struct {
+	Role string
+	Text string
+	At   string
+}
+
+type userRepositoryAccessView struct {
+	Repository domain.Repository
+	Viewer     bool
+	Freezer    bool
+	Thaw       bool
+	Evidence   []userGrantEvidenceView
+}
+
+type userDetailState struct {
+	FormError         string
+	RepositoryID      int64
+	RepositoryRoles   auth.RoleSet
+	AdminSubmitted    bool
+	AdminValue        bool
+	ResetPasswordOpen bool
+}
+
+type userDetailPageData struct {
+	AppName     string
+	PageTitle   string
+	Theme       string
+	ActivePage  string
+	CurrentUser currentUserView
+	CSRFToken   string
+	CSRFField   string
+	Toasts      []toastView
+
+	User               auth.User
+	IsSelf             bool
+	IsAdmin            bool
+	IsLastEnabledAdmin bool
+	AdminChecked       bool
+	Repositories       []userRepositoryAccessView
+	RepositoryCount    int
+	NoRepositories     bool
+	FormError          string
+	ResetPasswordOpen  bool
 }
 
 func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
-	w.Header().Add("Vary", "HX-Request")
 	if s.cfg.AuthService == nil {
 		http.Error(w, "auth service is not configured", http.StatusServiceUnavailable)
 		return
@@ -92,267 +119,161 @@ func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !session.Roles.CanManageRepositories() {
-		http.Error(w, "forbidden", http.StatusForbidden)
+	if !session.Grants.CanManageInstallation() {
+		s.renderErrorPage(w, http.StatusForbidden, false)
 		return
 	}
-	if isHXRequest(r) {
-		s.renderUsersFragment(w, r, defaultUsersPageState(), session, nil)
+	query, err := usersQueryFromRequest(r)
+	if err != nil {
+		s.renderUsersPage(w, r, http.StatusBadRequest, usersQuery{Search: strings.TrimSpace(r.URL.Query().Get("q"))}, usersPageState{FormError: err.Error()}, session)
 		return
 	}
-	s.renderUsersPage(w, r, http.StatusOK, defaultUsersPageState(), session)
+	s.renderUsersPage(w, r, http.StatusOK, query, usersPageState{}, session)
+}
+
+func usersQueryFromRequest(r *http.Request) (usersQuery, error) {
+	query := usersQuery{Search: strings.TrimSpace(r.URL.Query().Get("q"))}
+	if len(query.Search) > auth.UserDirectorySearchMaxLength {
+		return query, auth.ValidationError{Message: "search is too long"}
+	}
+	rawRepositoryID := strings.TrimSpace(r.URL.Query().Get("repo"))
+	if rawRepositoryID == "" {
+		return query, nil
+	}
+	repositoryID, err := strconv.ParseInt(rawRepositoryID, 10, 64)
+	if err != nil || repositoryID <= 0 {
+		return query, auth.ValidationError{Message: "repository filter is invalid"}
+	}
+	query.RepositoryID = repositoryID
+	return query, nil
 }
 
 func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
-	w.Header().Add("Vary", "HX-Request")
 	if s.cfg.AuthService == nil {
 		http.Error(w, "auth service is not configured", http.StatusServiceUnavailable)
 		return
 	}
-	session, ok := s.requireRepositoryManagerForm(w, r)
-	if !ok {
+	session, ok := s.requireAdminForm(w, r)
+	if !ok || session.UserID == nil {
 		return
 	}
-	roles := rolesFromForm(r)
-	_, err := s.cfg.AuthService.CreateUser(r.Context(), auth.CreateUserParams{
+	user, err := s.cfg.AuthService.CreateUser(r.Context(), auth.CreateUserParams{
+		ActorUserID: *session.UserID,
 		Email:       r.PostFormValue("email"),
 		DisplayName: r.PostFormValue("display_name"),
-		Password:    r.PostFormValue("password"),
-		Roles:       roles,
+		Password:    r.PostFormValue("temporary_password"),
 	})
 	if err != nil {
-		s.renderUsersValidationError(w, r, err, usersPageState{
+		if !auth.IsValidationError(err) {
+			s.renderErrorPage(w, http.StatusInternalServerError, false)
+			return
+		}
+		s.renderUsersPage(w, r, http.StatusBadRequest, usersQuery{}, usersPageState{
+			FormError:         err.Error(),
 			CreateOpen:        true,
-			CreateEmail:       r.PostFormValue("email"),
-			CreateDisplayName: r.PostFormValue("display_name"),
-			CreateRoles:       auth.RoleSet(roles),
+			CreateEmail:       strings.TrimSpace(r.PostFormValue("email")),
+			CreateDisplayName: strings.TrimSpace(r.PostFormValue("display_name")),
 		}, session)
 		return
 	}
-	s.completeUsersMutation(w, r, session, "User created")
+	http.Redirect(w, r, fmt.Sprintf("/users/%d?notice=created", user.ID), http.StatusSeeOther)
 }
 
-func (s *Server) handleUpdateUserRoles(w http.ResponseWriter, r *http.Request) {
-	w.Header().Add("Vary", "HX-Request")
-	if s.cfg.AuthService == nil {
-		http.Error(w, "auth service is not configured", http.StatusServiceUnavailable)
-		return
-	}
-	session, ok := s.requireRepositoryManagerForm(w, r)
-	if !ok || session.UserID == nil {
-		return
-	}
-	userID := formUserID(r)
-	roles := rolesFromForm(r)
-	_, err := s.cfg.AuthService.UpdateUserRoles(r.Context(), auth.UpdateUserRolesParams{
-		ActorUserID: *session.UserID,
-		UserID:      userID,
-		Roles:       roles,
-	})
-	if err != nil {
-		state := defaultUsersPageState()
-		state.RoleFormUserID = userID
-		state.RoleFormRoles, _ = auth.NormalizeRoleSet(roles)
-		s.renderUsersValidationError(w, r, err, state, session)
-		return
-	}
-	s.completeUsersMutation(w, r, session, "Roles saved")
-}
-
-func (s *Server) handleDisableUser(w http.ResponseWriter, r *http.Request) {
-	w.Header().Add("Vary", "HX-Request")
-	if s.cfg.AuthService == nil {
-		http.Error(w, "auth service is not configured", http.StatusServiceUnavailable)
-		return
-	}
-	session, ok := s.requireRepositoryManagerForm(w, r)
-	if !ok || session.UserID == nil {
-		return
-	}
-	userID := formUserID(r)
-	if _, err := s.cfg.AuthService.DisableUser(r.Context(), *session.UserID, userID); err != nil {
-		s.renderUsersValidationError(w, r, err, defaultUsersPageState(), session)
-		return
-	}
-	if *session.UserID == userID {
-		// The actor just revoked their own sessions; a fragment would render
-		// a dead page under a cleared cookie, so htmx gets a full redirect.
-		clearSessionCookie(w, r)
-		if isHXRequest(r) {
-			w.Header().Set("HX-Redirect", "/login")
-			return
-		}
-		http.Redirect(w, r, "/login", http.StatusSeeOther)
-		return
-	}
-	s.completeUsersMutation(w, r, session, "User disabled")
-}
-
-func (s *Server) handleEnableUser(w http.ResponseWriter, r *http.Request) {
-	w.Header().Add("Vary", "HX-Request")
-	if s.cfg.AuthService == nil {
-		http.Error(w, "auth service is not configured", http.StatusServiceUnavailable)
-		return
-	}
-	session, ok := s.requireRepositoryManagerForm(w, r)
-	if !ok || session.UserID == nil {
-		return
-	}
-	if _, err := s.cfg.AuthService.EnableUser(r.Context(), *session.UserID, formUserID(r)); err != nil {
-		s.renderUsersValidationError(w, r, err, defaultUsersPageState(), session)
-		return
-	}
-	s.completeUsersMutation(w, r, session, "User re-enabled")
-}
-
-func (s *Server) handleResetUserPassword(w http.ResponseWriter, r *http.Request) {
-	w.Header().Add("Vary", "HX-Request")
-	if s.cfg.AuthService == nil {
-		http.Error(w, "auth service is not configured", http.StatusServiceUnavailable)
-		return
-	}
-	session, ok := s.requireRepositoryManagerForm(w, r)
-	if !ok || session.UserID == nil {
-		return
-	}
-	userID := formUserID(r)
-	state := defaultUsersPageState()
-	state.ResetFormUserID = userID
-	if r.PostFormValue("temporary_password") != r.PostFormValue("temporary_password_confirmation") {
-		s.renderUsersValidationError(w, r, auth.ValidationError{Message: "temporary passwords do not match"}, state, session)
-		return
-	}
-	err := s.cfg.AuthService.ResetPassword(r.Context(), auth.ResetPasswordParams{
-		ActorUserID:       *session.UserID,
-		UserID:            userID,
-		TemporaryPassword: r.PostFormValue("temporary_password"),
-	})
-	if err != nil {
-		s.renderUsersValidationError(w, r, err, state, session)
-		return
-	}
-	s.completeUsersMutation(w, r, session, "Temporary password set")
-}
-
-// completeUsersMutation finishes a successful POST: htmx requests get the
-// refreshed #users-live fragment plus an out-of-band success toast, browsers
-// keep the legacy 303 PRG.
-func (s *Server) completeUsersMutation(w http.ResponseWriter, r *http.Request, session sessionState, message string) {
-	if isHXRequest(r) {
-		s.renderUsersFragment(w, r, defaultUsersPageState(), session, &toastView{Message: message, Tone: "success"})
-		return
-	}
-	http.Redirect(w, r, "/users", http.StatusSeeOther)
-}
-
-// renderUsersValidationError re-renders the users page for a typed validation
-// error and hides internal error details. Password values are never echoed.
-// htmx requests get a 200 fragment with the failed dialog re-opened (the
-// client does not swap 4xx responses); browsers keep the legacy 400 full page.
-func (s *Server) renderUsersValidationError(w http.ResponseWriter, r *http.Request, err error, state usersPageState, session sessionState) {
-	if !auth.IsValidationError(err) {
-		internalServerError(w)
-		return
-	}
-	state.FormError = err.Error()
-	if isHXRequest(r) {
-		s.renderUsersFragment(w, r, state, session, nil)
-		return
-	}
-	s.renderUsersPage(w, r, http.StatusBadRequest, state, session)
-}
-
-func (s *Server) renderUsersPage(w http.ResponseWriter, r *http.Request, statusCode int, state usersPageState, session sessionState) {
-	data, ok := s.loadUsersPageData(w, r, state, session)
+func (s *Server) renderUsersPage(w http.ResponseWriter, r *http.Request, status int, query usersQuery, state usersPageState, session sessionState) {
+	data, ok := s.loadUsersPageData(w, r, query, state, session)
 	if !ok {
 		return
 	}
-	s.renderPageStatus(w, statusCode, "layouts/users", data)
+	s.renderPageStatus(w, status, "layouts/users", data)
 }
 
-func (s *Server) renderUsersFragment(w http.ResponseWriter, r *http.Request, state usersPageState, session sessionState, toast *toastView) {
-	data, ok := s.loadUsersPageData(w, r, state, session)
-	if !ok {
-		return
-	}
-	s.renderPageStatus(w, http.StatusOK, "components/users-live-fragment", usersFragment{Data: data, Toast: toast})
-}
-
-func (s *Server) loadUsersPageData(w http.ResponseWriter, r *http.Request, state usersPageState, session sessionState) (usersPageData, bool) {
-	users, err := s.cfg.AuthService.ListUsers(r.Context())
+func (s *Server) loadUsersPageData(w http.ResponseWriter, r *http.Request, query usersQuery, state usersPageState, session sessionState) (usersPageData, bool) {
+	repositories, err := s.repositories(r.Context(), session.Grants.RepositoryReadScope())
 	if err != nil {
-		internalServerError(w)
+		s.renderErrorPage(w, http.StatusInternalServerError, false)
 		return usersPageData{}, false
 	}
-	return usersPageDataFor(s.cfg.AppName, users, state, session), true
-}
-
-func usersPageDataFor(appName string, users []auth.User, state usersPageState, session sessionState) usersPageData {
+	entries, err := s.cfg.AuthService.ListUsersDirectory(r.Context(), auth.UserDirectoryQuery{Search: query.Search, RepositoryID: query.RepositoryID})
+	if err != nil {
+		if auth.IsValidationError(err) {
+			state.FormError = err.Error()
+			entries, err = s.cfg.AuthService.ListUsersDirectory(r.Context(), auth.UserDirectoryQuery{})
+		}
+		if err != nil {
+			s.renderErrorPage(w, http.StatusInternalServerError, false)
+			return usersPageData{}, false
+		}
+	}
 	data := usersPageData{
-		AppName:           appName,
-		PageTitle:         "Users & Roles",
+		AppName:           s.cfg.AppName,
+		PageTitle:         "Users & Access",
 		ActivePage:        "users",
 		CurrentUser:       currentUserFromSession(session),
 		CSRFToken:         session.CSRFToken,
 		CSRFField:         csrfFormField,
-		Users:             usersUserViews(users, state, session),
-		UserCount:         len(users),
+		RepositoryOptions: usersRepositoryOptions(repositories, query.RepositoryID),
+		Query:             query,
+		Filtered:          query.Search != "" || query.RepositoryID > 0,
+		NoRepositories:    len(repositories) == 0,
+		FormError:         state.FormError,
 		CreateOpen:        state.CreateOpen,
+		CreateError:       state.FormError,
 		CreateEmail:       state.CreateEmail,
 		CreateDisplayName: state.CreateDisplayName,
-		CreateRoleOptions: roleOptionsFor(state.CreateRoles),
 	}
-	if state.CreateOpen {
-		data.CreateError = state.FormError
-	}
-	if state.FormError != "" && !usersErrorClaimed(data) {
-		data.FormError = state.FormError
-	}
-	return data
+	data.Users = usersDirectoryViews(entries, session)
+	data.UserCount = len(data.Users)
+	return data, true
 }
 
-// usersErrorClaimed reports whether a rendered dialog or row form already
-// displays the validation message, so the page-level fallback stays quiet.
-func usersErrorClaimed(data usersPageData) bool {
-	if data.CreateError != "" {
-		return true
+func usersRepositoryOptions(repositories []domain.Repository, selectedID int64) []usersRepositoryOption {
+	options := []usersRepositoryOption{{Label: "Any repository", Selected: selectedID == 0}}
+	for _, repository := range repositories {
+		options = append(options, usersRepositoryOption{
+			Value:    strconv.FormatInt(repository.ID, 10),
+			Label:    repository.FullName(),
+			Selected: repository.ID == selectedID,
+		})
 	}
-	for _, user := range data.Users {
-		if user.RoleFormError != "" || user.ResetFormError != "" {
-			return true
-		}
-	}
-	return false
+	return options
 }
 
-func usersUserViews(users []auth.User, state usersPageState, session sessionState) []usersUserView {
-	lastAdminID := lastEnabledAdminID(users)
-	views := make([]usersUserView, 0, len(users))
-	for _, user := range users {
-		roleFormRoles := userRoleSet(user)
-		if state.RoleFormUserID != 0 && state.RoleFormUserID == user.ID {
-			roleFormRoles = state.RoleFormRoles
-		}
-		isSelf := session.UserID != nil && *session.UserID == user.ID
+func usersDirectoryViews(entries []auth.UserDirectoryEntry, session sessionState) []usersUserView {
+	views := make([]usersUserView, 0, len(entries))
+	for _, entry := range entries {
 		view := usersUserView{
-			ID:                 user.ID,
-			DisplayName:        user.DisplayName,
-			Email:              user.Email,
-			Disabled:           user.Disabled(),
-			MustChangePassword: user.MustChangePassword,
-			IsSelf:             isSelf,
-			IsLastEnabledAdmin: lastAdminID != 0 && lastAdminID == user.ID,
-			CreatedAt:          user.CreatedAt.UTC().Format("2006-01-02 15:04 UTC"),
-			CreatedAtISO:       user.CreatedAt.UTC().Format(time.RFC3339),
-			RoleOptions:        roleOptionsFor(roleFormRoles),
-			ResetFormOpen:      !isSelf && state.ResetFormUserID != 0 && state.ResetFormUserID == user.ID,
+			ID:                 entry.ID,
+			DisplayName:        entry.DisplayName,
+			Email:              entry.Email,
+			Disabled:           entry.Disabled(),
+			MustChangePassword: entry.MustChangePassword,
+			IsSelf:             session.UserID != nil && *session.UserID == entry.ID,
+			IsAdmin:            entry.IsAdmin,
+			RepositoryCount:    entry.RepositoryCount,
 		}
-		if state.FormError != "" {
-			if state.RoleFormUserID != 0 && state.RoleFormUserID == user.ID {
-				view.RoleFormError = state.FormError
-			}
-			if view.ResetFormOpen {
-				view.ResetFormError = state.FormError
+		if entry.HasViewer {
+			view.ScopedRoleLabels = append(view.ScopedRoleLabels, auth.RoleViewer.Label())
+		}
+		if entry.HasFreezer {
+			view.ScopedRoleLabels = append(view.ScopedRoleLabels, auth.RoleFreezer.Label())
+		}
+		if entry.HasThawApprover {
+			view.ScopedRoleLabels = append(view.ScopedRoleLabels, auth.RoleThawApprover.Label())
+		}
+		switch {
+		case entry.IsAdmin:
+			view.AccessTitle = "Admin"
+			view.AccessDetail = "Views every repository"
+		case entry.RepositoryCount == 0:
+			view.AccessTitle = "No repository access"
+		default:
+			view.AccessTitle = fmt.Sprintf("%d repositories", entry.RepositoryCount)
+		}
+		if entry.Disabled() {
+			if view.AccessDetail != "" {
+				view.AccessDetail += " · Suspended while disabled"
+			} else {
+				view.AccessDetail = "Suspended while disabled"
 			}
 		}
 		views = append(views, view)
@@ -360,76 +281,294 @@ func usersUserViews(users []auth.User, state usersPageState, session sessionStat
 	return views
 }
 
-// userRoleSet mirrors the fallback used for the roles label: accounts from
-// before multi-role support may carry only the primary Role column.
-func userRoleSet(user auth.User) auth.RoleSet {
-	if len(user.Roles) > 0 {
-		return user.Roles
+func (s *Server) handleUserDetail(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.AuthService == nil {
+		http.Error(w, "auth service is not configured", http.StatusServiceUnavailable)
+		return
 	}
-	if user.Role.Valid() {
-		return auth.RoleSet{user.Role}
+	session, ok := s.requireView(w, r)
+	if !ok {
+		return
 	}
-	return nil
+	if !session.Grants.CanManageInstallation() {
+		s.renderErrorPage(w, http.StatusForbidden, false)
+		return
+	}
+	userID, ok := userIDFromPath(r)
+	if !ok {
+		s.renderErrorPage(w, http.StatusNotFound, false)
+		return
+	}
+	data, found := s.loadUserDetailPageData(w, r, userID, userDetailState{}, session)
+	if !found {
+		return
+	}
+	switch r.URL.Query().Get("notice") {
+	case "created":
+		data.Toasts = []toastView{{Message: "Local user created with no repository access. They must change the temporary password at first sign-in.", Tone: "success", DismissHref: fmt.Sprintf("/users/%d", userID)}}
+	case "admin-saved":
+		data.Toasts = []toastView{{Message: "Admin access saved.", Tone: "success", DismissHref: fmt.Sprintf("/users/%d", userID)}}
+	case "access-saved":
+		data.Toasts = []toastView{{Message: "Repository access saved.", Tone: "success", DismissHref: fmt.Sprintf("/users/%d", userID)}}
+	case "disabled":
+		data.Toasts = []toastView{{Message: "User disabled and sessions revoked.", Tone: "success", DismissHref: fmt.Sprintf("/users/%d", userID)}}
+	case "enabled":
+		data.Toasts = []toastView{{Message: "User re-enabled. Previous sessions were not restored.", Tone: "success", DismissHref: fmt.Sprintf("/users/%d", userID)}}
+	case "password-reset":
+		data.Toasts = []toastView{{Message: "Temporary password reset. Existing sessions were revoked.", Tone: "success", DismissHref: fmt.Sprintf("/users/%d", userID)}}
+	}
+	s.renderPage(w, "layouts/user-detail", data)
 }
 
-// lastEnabledAdminID returns the ID of the only enabled admin in the listed
-// set, or 0 when zero or several enabled admins exist. The view pre-disables
-// the guarded controls on that row; the service invariant stays authoritative
-// because this snapshot can be stale across two admin sessions.
-func lastEnabledAdminID(users []auth.User) int64 {
-	var id int64
-	count := 0
-	for _, user := range users {
-		if user.Disabled() || !userRoleSet(user).Contains(auth.RoleAdmin) {
-			continue
+func userIDFromPath(r *http.Request) (int64, bool) {
+	userID, err := strconv.ParseInt(strings.TrimSpace(r.PathValue("id")), 10, 64)
+	return userID, err == nil && userID > 0
+}
+
+func (s *Server) loadUserDetailPageData(w http.ResponseWriter, r *http.Request, userID int64, state userDetailState, session sessionState) (userDetailPageData, bool) {
+	user, err := s.cfg.AuthService.GetUser(r.Context(), userID)
+	if err != nil {
+		if isMissingUser(err) {
+			s.renderErrorPage(w, http.StatusNotFound, false)
+		} else {
+			s.renderErrorPage(w, http.StatusInternalServerError, false)
 		}
-		count++
-		id = user.ID
+		return userDetailPageData{}, false
 	}
-	if count != 1 {
-		return 0
+	repositories, err := s.repositories(r.Context(), session.Grants.RepositoryReadScope())
+	if err != nil {
+		s.renderErrorPage(w, http.StatusInternalServerError, false)
+		return userDetailPageData{}, false
 	}
-	return id
+	grants, err := s.cfg.AuthService.ListUserRepositoryGrants(r.Context(), userID)
+	if err != nil {
+		s.renderErrorPage(w, http.StatusInternalServerError, false)
+		return userDetailPageData{}, false
+	}
+	entries, err := s.cfg.AuthService.ListUsersDirectory(r.Context(), auth.UserDirectoryQuery{})
+	if err != nil {
+		s.renderErrorPage(w, http.StatusInternalServerError, false)
+		return userDetailPageData{}, false
+	}
+	enabledAdmins := 0
+	for _, entry := range entries {
+		if entry.IsAdmin && !entry.Disabled() {
+			enabledAdmins++
+		}
+	}
+	isAdmin := user.Roles.Contains(auth.RoleAdmin)
+	data := userDetailPageData{
+		AppName:            s.cfg.AppName,
+		PageTitle:          user.DisplayName,
+		ActivePage:         "users",
+		CurrentUser:        currentUserFromSession(session),
+		CSRFToken:          session.CSRFToken,
+		CSRFField:          csrfFormField,
+		User:               user,
+		IsSelf:             session.UserID != nil && *session.UserID == user.ID,
+		IsAdmin:            isAdmin,
+		IsLastEnabledAdmin: isAdmin && !user.Disabled() && enabledAdmins == 1,
+		AdminChecked:       isAdmin,
+		RepositoryCount:    len(repositories),
+		NoRepositories:     len(repositories) == 0,
+		FormError:          state.FormError,
+		ResetPasswordOpen:  state.ResetPasswordOpen,
+	}
+	if state.AdminSubmitted {
+		data.AdminChecked = state.AdminValue
+	}
+	data.Repositories = userRepositoryAccessViews(repositories, grants, state)
+	return data, true
 }
 
-func roleOptionsFor(selected auth.RoleSet) []roleOption {
-	roles := auth.Roles()
-	options := make([]roleOption, 0, len(roles))
-	for _, role := range roles {
-		options = append(options, roleOption{Value: string(role), Label: role.Label(), Hint: roleHint(role), Selected: selected.Contains(role)})
+func userRepositoryAccessViews(repositories []domain.Repository, grants []auth.RepositoryGrantDetail, state userDetailState) []userRepositoryAccessView {
+	byRepository := make(map[int64][]auth.RepositoryGrantDetail)
+	for _, grant := range grants {
+		byRepository[grant.RepositoryID] = append(byRepository[grant.RepositoryID], grant)
 	}
-	return options
+	views := make([]userRepositoryAccessView, 0, len(repositories))
+	for _, repository := range repositories {
+		view := userRepositoryAccessView{Repository: repository}
+		for _, grant := range byRepository[repository.ID] {
+			switch grant.Role {
+			case auth.RoleViewer:
+				view.Viewer = true
+			case auth.RoleFreezer:
+				view.Freezer = true
+			case auth.RoleThawApprover:
+				view.Thaw = true
+			}
+			text := "Added by a deleted or unavailable user"
+			switch {
+			case grant.Migrated:
+				text = "Migrated legacy access"
+			case grant.GranterDisplayName != "":
+				text = "Added by " + grant.GranterDisplayName
+			}
+			view.Evidence = append(view.Evidence, userGrantEvidenceView{Role: grant.Role.Label(), Text: text, At: grant.GrantedAt.UTC().Format("2006-01-02 15:04 UTC")})
+		}
+		if state.RepositoryID == repository.ID {
+			view.Viewer = state.RepositoryRoles.Contains(auth.RoleViewer)
+			view.Freezer = state.RepositoryRoles.Contains(auth.RoleFreezer)
+			view.Thaw = state.RepositoryRoles.Contains(auth.RoleThawApprover)
+		}
+		views = append(views, view)
+	}
+	return views
 }
 
-// roleHint is the per-role line of the legacy role explainer, shown in the
-// add-user dialog only (rows stay dense).
-func roleHint(role auth.Role) string {
-	switch role {
-	case auth.RoleAdmin:
-		return "Manages repositories, users, roles, tokens, and webhook secrets."
-	case auth.RoleFreezer:
-		return "Creates and ends freezes."
-	case auth.RoleThawApprover:
-		return "Approves PR exceptions."
-	case auth.RoleViewer:
-		return "Reads dashboards and audit history."
-	default:
-		return ""
+func (s *Server) handleSetUserAdmin(w http.ResponseWriter, r *http.Request) {
+	session, userID, ok := s.requireAdminUserMutation(w, r)
+	if !ok {
+		return
 	}
+	adminValue := r.PostFormValue("admin") == "1"
+	_, err := s.cfg.AuthService.SetUserAdmin(r.Context(), auth.SetUserAdminParams{ActorUserID: *session.UserID, UserID: userID, Admin: adminValue})
+	if err != nil {
+		s.renderUserMutationError(w, r, userID, userDetailState{FormError: err.Error(), AdminSubmitted: true, AdminValue: adminValue}, session, err)
+		return
+	}
+	if *session.UserID == userID && !adminValue {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/users/%d?notice=admin-saved", userID), http.StatusSeeOther)
 }
 
-func rolesFromForm(r *http.Request) []auth.Role {
+func (s *Server) handleSetUserRepositoryAccess(w http.ResponseWriter, r *http.Request) {
+	session, userID, ok := s.requireAdminUserMutation(w, r)
+	if !ok {
+		return
+	}
+	repositoryID := repositoryIDFromForm(r)
+	if _, visible := s.visibleRepository(w, r, session, repositoryID); !visible {
+		return
+	}
+	roles := repositoryRolesFromForm(r)
+	err := s.cfg.AuthService.SetUserRepositoryRoles(r.Context(), auth.SetUserRepositoryRolesParams{ActorUserID: *session.UserID, UserID: userID, RepositoryID: repositoryID, Roles: roles})
+	if err != nil {
+		s.renderUserMutationError(w, r, userID, userDetailState{FormError: err.Error(), RepositoryID: repositoryID, RepositoryRoles: auth.RoleSet(roles)}, session, err)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/users/%d?notice=access-saved", userID), http.StatusSeeOther)
+}
+
+func (s *Server) handleRemoveUserRepositoryAccess(w http.ResponseWriter, r *http.Request) {
+	session, userID, ok := s.requireAdminUserMutation(w, r)
+	if !ok {
+		return
+	}
+	repositoryID := repositoryIDFromForm(r)
+	if _, visible := s.visibleRepository(w, r, session, repositoryID); !visible {
+		return
+	}
+	err := s.cfg.AuthService.SetUserRepositoryRoles(r.Context(), auth.SetUserRepositoryRolesParams{ActorUserID: *session.UserID, UserID: userID, RepositoryID: repositoryID})
+	if err != nil {
+		s.renderUserMutationError(w, r, userID, userDetailState{FormError: err.Error(), RepositoryID: repositoryID}, session, err)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/users/%d?notice=access-saved", userID), http.StatusSeeOther)
+}
+
+func (s *Server) handleDisableUser(w http.ResponseWriter, r *http.Request) {
+	session, userID, ok := s.requireAdminUserMutation(w, r)
+	if !ok {
+		return
+	}
+	if _, err := s.cfg.AuthService.DisableUser(r.Context(), *session.UserID, userID); err != nil {
+		s.renderUserMutationError(w, r, userID, userDetailState{FormError: err.Error()}, session, err)
+		return
+	}
+	if *session.UserID == userID {
+		clearSessionCookie(w, r)
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/users/%d?notice=disabled", userID), http.StatusSeeOther)
+}
+
+func (s *Server) handleEnableUser(w http.ResponseWriter, r *http.Request) {
+	session, userID, ok := s.requireAdminUserMutation(w, r)
+	if !ok {
+		return
+	}
+	if _, err := s.cfg.AuthService.EnableUser(r.Context(), *session.UserID, userID); err != nil {
+		s.renderUserMutationError(w, r, userID, userDetailState{FormError: err.Error()}, session, err)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/users/%d?notice=enabled", userID), http.StatusSeeOther)
+}
+
+func (s *Server) handleResetUserPassword(w http.ResponseWriter, r *http.Request) {
+	session, userID, ok := s.requireAdminUserMutation(w, r)
+	if !ok {
+		return
+	}
+	state := userDetailState{ResetPasswordOpen: true}
+	if r.PostFormValue("temporary_password") != r.PostFormValue("temporary_password_confirmation") {
+		err := auth.ValidationError{Message: "temporary passwords do not match"}
+		state.FormError = err.Error()
+		s.renderUserMutationError(w, r, userID, state, session, err)
+		return
+	}
+	err := s.cfg.AuthService.ResetPassword(r.Context(), auth.ResetPasswordParams{ActorUserID: *session.UserID, UserID: userID, TemporaryPassword: r.PostFormValue("temporary_password")})
+	if err != nil {
+		state.FormError = err.Error()
+		s.renderUserMutationError(w, r, userID, state, session, err)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/users/%d?notice=password-reset", userID), http.StatusSeeOther)
+}
+
+func (s *Server) requireAdminUserMutation(w http.ResponseWriter, r *http.Request) (sessionState, int64, bool) {
+	if s.cfg.AuthService == nil {
+		http.Error(w, "auth service is not configured", http.StatusServiceUnavailable)
+		return sessionState{}, 0, false
+	}
+	session, ok := s.requireAdminForm(w, r)
+	if !ok || session.UserID == nil {
+		return sessionState{}, 0, false
+	}
+	userID, valid := userIDFromPath(r)
+	if !valid {
+		s.renderErrorPage(w, http.StatusNotFound, false)
+		return sessionState{}, 0, false
+	}
+	if _, err := s.cfg.AuthService.GetUser(r.Context(), userID); err != nil {
+		if isMissingUser(err) {
+			s.renderErrorPage(w, http.StatusNotFound, false)
+		} else {
+			s.renderErrorPage(w, http.StatusInternalServerError, false)
+		}
+		return sessionState{}, 0, false
+	}
+	return session, userID, true
+}
+
+func (s *Server) renderUserMutationError(w http.ResponseWriter, r *http.Request, userID int64, state userDetailState, session sessionState, err error) {
+	if isMissingUser(err) {
+		s.renderErrorPage(w, http.StatusNotFound, false)
+		return
+	}
+	if !auth.IsValidationError(err) {
+		s.renderErrorPage(w, http.StatusInternalServerError, false)
+		return
+	}
+	data, ok := s.loadUserDetailPageData(w, r, userID, state, session)
+	if !ok {
+		return
+	}
+	s.renderPageStatus(w, http.StatusBadRequest, "layouts/user-detail", data)
+}
+
+func isMissingUser(err error) bool {
+	return auth.IsValidationError(err) && err.Error() == "user was not found"
+}
+
+func repositoryRolesFromForm(r *http.Request) []auth.Role {
 	roles := make([]auth.Role, 0, len(r.PostForm["roles"]))
-	for _, role := range r.PostForm["roles"] {
-		roles = append(roles, auth.Role(strings.TrimSpace(role)))
+	for _, value := range r.PostForm["roles"] {
+		roles = append(roles, auth.Role(strings.TrimSpace(value)))
 	}
 	return roles
-}
-
-func formUserID(r *http.Request) int64 {
-	userID, err := strconv.ParseInt(strings.TrimSpace(r.PostFormValue("user_id")), 10, 64)
-	if err != nil {
-		return 0
-	}
-	return userID
 }

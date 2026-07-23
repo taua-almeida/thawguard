@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/repositoryscope"
 	"github.com/taua-almeida/thawguard/internal/statusresult"
 )
 
@@ -347,13 +348,14 @@ func (s *Server) decisionsPageData(repositories []domain.Repository, results []s
 // already handled the nil-StatusDecisionStore 503 guard.
 func (s *Server) loadDecisionsPageData(w http.ResponseWriter, r *http.Request, state decisionsPageState, session sessionState) (decisionsPageData, bool) {
 	ctx := r.Context()
-	repositories, err := s.repositories(ctx)
+	scope := session.Grants.RepositoryReadScope()
+	repositories, err := s.repositories(ctx, scope)
 	if err != nil {
 		internalServerError(w)
 		return decisionsPageData{}, false
 	}
 	_, status := decisionFilterState(state.Query.State)
-	results, total, err := s.cfg.StatusDecisionStore.ListDecisionsPage(ctx, status, state.Query.RepositoryID, (state.Query.Page-1)*decisionsPageSize, decisionsPageSize)
+	results, total, err := s.cfg.StatusDecisionStore.ListDecisionsPageForScope(ctx, scope, status, state.Query.RepositoryID, (state.Query.Page-1)*decisionsPageSize, decisionsPageSize)
 	if err != nil {
 		internalServerError(w)
 		return decisionsPageData{}, false
@@ -361,13 +363,14 @@ func (s *Server) loadDecisionsPageData(w http.ResponseWriter, r *http.Request, s
 	if len(results) == 0 && total > 0 && state.Query.Page > 1 {
 		lastPage := (total + decisionsPageSize - 1) / decisionsPageSize
 		state.Query.Page = lastPage
-		results, total, err = s.cfg.StatusDecisionStore.ListDecisionsPage(ctx, status, state.Query.RepositoryID, (lastPage-1)*decisionsPageSize, decisionsPageSize)
+		results, total, err = s.cfg.StatusDecisionStore.ListDecisionsPageForScope(ctx, scope, status, state.Query.RepositoryID, (lastPage-1)*decisionsPageSize, decisionsPageSize)
 		if err != nil {
 			internalServerError(w)
 			return decisionsPageData{}, false
 		}
 	}
-	branchOptions, err := s.managedBranchOptions(ctx, repositories)
+	actionRepositories := thawRepositories(repositories, session.Grants)
+	branchOptions, err := s.managedBranchOptions(ctx, actionRepositories)
 	if err != nil {
 		internalServerError(w)
 		return decisionsPageData{}, false
@@ -375,7 +378,7 @@ func (s *Server) loadDecisionsPageData(w http.ResponseWriter, r *http.Request, s
 	var eligibility *thawEligibilityView
 	if state.DecisionForm.Submitted {
 		if index, convErr := strconv.Atoi(strings.TrimSpace(state.DecisionForm.PullRequestIndex)); convErr == nil {
-			eligibility, err = s.thawEligibility(ctx, repositories, state.DecisionForm.RepositoryID, index)
+			eligibility, err = s.thawEligibility(ctx, scope, actionRepositories, state.DecisionForm.RepositoryID, index)
 			if err != nil {
 				internalServerError(w)
 				return decisionsPageData{}, false
@@ -383,7 +386,10 @@ func (s *Server) loadDecisionsPageData(w http.ResponseWriter, r *http.Request, s
 		}
 	}
 	currentUser := currentUserFromSession(session)
-	return s.decisionsPageData(repositories, results, branchOptions, total, state, eligibility, session.CSRFToken, currentUser), true
+	currentUser.CanThaw = len(actionRepositories) > 0
+	data := s.decisionsPageData(repositories, results, branchOptions, total, state, eligibility, session.CSRFToken, currentUser)
+	data.EnforceableRepositories = enforcementActiveRepositories(actionRepositories)
+	return data, true
 }
 
 // thawEligibility builds the #thaw-eligibility preview from the
@@ -391,7 +397,7 @@ func (s *Server) loadDecisionsPageData(w http.ResponseWriter, r *http.Request, s
 // forge regardless of what this preview showed. Nil (the prompt state) when
 // there is nothing to preview yet: no repository, no positive index, an
 // unknown repository, or no pull request cache configured.
-func (s *Server) thawEligibility(ctx context.Context, repositories []domain.Repository, repositoryID int64, pullRequestIndex int) (*thawEligibilityView, error) {
+func (s *Server) thawEligibility(ctx context.Context, scope repositoryscope.ReadScope, repositories []domain.Repository, repositoryID int64, pullRequestIndex int) (*thawEligibilityView, error) {
 	if repositoryID <= 0 || pullRequestIndex <= 0 || s.cfg.PullRequestStore == nil {
 		return nil, nil
 	}
@@ -413,7 +419,7 @@ func (s *Server) thawEligibility(ctx context.Context, repositories []domain.Repo
 	view.TargetBranch = pr.TargetBranch
 	view.ShortHeadSHA = shortHeadSHA(pr.HeadSHA)
 	if s.cfg.FreezeStore != nil {
-		freezes, err := s.cfg.FreezeStore.ListActive(ctx)
+		freezes, err := s.cfg.FreezeStore.ListActiveForScope(ctx, scope)
 		if err != nil {
 			return nil, fmt.Errorf("list active freezes for eligibility preview: %w", err)
 		}
@@ -445,11 +451,8 @@ func (s *Server) thawEligibility(ctx context.Context, repositories []domain.Repo
 // get the fragment, everything else goes back to the full page.
 func (s *Server) handleThawEligibility(w http.ResponseWriter, r *http.Request) {
 	w.Header().Add("Vary", "HX-Request")
-	if _, ok := s.requireView(w, r); !ok {
-		return
-	}
-	if !isHXRequest(r) {
-		http.Redirect(w, r, "/decisions", http.StatusSeeOther)
+	session, ok := s.requireView(w, r)
+	if !ok {
 		return
 	}
 	repositoryID, err := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("repository_id")), 10, 64)
@@ -460,12 +463,22 @@ func (s *Server) handleThawEligibility(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		pullRequestIndex = 0
 	}
-	repositories, err := s.repositories(r.Context())
+	if repositoryID > 0 {
+		if _, authorized := s.requireThawRepository(w, r, session, repositoryID); !authorized {
+			return
+		}
+	}
+	if !isHXRequest(r) {
+		http.Redirect(w, r, "/decisions", http.StatusSeeOther)
+		return
+	}
+	scope := session.Grants.RepositoryReadScope()
+	repositories, err := s.repositories(r.Context(), scope)
 	if err != nil {
 		internalServerError(w)
 		return
 	}
-	eligibility, err := s.thawEligibility(r.Context(), repositories, repositoryID, pullRequestIndex)
+	eligibility, err := s.thawEligibility(r.Context(), scope, thawRepositories(repositories, session.Grants), repositoryID, pullRequestIndex)
 	if err != nil {
 		internalServerError(w)
 		return

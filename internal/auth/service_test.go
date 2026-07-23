@@ -20,7 +20,7 @@ func TestCreateFirstAdminBootstrapsOnlyEmptyDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if session.User.ID == 0 || session.User.Email != "admin@example.test" || session.User.Role != RoleAdmin || !session.User.Roles.Contains(RoleAdmin) || !session.User.Roles.CanFreeze() || !session.User.Roles.CanThaw() || session.ID == "" || session.CSRFToken == "" {
+	if session.User.ID == 0 || session.User.Email != "admin@example.test" || session.User.Role != RoleAdmin || !session.User.Roles.Contains(RoleAdmin) || !session.Grants.CanManageInstallation() || session.Grants.CanFreezeRepository(1) || session.Grants.CanThawRepository(1) || session.ID == "" || session.CSRFToken == "" {
 		t.Fatalf("unexpected first admin session: %+v", session)
 	}
 	hasUsers, err := service.HasUsers(ctx)
@@ -98,36 +98,37 @@ func TestLoginCreatesPersistentSession(t *testing.T) {
 	}
 }
 
-func TestCreateUserSupportsMultipleRolesAndValidatesDuplicates(t *testing.T) {
+func TestCreateUserStartsWithZeroAccessAndValidatesDuplicates(t *testing.T) {
 	ctx := context.Background()
 	database := newAuthTestDB(t, ctx)
 	service := NewService(database)
-	if _, err := service.CreateFirstAdmin(ctx, CreateFirstAdminParams{Email: "admin@example.test", DisplayName: "Admin", Password: "correct horse battery staple"}); err != nil {
-		t.Fatal(err)
-	}
-
-	user, err := service.CreateUser(ctx, CreateUserParams{Email: " lead@example.test ", DisplayName: "Lead", Password: "correct horse battery staple", Roles: []Role{RoleThawApprover, RoleFreezer}})
+	admin, err := service.CreateFirstAdmin(ctx, CreateFirstAdminParams{Email: "admin@example.test", DisplayName: "Admin", Password: "correct horse battery staple"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if user.Email != "lead@example.test" || user.Role != RoleFreezer || !user.Roles.CanFreeze() || !user.Roles.CanThaw() || user.Roles.CanManageRepositories() {
+
+	user, err := service.CreateUser(ctx, CreateUserParams{ActorUserID: admin.User.ID, Email: " lead@example.test ", DisplayName: "Lead", Password: "correct horse battery staple"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.Email != "lead@example.test" || user.Role != "" || len(user.Roles) != 0 || !user.MustChangePassword {
 		t.Fatalf("unexpected user: %+v", user)
 	}
 	session, err := service.Login(ctx, LoginParams{Email: "lead@example.test", Password: "correct horse battery staple"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !session.User.Roles.CanFreeze() || !session.User.Roles.CanThaw() {
-		t.Fatalf("expected login session to carry multiple roles: %+v", session.User.Roles)
+	if session.Grants.HasRepositoryAccess() || session.Grants.CanManageInstallation() {
+		t.Fatalf("expected login session to carry zero access, got %+v", session.Grants)
 	}
-	if _, err := service.CreateUser(ctx, CreateUserParams{Email: "lead@example.test", DisplayName: "Lead", Password: "correct horse battery staple", Roles: []Role{RoleFreezer}}); !IsValidationError(err) {
+	if _, err := service.CreateUser(ctx, CreateUserParams{ActorUserID: admin.User.ID, Email: "lead@example.test", DisplayName: "Lead", Password: "correct horse battery staple"}); !IsValidationError(err) {
 		t.Fatalf("expected duplicate email validation error, got %v", err)
 	}
-	if _, err := service.CreateUser(ctx, CreateUserParams{Email: "viewer@example.test", DisplayName: "Viewer", Password: "correct horse battery staple", Roles: []Role{Role("owner")}}); !IsValidationError(err) {
-		t.Fatalf("expected invalid role validation error, got %v", err)
+	if _, err := service.CreateUser(ctx, CreateUserParams{ActorUserID: admin.User.ID, Email: "viewer@example.test", DisplayName: "Viewer", Password: "correct horse battery staple", Roles: []Role{RoleViewer}}); !IsValidationError(err) {
+		t.Fatalf("expected roleful creation to be rejected, got %v", err)
 	}
-	if _, err := service.CreateUser(ctx, CreateUserParams{Email: "blank@example.test", DisplayName: "Blank", Password: "correct horse battery staple"}); !IsValidationError(err) {
-		t.Fatalf("expected missing role validation error, got %v", err)
+	if _, err := service.CreateUser(ctx, CreateUserParams{ActorUserID: user.ID, Email: "blank@example.test", DisplayName: "Blank", Password: "correct horse battery staple"}); !IsValidationError(err) {
+		t.Fatalf("expected non-Admin actor rejection, got %v", err)
 	}
 }
 
