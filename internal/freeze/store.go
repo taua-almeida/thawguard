@@ -302,6 +302,43 @@ LIMIT ?`, append(append([]any{}, scopeArgs...), limit)...)
 	return freezes, nil
 }
 
+// PendingScheduledCountsForScope returns exact pending one-time schedule
+// counts grouped by repository inside the caller's read scope. The scope and
+// pending-state predicates apply before grouping, so hidden repositories never
+// contribute keys or counts.
+func (s *Store) PendingScheduledCountsForScope(ctx context.Context, scope repositoryscope.ReadScope) (map[int64]int, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("freeze store has no database")
+	}
+	predicate, args := scope.SQLPredicate("repository_id")
+	args = append(args, domain.BranchFreezeStatusScheduled)
+	rows, err := s.db.QueryContext(ctx, `
+SELECT repository_id, COUNT(*)
+FROM branch_freezes
+WHERE `+predicate+`
+  AND scheduled = 1
+  AND status = ?
+GROUP BY repository_id`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("count pending scheduled freezes by repository: %w", err)
+	}
+	defer rows.Close()
+
+	counts := make(map[int64]int)
+	for rows.Next() {
+		var repositoryID int64
+		var count int
+		if err := rows.Scan(&repositoryID, &count); err != nil {
+			return nil, fmt.Errorf("scan pending scheduled freeze count: %w", err)
+		}
+		counts[repositoryID] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("count pending scheduled freezes rows: %w", err)
+	}
+	return counts, nil
+}
+
 func (s *Store) ListScheduledPage(ctx context.Context, status domain.BranchFreezeStatus, offset, limit int) ([]domain.BranchFreeze, int, error) {
 	return s.ListScheduledPageForScope(ctx, repositoryscope.All(), status, offset, limit)
 }

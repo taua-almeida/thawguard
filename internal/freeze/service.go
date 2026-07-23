@@ -90,6 +90,13 @@ func (s *Service) ListScheduledForScope(ctx context.Context, scope repositorysco
 	return NewStore(s.db).ListScheduledForScope(ctx, scope, limit)
 }
 
+func (s *Service) PendingScheduledCountsForScope(ctx context.Context, scope repositoryscope.ReadScope) (map[int64]int, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("freeze service has no database")
+	}
+	return NewStore(s.db).PendingScheduledCountsForScope(ctx, scope)
+}
+
 func (s *Service) ListScheduledPage(ctx context.Context, status domain.BranchFreezeStatus, offset, limit int) ([]domain.BranchFreeze, int, error) {
 	if s == nil || s.db == nil {
 		return nil, 0, errors.New("freeze service has no database")

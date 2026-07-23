@@ -487,6 +487,114 @@ func TestStoreListScheduledForScopeFiltersBeforeLimit(t *testing.T) {
 	}
 }
 
+func TestStorePendingScheduledCountsForScope(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	repoA := createTestRepository(t, ctx, database)
+	repoB := createTestRepositoryNamed(t, ctx, database, "thawguard-docs")
+	repoWithoutPending := createTestRepositoryNamed(t, ctx, database, "thawguard-site")
+	store := NewStore(database)
+	base := time.Date(2026, 7, 20, 8, 0, 0, 0, time.UTC)
+
+	insertTestFreezeRows(t, ctx, database, repoA.ID, domain.BranchFreezeStatusScheduled, true, base.Add(time.Hour), 2)
+	insertTestFreezeRows(t, ctx, database, repoA.ID, domain.BranchFreezeStatusActive, true, base, 1)
+	insertTestFreezeRows(t, ctx, database, repoA.ID, domain.BranchFreezeStatusEnded, true, base, 1)
+	insertTestFreezeRows(t, ctx, database, repoA.ID, domain.BranchFreezeStatusCancelled, true, base, 1)
+	insertTestFreezeRows(t, ctx, database, repoA.ID, domain.BranchFreezeStatusScheduled, false, base.Add(time.Hour), 1)
+	insertTestFreezeRows(t, ctx, database, repoB.ID, domain.BranchFreezeStatusScheduled, true, base.Add(2*time.Hour), 7)
+	insertTestFreezeRows(t, ctx, database, repoWithoutPending.ID, domain.BranchFreezeStatusActive, true, base, 2)
+
+	denied, err := store.PendingScheduledCountsForScope(ctx, repositoryscope.ReadScope{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if denied == nil || len(denied) != 0 {
+		t.Fatalf("expected a non-nil empty map for the zero scope, got %#v", denied)
+	}
+
+	all, err := store.PendingScheduledCountsForScope(ctx, repositoryscope.All())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 || all[repoA.ID] != 2 || all[repoB.ID] != 7 {
+		t.Fatalf("expected exact pending counts for both repositories, got %#v", all)
+	}
+	if _, ok := all[repoWithoutPending.ID]; ok {
+		t.Fatalf("expected repository without pending rows to be absent, got %#v", all)
+	}
+
+	scoped, err := store.PendingScheduledCountsForScope(ctx, repositoryscope.IDs(repoA.ID, repoWithoutPending.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scoped) != 1 || scoped[repoA.ID] != 2 {
+		t.Fatalf("expected only repo A's count without hidden influence, got %#v", scoped)
+	}
+	if _, ok := scoped[repoB.ID]; ok {
+		t.Fatalf("expected hidden repository to be absent, got %#v", scoped)
+	}
+
+	viaService, err := NewService(database).PendingScheduledCountsForScope(ctx, repositoryscope.IDs(repoA.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(viaService) != 1 || viaService[repoA.ID] != 2 {
+		t.Fatalf("expected service pass-through to preserve the scoped count, got %#v", viaService)
+	}
+}
+
+func TestStorePendingScheduledCountsForScopeAreUncapped(t *testing.T) {
+	ctx := context.Background()
+	database := newTestDB(t, ctx)
+	visibleRepo := createTestRepository(t, ctx, database)
+	hiddenRepo := createTestRepositoryNamed(t, ctx, database, "thawguard-docs")
+	store := NewStore(database)
+	base := time.Date(2026, 7, 20, 8, 0, 0, 0, time.UTC)
+
+	hiddenIDs := insertTestFreezeRows(t, ctx, database, hiddenRepo.ID, domain.BranchFreezeStatusScheduled, true, base.Add(time.Hour), 503)
+	visibleIDs := insertTestFreezeRows(t, ctx, database, visibleRepo.ID, domain.BranchFreezeStatusScheduled, true, base.Add(2*time.Hour), 501)
+
+	all, err := store.PendingScheduledCountsForScope(ctx, repositoryscope.All())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 || all[visibleRepo.ID] != 501 || all[hiddenRepo.ID] != 503 {
+		t.Fatalf("expected uncapped counts across both repositories, got %#v", all)
+	}
+
+	scoped, err := store.PendingScheduledCountsForScope(ctx, repositoryscope.IDs(visibleRepo.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scoped) != 1 || scoped[visibleRepo.ID] != 501 {
+		t.Fatalf("expected exact visible count despite the larger hidden repository, got %#v", scoped)
+	}
+
+	listed, err := store.ListScheduledForScope(ctx, repositoryscope.IDs(visibleRepo.ID), 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 500 || listed[0].ID != visibleIDs[0] || listed[499].ID != visibleIDs[499] {
+		t.Fatalf("expected the existing scoped list order and 500-row limit, got len=%d", len(listed))
+	}
+
+	defaultLimited, err := store.ListScheduledForScope(ctx, repositoryscope.IDs(visibleRepo.ID), 501)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defaultLimited) != 100 || defaultLimited[0].ID != visibleIDs[0] || defaultLimited[99].ID != visibleIDs[99] {
+		t.Fatalf("expected the existing over-limit fallback to 100 rows, got len=%d", len(defaultLimited))
+	}
+
+	unrestricted, err := store.ListScheduled(ctx, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unrestricted) != 2 || unrestricted[0].ID != hiddenIDs[0] || unrestricted[1].ID != hiddenIDs[1] {
+		t.Fatalf("expected unrestricted scheduled-list ordering to remain unchanged, got %+v", unrestricted)
+	}
+}
+
 func TestStoreListScheduledPageForScopeCountsAndPagesInsideScope(t *testing.T) {
 	ctx := context.Background()
 	database := newTestDB(t, ctx)
@@ -1534,6 +1642,44 @@ func assertLatestFreezeAudit(t *testing.T, ctx context.Context, database *sql.DB
 	if details["actor_kind"] != domain.ActorKindBootstrapAdmin || details["actor_role"] != "admin" || details["repository_id"] != strconv.FormatInt(freeze.RepositoryID, 10) || details["branch"] != freeze.Branch || details["status"] != string(freeze.Status) || details["reason"] != freeze.Reason {
 		t.Fatalf("unexpected audit details: %s", event.DetailsJSON)
 	}
+}
+
+func insertTestFreezeRows(t *testing.T, ctx context.Context, database *sql.DB, repositoryID int64, status domain.BranchFreezeStatus, scheduled bool, startsAt time.Time, count int) []int64 {
+	t.Helper()
+	tx, err := database.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	stmt, err := tx.PrepareContext(ctx, `
+INSERT INTO branch_freezes(repository_id, branch, status, reason, starts_at, ends_at, scheduled, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stmt.Close() }()
+
+	scheduledValue := 0
+	if scheduled {
+		scheduledValue = 1
+	}
+	timestamp := startsAt.UTC().Format(sqliteTimestampFormat)
+	ids := make([]int64, 0, count)
+	for i := range count {
+		result, err := stmt.ExecContext(ctx, repositoryID, "fixture-"+strconv.Itoa(i), status, "fixture", timestamp, scheduledValue, timestamp, timestamp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := result.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	return ids
 }
 
 func newTestDB(t *testing.T, ctx context.Context) *sql.DB {
