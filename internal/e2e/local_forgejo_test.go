@@ -1971,10 +1971,7 @@ func proveRoleBoundaries(t *testing.T, ctx context.Context, forgejo *forgejoAPI,
 		{path: viewerUserPath + "/repository-access/remove", values: url.Values{"repository_id": {repositoryValue}}, label: "repository access removal"},
 		{path: viewerUserPath + "/disable", values: nil, label: "user disable"},
 		{path: viewerUserPath + "/enable", values: nil, label: "user enable"},
-		{path: viewerUserPath + "/reset-password", values: url.Values{
-			"temporary_password":              {cfg.thawguardPassword},
-			"temporary_password_confirmation": {cfg.thawguardPassword},
-		}, label: "user password reset"},
+		{path: viewerUserPath + "/password-recovery", values: nil, label: "user password recovery issuance"},
 	}
 
 	for _, session := range []roleBoundarySession{freezerSession, thawApproverSession, viewerSession} {
@@ -4210,7 +4207,7 @@ func requireForbiddenRoleMutation(t *testing.T, ctx context.Context, session rol
 		parts := strings.Split(strings.TrimPrefix(path, "/users/"), "/")
 		if len(parts) == 2 {
 			userID, err := strconv.ParseInt(parts[0], 10, 64)
-			allowed = err == nil && userID > 0 && slices.Contains([]string{"admin", "repository-access", "disable", "enable", "reset-password"}, parts[1])
+			allowed = err == nil && userID > 0 && slices.Contains([]string{"admin", "repository-access", "disable", "enable", "password-recovery"}, parts[1])
 		}
 		if len(parts) == 3 {
 			userID, err := strconv.ParseInt(parts[0], 10, 64)

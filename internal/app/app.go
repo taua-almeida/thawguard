@@ -48,6 +48,11 @@ func New(cfg config.Config, logger *slog.Logger) *App {
 }
 
 func (a *App) Run(ctx context.Context) error {
+	publicURL, err := config.CanonicalPublicURL(a.cfg.PublicURL)
+	if err != nil {
+		return err
+	}
+
 	database, err := db.Open(ctx, db.DefaultConfig(a.cfg.DatabasePath))
 	if err != nil {
 		return err
@@ -99,6 +104,7 @@ func (a *App) Run(ctx context.Context) error {
 		Addr: a.cfg.HTTPAddr,
 		Handler: web.NewServer(web.Config{
 			AppName:                              "Thawguard",
+			PublicURL:                            publicURL,
 			RepositoryStore:                      repositorySetup,
 			RepositorySecretEncryptionConfigured: secretStore != nil,
 			SetupCheckStore:                      setupCheckStore,
@@ -129,7 +135,7 @@ func (a *App) Run(ctx context.Context) error {
 	go lifecycleRunner.Start(ctx)
 	go newRepositoryReconciliationRunner(jobStore, enforcementService, a.logger).Start(ctx)
 	go func() {
-		a.logger.Info("starting thawguard", "addr", a.cfg.HTTPAddr, "db", a.cfg.DatabasePath, "public_url", a.cfg.PublicURL)
+		a.logger.Info("starting thawguard", "addr", a.cfg.HTTPAddr, "db", a.cfg.DatabasePath, "public_url", publicURL)
 		errc <- server.ListenAndServe()
 	}()
 

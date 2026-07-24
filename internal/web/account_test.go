@@ -49,7 +49,7 @@ func TestAccountAdministrationRoutesRequireAdmin(t *testing.T) {
 		fmt.Sprintf("/users/%d/admin", admin.User.ID),
 		fmt.Sprintf("/users/%d/disable", admin.User.ID),
 		fmt.Sprintf("/users/%d/enable", admin.User.ID),
-		fmt.Sprintf("/users/%d/reset-password", admin.User.ID),
+		fmt.Sprintf("/users/%d/password-recovery", admin.User.ID),
 	}
 	for _, route := range routes {
 		form := url.Values{"admin": {"1"}, csrfFormField: {viewerSession.CSRFToken}}
@@ -73,7 +73,7 @@ func TestAccountMutationsRejectMissingAndInvalidCSRF(t *testing.T) {
 		fmt.Sprintf("/users/%d/admin", admin.User.ID),
 		fmt.Sprintf("/users/%d/disable", admin.User.ID),
 		fmt.Sprintf("/users/%d/enable", admin.User.ID),
-		fmt.Sprintf("/users/%d/reset-password", admin.User.ID),
+		fmt.Sprintf("/users/%d/password-recovery", admin.User.ID),
 		"/account/password",
 	}
 	for _, route := range routes {
@@ -158,12 +158,32 @@ func TestUsersPageShowsAccountStateAndResponsiveLabels(t *testing.T) {
 	}
 	for _, want := range []string{
 		fmt.Sprintf(`action="/users/%d/enable"`, user.ID),
-		fmt.Sprintf(`action="/users/%d/reset-password"`, user.ID),
-		`It does not re-enable a disabled account.`,
+		`Re-enable this account before issuing a recovery link.`,
 		`Repository access`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected user detail page to contain %q", want)
+		}
+	}
+	if strings.Contains(body, fmt.Sprintf(`action="/users/%d/password-recovery"`, user.ID)) {
+		t.Fatal("expected disabled user detail to omit the recovery issuance action")
+	}
+
+	if _, err := authService.EnableUser(ctx, admin.User.ID, user.ID); err != nil {
+		t.Fatal(err)
+	}
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, fmt.Sprintf("/users/%d", user.ID), nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: admin.ID})
+	server.Routes().ServeHTTP(recorder, request)
+	body = recorder.Body.String()
+	for _, want := range []string{
+		fmt.Sprintf(`action="/users/%d/password-recovery"`, user.ID),
+		`Issue recovery link`,
+		`Create a one-hour bearer link. Anyone with this link can set this person&rsquo;s password until it expires. Share it through a trusted channel.`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected enabled user detail page to contain %q", want)
 		}
 	}
 }
@@ -212,52 +232,6 @@ func renderedControlTag(t *testing.T, body, id string) string {
 		t.Fatalf("expected control %q tag to close", id)
 	}
 	return rest[:end]
-}
-
-func TestPasswordResetNeverRendersPasswordValues(t *testing.T) {
-	ctx := context.Background()
-	database := newWebTestDB(t, ctx)
-	authService := auth.NewService(database)
-	admin := mustSetupWebAdmin(t, ctx, authService)
-	user := mustCreateWebUser(t, ctx, authService, "freezer@example.test", false)
-	server := NewServer(Config{AppName: "Thawguard", AuthService: authService})
-	adminCookie := &http.Cookie{Name: sessionCookieName, Value: admin.ID}
-
-	const secretValue = "leak-canary-temporary-password"
-	form := url.Values{
-		"user_id":                         {fmt.Sprint(user.ID)},
-		"temporary_password":              {secretValue},
-		"temporary_password_confirmation": {secretValue + "-mismatch"},
-		csrfFormField:                     {admin.CSRFToken},
-	}
-	recorder := postAccountForm(t, server, fmt.Sprintf("/users/%d/reset-password", user.ID), adminCookie, form)
-	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "temporary passwords do not match") {
-		t.Fatalf("expected mismatch validation, status=%d body=%q", recorder.Code, recorder.Body.String())
-	}
-	if strings.Contains(recorder.Body.String(), secretValue) {
-		t.Fatal("expected temporary password to never be re-rendered")
-	}
-	if !strings.Contains(recorder.Body.String(), `<dialog id="user-reset-password" open`) {
-		t.Fatal("expected failed reset dialog to re-open on its row")
-	}
-	passwordTag := renderedControlTag(t, recorder.Body.String(), "reset-temporary-password")
-	// A bare " disabled" attribute, not the class's disabled: variant prefixes.
-	if !strings.Contains(passwordTag, `minlength="12"`) || strings.Contains(passwordTag, " disabled ") || strings.HasSuffix(passwordTag, " disabled") {
-		t.Fatalf("expected re-opened reset password input to stay enabled, got %q", passwordTag)
-	}
-	if strings.Contains(passwordTag, " value=") {
-		t.Fatalf("expected reset password input to render blank, got %q", passwordTag)
-	}
-
-	form.Set("temporary_password_confirmation", secretValue)
-	recorder = postAccountForm(t, server, fmt.Sprintf("/users/%d/reset-password", user.ID), adminCookie, form)
-	wantLocation := fmt.Sprintf("/users/%d?notice=password-reset", user.ID)
-	if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != wantLocation {
-		t.Fatalf("expected reset redirect, status=%d body=%q", recorder.Code, recorder.Body.String())
-	}
-	if strings.Contains(recorder.Body.String(), secretValue) {
-		t.Fatal("expected reset response to exclude the temporary password")
-	}
 }
 
 func TestDisabledUserSessionRedirectsToLogin(t *testing.T) {
@@ -350,7 +324,7 @@ func TestForcedPasswordSessionIsGatedToPasswordChangeAndLogout(t *testing.T) {
 		}
 	}
 
-	for _, path := range []string{"/freezes", fmt.Sprintf("/users/%d/admin", user.ID), fmt.Sprintf("/users/%d/reset-password", user.ID), "/repositories"} {
+	for _, path := range []string{"/freezes", fmt.Sprintf("/users/%d/admin", user.ID), fmt.Sprintf("/users/%d/password-recovery", user.ID), "/repositories"} {
 		form := url.Values{"user_id": {"1"}, "repository_id": {"1"}, "branch": {"main"}, "reason": {"release"}, csrfFormField: {forcedSession.CSRFToken}}
 		recorder := postAccountForm(t, server, path, forcedCookie, form)
 		if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != "/account/password" {
@@ -554,6 +528,7 @@ func postAccountForm(t *testing.T, server *Server, path string, cookie *http.Coo
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(form.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", server.cfg.PublicURL)
 	request.AddCookie(cookie)
 	server.Routes().ServeHTTP(recorder, request)
 	return recorder

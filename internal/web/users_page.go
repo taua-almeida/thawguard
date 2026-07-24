@@ -80,12 +80,11 @@ type userRepositoryAccessView struct {
 }
 
 type userDetailState struct {
-	FormError         string
-	RepositoryID      int64
-	RepositoryRoles   auth.RoleSet
-	AdminSubmitted    bool
-	AdminValue        bool
-	ResetPasswordOpen bool
+	FormError       string
+	RepositoryID    int64
+	RepositoryRoles auth.RoleSet
+	AdminSubmitted  bool
+	AdminValue      bool
 }
 
 type userDetailPageData struct {
@@ -107,7 +106,6 @@ type userDetailPageData struct {
 	RepositoryCount    int
 	NoRepositories     bool
 	FormError          string
-	ResetPasswordOpen  bool
 }
 
 func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
@@ -314,8 +312,6 @@ func (s *Server) handleUserDetail(w http.ResponseWriter, r *http.Request) {
 		data.Toasts = []toastView{{Message: "User disabled and sessions revoked.", Tone: "success", DismissHref: fmt.Sprintf("/users/%d", userID)}}
 	case "enabled":
 		data.Toasts = []toastView{{Message: "User re-enabled. Previous sessions were not restored.", Tone: "success", DismissHref: fmt.Sprintf("/users/%d", userID)}}
-	case "password-reset":
-		data.Toasts = []toastView{{Message: "Temporary password reset. Existing sessions were revoked.", Tone: "success", DismissHref: fmt.Sprintf("/users/%d", userID)}}
 	}
 	s.renderPage(w, "layouts/user-detail", data)
 }
@@ -372,7 +368,6 @@ func (s *Server) loadUserDetailPageData(w http.ResponseWriter, r *http.Request, 
 		RepositoryCount:    len(repositories),
 		NoRepositories:     len(repositories) == 0,
 		FormError:          state.FormError,
-		ResetPasswordOpen:  state.ResetPasswordOpen,
 	}
 	if state.AdminSubmitted {
 		data.AdminChecked = state.AdminValue
@@ -418,25 +413,25 @@ func userRepositoryAccessViews(repositories []domain.Repository, grants []auth.R
 }
 
 func (s *Server) handleSetUserAdmin(w http.ResponseWriter, r *http.Request) {
-	session, userID, ok := s.requireAdminUserMutation(w, r)
+	session, target, ok := s.requireAdminUserMutation(w, r)
 	if !ok {
 		return
 	}
 	adminValue := r.PostFormValue("admin") == "1"
-	_, err := s.cfg.AuthService.SetUserAdmin(r.Context(), auth.SetUserAdminParams{ActorUserID: *session.UserID, UserID: userID, Admin: adminValue})
+	_, err := s.cfg.AuthService.SetUserAdmin(r.Context(), auth.SetUserAdminParams{ActorUserID: *session.UserID, UserID: target.ID, Admin: adminValue})
 	if err != nil {
-		s.renderUserMutationError(w, r, userID, userDetailState{FormError: err.Error(), AdminSubmitted: true, AdminValue: adminValue}, session, err)
+		s.renderUserMutationError(w, r, target.ID, userDetailState{FormError: err.Error(), AdminSubmitted: true, AdminValue: adminValue}, session, err)
 		return
 	}
-	if *session.UserID == userID && !adminValue {
+	if *session.UserID == target.ID && !adminValue {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	http.Redirect(w, r, fmt.Sprintf("/users/%d?notice=admin-saved", userID), http.StatusSeeOther)
+	http.Redirect(w, r, fmt.Sprintf("/users/%d?notice=admin-saved", target.ID), http.StatusSeeOther)
 }
 
 func (s *Server) handleSetUserRepositoryAccess(w http.ResponseWriter, r *http.Request) {
-	session, userID, ok := s.requireAdminUserMutation(w, r)
+	session, target, ok := s.requireAdminUserMutation(w, r)
 	if !ok {
 		return
 	}
@@ -445,16 +440,16 @@ func (s *Server) handleSetUserRepositoryAccess(w http.ResponseWriter, r *http.Re
 		return
 	}
 	roles := repositoryRolesFromForm(r)
-	err := s.cfg.AuthService.SetUserRepositoryRoles(r.Context(), auth.SetUserRepositoryRolesParams{ActorUserID: *session.UserID, UserID: userID, RepositoryID: repositoryID, Roles: roles})
+	err := s.cfg.AuthService.SetUserRepositoryRoles(r.Context(), auth.SetUserRepositoryRolesParams{ActorUserID: *session.UserID, UserID: target.ID, RepositoryID: repositoryID, Roles: roles})
 	if err != nil {
-		s.renderUserMutationError(w, r, userID, userDetailState{FormError: err.Error(), RepositoryID: repositoryID, RepositoryRoles: auth.RoleSet(roles)}, session, err)
+		s.renderUserMutationError(w, r, target.ID, userDetailState{FormError: err.Error(), RepositoryID: repositoryID, RepositoryRoles: auth.RoleSet(roles)}, session, err)
 		return
 	}
-	http.Redirect(w, r, fmt.Sprintf("/users/%d?notice=access-saved", userID), http.StatusSeeOther)
+	http.Redirect(w, r, fmt.Sprintf("/users/%d?notice=access-saved", target.ID), http.StatusSeeOther)
 }
 
 func (s *Server) handleRemoveUserRepositoryAccess(w http.ResponseWriter, r *http.Request) {
-	session, userID, ok := s.requireAdminUserMutation(w, r)
+	session, target, ok := s.requireAdminUserMutation(w, r)
 	if !ok {
 		return
 	}
@@ -462,87 +457,67 @@ func (s *Server) handleRemoveUserRepositoryAccess(w http.ResponseWriter, r *http
 	if _, visible := s.visibleRepository(w, r, session, repositoryID); !visible {
 		return
 	}
-	err := s.cfg.AuthService.SetUserRepositoryRoles(r.Context(), auth.SetUserRepositoryRolesParams{ActorUserID: *session.UserID, UserID: userID, RepositoryID: repositoryID})
+	err := s.cfg.AuthService.SetUserRepositoryRoles(r.Context(), auth.SetUserRepositoryRolesParams{ActorUserID: *session.UserID, UserID: target.ID, RepositoryID: repositoryID})
 	if err != nil {
-		s.renderUserMutationError(w, r, userID, userDetailState{FormError: err.Error(), RepositoryID: repositoryID}, session, err)
+		s.renderUserMutationError(w, r, target.ID, userDetailState{FormError: err.Error(), RepositoryID: repositoryID}, session, err)
 		return
 	}
-	http.Redirect(w, r, fmt.Sprintf("/users/%d?notice=access-saved", userID), http.StatusSeeOther)
+	http.Redirect(w, r, fmt.Sprintf("/users/%d?notice=access-saved", target.ID), http.StatusSeeOther)
 }
 
 func (s *Server) handleDisableUser(w http.ResponseWriter, r *http.Request) {
-	session, userID, ok := s.requireAdminUserMutation(w, r)
+	session, target, ok := s.requireAdminUserMutation(w, r)
 	if !ok {
 		return
 	}
-	if _, err := s.cfg.AuthService.DisableUser(r.Context(), *session.UserID, userID); err != nil {
-		s.renderUserMutationError(w, r, userID, userDetailState{FormError: err.Error()}, session, err)
+	if _, err := s.cfg.AuthService.DisableUser(r.Context(), *session.UserID, target.ID); err != nil {
+		s.renderUserMutationError(w, r, target.ID, userDetailState{FormError: err.Error()}, session, err)
 		return
 	}
-	if *session.UserID == userID {
+	if *session.UserID == target.ID {
 		clearSessionCookie(w, r)
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
-	http.Redirect(w, r, fmt.Sprintf("/users/%d?notice=disabled", userID), http.StatusSeeOther)
+	http.Redirect(w, r, fmt.Sprintf("/users/%d?notice=disabled", target.ID), http.StatusSeeOther)
 }
 
 func (s *Server) handleEnableUser(w http.ResponseWriter, r *http.Request) {
-	session, userID, ok := s.requireAdminUserMutation(w, r)
+	session, target, ok := s.requireAdminUserMutation(w, r)
 	if !ok {
 		return
 	}
-	if _, err := s.cfg.AuthService.EnableUser(r.Context(), *session.UserID, userID); err != nil {
-		s.renderUserMutationError(w, r, userID, userDetailState{FormError: err.Error()}, session, err)
+	if _, err := s.cfg.AuthService.EnableUser(r.Context(), *session.UserID, target.ID); err != nil {
+		s.renderUserMutationError(w, r, target.ID, userDetailState{FormError: err.Error()}, session, err)
 		return
 	}
-	http.Redirect(w, r, fmt.Sprintf("/users/%d?notice=enabled", userID), http.StatusSeeOther)
+	http.Redirect(w, r, fmt.Sprintf("/users/%d?notice=enabled", target.ID), http.StatusSeeOther)
 }
 
-func (s *Server) handleResetUserPassword(w http.ResponseWriter, r *http.Request) {
-	session, userID, ok := s.requireAdminUserMutation(w, r)
-	if !ok {
-		return
-	}
-	state := userDetailState{ResetPasswordOpen: true}
-	if r.PostFormValue("temporary_password") != r.PostFormValue("temporary_password_confirmation") {
-		err := auth.ValidationError{Message: "temporary passwords do not match"}
-		state.FormError = err.Error()
-		s.renderUserMutationError(w, r, userID, state, session, err)
-		return
-	}
-	err := s.cfg.AuthService.ResetPassword(r.Context(), auth.ResetPasswordParams{ActorUserID: *session.UserID, UserID: userID, TemporaryPassword: r.PostFormValue("temporary_password")})
-	if err != nil {
-		state.FormError = err.Error()
-		s.renderUserMutationError(w, r, userID, state, session, err)
-		return
-	}
-	http.Redirect(w, r, fmt.Sprintf("/users/%d?notice=password-reset", userID), http.StatusSeeOther)
-}
-
-func (s *Server) requireAdminUserMutation(w http.ResponseWriter, r *http.Request) (sessionState, int64, bool) {
+func (s *Server) requireAdminUserMutation(w http.ResponseWriter, r *http.Request) (sessionState, auth.User, bool) {
 	if s.cfg.AuthService == nil {
 		http.Error(w, "auth service is not configured", http.StatusServiceUnavailable)
-		return sessionState{}, 0, false
+		return sessionState{}, auth.User{}, false
 	}
 	session, ok := s.requireAdminForm(w, r)
 	if !ok || session.UserID == nil {
-		return sessionState{}, 0, false
+		return sessionState{}, auth.User{}, false
 	}
 	userID, valid := userIDFromPath(r)
 	if !valid {
 		s.renderErrorPage(w, http.StatusNotFound, false)
-		return sessionState{}, 0, false
+		return sessionState{}, auth.User{}, false
 	}
-	if _, err := s.cfg.AuthService.GetUser(r.Context(), userID); err != nil {
+	target, err := s.cfg.AuthService.GetUser(r.Context(), userID)
+	if err != nil {
 		if isMissingUser(err) {
 			s.renderErrorPage(w, http.StatusNotFound, false)
 		} else {
 			s.renderErrorPage(w, http.StatusInternalServerError, false)
 		}
-		return sessionState{}, 0, false
+		return sessionState{}, auth.User{}, false
 	}
-	return session, userID, true
+	return session, target, true
 }
 
 func (s *Server) renderUserMutationError(w http.ResponseWriter, r *http.Request, userID int64, state userDetailState, session sessionState, err error) {

@@ -33,8 +33,14 @@ import (
 const defaultWebhookMaxBodyBytes int64 = 1 << 20
 const scheduledFreezeReasonMaxLength = 500
 
+const (
+	passwordRecoveryMaxBodyBytes int64 = 8 << 10
+	passwordRecoveryCSP                = "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self'"
+)
+
 type Config struct {
 	AppName                              string
+	PublicURL                            string
 	RepositoryStore                      RepositoryStore
 	RepositorySecretEncryptionConfigured bool
 	SetupCheckStore                      SetupCheckStore
@@ -100,7 +106,8 @@ type AuthService interface {
 	DisableUser(ctx context.Context, actorUserID int64, userID int64) (auth.User, error)
 	EnableUser(ctx context.Context, actorUserID int64, userID int64) (auth.User, error)
 	ChangePassword(ctx context.Context, params auth.ChangePasswordParams) (auth.Session, error)
-	ResetPassword(ctx context.Context, params auth.ResetPasswordParams) error
+	IssuePasswordRecoveryToken(ctx context.Context, params auth.IssuePasswordRecoveryParams) (auth.PasswordRecoveryToken, error)
+	CompletePasswordRecovery(ctx context.Context, params auth.CompletePasswordRecoveryParams) error
 }
 
 type RepositoryStore interface {
@@ -298,13 +305,37 @@ func NewServer(cfg Config) *Server {
 	if cfg.AppName == "" {
 		cfg.AppName = "Thawguard"
 	}
+	if cfg.PublicURL == "" {
+		cfg.PublicURL = "http://localhost:8080"
+	}
 	s := &Server{cfg: cfg, mux: http.NewServeMux(), sessions: newSessionStore(), csrfKey: newCSRFSigningKey()}
 	s.routes()
 	return s
 }
 
 func (s *Server) Routes() http.Handler {
-	return s.mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isPasswordRecoveryPath(r.URL.Path) {
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Referrer-Policy", "no-referrer")
+			w.Header().Set("X-Frame-Options", "DENY")
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.Header().Set("Content-Security-Policy", passwordRecoveryCSP)
+		}
+		s.mux.ServeHTTP(w, r)
+	})
+}
+
+func isPasswordRecoveryPath(path string) bool {
+	if path == "/password-recovery" {
+		return true
+	}
+	rest, ok := strings.CutPrefix(path, "/users/")
+	if !ok {
+		return false
+	}
+	userID, suffix, ok := strings.Cut(rest, "/")
+	return ok && userID != "" && suffix == "password-recovery"
 }
 
 func (s *Server) routes() {
@@ -313,6 +344,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /setup", s.handleCreateFirstAdmin)
 	s.mux.HandleFunc("GET /login", s.handleLogin)
 	s.mux.HandleFunc("POST /login", s.handleLoginPost)
+	s.mux.HandleFunc("GET /password-recovery", s.handlePasswordRecovery)
+	s.mux.HandleFunc("POST /password-recovery", s.handlePasswordRecoveryPost)
 	s.mux.HandleFunc("POST /logout", s.handleLogout)
 	// "/{$}" matches exactly "/"; the bare "GET /" pattern is the catch-all
 	// for every unmatched GET path, which must 404 instead of rendering the
@@ -367,7 +400,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /users/{id}/repository-access/remove", s.handleRemoveUserRepositoryAccess)
 	s.mux.HandleFunc("POST /users/{id}/disable", s.handleDisableUser)
 	s.mux.HandleFunc("POST /users/{id}/enable", s.handleEnableUser)
-	s.mux.HandleFunc("POST /users/{id}/reset-password", s.handleResetUserPassword)
+	s.mux.HandleFunc("POST /users/{id}/password-recovery", s.handleIssuePasswordRecovery)
 	s.mux.HandleFunc("GET /account/password", s.handleAccountPassword)
 	s.mux.HandleFunc("POST /account/password", s.handleAccountPasswordPost)
 	s.mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(webassets.StaticFS()))))
@@ -1929,7 +1962,11 @@ func (s *Server) requireFormWithGate(w http.ResponseWriter, r *http.Request, all
 		return sessionState{}, false
 	}
 	if !ok {
-		http.Error(w, "forbidden", http.StatusForbidden)
+		if isPasswordRecoveryPath(r.URL.Path) {
+			s.renderPasswordRecoveryForbidden(w)
+		} else {
+			http.Error(w, "forbidden", http.StatusForbidden)
+		}
 		return sessionState{}, false
 	}
 	if !allowForced && session.MustChangePassword {
@@ -1941,11 +1978,19 @@ func (s *Server) requireFormWithGate(w http.ResponseWriter, r *http.Request, all
 		return sessionState{}, false
 	}
 	if err := r.ParseForm(); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
+		if isPasswordRecoveryPath(r.URL.Path) {
+			s.renderPasswordRecoveryBadRequest(w)
+		} else {
+			http.Error(w, "bad request", http.StatusBadRequest)
+		}
 		return sessionState{}, false
 	}
 	if !constantTimeTokenEqual(r.PostForm.Get(csrfFormField), session.CSRFToken) {
-		http.Error(w, "forbidden", http.StatusForbidden)
+		if isPasswordRecoveryPath(r.URL.Path) {
+			s.renderPasswordRecoveryForbidden(w)
+		} else {
+			http.Error(w, "forbidden", http.StatusForbidden)
+		}
 		return sessionState{}, false
 	}
 	return session, true

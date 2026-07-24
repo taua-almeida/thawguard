@@ -29,8 +29,9 @@ const (
 )
 
 const (
-	setupCSRFPurpose = "setup"
-	loginCSRFPurpose = "login"
+	setupCSRFPurpose            = "setup"
+	loginCSRFPurpose            = "login"
+	passwordRecoveryCSRFPurpose = "password-recovery"
 )
 
 type sessionState struct {
@@ -249,6 +250,14 @@ func (s *Server) newLoginCSRFToken(w http.ResponseWriter, r *http.Request) (stri
 
 func (s *Server) validLoginCSRFToken(r *http.Request) bool {
 	return s.validPreAuthCSRFToken(r, loginCSRFPurpose)
+}
+
+func (s *Server) newPasswordRecoveryCSRFToken() (string, error) {
+	return s.newSignedCSRFToken(passwordRecoveryCSRFPurpose)
+}
+
+func (s *Server) validPasswordRecoveryCSRFToken(r *http.Request) bool {
+	return s.validPreAuthCSRFToken(r, passwordRecoveryCSRFPurpose)
 }
 
 func (s *Server) newSignedCSRFToken(purpose string) (string, error) {

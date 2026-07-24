@@ -401,6 +401,7 @@ func TestStaticAssetsServedFromEmbeddedFS(t *testing.T) {
 		{"/static/js/main.js", "dialog.js"},
 		{"/static/js/dialog.js", "formmethod"},
 		{"/static/js/datetime.js", "datetime"},
+		{"/static/js/password-recovery.js", "history.replaceState"},
 	}
 	for _, tc := range cases {
 		recorder := httptest.NewRecorder()

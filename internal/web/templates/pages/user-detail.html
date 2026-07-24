@@ -19,7 +19,7 @@
   <section class="rounded-panel border border-border bg-surface p-(--card-spacing) shadow-card" aria-labelledby="user-sign-in-title">
     <div class="flex flex-wrap items-start justify-between gap-3">
       <div><h2 id="user-sign-in-title" class="m-0 text-lg font-bold text-text">Sign-in</h2><p class="m-0 mt-1 text-sm text-text-muted">Password{{ if .User.MustChangePassword }} · temporary password must be changed at next sign-in{{ end }}</p></div>
-      {{ if .IsSelf }}<a class="text-sm font-semibold text-accent-strong no-underline hover:underline" href="/account/password">Change your password</a>{{ else }}{{ template "ui/button" dict "Label" "Reset temporary password" "Variant" "secondary" "Icon" "tg-i-key" "DialogTarget" "user-reset-password" }}{{ end }}
+      {{ if .IsSelf }}<a class="text-sm font-semibold text-accent-strong no-underline hover:underline" href="/account/password">Change your password</a>{{ else if .User.Disabled }}<p class="m-0 text-sm text-text-muted">Re-enable this account before issuing a recovery link.</p>{{ else }}{{ template "ui/button" dict "Label" "Issue recovery link" "Variant" "secondary" "Icon" "tg-i-key" "DialogTarget" "user-password-recovery" }}{{ end }}
     </div>
   </section>
 
@@ -52,11 +52,12 @@
   </section>
 </div>
 
-{{ if not .IsSelf }}
-<dialog id="user-reset-password"{{ if .ResetPasswordOpen }} open{{ end }} class="m-auto w-[min(32rem,90vw)] rounded-panel border border-border bg-surface p-6 text-text shadow-card" aria-labelledby="user-reset-password-title">
-  <h2 id="user-reset-password-title" class="m-0 text-base font-bold">Reset temporary password</h2>
-  <p class="m-0 mt-2 text-sm text-text-muted">Temporary local workflow. This revokes every existing session and forces a password change at next sign-in. It does not re-enable a disabled account.</p>
-  <form method="post" action="/users/{{ .User.ID }}/reset-password"><input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}"><div class="mt-4 flex flex-col gap-4">{{ template "ui/input" dict "ID" "reset-temporary-password" "Name" "temporary_password" "Label" "Temporary password" "Type" "password" "Required" true "Minlength" "12" "Autocomplete" "new-password" }}{{ template "ui/input" dict "ID" "reset-temporary-password-confirmation" "Name" "temporary_password_confirmation" "Label" "Confirm temporary password" "Type" "password" "Required" true "Minlength" "12" "Autocomplete" "new-password" }}</div><div class="mt-5 flex flex-row-reverse gap-2">{{ template "ui/button" dict "Label" "Reset password" "Variant" "danger" "Type" "submit" }}{{ template "ui/button" dict "Label" "Cancel" "Variant" "secondary" "Type" "submit" "Dismiss" true }}</div></form>
+{{ if and (not .IsSelf) (not .User.Disabled) }}
+<dialog id="user-password-recovery" class="m-auto w-[min(32rem,90vw)] rounded-panel border border-border bg-surface p-6 text-text shadow-card" aria-labelledby="user-password-recovery-title">
+  <h2 id="user-password-recovery-title" class="m-0 text-base font-bold">Issue recovery link</h2>
+  <p class="m-0 mt-2 text-sm font-semibold text-text">{{ .User.DisplayName }} · <code class="font-mono text-xs text-text-muted">{{ .User.Email }}</code></p>
+  <p class="m-0 mt-2 text-sm text-text-muted">Create a one-hour bearer link. Anyone with this link can set this person&rsquo;s password until it expires. Share it through a trusted channel.</p>
+  <form method="post" action="/users/{{ .User.ID }}/password-recovery"><input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}"><div class="mt-5 flex flex-row-reverse gap-2">{{ template "ui/button" dict "Label" "Issue recovery link" "Variant" "primary" "Type" "submit" }}{{ template "ui/button" dict "Label" "Cancel" "Variant" "secondary" "Type" "submit" "Dismiss" true }}</div></form>
 </dialog>
 {{ end }}
 {{ end }}

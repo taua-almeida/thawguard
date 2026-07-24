@@ -1,6 +1,7 @@
 {{/*
-  auth/start + auth/end — centered-card layout for signed-out pages
-  (login, first-run setup). No scripts: auth pages are plain forms.
+  auth/start + auth/end — centered-card layout for signed-out pages.
+  Login and first-run setup are script-free; password recovery adds one
+  purpose-specific local script from its page template.
   Expected view fields: AppName, PageTitle, Theme ("" | "dark" | "light").
 */}}
 {{ define "auth/start" }}<!doctype html>
