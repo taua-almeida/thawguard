@@ -136,6 +136,9 @@ func (s *Service) DisableUser(ctx context.Context, actorUserID int64, userID int
 	if err := deleteUserSessions(ctx, tx, record.ID); err != nil {
 		return User{}, err
 	}
+	if err := deleteUserPasswordRecoveryToken(ctx, tx, record.ID); err != nil {
+		return User{}, err
+	}
 	event := userAuditEvent(audit.ActionUserDisabled, actorUserID, record.ID, map[string]string{"enabled": "false"})
 	if err := audit.NewStoreTx(tx).Record(ctx, event); err != nil {
 		return User{}, fmt.Errorf("record user disable audit event: %w", err)
@@ -226,7 +229,16 @@ func (s *Service) ChangePassword(ctx context.Context, params ChangePasswordParam
 	if err != nil {
 		return Session{}, err
 	}
+	return s.commitPasswordChange(ctx, record, passwordHash, sessionID, csrfToken)
+}
 
+func (s *Service) commitPasswordChange(
+	ctx context.Context,
+	record userRecord,
+	passwordHash string,
+	sessionID string,
+	csrfToken string,
+) (Session, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Session{}, fmt.Errorf("begin password change: %w", err)
@@ -234,16 +246,38 @@ func (s *Service) ChangePassword(ctx context.Context, params ChangePasswordParam
 	defer tx.Rollback()
 
 	now := s.now().UTC()
-	if _, err := tx.ExecContext(ctx, `UPDATE users SET password_hash = ?, must_change_password = 0, updated_at = ? WHERE id = ?`, passwordHash, now.Format(time.RFC3339Nano), record.ID); err != nil {
+	result, err := tx.ExecContext(ctx, `
+UPDATE users
+SET password_hash = ?, must_change_password = 0, updated_at = ?
+WHERE id = ? AND password_hash = ? AND disabled_at IS NULL`,
+		passwordHash,
+		now.Format(time.RFC3339Nano),
+		record.ID,
+		record.passwordHash,
+	)
+	if err != nil {
 		return Session{}, fmt.Errorf("update user password: %w", err)
 	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return Session{}, fmt.Errorf("count updated user passwords: %w", err)
+	}
+	if updated == 0 {
+		return Session{}, ValidationError{Message: "current password is incorrect"}
+	}
+	if updated != 1 {
+		return Session{}, fmt.Errorf("update user password affected %d rows", updated)
+	}
 	if err := deleteUserSessions(ctx, tx, record.ID); err != nil {
+		return Session{}, err
+	}
+	if err := deleteUserPasswordRecoveryToken(ctx, tx, record.ID); err != nil {
 		return Session{}, err
 	}
 	user := record.User
 	user.MustChangePassword = false
 	user.UpdatedAt = now
-	session, err := s.insertSession(ctx, tx, user, sessionID, csrfToken)
+	session, err := s.insertSession(ctx, tx, user, passwordHash, sessionID, csrfToken)
 	if err != nil {
 		return Session{}, err
 	}
@@ -298,6 +332,9 @@ func (s *Service) ResetPassword(ctx context.Context, params ResetPasswordParams)
 	if err := deleteUserSessions(ctx, tx, record.ID); err != nil {
 		return err
 	}
+	if err := deleteUserPasswordRecoveryToken(ctx, tx, record.ID); err != nil {
+		return err
+	}
 	event := userAuditEvent(audit.ActionUserPasswordReset, params.ActorUserID, record.ID, nil)
 	if err := audit.NewStoreTx(tx).Record(ctx, event); err != nil {
 		return fmt.Errorf("record password reset audit event: %w", err)
@@ -328,6 +365,13 @@ WHERE u.disabled_at IS NULL`, RoleAdmin).Scan(&count); err != nil {
 func deleteUserSessions(ctx context.Context, q queryer, userID int64) error {
 	if _, err := q.ExecContext(ctx, `DELETE FROM sessions WHERE user_id = ?`, userID); err != nil {
 		return fmt.Errorf("delete user sessions: %w", err)
+	}
+	return nil
+}
+
+func deleteUserPasswordRecoveryToken(ctx context.Context, q queryer, userID int64) error {
+	if _, err := q.ExecContext(ctx, `DELETE FROM password_recovery_tokens WHERE user_id = ?`, userID); err != nil {
+		return fmt.Errorf("delete user password recovery token: %w", err)
 	}
 	return nil
 }

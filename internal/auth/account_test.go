@@ -465,6 +465,7 @@ func TestAccountMutationsRollBackWhenAuditPersistenceFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	recovery := mustIssuePasswordRecoveryToken(t, ctx, service, admin.User.ID, user.ID)
 
 	if _, err := database.ExecContext(ctx, `ALTER TABLE audit_events RENAME TO audit_events_broken`); err != nil {
 		t.Fatal(err)
@@ -486,10 +487,20 @@ func TestAccountMutationsRollBackWhenAuditPersistenceFails(t *testing.T) {
 	if _, found, err := service.SessionByID(ctx, session.ID); err != nil || !found {
 		t.Fatalf("expected session revocation to roll back with audit failure, found=%v err=%v", found, err)
 	}
+	assertStoredPasswordRecoveryToken(t, ctx, database, user.ID, recovery)
+
+	if _, err := service.ChangePassword(ctx, ChangePasswordParams{UserID: user.ID, CurrentPassword: accountTestPassword, NewPassword: "a brand new local password"}); err == nil || IsValidationError(err) {
+		t.Fatalf("expected password change to fail when audit persistence fails, got %v", err)
+	}
+	if _, found, err := service.SessionByID(ctx, session.ID); err != nil || !found {
+		t.Fatalf("expected password-change session revocation to roll back, found=%v err=%v", found, err)
+	}
+	assertStoredPasswordRecoveryToken(t, ctx, database, user.ID, recovery)
 
 	if err := service.ResetPassword(ctx, ResetPasswordParams{ActorUserID: admin.User.ID, UserID: user.ID, TemporaryPassword: "temporary local password"}); err == nil || IsValidationError(err) {
 		t.Fatalf("expected reset to fail when audit persistence fails, got %v", err)
 	}
+	assertStoredPasswordRecoveryToken(t, ctx, database, user.ID, recovery)
 	if _, err := service.Login(ctx, LoginParams{Email: "lead@example.test", Password: accountTestPassword}); err != nil {
 		t.Fatalf("expected password unchanged after rolled-back reset, got %v", err)
 	}

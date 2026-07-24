@@ -1,6 +1,7 @@
 package db
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -87,6 +88,7 @@ func TestOpenAndApplyMigrationsAgainstSQLite(t *testing.T) {
 	assertColumnDoesNotExist(t, database, "users", "role")
 	assertColumnExists(t, database, "users", "disabled_at")
 	assertColumnExists(t, database, "users", "must_change_password")
+	assertTableExists(t, database, "password_recovery_tokens")
 	assertColumnExists(t, database, "repositories", "enforcement_state")
 	assertColumnExists(t, database, "repositories", "enforcement_failure_reason")
 	assertColumnExists(t, database, "repositories", "enforcement_failed_at")
@@ -1112,6 +1114,159 @@ WHERE id = 30
 	}
 	if migrationAuditCount != 1 {
 		t.Fatalf("expected migration grant audit evidence preserved, got %d rows", migrationAuditCount)
+	}
+	assertForeignKeyCheckClean(t, database)
+}
+
+func TestPasswordRecoveryTokensMigrationPreserves0033DataAndAppliesOnce(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-password-recovery-upgrade-test.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveryIndex := migrationIndex(t, migrations, "0034_password_recovery_tokens.sql")
+	if err := ApplyMigrations(ctx, database, migrations[:recoveryIndex]); err != nil {
+		t.Fatal(err)
+	}
+	assertTableExists(t, database, "user_roles")
+	assertColumnDoesNotExist(t, database, "users", "role")
+
+	const createdAt = "2026-07-23T10:00:00.000000000Z"
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO users(id, email, display_name, password_hash, disabled_at, must_change_password, created_at, updated_at)
+VALUES
+  (1, 'admin@example.test', 'Admin', 'hash-1', NULL, 0, ?, ?),
+  (2, 'operator@example.test', 'Operator', 'hash-2', NULL, 1, ?, ?);
+INSERT INTO user_roles(user_id, role, created_at)
+VALUES (1, 'admin', ?);
+INSERT INTO repositories(id, forge, base_url, owner, name, default_branch, active, created_at, updated_at)
+VALUES (10, 'forgejo', 'https://forge.example.test', 'acme', 'api', 'main', 1, ?, ?);
+INSERT INTO repository_grants(repository_id, user_id, role, granted_by_user_id, granted_at)
+VALUES (10, 2, 'freezer', 1, '2026-07-23T10:05:00.000000000Z');
+INSERT INTO sessions(id, user_id, csrf_token, expires_at, created_at)
+VALUES ('preserved-session', 2, 'preserved-csrf', '2026-07-24T10:00:00.000000000Z', ?);
+INSERT INTO audit_events(id, actor_user_id, action, subject_type, subject_id, details_json, created_at)
+VALUES (20, 1, 'repository_grant.added', 'repository', '10', '{"actor_kind":"user","user_id":"2","role":"freezer"}', ?);`,
+		createdAt,
+		createdAt,
+		createdAt,
+		createdAt,
+		createdAt,
+		createdAt,
+		createdAt,
+		createdAt,
+		createdAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ApplyMigrations(ctx, database, migrations[:recoveryIndex+1]); err != nil {
+		t.Fatal(err)
+	}
+	assertTableExists(t, database, "password_recovery_tokens")
+
+	var passwordHash string
+	var mustChangePassword int
+	if err := database.QueryRowContext(ctx, `SELECT password_hash, must_change_password FROM users WHERE id = 2`).Scan(&passwordHash, &mustChangePassword); err != nil {
+		t.Fatal(err)
+	}
+	if passwordHash != "hash-2" || mustChangePassword != 1 {
+		t.Fatalf("expected user credentials and forced-change state preserved, hash=%q forced=%d", passwordHash, mustChangePassword)
+	}
+	var sessionUser int64
+	var csrfToken string
+	if err := database.QueryRowContext(ctx, `SELECT user_id, csrf_token FROM sessions WHERE id = 'preserved-session'`).Scan(&sessionUser, &csrfToken); err != nil {
+		t.Fatal(err)
+	}
+	if sessionUser != 2 || csrfToken != "preserved-csrf" {
+		t.Fatalf("expected session preserved, user=%d csrf=%q", sessionUser, csrfToken)
+	}
+	var grantUser, grantActor int64
+	var grantRole, grantedAt string
+	if err := database.QueryRowContext(ctx, `
+SELECT user_id, role, granted_by_user_id, granted_at
+FROM repository_grants
+WHERE repository_id = 10`).Scan(&grantUser, &grantRole, &grantActor, &grantedAt); err != nil {
+		t.Fatal(err)
+	}
+	if grantUser != 2 || grantRole != "freezer" || grantActor != 1 || grantedAt != "2026-07-23T10:05:00.000000000Z" {
+		t.Fatalf("expected grant and attribution preserved, user=%d role=%q actor=%d at=%q", grantUser, grantRole, grantActor, grantedAt)
+	}
+	var auditActor int64
+	if err := database.QueryRowContext(ctx, `SELECT actor_user_id FROM audit_events WHERE id = 20`).Scan(&auditActor); err != nil {
+		t.Fatal(err)
+	}
+	if auditActor != 1 {
+		t.Fatalf("expected audit attribution preserved, got actor %d", auditActor)
+	}
+
+	digestA := bytes.Repeat([]byte{0x11}, 32)
+	digestB := bytes.Repeat([]byte{0x22}, 32)
+	const expiry = int64(1784804400000000000)
+	if _, err := database.ExecContext(ctx, `INSERT INTO password_recovery_tokens(user_id, token_digest, expires_at) VALUES (2, ?, ?)`, digestA, expiry); err != nil {
+		t.Fatal(err)
+	}
+	var storedDigest []byte
+	var storedExpiry int64
+	if err := database.QueryRowContext(ctx, `SELECT token_digest, expires_at FROM password_recovery_tokens WHERE user_id = 2`).Scan(&storedDigest, &storedExpiry); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(storedDigest, digestA) || storedExpiry != expiry {
+		t.Fatalf("unexpected stored recovery row: digest length=%d expiry=%d", len(storedDigest), storedExpiry)
+	}
+	for name, statement := range map[string]struct {
+		query string
+		args  []any
+	}{
+		"one row per user": {query: `INSERT INTO password_recovery_tokens(user_id, token_digest, expires_at) VALUES (2, ?, ?)`, args: []any{digestB, expiry}},
+		"unique digest":    {query: `INSERT INTO password_recovery_tokens(user_id, token_digest, expires_at) VALUES (1, ?, ?)`, args: []any{digestA, expiry}},
+		"32 byte digest":   {query: `INSERT INTO password_recovery_tokens(user_id, token_digest, expires_at) VALUES (1, ?, ?)`, args: []any{[]byte{0x33}, expiry}},
+		"blob digest":      {query: `INSERT INTO password_recovery_tokens(user_id, token_digest, expires_at) VALUES (1, ?, ?)`, args: []any{strings.Repeat("a", 32), expiry}},
+		"integer expiry":   {query: `INSERT INTO password_recovery_tokens(user_id, token_digest, expires_at) VALUES (1, ?, ?)`, args: []any{digestB, createdAt}},
+		"existing user":    {query: `INSERT INTO password_recovery_tokens(user_id, token_digest, expires_at) VALUES (999, ?, ?)`, args: []any{digestB, expiry}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := database.ExecContext(ctx, statement.query, statement.args...); err == nil {
+				t.Fatal("expected recovery-token constraint violation")
+			}
+		})
+	}
+
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO users(id, email, display_name, password_hash, created_at, updated_at)
+VALUES (3, 'cascade@example.test', 'Cascade', 'hash-3', ?, ?)`, createdAt, createdAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO password_recovery_tokens(user_id, token_digest, expires_at)
+VALUES (3, ?, ?)`, digestB, expiry); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `DELETE FROM users WHERE id = 3`); err != nil {
+		t.Fatal(err)
+	}
+	var cascaded int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM password_recovery_tokens WHERE user_id = 3`).Scan(&cascaded); err != nil {
+		t.Fatal(err)
+	}
+	if cascaded != 0 {
+		t.Fatalf("expected user deletion to cascade recovery token, got %d rows", cascaded)
+	}
+
+	if err := ApplyMigrations(ctx, database, migrations[:recoveryIndex+1]); err != nil {
+		t.Fatal(err)
+	}
+	var applied int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = '0034_password_recovery_tokens'`).Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected password recovery migration applied once, got %d", applied)
 	}
 	assertForeignKeyCheckClean(t, database)
 }

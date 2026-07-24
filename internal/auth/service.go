@@ -135,7 +135,7 @@ func (s *Service) CreateFirstAdmin(ctx context.Context, params CreateFirstAdminP
 	if err != nil {
 		return Session{}, err
 	}
-	session, err := s.insertSession(ctx, tx, user, sessionID, csrfToken)
+	session, err := s.insertSession(ctx, tx, user, passwordHash, sessionID, csrfToken)
 	if err != nil {
 		return Session{}, err
 	}
@@ -204,7 +204,7 @@ func (s *Service) Login(ctx context.Context, params LoginParams) (Session, error
 	if err != nil {
 		return Session{}, err
 	}
-	return s.insertSession(ctx, s.db, record.User, sessionID, csrfToken)
+	return s.insertSession(ctx, s.db, record.User, record.passwordHash, sessionID, csrfToken)
 }
 
 func (s *Service) SessionByID(ctx context.Context, id string) (Session, bool, error) {
@@ -381,20 +381,53 @@ func boolInt(value bool) int {
 	return 0
 }
 
-func (s *Service) insertSession(ctx context.Context, q queryer, user User, sessionID string, csrfToken string) (Session, error) {
+func (s *Service) insertSession(
+	ctx context.Context,
+	q queryer,
+	user User,
+	passwordHash string,
+	sessionID string,
+	csrfToken string,
+) (Session, error) {
 	grants, err := loadGrants(ctx, q, user)
 	if err != nil {
 		return Session{}, err
 	}
 	now := s.now().UTC()
 	expiresAt := now.Add(s.sessionTTL)
-	_, err = q.ExecContext(ctx, `
+	result, err := q.ExecContext(ctx, `
 INSERT INTO sessions(id, user_id, csrf_token, expires_at, created_at)
-VALUES (?, ?, ?, ?, ?)`, sessionID, user.ID, csrfToken, expiresAt.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
+SELECT ?, u.id, ?, ?, ?
+FROM users u
+WHERE u.id = ? AND u.password_hash = ? AND u.disabled_at IS NULL`,
+		sessionID,
+		csrfToken,
+		expiresAt.Format(time.RFC3339Nano),
+		now.Format(time.RFC3339Nano),
+		user.ID,
+		passwordHash,
+	)
 	if err != nil {
 		return Session{}, fmt.Errorf("create session: %w", err)
 	}
-	return Session{ID: sessionID, CSRFToken: csrfToken, User: user, Grants: grants, ExpiresAt: expiresAt, CreatedAt: now}, nil
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return Session{}, fmt.Errorf("count created sessions: %w", err)
+	}
+	if inserted == 0 {
+		return Session{}, AuthenticationError{}
+	}
+	if inserted != 1 {
+		return Session{}, fmt.Errorf("create session affected %d rows", inserted)
+	}
+	return Session{
+		ID:        sessionID,
+		CSRFToken: csrfToken,
+		User:      user,
+		Grants:    grants,
+		ExpiresAt: expiresAt,
+		CreatedAt: now,
+	}, nil
 }
 
 func scanUser(row scanner) (User, error) {

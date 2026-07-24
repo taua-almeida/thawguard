@@ -2966,6 +2966,8 @@ func TestActivityMappingCoversCurrentFamilies(t *testing.T) {
 		{name: "enabled", action: audit.ActionUserEnabled, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{}`, outcome: "Enabled", contains: []string{"sessions were not restored"}},
 		{name: "password changed", action: audit.ActionUserPasswordChanged, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{}`, outcome: "Changed", contains: []string{"Self-service password change"}},
 		{name: "password reset", action: audit.ActionUserPasswordReset, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{}`, outcome: "Reset", contains: []string{"required at next login"}},
+		{name: "password recovery issued", action: audit.ActionUserPasswordRecoveryIssued, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"expires_at":"2026-07-23T11:00:00Z"}`, outcome: "Issued", contains: []string{"Ada Operator (User #42)", "any earlier link is invalid", "2026-07-23 11:00 UTC"}},
+		{name: "password recovery completed", action: audit.ActionUserPasswordRecoveryCompleted, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"recovery_link"}`, outcome: "Completed", contains: []string{"Ada Operator (User #42)", "forced-password state cleared", "sessions revoked"}},
 		{name: "repository grant added", action: audit.ActionRepositoryGrantAdded, subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"user_id":"42","role":"freezer"}`, outcome: "Granted", contains: []string{"taua-almeida/thawguard", "Freezer role granted to Ada Operator (User #42)"}},
 		{name: "repository grant revoked", action: audit.ActionRepositoryGrantRevoked, subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"user_id":"42","role":"viewer"}`, outcome: "Revoked", contains: []string{"taua-almeida/thawguard", "Viewer role revoked from Ada Operator (User #42)"}},
 	}
@@ -3014,6 +3016,7 @@ func TestActivityActorAndMissingTargetResolution(t *testing.T) {
 		{details: `{"actor_kind":"system","actor_role":"migration"}`, actor: "Authorization migration"},
 		{details: `{"actor_kind":"system","actor_role":"reconciliation_runner"}`, actor: "Reconciliation runner"},
 		{details: `{"actor_kind":"system","actor_role":"runtime"}`, actor: "Runtime process"},
+		{details: `{"actor_kind":"recovery_link"}`, actor: "Password recovery link"},
 		{details: `{"actor_kind":"untrusted-actor","actor_role":"secret-token"}`, actor: "Unknown system actor"},
 	} {
 		view = activityEventViewForEvent(nil, nil, audit.Event{Action: audit.ActionRepositoryCreated, SubjectType: audit.SubjectTypeRepository, SubjectID: "1", DetailsJSON: test.details})

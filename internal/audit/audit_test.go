@@ -343,6 +343,8 @@ func TestScopedActionClassificationCoversEveryKnownAction(t *testing.T) {
 		"user.enabled":                               adminOnly,
 		"user.password_changed":                      adminOnly,
 		"user.password_reset":                        adminOnly,
+		"user.password_recovery_issued":              adminOnly,
+		"user.password_recovery_completed":           adminOnly,
 	}
 
 	classified := map[string]string{}

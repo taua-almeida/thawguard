@@ -2101,6 +2101,8 @@ var activityActionDefinitions = map[string]activityActionDefinition{
 	audit.ActionUserEnabled:                        {Label: "User access", Outcome: "Enabled", OutcomeClass: "ok"},
 	audit.ActionUserPasswordChanged:                {Label: "User password", Outcome: "Changed", OutcomeClass: "ok"},
 	audit.ActionUserPasswordReset:                  {Label: "User password", Outcome: "Reset", OutcomeClass: "warning"},
+	audit.ActionUserPasswordRecoveryIssued:         {Label: "Password recovery", Outcome: "Issued", OutcomeClass: "warning"},
+	audit.ActionUserPasswordRecoveryCompleted:      {Label: "Password recovery", Outcome: "Completed", OutcomeClass: "ok"},
 }
 
 func activityEventViews(repositories []domain.Repository, users []auth.User, events []audit.Event) []activityEventView {
@@ -2228,6 +2230,12 @@ func activityEventViewForEvent(repositories map[int64]domain.Repository, users m
 	case audit.ActionUserPasswordReset:
 		view.Target = activityUserTarget(users, event.SubjectID)
 		view.Detail = "Temporary password set by an admin; all sessions revoked and a new password is required at next login."
+	case audit.ActionUserPasswordRecoveryIssued:
+		view.Target = activityUserTarget(users, event.SubjectID)
+		view.Detail = "Recovery link issued by an admin; any earlier link is invalid. Expires " + activityTimeOrUnavailable(details, "expires_at", false) + "."
+	case audit.ActionUserPasswordRecoveryCompleted:
+		view.Target = activityUserTarget(users, event.SubjectID)
+		view.Detail = "Password recovered with a bearer link; forced-password state cleared and all sessions revoked."
 	case audit.ActionRepositoryGrantAdded:
 		view.Target = activityRepositoryTarget(repositories, event, details, "")
 		view.Detail = activityRolesOrUnavailable(details, "role") + " role granted to " + activityUserTarget(users, activityTextOrUnavailable(details, "user_id", 20)) + "."
@@ -2306,6 +2314,8 @@ func activityActor(users map[int64]auth.User, event audit.Event, details activit
 		default:
 			return "Unknown system actor"
 		}
+	case audit.ActorKindPasswordRecoveryLink:
+		return "Password recovery link"
 	default:
 		return "Unknown system actor"
 	}

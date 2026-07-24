@@ -60,6 +60,10 @@ const (
 	ActionUserEnabled                        = "user.enabled"
 	ActionUserPasswordChanged                = "user.password_changed"
 	ActionUserPasswordReset                  = "user.password_reset"
+	ActionUserPasswordRecoveryIssued         = "user.password_recovery_issued"
+	ActionUserPasswordRecoveryCompleted      = "user.password_recovery_completed"
+
+	ActorKindPasswordRecoveryLink = "recovery_link"
 
 	SubjectTypeRepository    = "repository"
 	SubjectTypeSchedule      = "schedule"
@@ -120,6 +124,8 @@ func KnownActions() []string {
 		ActionUserEnabled,
 		ActionUserPasswordChanged,
 		ActionUserPasswordReset,
+		ActionUserPasswordRecoveryIssued,
+		ActionUserPasswordRecoveryCompleted,
 	}
 }
 
