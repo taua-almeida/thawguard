@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/taua-almeida/thawguard/internal/auth"
 )
 
 func TestLoadMigrationsSortsSQLFiles(t *testing.T) {
@@ -63,6 +65,10 @@ func TestOpenAndApplyMigrationsAgainstSQLite(t *testing.T) {
 	assertIndexExists(t, database, "idx_status_publication_intents_idempotency")
 	assertTableExists(t, database, "status_publication_attempts")
 	assertIndexExists(t, database, "idx_status_publication_attempts_recent")
+	assertTableExists(t, database, "invitations")
+	assertTableExists(t, database, "invitation_repository_grants")
+	assertIndexExists(t, database, "idx_invitations_token_digest")
+	assertIndexExists(t, database, "idx_invitations_active_canonical_email")
 	assertStatusPublicationLiveModesAllowed(t, database)
 	assertColumnExists(t, database, "branch_freezes", "scheduled")
 	assertColumnExists(t, database, "branch_freezes", "planned_ends_at")
@@ -1271,6 +1277,458 @@ VALUES (3, ?, ?)`, digestB, expiry); err != nil {
 	assertForeignKeyCheckClean(t, database)
 }
 
+func TestInvitationsMigrationPreserves0034DataAndAppliesOnce(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-invitations-upgrade-test.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	invitationIndex := migrationIndex(t, migrations, "0035_invitations.sql")
+	if err := ApplyMigrations(ctx, database, migrations[:invitationIndex]); err != nil {
+		t.Fatal(err)
+	}
+	assertTableExists(t, database, "password_recovery_tokens")
+
+	const createdAt = "2026-07-24T10:00:00.000000000Z"
+	digest := bytes.Repeat([]byte{0x34}, 32)
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO users(id, email, display_name, password_hash, disabled_at, must_change_password, created_at, updated_at)
+VALUES
+  (1, 'admin@example.test', 'Admin', 'hash-1', NULL, 0, ?, ?),
+  (2, 'operator@example.test', 'Operator', 'hash-2', NULL, 1, ?, ?);
+INSERT INTO user_roles(user_id, role, created_at)
+VALUES (1, 'admin', ?);
+INSERT INTO repositories(id, forge, base_url, owner, name, default_branch, active, created_at, updated_at)
+VALUES (10, 'forgejo', 'https://forge.example.test', 'acme', 'api', 'main', 1, ?, ?);
+INSERT INTO repository_grants(repository_id, user_id, role, granted_by_user_id, granted_at)
+VALUES (10, 2, 'freezer', 1, ?);
+INSERT INTO sessions(id, user_id, csrf_token, expires_at, created_at)
+VALUES ('preserved-invitation-session', 2, 'preserved-invitation-csrf', '2026-07-25T10:00:00.000000000Z', ?);`,
+		createdAt,
+		createdAt,
+		createdAt,
+		createdAt,
+		createdAt,
+		createdAt,
+		createdAt,
+		createdAt,
+		createdAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO password_recovery_tokens(user_id, token_digest, expires_at)
+VALUES (2, ?, 1784887200000000000)`, digest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO audit_events(id, actor_user_id, action, subject_type, subject_id, details_json, created_at)
+VALUES (20, 1, 'user.password_recovery_issued', 'user', '2', '{"actor_kind":"user"}', ?)`, createdAt); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ApplyMigrations(ctx, database, migrations[:invitationIndex+1]); err != nil {
+		t.Fatal(err)
+	}
+	assertTableExists(t, database, "invitations")
+	assertTableExists(t, database, "invitation_repository_grants")
+	assertIndexExists(t, database, "idx_invitations_token_digest")
+	assertIndexExists(t, database, "idx_invitations_active_canonical_email")
+
+	for _, check := range []struct {
+		name  string
+		query string
+		args  []any
+		want  int
+	}{
+		{name: "users", query: `SELECT count(*) FROM users WHERE id IN (1, 2)`, want: 2},
+		{name: "admins", query: `SELECT count(*) FROM user_roles WHERE user_id = 1 AND role = 'admin'`, want: 1},
+		{name: "grants", query: `SELECT count(*) FROM repository_grants WHERE repository_id = 10 AND user_id = 2 AND role = 'freezer' AND granted_by_user_id = 1 AND granted_at = ?`, args: []any{createdAt}, want: 1},
+		{name: "sessions", query: `SELECT count(*) FROM sessions WHERE id = 'preserved-invitation-session' AND user_id = 2 AND csrf_token = 'preserved-invitation-csrf'`, want: 1},
+		{name: "recovery tokens", query: `SELECT count(*) FROM password_recovery_tokens WHERE user_id = 2 AND expires_at = 1784887200000000000`, want: 1},
+		{name: "audits", query: `SELECT count(*) FROM audit_events WHERE id = 20 AND actor_user_id = 1 AND subject_type = 'user' AND subject_id = '2'`, want: 1},
+	} {
+		var got int
+		if err := database.QueryRowContext(ctx, check.query, check.args...).Scan(&got); err != nil {
+			t.Fatalf("count preserved %s: %v", check.name, err)
+		}
+		if got != check.want {
+			t.Fatalf("expected %d preserved %s rows, got %d", check.want, check.name, got)
+		}
+	}
+	var storedDigest []byte
+	if err := database.QueryRowContext(ctx, `SELECT token_digest FROM password_recovery_tokens WHERE user_id = 2`).Scan(&storedDigest); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(storedDigest, digest) {
+		t.Fatal("expected password recovery digest preserved exactly")
+	}
+
+	if err := ApplyMigrations(ctx, database, migrations[:invitationIndex+1]); err != nil {
+		t.Fatal(err)
+	}
+	var applied int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = '0035_invitations'`).Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected invitations migration applied once, got %d", applied)
+	}
+	assertForeignKeyCheckClean(t, database)
+}
+
+func TestInvitationIDConstraintMatchesAuthValidator(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-invitation-id-test.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+		t.Fatal(err)
+	}
+
+	for i, final := range []byte{'A', 'Q', 'g', 'w'} {
+		id := testInvitationID(byte('A'+i), final)
+		if !auth.ValidInvitationID(id) {
+			t.Fatalf("application validator rejected canonical ID %q", id)
+		}
+		if _, err := database.ExecContext(ctx, `
+INSERT INTO invitations(id, status, created_at, updated_at)
+VALUES (?, 'cancelled', '2026-07-24T10:00:00Z', '2026-07-24T10:00:00Z')`, id); err != nil {
+			t.Fatalf("database rejected canonical ID %q: %v", id, err)
+		}
+	}
+
+	malformed := []string{
+		"bad_" + strings.Repeat("A", 22),
+		"inv_" + strings.Repeat("A", 21),
+		"inv_" + strings.Repeat("A", 23),
+		"inv_" + strings.Repeat("A", 20) + "*A",
+		"inv_" + strings.Repeat("A", 21) + "E",
+		"inv_" + strings.Repeat("A", 21) + "=",
+	}
+	for _, id := range malformed {
+		if auth.ValidInvitationID(id) {
+			t.Fatalf("application validator accepted malformed ID %q", id)
+		}
+		if _, err := database.ExecContext(ctx, `
+INSERT INTO invitations(id, status, created_at, updated_at)
+VALUES (?, 'cancelled', '2026-07-24T10:00:00Z', '2026-07-24T10:00:00Z')`, id); err == nil {
+			t.Fatalf("database accepted malformed ID %q", id)
+		}
+	}
+}
+
+func TestInvitationsMigrationEnforcesShapesUniquenessAndCascades(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-invitation-constraints-test.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+		t.Fatal(err)
+	}
+
+	const timestamp = "2026-07-24T10:00:00.000000000Z"
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO users(id, email, display_name, password_hash, created_at, updated_at)
+VALUES
+  (1, 'admin@example.test', 'Admin', 'hash-1', ?, ?),
+  (2, 'deletable@example.test', 'Deletable', 'hash-2', ?, ?);
+INSERT INTO user_roles(user_id, role, created_at)
+VALUES (1, 'admin', ?);
+INSERT INTO repositories(id, forge, base_url, owner, name, default_branch, active, created_at, updated_at)
+VALUES
+  (10, 'forgejo', 'https://forge.example.test', 'acme', 'api', 'main', 1, ?, ?),
+  (11, 'forgejo', 'https://forge.example.test', 'acme', 'web', 'main', 1, ?, ?);`,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	digest := bytes.Repeat([]byte{0x51}, 32)
+	expiresAt := int64(1785492000123456789)
+	pending := migrationInvitationRow{
+		ID:           testInvitationID('P', 'A'),
+		Status:       "pending",
+		Email:        "pending@example.test",
+		DisplayName:  "Pending User",
+		TokenDigest:  digest,
+		ExpiresAt:    expiresAt,
+		IsAdmin:      1,
+		AuthorizedBy: 1,
+		Expected:     0,
+		CreatedAt:    timestamp,
+		UpdatedAt:    timestamp,
+	}
+	if err := insertMigrationInvitation(ctx, database, pending); err != nil {
+		t.Fatal(err)
+	}
+	var storedDigest []byte
+	var storedExpiry int64
+	if err := database.QueryRowContext(ctx, `SELECT token_digest, expires_at FROM invitations WHERE id = ?`, pending.ID).Scan(&storedDigest, &storedExpiry); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(storedDigest, digest) || storedExpiry != expiresAt {
+		t.Fatalf("expected exact digest and Unix-nanosecond expiry, digest=%d expiry=%d", len(storedDigest), storedExpiry)
+	}
+
+	malformedCases := []struct {
+		name   string
+		mutate func(*migrationInvitationRow)
+	}{
+		{name: "unknown status", mutate: func(row *migrationInvitationRow) { row.Status = "unknown" }},
+		{name: "pending null email", mutate: func(row *migrationInvitationRow) { row.Email = nil }},
+		{name: "pending null display name", mutate: func(row *migrationInvitationRow) { row.DisplayName = nil }},
+		{name: "digest text", mutate: func(row *migrationInvitationRow) { row.TokenDigest = strings.Repeat("a", 32) }},
+		{name: "digest length", mutate: func(row *migrationInvitationRow) { row.TokenDigest = bytes.Repeat([]byte{1}, 31) }},
+		{name: "expiry text", mutate: func(row *migrationInvitationRow) { row.ExpiresAt = "not-an-expiry" }},
+		{name: "expiry range", mutate: func(row *migrationInvitationRow) { row.ExpiresAt = 0 }},
+		{name: "Administrator flag", mutate: func(row *migrationInvitationRow) { row.IsAdmin = 2 }},
+		{name: "expected grant count", mutate: func(row *migrationInvitationRow) { row.Expected = -1 }},
+		{name: "needs reissue bearer", mutate: func(row *migrationInvitationRow) {
+			row.Status = "needs_reissue"
+			row.ExpiresAt = nil
+			row.AuthorizedBy = nil
+		}},
+		{name: "needs reissue authorizer", mutate: func(row *migrationInvitationRow) {
+			row.Status = "needs_reissue"
+			row.TokenDigest = nil
+			row.ExpiresAt = nil
+		}},
+		{name: "accepted live identity", mutate: func(row *migrationInvitationRow) {
+			row.Status = "accepted"
+			row.TokenDigest = nil
+			row.ExpiresAt = nil
+			row.IsAdmin = nil
+			row.AuthorizedBy = nil
+			row.Expected = nil
+		}},
+		{name: "cancelled live count", mutate: func(row *migrationInvitationRow) {
+			row.Status = "cancelled"
+			row.Email = nil
+			row.DisplayName = nil
+			row.TokenDigest = nil
+			row.ExpiresAt = nil
+			row.IsAdmin = nil
+			row.AuthorizedBy = nil
+		}},
+		{name: "null created timestamp", mutate: func(row *migrationInvitationRow) { row.CreatedAt = nil }},
+	}
+	for i, testCase := range malformedCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			row := pending
+			row.ID = testInvitationID(byte('A'+i), 'Q')
+			row.Email = fmt.Sprintf("malformed-%d@example.test", i)
+			row.TokenDigest = bytes.Repeat([]byte{byte(i + 2)}, 32)
+			testCase.mutate(&row)
+			if err := insertMigrationInvitation(ctx, database, row); err == nil {
+				t.Fatal("expected invitation row-shape constraint violation")
+			}
+		})
+	}
+
+	duplicateDigest := pending
+	duplicateDigest.ID = testInvitationID('D', 'g')
+	duplicateDigest.Email = "digest@example.test"
+	if err := insertMigrationInvitation(ctx, database, duplicateDigest); err == nil {
+		t.Fatal("expected non-null invitation digest uniqueness violation")
+	}
+	duplicateEmail := migrationInvitationRow{
+		ID:          testInvitationID('E', 'g'),
+		Status:      "needs_reissue",
+		Email:       pending.Email,
+		DisplayName: "Reserved User",
+		IsAdmin:     0,
+		Expected:    0,
+		CreatedAt:   timestamp,
+		UpdatedAt:   timestamp,
+	}
+	if err := insertMigrationInvitation(ctx, database, duplicateEmail); err == nil {
+		t.Fatal("expected pending email to remain reserved against needs_reissue")
+	}
+
+	if _, err := database.ExecContext(ctx, `
+UPDATE invitations
+SET status = 'cancelled',
+    canonical_email = NULL,
+    display_name = NULL,
+    token_digest = NULL,
+    expires_at = NULL,
+    is_admin = NULL,
+    authorized_by_user_id = NULL,
+    expected_repository_grant_count = NULL,
+    updated_at = ?
+WHERE id = ?`, timestamp, pending.ID); err != nil {
+		t.Fatal(err)
+	}
+	var redacted int
+	if err := database.QueryRowContext(ctx, `
+SELECT count(*)
+FROM invitations
+WHERE id = ?
+  AND status = 'cancelled'
+  AND canonical_email IS NULL
+  AND display_name IS NULL
+  AND token_digest IS NULL
+  AND expires_at IS NULL
+  AND is_admin IS NULL
+  AND authorized_by_user_id IS NULL
+  AND expected_repository_grant_count IS NULL`, pending.ID).Scan(&redacted); err != nil {
+		t.Fatal(err)
+	}
+	if redacted != 1 {
+		t.Fatal("expected cancelled invitation to retain only its opaque ID, status, and timestamps")
+	}
+	if err := insertMigrationInvitation(ctx, database, duplicateEmail); err != nil {
+		t.Fatalf("expected cancellation to release active email reservation: %v", err)
+	}
+
+	for _, status := range []string{"accepted", "cancelled"} {
+		row := migrationInvitationRow{
+			ID:        testInvitationID(status[0], 'w'),
+			Status:    status,
+			CreatedAt: timestamp,
+			UpdatedAt: timestamp,
+		}
+		if err := insertMigrationInvitation(ctx, database, row); err != nil {
+			t.Fatalf("insert redacted %s row: %v", status, err)
+		}
+	}
+
+	authorizerDeletion := migrationInvitationRow{
+		ID:           testInvitationID('Z', 'A'),
+		Status:       "pending",
+		Email:        "deleted-authorizer@example.test",
+		DisplayName:  "Deleted Authorizer",
+		TokenDigest:  bytes.Repeat([]byte{0x61}, 32),
+		ExpiresAt:    expiresAt,
+		IsAdmin:      0,
+		AuthorizedBy: 2,
+		Expected:     0,
+		CreatedAt:    timestamp,
+		UpdatedAt:    timestamp,
+	}
+	if err := insertMigrationInvitation(ctx, database, authorizerDeletion); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `DELETE FROM users WHERE id = 2`); err != nil {
+		t.Fatal(err)
+	}
+	var authorizer sql.NullInt64
+	var status string
+	if err := database.QueryRowContext(ctx, `SELECT status, authorized_by_user_id FROM invitations WHERE id = ?`, authorizerDeletion.ID).Scan(&status, &authorizer); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" || authorizer.Valid {
+		t.Fatalf("expected authorizer deletion to leave pending invitation with null authorizer, status=%q authorizer=%v", status, authorizer)
+	}
+
+	drift := migrationInvitationRow{
+		ID:           testInvitationID('R', 'Q'),
+		Status:       "pending",
+		Email:        "drift@example.test",
+		DisplayName:  "Drift User",
+		TokenDigest:  bytes.Repeat([]byte{0x71}, 32),
+		ExpiresAt:    expiresAt,
+		IsAdmin:      0,
+		AuthorizedBy: 1,
+		Expected:     1,
+		CreatedAt:    timestamp,
+		UpdatedAt:    timestamp,
+	}
+	if err := insertMigrationInvitation(ctx, database, drift); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO invitation_repository_grants(invitation_id, repository_id, role) VALUES (?, 10, 'viewer')`, drift.ID); err != nil {
+		t.Fatal(err)
+	}
+	for name, statement := range map[string]struct {
+		query string
+		args  []any
+	}{
+		"null invitation":    {query: `INSERT INTO invitation_repository_grants(invitation_id, repository_id, role) VALUES (NULL, 11, 'viewer')`},
+		"null repository":    {query: `INSERT INTO invitation_repository_grants(invitation_id, repository_id, role) VALUES (?, NULL, 'viewer')`, args: []any{drift.ID}},
+		"missing invitation": {query: `INSERT INTO invitation_repository_grants(invitation_id, repository_id, role) VALUES (?, 11, 'viewer')`, args: []any{testInvitationID('M', 'A')}},
+		"missing repository": {query: `INSERT INTO invitation_repository_grants(invitation_id, repository_id, role) VALUES (?, 999, 'viewer')`, args: []any{drift.ID}},
+		"Administrator role": {query: `INSERT INTO invitation_repository_grants(invitation_id, repository_id, role) VALUES (?, 11, 'admin')`, args: []any{drift.ID}},
+		"unknown role":       {query: `INSERT INTO invitation_repository_grants(invitation_id, repository_id, role) VALUES (?, 11, 'owner')`, args: []any{drift.ID}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := database.ExecContext(ctx, statement.query, statement.args...); err == nil {
+				t.Fatal("expected invitation repository grant constraint violation")
+			}
+		})
+	}
+	if _, err := database.ExecContext(ctx, `DELETE FROM repositories WHERE id = 10`); err != nil {
+		t.Fatal(err)
+	}
+	var expected, actual int
+	if err := database.QueryRowContext(ctx, `SELECT expected_repository_grant_count FROM invitations WHERE id = ?`, drift.ID).Scan(&expected); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM invitation_repository_grants WHERE invitation_id = ?`, drift.ID).Scan(&actual); err != nil {
+		t.Fatal(err)
+	}
+	if expected != 1 || actual != 0 {
+		t.Fatalf("expected repository deletion to leave durable grant-count drift, expected=%d actual=%d", expected, actual)
+	}
+
+	cascade := migrationInvitationRow{
+		ID:           testInvitationID('C', 'A'),
+		Status:       "pending",
+		Email:        "cascade@example.test",
+		DisplayName:  "Cascade User",
+		TokenDigest:  bytes.Repeat([]byte{0x81}, 32),
+		ExpiresAt:    expiresAt,
+		IsAdmin:      0,
+		AuthorizedBy: 1,
+		Expected:     1,
+		CreatedAt:    timestamp,
+		UpdatedAt:    timestamp,
+	}
+	if err := insertMigrationInvitation(ctx, database, cascade); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO invitation_repository_grants(invitation_id, repository_id, role) VALUES (?, 11, 'freezer')`, cascade.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `DELETE FROM invitations WHERE id = ?`, cascade.ID); err != nil {
+		t.Fatal(err)
+	}
+	var children int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM invitation_repository_grants WHERE invitation_id = ?`, cascade.ID).Scan(&children); err != nil {
+		t.Fatal(err)
+	}
+	if children != 0 {
+		t.Fatalf("expected invitation deletion to cascade staged grants, got %d", children)
+	}
+	assertForeignKeyCheckClean(t, database)
+}
+
 func TestUserAccountManagementMigrationPreservesUsersAndSessionsAndAppliesOnce(t *testing.T) {
 	ctx := context.Background()
 	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-test.db")))
@@ -1512,6 +1970,55 @@ VALUES (601, 502, 'freezer', 501, '2026-07-20T11:00:00.000000000Z')`); err == ni
 	if remaining != 0 {
 		t.Fatalf("expected user deletion to cascade their grants, got %d rows", remaining)
 	}
+}
+
+type migrationInvitationRow struct {
+	ID           string
+	Status       string
+	Email        any
+	DisplayName  any
+	TokenDigest  any
+	ExpiresAt    any
+	IsAdmin      any
+	AuthorizedBy any
+	Expected     any
+	CreatedAt    any
+	UpdatedAt    any
+}
+
+func insertMigrationInvitation(ctx context.Context, database *sql.DB, row migrationInvitationRow) error {
+	_, err := database.ExecContext(ctx, `
+INSERT INTO invitations(
+  id,
+  status,
+  canonical_email,
+  display_name,
+  token_digest,
+  expires_at,
+  is_admin,
+  authorized_by_user_id,
+  expected_repository_grant_count,
+  created_at,
+  updated_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		row.ID,
+		row.Status,
+		row.Email,
+		row.DisplayName,
+		row.TokenDigest,
+		row.ExpiresAt,
+		row.IsAdmin,
+		row.AuthorizedBy,
+		row.Expected,
+		row.CreatedAt,
+		row.UpdatedAt,
+	)
+	return err
+}
+
+func testInvitationID(fill byte, final byte) string {
+	return "inv_" + strings.Repeat(string(fill), 21) + string(final)
 }
 
 func migrationIndex(t *testing.T, migrations []Migration, name string) int {

@@ -72,7 +72,7 @@ func activityFilterActions(filter string) []string {
 	case "repositories":
 		return activityActionsWithPrefix("repository.", "repository_grant.")
 	case "users":
-		return activityActionsWithPrefix("user.", "repository_grant.")
+		return activityActionsWithPrefix("user.", "invitation.", "repository_grant.")
 	default:
 		return nil
 	}

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -126,6 +127,83 @@ func TestCreateUserStartsWithZeroAccessAndValidatesDuplicates(t *testing.T) {
 	}
 	if _, err := service.CreateUser(ctx, CreateUserParams{ActorUserID: user.ID, Email: "blank@example.test", DisplayName: "Blank", Password: "correct horse battery staple"}); !IsValidationError(err) {
 		t.Fatalf("expected non-Admin actor rejection, got %v", err)
+	}
+}
+
+func TestCreateUserSerializationLockWaitsBeforeMutationTime(t *testing.T) {
+	ctx := context.Background()
+	database := newAuthTestDB(t, ctx)
+	service := NewService(database)
+	admin := mustCreateFirstAdmin(t, ctx, service)
+
+	blocker, err := database.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Rollback()
+	if _, err := blocker.ExecContext(ctx, `UPDATE users SET updated_at = updated_at WHERE id = ?`, admin.User.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	beforeLock := time.Date(2026, 7, 24, 10, 0, 0, 0, time.UTC)
+	afterLock := beforeLock.Add(time.Minute)
+	var clockNanos atomic.Int64
+	clockNanos.Store(beforeLock.UnixNano())
+	clockRead := make(chan struct{}, 1)
+	service.now = func() time.Time {
+		select {
+		case clockRead <- struct{}{}:
+		default:
+		}
+		return time.Unix(0, clockNanos.Load()).UTC()
+	}
+
+	type lockResult struct {
+		sampled time.Time
+		err     error
+	}
+	result := make(chan lockResult, 1)
+	go func() {
+		tx, err := database.BeginTx(ctx, nil)
+		if err != nil {
+			result <- lockResult{err: err}
+			return
+		}
+		defer tx.Rollback()
+		if err := service.lockEnabledAdminActor(ctx, tx, admin.User.ID); err != nil {
+			result <- lockResult{err: err}
+			return
+		}
+		sampled := service.now().UTC()
+		if err := tx.Commit(); err != nil {
+			result <- lockResult{err: err}
+			return
+		}
+		result <- lockResult{sampled: sampled}
+	}()
+
+	select {
+	case <-clockRead:
+		t.Fatal("mutation time was sampled before SQLite writer ownership")
+	case got := <-result:
+		t.Fatalf("controlled writer contention returned before release: %v", got.err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	clockNanos.Store(afterLock.UnixNano())
+	if err := blocker.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-result:
+		if got.err != nil {
+			t.Fatalf("expected contention released within BusyTimeout to succeed, got %v", got.err)
+		}
+		if !got.sampled.Equal(afterLock) {
+			t.Fatalf("expected post-lock mutation time %s, got %s", afterLock, got.sampled)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for identity-management writer lock")
 	}
 }
 

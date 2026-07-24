@@ -43,7 +43,7 @@ func (s *Service) SetUserAdmin(ctx context.Context, params SetUserAdminParams) (
 	}
 	defer tx.Rollback()
 
-	if err := s.requireEnabledAdminActor(ctx, tx, params.ActorUserID); err != nil {
+	if err := s.lockEnabledAdminActor(ctx, tx, params.ActorUserID); err != nil {
 		return User{}, err
 	}
 	record, err := s.userByID(ctx, tx, params.UserID)
@@ -69,6 +69,18 @@ VALUES (?, ?, ?)`, record.ID, RoleAdmin, nowText); err != nil {
 		}
 		if err := s.ensureEnabledAdminRemains(ctx, tx, "the final enabled admin must keep the admin role"); err != nil {
 			return User{}, err
+		}
+		if before {
+			if err := invalidateInvitationsAuthorizedBy(
+				ctx,
+				tx,
+				params.ActorUserID,
+				record.ID,
+				invitationRevocationAdminRemoved,
+				now,
+			); err != nil {
+				return User{}, err
+			}
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE users SET updated_at = ? WHERE id = ?`, nowText, record.ID); err != nil {
@@ -110,7 +122,7 @@ func (s *Service) DisableUser(ctx context.Context, actorUserID int64, userID int
 		return User{}, fmt.Errorf("begin user disable: %w", err)
 	}
 	defer tx.Rollback()
-	if err := s.requireEnabledAdminActor(ctx, tx, actorUserID); err != nil {
+	if err := s.lockEnabledAdminActor(ctx, tx, actorUserID); err != nil {
 		return User{}, err
 	}
 
@@ -131,6 +143,16 @@ func (s *Service) DisableUser(ctx context.Context, actorUserID int64, userID int
 		return User{}, fmt.Errorf("disable user: %w", err)
 	}
 	if err := s.ensureEnabledAdminRemains(ctx, tx, "the final enabled admin cannot be disabled"); err != nil {
+		return User{}, err
+	}
+	if err := invalidateInvitationsAuthorizedBy(
+		ctx,
+		tx,
+		actorUserID,
+		record.ID,
+		invitationRevocationAuthorizerDisabled,
+		now,
+	); err != nil {
 		return User{}, err
 	}
 	if err := deleteUserSessions(ctx, tx, record.ID); err != nil {
@@ -163,7 +185,7 @@ func (s *Service) EnableUser(ctx context.Context, actorUserID int64, userID int6
 		return User{}, fmt.Errorf("begin user enable: %w", err)
 	}
 	defer tx.Rollback()
-	if err := s.requireEnabledAdminActor(ctx, tx, actorUserID); err != nil {
+	if err := s.lockEnabledAdminActor(ctx, tx, actorUserID); err != nil {
 		return User{}, err
 	}
 

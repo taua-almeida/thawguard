@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -345,6 +346,10 @@ func TestScopedActionClassificationCoversEveryKnownAction(t *testing.T) {
 		"user.password_reset":                        adminOnly,
 		"user.password_recovery_issued":              adminOnly,
 		"user.password_recovery_completed":           adminOnly,
+		"invitation.created":                         adminOnly,
+		"invitation.reissued":                        adminOnly,
+		"invitation.cancelled":                       adminOnly,
+		"invitation.authorization_revoked":           adminOnly,
 	}
 
 	classified := map[string]string{}
@@ -390,6 +395,44 @@ func TestScopedActionClassificationCoversEveryKnownAction(t *testing.T) {
 	}
 }
 
+func TestScopedActionClassificationKeepsInvitationRepositorySpoofsAdminOnly(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	base := time.Date(2026, 7, 24, 10, 0, 0, 0, time.UTC)
+	for i, action := range []string{
+		ActionInvitationCreated,
+		ActionInvitationReissued,
+		ActionInvitationCancelled,
+		ActionInvitationAuthorizationRevoked,
+	} {
+		insertRawEvent(
+			t,
+			ctx,
+			store,
+			action,
+			SubjectTypeInvitation,
+			"inv_"+strings.Repeat(string(rune('A'+i)), 21)+"A",
+			`{"repository_id":"7"}`,
+			base.Add(time.Duration(i)*time.Second),
+		)
+	}
+
+	bounded, err := store.ListForScope(ctx, repositoryscope.IDs(7), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bounded) != 0 {
+		t.Fatalf("expected bounded repository scope to exclude invitation actions, got %+v", bounded)
+	}
+	unrestricted, err := store.List(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unrestricted) != 4 {
+		t.Fatalf("expected unrestricted Administrator scope to retain all invitation actions, got %d", len(unrestricted))
+	}
+}
+
 func TestListForScopeAssociationPrecedence(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t, ctx)
@@ -419,6 +462,7 @@ func TestListForScopeAssociationPrecedence(t *testing.T) {
 		{ActionThawExceptionApproved, SubjectTypeThawException, "3", `{"repository_id":"7"}`},                         // details-only family associates
 		{ActionThawExceptionSharedHeadApproved, SubjectTypeThawException, "9", `{"repository_id":"7"}`},               // shared-head subject id is not a repository
 		{ActionUserRolesUpdated, SubjectTypeUser, "7", `{"repository_id":"7"}`},                                       // user actions stay admin-only
+		{ActionInvitationCreated, SubjectTypeInvitation, "inv_AAAAAAAAAAAAAAAAAAAAAA", `{"repository_id":"7"}`},       // invitation actions stay admin-only
 		{"repository.future_action", SubjectTypeRepository, "7", `{"repository_id":"7"}`},                             // unknown action stays admin-only
 		{ActionRepositoryWebhookSecretConfigured, SubjectTypeSchedule, "7", `{"repository_id":"7"}`},                  // subject mismatch stays admin-only
 	}

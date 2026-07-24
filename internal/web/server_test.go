@@ -2922,6 +2922,7 @@ func TestActivityMappingsCoverEveryKnownAuditAction(t *testing.T) {
 func TestActivityMappingCoversCurrentFamilies(t *testing.T) {
 	repositories := map[int64]domain.Repository{1: {ID: 1, Owner: "taua-almeida", Name: "thawguard"}}
 	users := map[int64]auth.User{42: {ID: 42, DisplayName: "Ada Operator"}}
+	invitationID := "inv_" + strings.Repeat("A", 22)
 	cases := []struct {
 		name        string
 		action      string
@@ -2968,6 +2969,10 @@ func TestActivityMappingCoversCurrentFamilies(t *testing.T) {
 		{name: "password reset", action: audit.ActionUserPasswordReset, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{}`, outcome: "Reset", contains: []string{"required at next login"}},
 		{name: "password recovery issued", action: audit.ActionUserPasswordRecoveryIssued, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"expires_at":"2026-07-23T11:00:00Z"}`, outcome: "Issued", contains: []string{"Ada Operator (User #42)", "any earlier link is invalid", "2026-07-23 11:00 UTC"}},
 		{name: "password recovery completed", action: audit.ActionUserPasswordRecoveryCompleted, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"recovery_link"}`, outcome: "Completed", contains: []string{"Ada Operator (User #42)", "forced-password state cleared", "sessions revoked"}},
+		{name: "invitation created", action: audit.ActionInvitationCreated, subjectType: audit.SubjectTypeInvitation, subjectID: invitationID, details: `{"expires_at":"2026-07-31T11:00:00Z","administrator":"true","repository_grant_count":"2"}`, outcome: "Created", contains: []string{"Invitation " + invitationID, "Credential issued", "2026-07-31 11:00 UTC"}},
+		{name: "invitation reissued", action: audit.ActionInvitationReissued, subjectType: audit.SubjectTypeInvitation, subjectID: invitationID, details: `{"expires_at":"2026-08-01T11:00:00Z","administrator_before":"true","administrator_after":"false"}`, outcome: "Reissued", contains: []string{"Invitation " + invitationID, "Credential reissued", "2026-08-01 11:00 UTC"}},
+		{name: "invitation cancelled", action: audit.ActionInvitationCancelled, subjectType: audit.SubjectTypeInvitation, subjectID: invitationID, details: `{}`, outcome: "Cancelled", contains: []string{"Invitation " + invitationID, "staged identity and credential redacted"}},
+		{name: "invitation authorization revoked", action: audit.ActionInvitationAuthorizationRevoked, subjectType: audit.SubjectTypeInvitation, subjectID: invitationID, details: `{"reason":"authorizer_disabled"}`, outcome: "Revoked", contains: []string{"Invitation " + invitationID, "authorizing Administrator was disabled"}},
 		{name: "repository grant added", action: audit.ActionRepositoryGrantAdded, subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"user_id":"42","role":"freezer"}`, outcome: "Granted", contains: []string{"taua-almeida/thawguard", "Freezer role granted to Ada Operator (User #42)"}},
 		{name: "repository grant revoked", action: audit.ActionRepositoryGrantRevoked, subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"user_id":"42","role":"viewer"}`, outcome: "Revoked", contains: []string{"taua-almeida/thawguard", "Viewer role revoked from Ada Operator (User #42)"}},
 	}
@@ -2984,6 +2989,69 @@ func TestActivityMappingCoversCurrentFamilies(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestActivityInvitationTargetsAndDetailsFailSafely(t *testing.T) {
+	invitationID := "inv_" + strings.Repeat("A", 22)
+	malformedID := "inv_" + strings.Repeat("A", 21) + "E"
+	for _, testCase := range []struct {
+		name        string
+		subjectType string
+		subjectID   string
+		wantTarget  string
+	}{
+		{name: "canonical", subjectType: audit.SubjectTypeInvitation, subjectID: invitationID, wantTarget: "Invitation " + invitationID},
+		{name: "malformed subject", subjectType: audit.SubjectTypeInvitation, subjectID: malformedID, wantTarget: "Invitation unavailable"},
+		{name: "wrong subject type", subjectType: audit.SubjectTypeUser, subjectID: invitationID, wantTarget: "Invitation unavailable"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			view := activityEventViewForEvent(nil, nil, audit.Event{
+				Action:      audit.ActionInvitationCreated,
+				SubjectType: testCase.subjectType,
+				SubjectID:   testCase.subjectID,
+				DetailsJSON: `{"expires_at":"2026-07-31T11:00:00Z"}`,
+			})
+			if view.Target != testCase.wantTarget {
+				t.Fatalf("unexpected invitation target: got %q want %q", view.Target, testCase.wantTarget)
+			}
+		})
+	}
+
+	secretDetails := `{"expires_at":"2026-07-31T11:00:00Z","reason":"authorizer_admin_removed","email":"secret-email-canary","display_name":"secret-name-canary","token":"secret-token-canary","token_digest":"secret-digest-canary","link":"secret-link-canary","password":"secret-password-canary","password_hash":"secret-hash-canary","repository_id":"7"}`
+	for _, action := range []string{
+		audit.ActionInvitationCreated,
+		audit.ActionInvitationReissued,
+		audit.ActionInvitationCancelled,
+		audit.ActionInvitationAuthorizationRevoked,
+	} {
+		view := activityEventViewForEvent(nil, nil, audit.Event{
+			Action:      action,
+			SubjectType: audit.SubjectTypeInvitation,
+			SubjectID:   invitationID,
+			DetailsJSON: secretDetails,
+		})
+		visible := view.ActionLabel + " " + view.Target + " " + view.Outcome + " " + view.Detail
+		for _, canary := range []string{
+			"secret-email-canary",
+			"secret-name-canary",
+			"secret-token-canary",
+			"secret-digest-canary",
+			"secret-link-canary",
+			"secret-password-canary",
+			"secret-hash-canary",
+			"repository_id",
+		} {
+			if strings.Contains(visible, canary) {
+				t.Fatalf("invitation activity %q leaked %q in %q", action, canary, visible)
+			}
+		}
+		lower := strings.ToLower(visible)
+		for _, unsupported := range []string{"sent", "emailed", "delivered", "accepted", "account created"} {
+			if strings.Contains(lower, unsupported) {
+				t.Fatalf("invitation activity %q made unsupported claim %q in %q", action, unsupported, visible)
+			}
+		}
 	}
 }
 
@@ -3110,7 +3178,7 @@ func TestActivityFilterActionsGroupKnownActions(t *testing.T) {
 	prefixes := map[string][]string{
 		"freeze":       {"branch_freeze.", "freeze_schedule.", "schedule.", "thaw_exception."},
 		"repositories": {"repository.", "repository_grant."},
-		"users":        {"user.", "repository_grant."},
+		"users":        {"user.", "invitation.", "repository_grant."},
 	}
 	for filter, allowed := range prefixes {
 		actions := activityFilterActions(filter)
@@ -3127,6 +3195,17 @@ func TestActivityFilterActionsGroupKnownActions(t *testing.T) {
 			if !matched {
 				t.Fatalf("%s chip includes out-of-family action %q", filter, action)
 			}
+		}
+	}
+	users := activityFilterActions("users")
+	for _, action := range []string{
+		audit.ActionInvitationCreated,
+		audit.ActionInvitationReissued,
+		audit.ActionInvitationCancelled,
+		audit.ActionInvitationAuthorizationRevoked,
+	} {
+		if !slices.Contains(users, action) {
+			t.Fatalf("users chip is missing invitation action %q", action)
 		}
 	}
 }

@@ -62,6 +62,10 @@ const (
 	ActionUserPasswordReset                  = "user.password_reset"
 	ActionUserPasswordRecoveryIssued         = "user.password_recovery_issued"
 	ActionUserPasswordRecoveryCompleted      = "user.password_recovery_completed"
+	ActionInvitationCreated                  = "invitation.created"
+	ActionInvitationReissued                 = "invitation.reissued"
+	ActionInvitationCancelled                = "invitation.cancelled"
+	ActionInvitationAuthorizationRevoked     = "invitation.authorization_revoked"
 
 	ActorKindPasswordRecoveryLink = "recovery_link"
 
@@ -70,6 +74,7 @@ const (
 	SubjectTypeBranchFreeze  = "branch_freeze"
 	SubjectTypeThawException = "thaw_exception"
 	SubjectTypeUser          = "user"
+	SubjectTypeInvitation    = "invitation"
 )
 
 // KnownActions returns every audit action the application currently writes.
@@ -126,6 +131,10 @@ func KnownActions() []string {
 		ActionUserPasswordReset,
 		ActionUserPasswordRecoveryIssued,
 		ActionUserPasswordRecoveryCompleted,
+		ActionInvitationCreated,
+		ActionInvitationReissued,
+		ActionInvitationCancelled,
+		ActionInvitationAuthorizationRevoked,
 	}
 }
 
@@ -205,8 +214,9 @@ var thawExceptionSubjectActions = []string{
 	ActionThawExceptionSharedHeadApproved,
 }
 
-// User actions are deliberately absent from every family: account
-// administration stays admin-only even when details carry a repository_id.
+// User and invitation actions are deliberately absent from every family:
+// identity administration stays admin-only even when details carry a
+// repository_id.
 
 // scopedAuditEventsSQL derives a nullable associated_repository_id for
 // every audit event entirely inside SQL, so read scopes filter before

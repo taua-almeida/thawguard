@@ -2148,6 +2148,10 @@ var activityActionDefinitions = map[string]activityActionDefinition{
 	audit.ActionUserPasswordReset:                  {Label: "User password", Outcome: "Reset", OutcomeClass: "warning"},
 	audit.ActionUserPasswordRecoveryIssued:         {Label: "Password recovery", Outcome: "Issued", OutcomeClass: "warning"},
 	audit.ActionUserPasswordRecoveryCompleted:      {Label: "Password recovery", Outcome: "Completed", OutcomeClass: "ok"},
+	audit.ActionInvitationCreated:                  {Label: "Invitation", Outcome: "Created", OutcomeClass: "ok"},
+	audit.ActionInvitationReissued:                 {Label: "Invitation credential", Outcome: "Reissued", OutcomeClass: "warning"},
+	audit.ActionInvitationCancelled:                {Label: "Invitation", Outcome: "Cancelled", OutcomeClass: "warning"},
+	audit.ActionInvitationAuthorizationRevoked:     {Label: "Invitation credential", Outcome: "Revoked", OutcomeClass: "warning"},
 }
 
 func activityEventViews(repositories []domain.Repository, users []auth.User, events []audit.Event) []activityEventView {
@@ -2281,6 +2285,18 @@ func activityEventViewForEvent(repositories map[int64]domain.Repository, users m
 	case audit.ActionUserPasswordRecoveryCompleted:
 		view.Target = activityUserTarget(users, event.SubjectID)
 		view.Detail = "Password recovered with a bearer link; forced-password state cleared and all sessions revoked."
+	case audit.ActionInvitationCreated:
+		view.Target = activityInvitationTarget(event)
+		view.Detail = "Credential issued; expires " + activityTimeOrUnavailable(details, "expires_at", false) + "."
+	case audit.ActionInvitationReissued:
+		view.Target = activityInvitationTarget(event)
+		view.Detail = "Credential reissued; expires " + activityTimeOrUnavailable(details, "expires_at", false) + "."
+	case audit.ActionInvitationCancelled:
+		view.Target = activityInvitationTarget(event)
+		view.Detail = "Invitation cancelled; staged identity and credential redacted."
+	case audit.ActionInvitationAuthorizationRevoked:
+		view.Target = activityInvitationTarget(event)
+		view.Detail = activityInvitationAuthorizationRevokedDetail(details)
 	case audit.ActionRepositoryGrantAdded:
 		view.Target = activityRepositoryTarget(repositories, event, details, "")
 		view.Detail = activityRolesOrUnavailable(details, "role") + " role granted to " + activityUserTarget(users, activityTextOrUnavailable(details, "user_id", 20)) + "."
@@ -2429,7 +2445,29 @@ func activityUserTarget(users map[int64]auth.User, subjectID string) string {
 	return "User #" + strconv.FormatInt(userID, 10)
 }
 
+func activityInvitationTarget(event audit.Event) string {
+	if event.SubjectType != audit.SubjectTypeInvitation || !auth.ValidInvitationID(event.SubjectID) {
+		return "Invitation unavailable"
+	}
+	return "Invitation " + event.SubjectID
+}
+
+func activityInvitationAuthorizationRevokedDetail(details activityDetails) string {
+	reason, _ := activityTextDetail(details, "reason", 64)
+	switch reason {
+	case "authorizer_disabled":
+		return "Credential invalidated because its authorizing Administrator was disabled."
+	case "authorizer_admin_removed":
+		return "Credential invalidated because its authorizer is no longer an Administrator."
+	default:
+		return "Credential invalidated because its authorizer lost authority."
+	}
+}
+
 func activityFallbackTarget(event audit.Event) string {
+	if event.SubjectType == audit.SubjectTypeInvitation {
+		return activityInvitationTarget(event)
+	}
 	id, err := strconv.ParseInt(strings.TrimSpace(event.SubjectID), 10, 64)
 	if err != nil || id <= 0 {
 		switch event.SubjectType {

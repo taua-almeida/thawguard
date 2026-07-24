@@ -162,8 +162,15 @@ func (s *Service) CreateUser(ctx context.Context, params CreateUserParams) (User
 		return User{}, fmt.Errorf("begin create user: %w", err)
 	}
 	defer tx.Rollback()
-	if err := s.requireEnabledAdminActor(ctx, tx, params.ActorUserID); err != nil {
+	if err := s.lockEnabledAdminActor(ctx, tx, params.ActorUserID); err != nil {
 		return User{}, err
+	}
+	reserved, err := activeInvitationEmailExists(ctx, tx, params.Email)
+	if err != nil {
+		return User{}, err
+	}
+	if reserved {
+		return User{}, ValidationError{Message: "email is reserved by an active invitation"}
 	}
 	user, err := s.insertUser(ctx, tx, params, passwordHash, true, false)
 	if err != nil {
@@ -301,6 +308,16 @@ type queryer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// lockEnabledAdminActor makes a no-op write before any identity-management
+// read. SQLite deferred transactions then own the writer slot before actor or
+// identity state is observed and before mutation time is sampled.
+func (s *Service) lockEnabledAdminActor(ctx context.Context, tx *sql.Tx, actorUserID int64) error {
+	if _, err := tx.ExecContext(ctx, `UPDATE users SET updated_at = updated_at WHERE id = ?`, actorUserID); err != nil {
+		return fmt.Errorf("lock identity-management actor: %w", err)
+	}
+	return s.requireEnabledAdminActor(ctx, tx, actorUserID)
 }
 
 type scanner interface {
@@ -562,20 +579,27 @@ func normalizeEmail(email string) string {
 }
 
 func validateLocalUserParams(params CreateUserParams) error {
-	if params.Email == "" {
-		return ValidationError{Message: "email is required"}
-	}
-	if len(params.Email) > 254 || !strings.Contains(params.Email, "@") {
-		return ValidationError{Message: "email must be valid"}
-	}
-	if params.DisplayName == "" {
-		return ValidationError{Message: "display name is required"}
-	}
-	if len(params.DisplayName) > 120 {
-		return ValidationError{Message: "display name is too long"}
+	if err := validateLocalIdentity(params.Email, params.DisplayName); err != nil {
+		return err
 	}
 	if err := validatePassword(params.Password); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateLocalIdentity(email, displayName string) error {
+	if email == "" {
+		return ValidationError{Message: "email is required"}
+	}
+	if len(email) > 254 || !strings.Contains(email, "@") {
+		return ValidationError{Message: "email must be valid"}
+	}
+	if displayName == "" {
+		return ValidationError{Message: "display name is required"}
+	}
+	if len(displayName) > 120 {
+		return ValidationError{Message: "display name is too long"}
 	}
 	return nil
 }
