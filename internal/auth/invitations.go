@@ -62,6 +62,21 @@ type InvitationCredential struct {
 	ExpiresAt    time.Time
 }
 
+// InvalidInvitationError hides whether an invitation bearer or its current
+// lifecycle state caused an expected acceptance rejection.
+type InvalidInvitationError struct{}
+
+func (InvalidInvitationError) Error() string {
+	return "invitation is invalid or expired"
+}
+
+// IsInvalidInvitation reports whether acceptance failed through the generic
+// invitation rejection contract.
+func IsInvalidInvitation(err error) bool {
+	var invitationErr InvalidInvitationError
+	return errors.As(err, &invitationErr)
+}
+
 // ValidInvitationID reports whether id is the canonical inv_ encoding of
 // exactly 16 bytes.
 func ValidInvitationID(id string) bool {
@@ -331,6 +346,404 @@ WHERE id = ?
 		return fmt.Errorf("commit invitation cancellation: %w", err)
 	}
 	return nil
+}
+
+// AcceptInvitation atomically creates a local-password user and materializes
+// the identity and authority staged on a currently valid invitation. It does
+// not create a session.
+func (s *Service) AcceptInvitation(ctx context.Context, token, password string) (User, error) {
+	if s == nil || s.db == nil {
+		return User{}, errors.New("auth service has no database")
+	}
+	digest, ok := invitationBearerDigest(token)
+	if !ok {
+		return User{}, InvalidInvitationError{}
+	}
+	if err := s.preflightInvitationAcceptance(ctx, digest, s.now().UTC()); err != nil {
+		return User{}, err
+	}
+	if err := validatePassword(password); err != nil {
+		return User{}, err
+	}
+	passwordHash, err := HashPassword(password)
+	if err != nil {
+		return User{}, fmt.Errorf("hash invitation password: %w", err)
+	}
+	return s.commitInvitationAcceptance(ctx, digest, passwordHash)
+}
+
+type acceptanceInvitation struct {
+	ID                 string
+	CanonicalEmail     string
+	DisplayName        string
+	ExpiresAt          int64
+	IsAdmin            int64
+	AuthorizedBy       sql.NullInt64
+	ExpectedGrantCount int64
+}
+
+func (s *Service) preflightInvitationAcceptance(
+	ctx context.Context,
+	digest [sha256.Size]byte,
+	now time.Time,
+) error {
+	invitation, err := loadAcceptanceInvitation(ctx, s.db, digest)
+	if err != nil {
+		return err
+	}
+	_, err = validateAcceptanceInvitation(ctx, s.db, invitation, now)
+	return err
+}
+
+func (s *Service) commitInvitationAcceptance(
+	ctx context.Context,
+	digest [sha256.Size]byte,
+	passwordHash string,
+) (User, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return User{}, fmt.Errorf("begin invitation acceptance: %w", err)
+	}
+	defer tx.Rollback()
+
+	// BeginTx is deferred in SQLite. This digest-guarded no-op is deliberately
+	// the first write so every final read and the final clock sample happen
+	// after this transaction owns the writer slot.
+	result, err := tx.ExecContext(ctx, `
+UPDATE invitations
+SET status = status
+WHERE token_digest = ?
+  AND status = ?`, digest[:], invitationStatusPending)
+	if err != nil {
+		return User{}, fmt.Errorf("claim invitation for acceptance: %w", err)
+	}
+	claimed, err := result.RowsAffected()
+	if err != nil {
+		return User{}, fmt.Errorf("count claimed invitations: %w", err)
+	}
+	if claimed == 0 {
+		return User{}, InvalidInvitationError{}
+	}
+	if claimed != 1 {
+		return User{}, fmt.Errorf("claim invitation affected %d rows", claimed)
+	}
+
+	now := s.now().UTC()
+	invitation, err := loadAcceptanceInvitation(ctx, tx, digest)
+	if err != nil {
+		return User{}, err
+	}
+	grants, err := validateAcceptanceInvitation(ctx, tx, invitation, now)
+	if err != nil {
+		return User{}, err
+	}
+
+	user, err := s.insertUser(ctx, tx, CreateUserParams{
+		Email:       invitation.CanonicalEmail,
+		DisplayName: invitation.DisplayName,
+	}, passwordHash, false, invitation.IsAdmin != 0)
+	if err != nil {
+		if IsValidationError(err) {
+			return User{}, InvalidInvitationError{}
+		}
+		return User{}, fmt.Errorf("create invited user: %w", err)
+	}
+	if err := insertAcceptedRepositoryGrants(ctx, tx, user.ID, invitation.AuthorizedBy.Int64, grants, now); err != nil {
+		return User{}, err
+	}
+
+	result, err = tx.ExecContext(ctx, `
+UPDATE invitations
+SET status = ?,
+    canonical_email = NULL,
+    display_name = NULL,
+    token_digest = NULL,
+    expires_at = NULL,
+    is_admin = NULL,
+    authorized_by_user_id = NULL,
+    expected_repository_grant_count = NULL,
+    updated_at = ?
+WHERE id = ?
+  AND token_digest = ?
+  AND status = ?`,
+		invitationStatusAccepted,
+		now.Format(time.RFC3339Nano),
+		invitation.ID,
+		digest[:],
+		invitationStatusPending,
+	)
+	if err != nil {
+		return User{}, fmt.Errorf("redact accepted invitation: %w", err)
+	}
+	transitioned, err := result.RowsAffected()
+	if err != nil {
+		return User{}, fmt.Errorf("count accepted invitation transitions: %w", err)
+	}
+	if transitioned == 0 {
+		return User{}, InvalidInvitationError{}
+	}
+	if transitioned != 1 {
+		return User{}, fmt.Errorf("accept invitation affected %d rows", transitioned)
+	}
+
+	result, err = tx.ExecContext(ctx, `DELETE FROM invitation_repository_grants WHERE invitation_id = ?`, invitation.ID)
+	if err != nil {
+		return User{}, fmt.Errorf("delete accepted invitation repository grants: %w", err)
+	}
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return User{}, fmt.Errorf("count deleted invitation repository grants: %w", err)
+	}
+	if deleted != int64(len(grants)) {
+		return User{}, InvalidInvitationError{}
+	}
+	if err := recordInvitationAcceptanceAudits(ctx, tx, invitation, user, grants); err != nil {
+		return User{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return User{}, fmt.Errorf("commit invitation acceptance: %w", err)
+	}
+	return user, nil
+}
+
+func loadAcceptanceInvitation(
+	ctx context.Context,
+	q queryer,
+	digest [sha256.Size]byte,
+) (acceptanceInvitation, error) {
+	var invitation acceptanceInvitation
+	err := q.QueryRowContext(ctx, `
+SELECT
+  id,
+  canonical_email,
+  display_name,
+  expires_at,
+  is_admin,
+  authorized_by_user_id,
+  expected_repository_grant_count
+FROM invitations
+WHERE token_digest = ?
+  AND status = ?`, digest[:], invitationStatusPending).Scan(
+		&invitation.ID,
+		&invitation.CanonicalEmail,
+		&invitation.DisplayName,
+		&invitation.ExpiresAt,
+		&invitation.IsAdmin,
+		&invitation.AuthorizedBy,
+		&invitation.ExpectedGrantCount,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return acceptanceInvitation{}, InvalidInvitationError{}
+	}
+	if err != nil {
+		return acceptanceInvitation{}, fmt.Errorf("load invitation for acceptance: %w", err)
+	}
+	return invitation, nil
+}
+
+func validateAcceptanceInvitation(
+	ctx context.Context,
+	q queryer,
+	invitation acceptanceInvitation,
+	now time.Time,
+) ([]InvitationRepositoryGrant, error) {
+	if !ValidInvitationID(invitation.ID) ||
+		invitation.CanonicalEmail != normalizeEmail(invitation.CanonicalEmail) ||
+		invitation.DisplayName != strings.TrimSpace(invitation.DisplayName) ||
+		validateLocalIdentity(invitation.CanonicalEmail, invitation.DisplayName) != nil ||
+		invitation.ExpiresAt <= now.UTC().UnixNano() ||
+		(invitation.IsAdmin != 0 && invitation.IsAdmin != 1) ||
+		!invitation.AuthorizedBy.Valid || invitation.AuthorizedBy.Int64 <= 0 ||
+		invitation.ExpectedGrantCount < 0 {
+		return nil, InvalidInvitationError{}
+	}
+
+	var authorizerEligible int
+	if err := q.QueryRowContext(ctx, `
+SELECT EXISTS (
+  SELECT 1
+  FROM users u
+  JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'admin'
+  WHERE u.id = ?
+    AND u.disabled_at IS NULL
+)`, invitation.AuthorizedBy.Int64).Scan(&authorizerEligible); err != nil {
+		return nil, fmt.Errorf("check invitation authorizer: %w", err)
+	}
+	if authorizerEligible == 0 {
+		return nil, InvalidInvitationError{}
+	}
+
+	var emailCollision int
+	if err := q.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM users WHERE email = ?)`, invitation.CanonicalEmail).Scan(&emailCollision); err != nil {
+		return nil, fmt.Errorf("check invited user collision: %w", err)
+	}
+	if emailCollision != 0 {
+		return nil, InvalidInvitationError{}
+	}
+
+	grants, err := loadAcceptanceRepositoryGrants(ctx, q, invitation.ID)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(grants)) != invitation.ExpectedGrantCount {
+		return nil, InvalidInvitationError{}
+	}
+	return grants, nil
+}
+
+func loadAcceptanceRepositoryGrants(
+	ctx context.Context,
+	q queryer,
+	invitationID string,
+) ([]InvitationRepositoryGrant, error) {
+	rows, err := q.QueryContext(ctx, `
+SELECT staged.repository_id, staged.role, repositories.id
+FROM invitation_repository_grants staged
+LEFT JOIN repositories ON repositories.id = staged.repository_id
+WHERE staged.invitation_id = ?
+ORDER BY staged.repository_id, staged.role`, invitationID)
+	if err != nil {
+		return nil, fmt.Errorf("load invitation repository grants for acceptance: %w", err)
+	}
+	defer rows.Close()
+
+	grants := make([]InvitationRepositoryGrant, 0)
+	for rows.Next() {
+		var grant InvitationRepositoryGrant
+		var repositoryID sql.NullInt64
+		if err := rows.Scan(&grant.RepositoryID, &grant.Role, &repositoryID); err != nil {
+			return nil, fmt.Errorf("scan invitation repository grant for acceptance: %w", err)
+		}
+		if !repositoryID.Valid || repositoryID.Int64 != grant.RepositoryID || !grant.Role.ValidForRepository() {
+			return nil, InvalidInvitationError{}
+		}
+		grants = append(grants, grant)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("load invitation repository grant rows for acceptance: %w", err)
+	}
+	return grants, nil
+}
+
+func insertAcceptedRepositoryGrants(
+	ctx context.Context,
+	tx *sql.Tx,
+	userID int64,
+	authorizerUserID int64,
+	grants []InvitationRepositoryGrant,
+	grantedAt time.Time,
+) error {
+	for _, grant := range grants {
+		result, err := tx.ExecContext(ctx, `
+INSERT INTO repository_grants(repository_id, user_id, role, granted_by_user_id, granted_at)
+VALUES (?, ?, ?, ?, ?)`,
+			grant.RepositoryID,
+			userID,
+			grant.Role,
+			authorizerUserID,
+			grantedAt.UTC().Format(time.RFC3339Nano),
+		)
+		if err != nil {
+			return fmt.Errorf("materialize invitation repository grant: %w", err)
+		}
+		inserted, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("count materialized invitation repository grants: %w", err)
+		}
+		if inserted != 1 {
+			return InvalidInvitationError{}
+		}
+	}
+	return nil
+}
+
+func recordInvitationAcceptanceAudits(
+	ctx context.Context,
+	tx *sql.Tx,
+	invitation acceptanceInvitation,
+	user User,
+	grants []InvitationRepositoryGrant,
+) error {
+	store := audit.NewStoreTx(tx)
+	userID := strconv.FormatInt(user.ID, 10)
+	acceptedDetails, err := json.Marshal(map[string]string{
+		"accepted_user_id": userID,
+		"actor_kind":       audit.ActorKindInvitationLink,
+	})
+	if err != nil {
+		return fmt.Errorf("encode invitation acceptance audit details: %w", err)
+	}
+	if err := store.Record(ctx, audit.Event{
+		Action:      audit.ActionInvitationAccepted,
+		SubjectType: audit.SubjectTypeInvitation,
+		SubjectID:   invitation.ID,
+		DetailsJSON: string(acceptedDetails),
+	}); err != nil {
+		return fmt.Errorf("record invitation acceptance audit event: %w", err)
+	}
+
+	createdDetails, err := json.Marshal(map[string]string{
+		"actor_kind": audit.ActorKindInvitationLink,
+		"onboarding": "invitation",
+		"sign_in":    "password",
+	})
+	if err != nil {
+		return fmt.Errorf("encode invited user creation audit details: %w", err)
+	}
+	if err := store.Record(ctx, audit.Event{
+		Action:      audit.ActionUserCreated,
+		SubjectType: audit.SubjectTypeUser,
+		SubjectID:   userID,
+		DetailsJSON: string(createdDetails),
+	}); err != nil {
+		return fmt.Errorf("record invited user creation audit event: %w", err)
+	}
+
+	authorizerUserID := invitation.AuthorizedBy.Int64
+	if invitation.IsAdmin != 0 {
+		event := userAuditEvent(audit.ActionUserRolesUpdated, authorizerUserID, user.ID, map[string]string{
+			"provenance":   "invitation_acceptance",
+			"roles_after":  "admin",
+			"roles_before": "none",
+		})
+		if err := store.Record(ctx, event); err != nil {
+			return fmt.Errorf("record accepted Admin audit event: %w", err)
+		}
+	}
+
+	for _, grant := range grants {
+		grantDetails, err := json.Marshal(map[string]string{
+			"actor_kind": "user",
+			"provenance": "invitation_acceptance",
+			"role":       string(grant.Role),
+			"user_id":    userID,
+		})
+		if err != nil {
+			return fmt.Errorf("encode accepted repository grant audit details: %w", err)
+		}
+		actor := authorizerUserID
+		if err := store.Record(ctx, audit.Event{
+			ActorUserID: &actor,
+			Action:      audit.ActionRepositoryGrantAdded,
+			SubjectType: audit.SubjectTypeRepository,
+			SubjectID:   strconv.FormatInt(grant.RepositoryID, 10),
+			DetailsJSON: string(grantDetails),
+		}); err != nil {
+			return fmt.Errorf("record accepted repository grant audit event: %w", err)
+		}
+	}
+	return nil
+}
+
+func invitationBearerDigest(token string) ([sha256.Size]byte, bool) {
+	if len(token) != base64.RawURLEncoding.EncodedLen(invitationBearerBytes) {
+		return [sha256.Size]byte{}, false
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil || len(raw) != invitationBearerBytes || base64.RawURLEncoding.EncodeToString(raw) != token {
+		return [sha256.Size]byte{}, false
+	}
+	return sha256.Sum256([]byte(token)), true
 }
 
 type managedInvitation struct {

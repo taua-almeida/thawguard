@@ -350,6 +350,7 @@ func TestScopedActionClassificationCoversEveryKnownAction(t *testing.T) {
 		"invitation.reissued":                        adminOnly,
 		"invitation.cancelled":                       adminOnly,
 		"invitation.authorization_revoked":           adminOnly,
+		"invitation.accepted":                        adminOnly,
 	}
 
 	classified := map[string]string{}
@@ -404,6 +405,7 @@ func TestScopedActionClassificationKeepsInvitationRepositorySpoofsAdminOnly(t *t
 		ActionInvitationReissued,
 		ActionInvitationCancelled,
 		ActionInvitationAuthorizationRevoked,
+		ActionInvitationAccepted,
 	} {
 		insertRawEvent(
 			t,
@@ -428,8 +430,77 @@ func TestScopedActionClassificationKeepsInvitationRepositorySpoofsAdminOnly(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(unrestricted) != 4 {
+	if len(unrestricted) != 5 {
 		t.Fatalf("expected unrestricted Administrator scope to retain all invitation actions, got %d", len(unrestricted))
+	}
+}
+
+func TestInvitationAcceptanceAuditVisibilityStaysSubjectDriven(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	base := time.Date(2026, 7, 25, 10, 0, 0, 0, time.UTC)
+	invitationID := "inv_" + strings.Repeat("A", 22)
+	insertRawEvent(
+		t,
+		ctx,
+		store,
+		ActionInvitationAccepted,
+		SubjectTypeInvitation,
+		invitationID,
+		`{"actor_kind":"invitation_link","accepted_user_id":"42","repository_id":"7"}`,
+		base,
+	)
+	insertRawEvent(
+		t,
+		ctx,
+		store,
+		ActionUserCreated,
+		SubjectTypeUser,
+		"42",
+		`{"actor_kind":"invitation_link","onboarding":"invitation","sign_in":"password","repository_id":"7"}`,
+		base.Add(time.Second),
+	)
+	insertRawEvent(
+		t,
+		ctx,
+		store,
+		ActionRepositoryGrantAdded,
+		SubjectTypeRepository,
+		"7",
+		`{"actor_kind":"user","provenance":"invitation_acceptance","user_id":"42","role":"viewer"}`,
+		base.Add(2*time.Second),
+	)
+	insertRawEvent(
+		t,
+		ctx,
+		store,
+		ActionRepositoryGrantAdded,
+		SubjectTypeRepository,
+		"8",
+		`{"actor_kind":"user","provenance":"invitation_acceptance","user_id":"42","role":"freezer"}`,
+		base.Add(3*time.Second),
+	)
+
+	repositorySeven, err := store.ListForScope(ctx, repositoryscope.IDs(7), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repositorySeven) != 1 || repositorySeven[0].Action != ActionRepositoryGrantAdded || repositorySeven[0].SubjectID != "7" {
+		t.Fatalf("repository 7 scope leaked identity or another repository event: %+v", repositorySeven)
+	}
+	repositoryEight, err := store.ListForScope(ctx, repositoryscope.IDs(8), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repositoryEight) != 1 || repositoryEight[0].Action != ActionRepositoryGrantAdded || repositoryEight[0].SubjectID != "8" {
+		t.Fatalf("repository 8 scope leaked identity or another repository event: %+v", repositoryEight)
+	}
+	all, err := store.List(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 4 {
+		t.Fatalf("Administrator scope lost acceptance audit events: %+v", all)
 	}
 }
 

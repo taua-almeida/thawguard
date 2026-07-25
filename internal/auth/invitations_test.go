@@ -1363,7 +1363,7 @@ func assertInvitationAuditSecretsAbsent(t *testing.T, details map[string]string,
 		t.Fatal(err)
 	}
 	visible := string(encoded)
-	for _, secret := range append(secrets, "password", "password_hash", "token_digest", "invitation_link") {
+	for _, secret := range append(secrets, "password", "password_hash", "token_digest") {
 		if secret != "" && strings.Contains(visible, secret) {
 			t.Fatalf("invitation audit leaked %q in %s", secret, visible)
 		}

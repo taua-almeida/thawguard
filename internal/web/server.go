@@ -2152,6 +2152,7 @@ var activityActionDefinitions = map[string]activityActionDefinition{
 	audit.ActionInvitationReissued:                 {Label: "Invitation credential", Outcome: "Reissued", OutcomeClass: "warning"},
 	audit.ActionInvitationCancelled:                {Label: "Invitation", Outcome: "Cancelled", OutcomeClass: "warning"},
 	audit.ActionInvitationAuthorizationRevoked:     {Label: "Invitation credential", Outcome: "Revoked", OutcomeClass: "warning"},
+	audit.ActionInvitationAccepted:                 {Label: "Invitation", Outcome: "Accepted", OutcomeClass: "ok"},
 }
 
 func activityEventViews(repositories []domain.Repository, users []auth.User, events []audit.Event) []activityEventView {
@@ -2170,13 +2171,22 @@ func activityEventViews(repositories []domain.Repository, users []auth.User, eve
 func activityEventViewForEvent(repositories map[int64]domain.Repository, users map[int64]auth.User, event audit.Event) activityEventView {
 	details, detailsOK := parseActivityDetails(event.DetailsJSON)
 	definition, actionOK := activityActionDefinitions[event.Action]
+	forceUnknownInvitationActor := event.Action == audit.ActionInvitationAccepted || event.Action == audit.ActionUserCreated
 	if !detailsOK || !actionOK {
-		return fallbackActivityEventView(users, event, details, detailsOK)
+		return fallbackActivityEventView(users, event, details, detailsOK, forceUnknownInvitationActor)
 	}
+	if activityHasDuplicateAcceptanceDetails(event.Action, event.DetailsJSON) {
+		return fallbackActivityEventView(users, event, details, true, forceUnknownInvitationActor)
+	}
+	if !activityInvitationAcceptanceDetailsValid(event, details) {
+		return fallbackActivityEventView(users, event, details, true, forceUnknownInvitationActor)
+	}
+	allowInvitationLinkActor := event.Action == audit.ActionInvitationAccepted ||
+		(event.Action == audit.ActionUserCreated && activityExactStringDetailEquals(details, "onboarding", "invitation"))
 
 	view := activityEventView{
 		CreatedAt:    activityCreatedAt(event.CreatedAt),
-		Actor:        activityActor(users, event, details),
+		Actor:        activityActor(users, event, details, allowInvitationLinkActor),
 		ActionLabel:  definition.Label,
 		Outcome:      definition.Outcome,
 		OutcomeClass: definition.OutcomeClass,
@@ -2263,10 +2273,18 @@ func activityEventViewForEvent(repositories map[int64]domain.Repository, users m
 		view.Detail = activitySharedHeadDetail(details)
 	case audit.ActionUserCreated:
 		view.Target = activityUserTarget(users, event.SubjectID)
-		view.Detail = "Created with no repository access; password sign-in requires a change after first login."
+		if _, invitationOrigin := details["onboarding"]; invitationOrigin {
+			view.Detail = "Created from an invitation with password sign-in enabled; no password change is required."
+		} else {
+			view.Detail = "Created with no repository access; password sign-in requires a change after first login."
+		}
 	case audit.ActionUserRolesUpdated:
 		view.Target = activityUserTarget(users, event.SubjectID)
-		view.Detail = "Roles " + activityRolesOrUnavailable(details, "roles_before") + " → " + activityRolesOrUnavailable(details, "roles_after") + "."
+		if _, invitationOrigin := details["provenance"]; invitationOrigin {
+			view.Detail = "Admin authority applied during invitation acceptance."
+		} else {
+			view.Detail = "Roles " + activityRolesOrUnavailable(details, "roles_before") + " → " + activityRolesOrUnavailable(details, "roles_after") + "."
+		}
 	case audit.ActionUserDisabled:
 		view.Target = activityUserTarget(users, event.SubjectID)
 		view.Detail = "Login blocked and all sessions revoked."
@@ -2297,25 +2315,44 @@ func activityEventViewForEvent(repositories map[int64]domain.Repository, users m
 	case audit.ActionInvitationAuthorizationRevoked:
 		view.Target = activityInvitationTarget(event)
 		view.Detail = activityInvitationAuthorizationRevokedDetail(details)
+	case audit.ActionInvitationAccepted:
+		acceptedUserID, _ := activityCanonicalPositiveInt64StringDetail(details, "accepted_user_id")
+		view.Target = activityUserTarget(users, strconv.FormatInt(acceptedUserID, 10))
+		view.Detail = "Invitation accepted and the local account was created."
 	case audit.ActionRepositoryGrantAdded:
 		view.Target = activityRepositoryTarget(repositories, event, details, "")
-		view.Detail = activityRolesOrUnavailable(details, "role") + " role granted to " + activityUserTarget(users, activityTextOrUnavailable(details, "user_id", 20)) + "."
+		if provenance, ok := activityExactStringDetail(details, "provenance"); ok && provenance == "invitation_acceptance" {
+			userID, _ := activityCanonicalPositiveInt64StringDetail(details, "user_id")
+			view.Detail = activityRolesOrUnavailable(details, "role") + " role applied to " + activityUserTarget(users, strconv.FormatInt(userID, 10)) + " during invitation acceptance."
+		} else {
+			view.Detail = activityRolesOrUnavailable(details, "role") + " role granted to " + activityUserTarget(users, activityTextOrUnavailable(details, "user_id", 20)) + "."
+		}
 	case audit.ActionRepositoryGrantRevoked:
 		view.Target = activityRepositoryTarget(repositories, event, details, "")
 		view.Detail = activityRolesOrUnavailable(details, "role") + " role revoked from " + activityUserTarget(users, activityTextOrUnavailable(details, "user_id", 20)) + "."
 	default:
-		return fallbackActivityEventView(users, event, details, true)
+		return fallbackActivityEventView(users, event, details, true, forceUnknownInvitationActor)
 	}
 	return view
 }
 
-func fallbackActivityEventView(users map[int64]auth.User, event audit.Event, details activityDetails, detailsOK bool) activityEventView {
+func fallbackActivityEventView(
+	users map[int64]auth.User,
+	event audit.Event,
+	details activityDetails,
+	detailsOK bool,
+	forceUnknownActor bool,
+) activityEventView {
 	if !detailsOK {
 		details = activityDetails{}
 	}
+	actor := activityActor(users, event, details, false)
+	if forceUnknownActor {
+		actor = "Unknown system actor"
+	}
 	return activityEventView{
 		CreatedAt:    activityCreatedAt(event.CreatedAt),
-		Actor:        activityActor(users, event, details),
+		Actor:        actor,
 		ActionLabel:  "Unrecognized activity",
 		Target:       activityFallbackTarget(event),
 		Outcome:      "Unknown",
@@ -2335,6 +2372,131 @@ func parseActivityDetails(raw string) (activityDetails, bool) {
 	return details, true
 }
 
+func activityHasDuplicateAcceptanceDetails(action, raw string) bool {
+	if strings.TrimSpace(raw) == "" || !activityHasAcceptanceSensitiveDetails(action) {
+		return false
+	}
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	opening, err := decoder.Token()
+	delimiter, ok := opening.(json.Delim)
+	if err != nil || !ok || delimiter != '{' {
+		return true
+	}
+	seen := make(map[string]struct{}, 4)
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return true
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return true
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return true
+		}
+		if !activityAcceptanceSensitiveDetail(action, key) {
+			continue
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return true
+		}
+		seen[key] = struct{}{}
+	}
+	closing, err := decoder.Token()
+	delimiter, ok = closing.(json.Delim)
+	return err != nil || !ok || delimiter != '}'
+}
+
+func activityHasAcceptanceSensitiveDetails(action string) bool {
+	switch action {
+	case audit.ActionInvitationAccepted,
+		audit.ActionUserCreated,
+		audit.ActionUserRolesUpdated,
+		audit.ActionRepositoryGrantAdded:
+		return true
+	default:
+		return false
+	}
+}
+
+func activityAcceptanceSensitiveDetail(action, key string) bool {
+	switch action {
+	case audit.ActionInvitationAccepted:
+		return key == "actor_kind" || key == "accepted_user_id"
+	case audit.ActionUserCreated:
+		return key == "actor_kind" || key == "onboarding" || key == "sign_in"
+	case audit.ActionUserRolesUpdated:
+		return key == "actor_kind" || key == "provenance" || key == "roles_before" || key == "roles_after"
+	case audit.ActionRepositoryGrantAdded:
+		return key == "actor_kind" || key == "provenance" || key == "user_id" || key == "role"
+	default:
+		return false
+	}
+}
+
+func activityInvitationAcceptanceDetailsValid(event audit.Event, details activityDetails) bool {
+	switch event.Action {
+	case audit.ActionInvitationAccepted:
+		if event.ActorUserID != nil || event.SubjectType != audit.SubjectTypeInvitation || !auth.ValidInvitationID(event.SubjectID) {
+			return false
+		}
+		if !activityExactStringDetailEquals(details, "actor_kind", audit.ActorKindInvitationLink) {
+			return false
+		}
+		_, ok := activityCanonicalPositiveInt64StringDetail(details, "accepted_user_id")
+		return ok
+	case audit.ActionUserCreated:
+		_, onboardingPresent := details["onboarding"]
+		actorKind, actorKindPresent := activityExactStringDetail(details, "actor_kind")
+		invitationActorMarker := actorKindPresent && strings.TrimSpace(actorKind) == audit.ActorKindInvitationLink
+		if !onboardingPresent && !invitationActorMarker {
+			return true
+		}
+		return event.ActorUserID == nil &&
+			event.SubjectType == audit.SubjectTypeUser &&
+			activityCanonicalPositiveInt64(event.SubjectID) > 0 &&
+			activityExactStringDetailEquals(details, "actor_kind", audit.ActorKindInvitationLink) &&
+			activityExactStringDetailEquals(details, "onboarding", "invitation") &&
+			activityExactStringDetailEquals(details, "sign_in", "password")
+	case audit.ActionUserRolesUpdated:
+		if _, present := details["provenance"]; !present {
+			return true
+		}
+		return event.ActorUserID != nil && *event.ActorUserID > 0 &&
+			event.SubjectType == audit.SubjectTypeUser &&
+			activityCanonicalPositiveInt64(event.SubjectID) > 0 &&
+			activityExactStringDetailEquals(details, "actor_kind", domain.ActorKindUser) &&
+			activityExactStringDetailEquals(details, "provenance", "invitation_acceptance") &&
+			activityExactStringDetailEquals(details, "roles_before", "none") &&
+			activityExactStringDetailEquals(details, "roles_after", "admin")
+	case audit.ActionRepositoryGrantAdded:
+		provenance, present := activityExactStringDetail(details, "provenance")
+		if !present {
+			_, hasRawProvenance := details["provenance"]
+			return !hasRawProvenance
+		}
+		if provenance == "legacy_authorization_cutover" {
+			return true
+		}
+		if provenance != "invitation_acceptance" ||
+			event.ActorUserID == nil || *event.ActorUserID <= 0 ||
+			event.SubjectType != audit.SubjectTypeRepository ||
+			activityCanonicalPositiveInt64(event.SubjectID) <= 0 ||
+			!activityExactStringDetailEquals(details, "actor_kind", domain.ActorKindUser) {
+			return false
+		}
+		if _, ok := activityCanonicalPositiveInt64StringDetail(details, "user_id"); !ok {
+			return false
+		}
+		role, ok := activityExactStringDetail(details, "role")
+		return ok && auth.Role(role).ValidForRepository()
+	default:
+		return true
+	}
+}
+
 func activityCreatedAt(createdAt time.Time) string {
 	if createdAt.IsZero() {
 		return "Time unavailable"
@@ -2342,7 +2504,7 @@ func activityCreatedAt(createdAt time.Time) string {
 	return createdAt.UTC().Format("2006-01-02 15:04 UTC")
 }
 
-func activityActor(users map[int64]auth.User, event audit.Event, details activityDetails) string {
+func activityActor(users map[int64]auth.User, event audit.Event, details activityDetails, allowInvitationLink bool) string {
 	if event.ActorUserID != nil && *event.ActorUserID > 0 {
 		if user, ok := users[*event.ActorUserID]; ok {
 			if displayName, ok := safeActivityText(user.DisplayName, 120); ok {
@@ -2350,6 +2512,9 @@ func activityActor(users map[int64]auth.User, event audit.Event, details activit
 			}
 		}
 		return "User #" + strconv.FormatInt(*event.ActorUserID, 10)
+	}
+	if allowInvitationLink && activityExactStringDetailEquals(details, "actor_kind", audit.ActorKindInvitationLink) {
+		return "Invitation link"
 	}
 	kind, _ := activityTextDetail(details, "actor_kind", 64)
 	role, _ := activityTextDetail(details, "actor_role", 64)
@@ -2507,6 +2672,40 @@ func activityTextDetail(details activityDetails, key string, maxLength int) (str
 		return "", false
 	}
 	return safeActivityText(value, maxLength)
+}
+
+func activityExactStringDetail(details activityDetails, key string) (string, bool) {
+	raw, ok := details[key]
+	if !ok {
+		return "", false
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", false
+	}
+	return value, true
+}
+
+func activityExactStringDetailEquals(details activityDetails, key, expected string) bool {
+	value, ok := activityExactStringDetail(details, key)
+	return ok && value == expected
+}
+
+func activityCanonicalPositiveInt64StringDetail(details activityDetails, key string) (int64, bool) {
+	value, ok := activityExactStringDetail(details, key)
+	if !ok {
+		return 0, false
+	}
+	parsed := activityCanonicalPositiveInt64(value)
+	return parsed, parsed > 0
+}
+
+func activityCanonicalPositiveInt64(value string) int64 {
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed <= 0 || strconv.FormatInt(parsed, 10) != value {
+		return 0
+	}
+	return parsed
 }
 
 func safeActivityText(value string, maxLength int) (string, bool) {

@@ -66,8 +66,10 @@ const (
 	ActionInvitationReissued                 = "invitation.reissued"
 	ActionInvitationCancelled                = "invitation.cancelled"
 	ActionInvitationAuthorizationRevoked     = "invitation.authorization_revoked"
+	ActionInvitationAccepted                 = "invitation.accepted"
 
 	ActorKindPasswordRecoveryLink = "recovery_link"
+	ActorKindInvitationLink       = "invitation_link"
 
 	SubjectTypeRepository    = "repository"
 	SubjectTypeSchedule      = "schedule"
@@ -135,6 +137,7 @@ func KnownActions() []string {
 		ActionInvitationReissued,
 		ActionInvitationCancelled,
 		ActionInvitationAuthorizationRevoked,
+		ActionInvitationAccepted,
 	}
 }
 

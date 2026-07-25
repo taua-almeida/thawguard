@@ -2912,7 +2912,13 @@ func TestActivityMappingsCoverEveryKnownAuditAction(t *testing.T) {
 		t.Fatalf("expected %d activity definitions, got %d", len(audit.KnownActions()), len(activityActionDefinitions))
 	}
 	for _, action := range audit.KnownActions() {
-		view := activityEventViewForEvent(nil, nil, audit.Event{Action: action, SubjectType: audit.SubjectTypeRepository, SubjectID: "1", DetailsJSON: `{}`})
+		event := audit.Event{Action: action, SubjectType: audit.SubjectTypeRepository, SubjectID: "1", DetailsJSON: `{}`}
+		if action == audit.ActionInvitationAccepted {
+			event.SubjectType = audit.SubjectTypeInvitation
+			event.SubjectID = "inv_" + strings.Repeat("A", 22)
+			event.DetailsJSON = `{"actor_kind":"invitation_link","accepted_user_id":"1"}`
+		}
+		view := activityEventViewForEvent(nil, nil, event)
 		if view.ActionLabel == "Unrecognized activity" || view.ActionLabel == "" || view.Outcome == "" || view.Target == "" || view.Detail == "" {
 			t.Fatalf("audit action %q lacks a complete curated activity mapping: %+v", action, view)
 		}
@@ -2923,9 +2929,11 @@ func TestActivityMappingCoversCurrentFamilies(t *testing.T) {
 	repositories := map[int64]domain.Repository{1: {ID: 1, Owner: "taua-almeida", Name: "thawguard"}}
 	users := map[int64]auth.User{42: {ID: 42, DisplayName: "Ada Operator"}}
 	invitationID := "inv_" + strings.Repeat("A", 22)
+	userActorID := int64(42)
 	cases := []struct {
 		name        string
 		action      string
+		actorUserID *int64
 		subjectType string
 		subjectID   string
 		details     string
@@ -2973,16 +2981,20 @@ func TestActivityMappingCoversCurrentFamilies(t *testing.T) {
 		{name: "invitation reissued", action: audit.ActionInvitationReissued, subjectType: audit.SubjectTypeInvitation, subjectID: invitationID, details: `{"expires_at":"2026-08-01T11:00:00Z","administrator_before":"true","administrator_after":"false"}`, outcome: "Reissued", contains: []string{"Invitation " + invitationID, "Credential reissued", "2026-08-01 11:00 UTC"}},
 		{name: "invitation cancelled", action: audit.ActionInvitationCancelled, subjectType: audit.SubjectTypeInvitation, subjectID: invitationID, details: `{}`, outcome: "Cancelled", contains: []string{"Invitation " + invitationID, "staged identity and credential redacted"}},
 		{name: "invitation authorization revoked", action: audit.ActionInvitationAuthorizationRevoked, subjectType: audit.SubjectTypeInvitation, subjectID: invitationID, details: `{"reason":"authorizer_disabled"}`, outcome: "Revoked", contains: []string{"Invitation " + invitationID, "authorizing Administrator was disabled"}},
+		{name: "invitation accepted", action: audit.ActionInvitationAccepted, subjectType: audit.SubjectTypeInvitation, subjectID: invitationID, details: `{"actor_kind":"invitation_link","accepted_user_id":"42"}`, outcome: "Accepted", contains: []string{"Invitation link", "Ada Operator (User #42)", "local account was created"}},
+		{name: "invitation user created", action: audit.ActionUserCreated, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"invitation_link","onboarding":"invitation","sign_in":"password"}`, outcome: "Created", contains: []string{"Invitation link", "Ada Operator (User #42)", "Created from an invitation", "password sign-in enabled", "no password change is required"}},
+		{name: "invitation Admin applied", action: audit.ActionUserRolesUpdated, actorUserID: &userActorID, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"user","provenance":"invitation_acceptance","roles_before":"none","roles_after":"admin"}`, outcome: "Changed", contains: []string{"Ada Operator", "Admin authority applied during invitation acceptance"}},
+		{name: "invitation repository grant applied", action: audit.ActionRepositoryGrantAdded, actorUserID: &userActorID, subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"actor_kind":"user","provenance":"invitation_acceptance","user_id":"42","role":"freezer"}`, outcome: "Granted", contains: []string{"Ada Operator", "Freezer role applied to Ada Operator (User #42) during invitation acceptance"}},
 		{name: "repository grant added", action: audit.ActionRepositoryGrantAdded, subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"user_id":"42","role":"freezer"}`, outcome: "Granted", contains: []string{"taua-almeida/thawguard", "Freezer role granted to Ada Operator (User #42)"}},
 		{name: "repository grant revoked", action: audit.ActionRepositoryGrantRevoked, subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"user_id":"42","role":"viewer"}`, outcome: "Revoked", contains: []string{"taua-almeida/thawguard", "Viewer role revoked from Ada Operator (User #42)"}},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
-			view := activityEventViewForEvent(repositories, users, audit.Event{Action: test.action, SubjectType: test.subjectType, SubjectID: test.subjectID, DetailsJSON: test.details})
+			view := activityEventViewForEvent(repositories, users, audit.Event{ActorUserID: test.actorUserID, Action: test.action, SubjectType: test.subjectType, SubjectID: test.subjectID, DetailsJSON: test.details})
 			if view.Outcome != test.outcome {
 				t.Fatalf("expected outcome %q, got %+v", test.outcome, view)
 			}
-			visible := view.ActionLabel + " " + view.Target + " " + view.Detail
+			visible := view.Actor + " " + view.ActionLabel + " " + view.Target + " " + view.Detail
 			for _, want := range test.contains {
 				if !strings.Contains(visible, want) {
 					t.Fatalf("expected mapping to contain %q, got %+v", want, view)
@@ -3024,6 +3036,7 @@ func TestActivityInvitationTargetsAndDetailsFailSafely(t *testing.T) {
 		audit.ActionInvitationReissued,
 		audit.ActionInvitationCancelled,
 		audit.ActionInvitationAuthorizationRevoked,
+		audit.ActionInvitationAccepted,
 	} {
 		view := activityEventViewForEvent(nil, nil, audit.Event{
 			Action:      action,
@@ -3046,12 +3059,246 @@ func TestActivityInvitationTargetsAndDetailsFailSafely(t *testing.T) {
 				t.Fatalf("invitation activity %q leaked %q in %q", action, canary, visible)
 			}
 		}
-		lower := strings.ToLower(visible)
-		for _, unsupported := range []string{"sent", "emailed", "delivered", "accepted", "account created"} {
-			if strings.Contains(lower, unsupported) {
-				t.Fatalf("invitation activity %q made unsupported claim %q in %q", action, unsupported, visible)
+		if action != audit.ActionInvitationAccepted {
+			lower := strings.ToLower(visible)
+			for _, unsupported := range []string{"sent", "emailed", "delivered", "accepted", "account created"} {
+				if strings.Contains(lower, unsupported) {
+					t.Fatalf("invitation activity %q made unsupported claim %q in %q", action, unsupported, visible)
+				}
 			}
 		}
+	}
+}
+
+func TestActivityInvitationAcceptedUserIDRequiresCanonicalString(t *testing.T) {
+	invitationID := "inv_" + strings.Repeat("A", 22)
+	users := map[int64]auth.User{42: {ID: 42, DisplayName: "Ada Operator"}}
+	for _, testCase := range []struct {
+		name string
+		raw  string
+	}{
+		{name: "surrounding whitespace", raw: `" 42"`},
+		{name: "trailing whitespace", raw: `"42 "`},
+		{name: "in-value whitespace", raw: `"4 2"`},
+		{name: "plus sign", raw: `"+42"`},
+		{name: "minus sign", raw: `"-42"`},
+		{name: "leading zero", raw: `"042"`},
+		{name: "zero", raw: `"0"`},
+		{name: "non-digits", raw: `"42x"`},
+		{name: "integer JSON", raw: `42`},
+		{name: "null", raw: `null`},
+		{name: "object", raw: `{}`},
+		{name: "array", raw: `[]`},
+		{name: "overflow", raw: `"9223372036854775808"`},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			view := activityEventViewForEvent(nil, users, audit.Event{
+				Action:      audit.ActionInvitationAccepted,
+				SubjectType: audit.SubjectTypeInvitation,
+				SubjectID:   invitationID,
+				DetailsJSON: `{"actor_kind":"invitation_link","accepted_user_id":` + testCase.raw + `}`,
+			})
+			assertRejectedInvitationLinkFallback(t, view)
+		})
+	}
+
+	view := activityEventViewForEvent(nil, users, audit.Event{
+		Action:      audit.ActionInvitationAccepted,
+		SubjectType: audit.SubjectTypeInvitation,
+		SubjectID:   invitationID,
+		DetailsJSON: `{"actor_kind":"invitation_link","accepted_user_id":"9223372036854775807"}`,
+	})
+	if view.ActionLabel == "Unrecognized activity" || view.Target != "User #9223372036854775807" {
+		t.Fatalf("expected canonical max int64 accepted-user ID, got %+v", view)
+	}
+}
+
+func TestActivityInvitationAcceptanceDiscriminatorsAreExactAndFailClosed(t *testing.T) {
+	invitationID := "inv_" + strings.Repeat("A", 22)
+	actorID := int64(7)
+	cases := []struct {
+		name        string
+		action      string
+		actorUserID *int64
+		subjectType string
+		subjectID   string
+		details     string
+	}{
+		{name: "accepted actor surrounding whitespace", action: audit.ActionInvitationAccepted, subjectType: audit.SubjectTypeInvitation, subjectID: invitationID, details: `{"actor_kind":" invitation_link","accepted_user_id":"42"}`},
+		{name: "accepted actor in-value whitespace", action: audit.ActionInvitationAccepted, subjectType: audit.SubjectTypeInvitation, subjectID: invitationID, details: `{"actor_kind":"invitation link","accepted_user_id":"42"}`},
+		{name: "accepted actor wrong JSON type", action: audit.ActionInvitationAccepted, subjectType: audit.SubjectTypeInvitation, subjectID: invitationID, details: `{"actor_kind":42,"accepted_user_id":"42"}`},
+		{name: "accepted stored actor ID", action: audit.ActionInvitationAccepted, actorUserID: &actorID, subjectType: audit.SubjectTypeInvitation, subjectID: invitationID, details: `{"actor_kind":"invitation_link","accepted_user_id":"42"}`},
+		{name: "user onboarding surrounding whitespace", action: audit.ActionUserCreated, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"invitation_link","onboarding":" invitation","sign_in":"password"}`},
+		{name: "user onboarding in-value whitespace", action: audit.ActionUserCreated, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"invitation_link","onboarding":"invita tion","sign_in":"password"}`},
+		{name: "user onboarding wrong JSON type", action: audit.ActionUserCreated, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"invitation_link","onboarding":{},"sign_in":"password"}`},
+		{name: "user missing onboarding", action: audit.ActionUserCreated, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"invitation_link","sign_in":"password"}`},
+		{name: "user missing onboarding with malformed actor", action: audit.ActionUserCreated, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":" invitation_link","sign_in":"password"}`},
+		{name: "user actor trailing whitespace", action: audit.ActionUserCreated, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"invitation_link ","onboarding":"invitation","sign_in":"password"}`},
+		{name: "user sign-in mismatch", action: audit.ActionUserCreated, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"invitation_link","onboarding":"invitation","sign_in":" password"}`},
+		{name: "user created stored actor ID", action: audit.ActionUserCreated, actorUserID: &actorID, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"invitation_link","onboarding":"invitation","sign_in":"password"}`},
+		{name: "Admin provenance leading whitespace", action: audit.ActionUserRolesUpdated, actorUserID: &actorID, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"user","provenance":" invitation_acceptance","roles_before":"none","roles_after":"admin"}`},
+		{name: "Admin provenance in-value whitespace", action: audit.ActionUserRolesUpdated, actorUserID: &actorID, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"user","provenance":"invitation acceptance","roles_before":"none","roles_after":"admin"}`},
+		{name: "Admin unknown provenance", action: audit.ActionUserRolesUpdated, actorUserID: &actorID, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"user","provenance":"future_source","roles_before":"none","roles_after":"admin"}`},
+		{name: "Admin provenance wrong JSON type", action: audit.ActionUserRolesUpdated, actorUserID: &actorID, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"user","provenance":null,"roles_before":"none","roles_after":"admin"}`},
+		{name: "Admin actor trailing whitespace", action: audit.ActionUserRolesUpdated, actorUserID: &actorID, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"user ","provenance":"invitation_acceptance","roles_before":"none","roles_after":"admin"}`},
+		{name: "repository provenance trailing whitespace", action: audit.ActionRepositoryGrantAdded, actorUserID: &actorID, subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"actor_kind":"user","provenance":"invitation_acceptance ","user_id":"42","role":"viewer"}`},
+		{name: "repository unknown provenance", action: audit.ActionRepositoryGrantAdded, actorUserID: &actorID, subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"actor_kind":"user","provenance":"future_source","user_id":"42","role":"viewer"}`},
+		{name: "repository provenance object", action: audit.ActionRepositoryGrantAdded, actorUserID: &actorID, subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"actor_kind":"user","provenance":{},"user_id":"42","role":"viewer"}`},
+		{name: "repository actor leading whitespace", action: audit.ActionRepositoryGrantAdded, actorUserID: &actorID, subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"actor_kind":" user","provenance":"invitation_acceptance","user_id":"42","role":"viewer"}`},
+		{name: "repository user ID noncanonical", action: audit.ActionRepositoryGrantAdded, actorUserID: &actorID, subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"actor_kind":"user","provenance":"invitation_acceptance","user_id":"042","role":"viewer"}`},
+		{name: "repository role surrounding whitespace", action: audit.ActionRepositoryGrantAdded, actorUserID: &actorID, subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"actor_kind":"user","provenance":"invitation_acceptance","user_id":"42","role":" viewer"}`},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			view := activityEventViewForEvent(nil, nil, audit.Event{
+				ActorUserID: testCase.actorUserID,
+				Action:      testCase.action,
+				SubjectType: testCase.subjectType,
+				SubjectID:   testCase.subjectID,
+				DetailsJSON: testCase.details,
+			})
+			if testCase.action == audit.ActionInvitationAccepted || testCase.action == audit.ActionUserCreated {
+				assertRejectedInvitationLinkFallback(t, view)
+			} else {
+				assertSafeActivityFallback(t, view)
+			}
+		})
+	}
+}
+
+func TestActivityInvitationAcceptanceDuplicateSensitiveKeysFailClosed(t *testing.T) {
+	invitationID := "inv_" + strings.Repeat("A", 22)
+	actorID := int64(7)
+	cases := []struct {
+		name        string
+		action      string
+		actorUserID *int64
+		subjectType string
+		subjectID   string
+		details     string
+	}{
+		{name: "accepted matching actor kind", action: audit.ActionInvitationAccepted, subjectType: audit.SubjectTypeInvitation, subjectID: invitationID, details: `{"actor_kind":"invitation_link","actor_kind":"invitation_link","accepted_user_id":"42"}`},
+		{name: "accepted conflicting actor kind with recovery link last", action: audit.ActionInvitationAccepted, subjectType: audit.SubjectTypeInvitation, subjectID: invitationID, details: `{"actor_kind":"invitation_link","actor_kind":"recovery_link","accepted_user_id":"42"}`},
+		{name: "accepted conflicting user ID with valid last value", action: audit.ActionInvitationAccepted, subjectType: audit.SubjectTypeInvitation, subjectID: invitationID, details: `{"actor_kind":"invitation_link","accepted_user_id":"INJECTED ACCEPTED USER","accepted_user_id":"42"}`},
+		{name: "user created conflicting actor kind with valid last value", action: audit.ActionUserCreated, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"INJECTED USER ACTOR","actor_kind":"invitation_link","onboarding":"invitation","sign_in":"password"}`},
+		{name: "user created conflicting actor kind with recovery link last", action: audit.ActionUserCreated, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"invitation_link","actor_kind":"recovery_link","onboarding":"invitation","sign_in":"password"}`},
+		{name: "user created conflicting onboarding with valid last value", action: audit.ActionUserCreated, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"invitation_link","onboarding":"INJECTED ONBOARDING","onboarding":"invitation","sign_in":"password"}`},
+		{name: "user created conflicting sign in with valid last value", action: audit.ActionUserCreated, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"invitation_link","onboarding":"invitation","sign_in":"INJECTED SIGN IN","sign_in":"password"}`},
+		{name: "Admin conflicting actor kind with valid last value", action: audit.ActionUserRolesUpdated, actorUserID: &actorID, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"INJECTED ADMIN ACTOR","actor_kind":"user","provenance":"invitation_acceptance","roles_before":"none","roles_after":"admin"}`},
+		{name: "Admin conflicting provenance with valid last value", action: audit.ActionUserRolesUpdated, actorUserID: &actorID, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"user","provenance":"INJECTED ADMIN PROVENANCE","provenance":"invitation_acceptance","roles_before":"none","roles_after":"admin"}`},
+		{name: "Admin conflicting prior roles with valid last value", action: audit.ActionUserRolesUpdated, actorUserID: &actorID, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"user","provenance":"invitation_acceptance","roles_before":"INJECTED PRIOR ROLES","roles_before":"none","roles_after":"admin"}`},
+		{name: "Admin conflicting resulting roles with valid last value", action: audit.ActionUserRolesUpdated, actorUserID: &actorID, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"user","provenance":"invitation_acceptance","roles_before":"none","roles_after":"INJECTED RESULT ROLES","roles_after":"admin"}`},
+		{name: "repository grant conflicting actor kind with valid last value", action: audit.ActionRepositoryGrantAdded, actorUserID: &actorID, subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"actor_kind":"INJECTED GRANT ACTOR","actor_kind":"user","provenance":"invitation_acceptance","user_id":"42","role":"viewer"}`},
+		{name: "repository grant conflicting provenance with valid last value", action: audit.ActionRepositoryGrantAdded, actorUserID: &actorID, subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"actor_kind":"user","provenance":"INJECTED GRANT PROVENANCE","provenance":"invitation_acceptance","user_id":"42","role":"viewer"}`},
+		{name: "repository grant conflicting user ID with valid last value", action: audit.ActionRepositoryGrantAdded, actorUserID: &actorID, subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"actor_kind":"user","provenance":"invitation_acceptance","user_id":"INJECTED GRANT USER","user_id":"42","role":"viewer"}`},
+		{name: "repository grant conflicting role with valid last value", action: audit.ActionRepositoryGrantAdded, actorUserID: &actorID, subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"actor_kind":"user","provenance":"invitation_acceptance","user_id":"42","role":"INJECTED GRANT ROLE","role":"viewer"}`},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			view := activityEventViewForEvent(nil, nil, audit.Event{
+				ActorUserID: testCase.actorUserID,
+				Action:      testCase.action,
+				SubjectType: testCase.subjectType,
+				SubjectID:   testCase.subjectID,
+				DetailsJSON: testCase.details,
+			})
+			if testCase.action == audit.ActionInvitationAccepted || testCase.action == audit.ActionUserCreated {
+				assertRejectedInvitationLinkFallback(t, view)
+			} else {
+				assertSafeActivityFallback(t, view)
+			}
+			visible := view.Actor + " " + view.ActionLabel + " " + view.Target + " " + view.Outcome + " " + view.Detail
+			if strings.Contains(visible, "INJECTED") {
+				t.Fatalf("duplicate acceptance details injected rendered text: %q", visible)
+			}
+		})
+	}
+}
+
+func TestActivityDuplicateAcceptanceKeyScanStaysTopLevelAndActionScoped(t *testing.T) {
+	invitationID := "inv_" + strings.Repeat("A", 22)
+	users := map[int64]auth.User{42: {ID: 42, DisplayName: "Ada Operator"}}
+	for _, testCase := range []struct {
+		name  string
+		event audit.Event
+	}{
+		{
+			name: "nested sensitive duplicates",
+			event: audit.Event{
+				Action:      audit.ActionInvitationAccepted,
+				SubjectType: audit.SubjectTypeInvitation,
+				SubjectID:   invitationID,
+				DetailsJSON: `{"actor_kind":"invitation_link","accepted_user_id":"42","nested":{"actor_kind":"bad","actor_kind":"invitation_link","accepted_user_id":"0","accepted_user_id":"42"}}`,
+			},
+		},
+		{
+			name: "duplicate unrelated extra key",
+			event: audit.Event{
+				Action:      audit.ActionInvitationAccepted,
+				SubjectType: audit.SubjectTypeInvitation,
+				SubjectID:   invitationID,
+				DetailsJSON: `{"actor_kind":"invitation_link","accepted_user_id":"42","extra":"first","extra":"second"}`,
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			view := activityEventViewForEvent(nil, users, testCase.event)
+			if view.ActionLabel == "Unrecognized activity" || view.Actor != "Invitation link" || view.Target != "Ada Operator (User #42)" {
+				t.Fatalf("non-top-level or unrelated duplicate changed valid acceptance rendering: %+v", view)
+			}
+		})
+	}
+
+	view := activityEventViewForEvent(nil, nil, audit.Event{
+		Action:      audit.ActionRepositoryCreated,
+		SubjectType: audit.SubjectTypeRepository,
+		SubjectID:   "1",
+		DetailsJSON: `{"default_branch":"old","default_branch":"main"}`,
+	})
+	if view.ActionLabel != "Repository added" || view.Detail != "Default branch main." {
+		t.Fatalf("unrelated duplicate-key historical behavior changed: %+v", view)
+	}
+}
+
+func TestActivityInvitationAcceptanceIgnoresExtraNameCanariesAndResolvesCurrentUser(t *testing.T) {
+	invitationID := "inv_" + strings.Repeat("A", 22)
+	actorID := int64(7)
+	users := map[int64]auth.User{
+		7:  {ID: 7, DisplayName: "Current Authorizer"},
+		42: {ID: 42, DisplayName: "Current Accepted User"},
+	}
+	repositories := map[int64]domain.Repository{1: {ID: 1, Owner: "acme", Name: "api"}}
+	events := []audit.Event{
+		{Action: audit.ActionInvitationAccepted, SubjectType: audit.SubjectTypeInvitation, SubjectID: invitationID, DetailsJSON: `{"actor_kind":"invitation_link","accepted_user_id":"42","display_name":"INJECTED ACCEPTED NAME","name":"INJECTED NAME"}`},
+		{Action: audit.ActionUserCreated, SubjectType: audit.SubjectTypeUser, SubjectID: "42", DetailsJSON: `{"actor_kind":"invitation_link","onboarding":"invitation","sign_in":"password","display_name":"INJECTED CREATED NAME"}`},
+		{ActorUserID: &actorID, Action: audit.ActionUserRolesUpdated, SubjectType: audit.SubjectTypeUser, SubjectID: "42", DetailsJSON: `{"actor_kind":"user","provenance":"invitation_acceptance","roles_before":"none","roles_after":"admin","display_name":"INJECTED ADMIN NAME"}`},
+		{ActorUserID: &actorID, Action: audit.ActionRepositoryGrantAdded, SubjectType: audit.SubjectTypeRepository, SubjectID: "1", DetailsJSON: `{"actor_kind":"user","provenance":"invitation_acceptance","user_id":"42","role":"viewer","display_name":"INJECTED GRANT NAME"}`},
+	}
+	for _, event := range events {
+		view := activityEventViewForEvent(repositories, users, event)
+		visible := view.Actor + " " + view.ActionLabel + " " + view.Target + " " + view.Detail
+		if view.ActionLabel == "Unrecognized activity" || !strings.Contains(visible, "Current Accepted User") {
+			t.Fatalf("expected authorized current-user resolution, got %+v", view)
+		}
+		if strings.Contains(visible, "INJECTED") {
+			t.Fatalf("extra details injected rendered text: %q", visible)
+		}
+	}
+}
+
+func assertSafeActivityFallback(t *testing.T, view activityEventView) {
+	t.Helper()
+	if view.ActionLabel != "Unrecognized activity" || view.Outcome != "Unknown" ||
+		view.Detail != "Stored audit details could not be displayed safely." || view.Actor == "Invitation link" {
+		t.Fatalf("expected existing safe Activity fallback, got %+v", view)
+	}
+}
+
+func assertRejectedInvitationLinkFallback(t *testing.T, view activityEventView) {
+	t.Helper()
+	assertSafeActivityFallback(t, view)
+	if view.Actor != "Unknown system actor" {
+		t.Fatalf("expected rejected invitation-link event to hide actor attribution, got %+v", view)
 	}
 }
 
@@ -3085,6 +3332,8 @@ func TestActivityActorAndMissingTargetResolution(t *testing.T) {
 		{details: `{"actor_kind":"system","actor_role":"reconciliation_runner"}`, actor: "Reconciliation runner"},
 		{details: `{"actor_kind":"system","actor_role":"runtime"}`, actor: "Runtime process"},
 		{details: `{"actor_kind":"recovery_link"}`, actor: "Password recovery link"},
+		{details: `{"actor_kind":"invitation_link"}`, actor: "Unknown system actor"},
+		{details: `{"actor_kind":" invitation_link"}`, actor: "Unknown system actor"},
 		{details: `{"actor_kind":"untrusted-actor","actor_role":"secret-token"}`, actor: "Unknown system actor"},
 	} {
 		view = activityEventViewForEvent(nil, nil, audit.Event{Action: audit.ActionRepositoryCreated, SubjectType: audit.SubjectTypeRepository, SubjectID: "1", DetailsJSON: test.details})
@@ -3203,6 +3452,7 @@ func TestActivityFilterActionsGroupKnownActions(t *testing.T) {
 		audit.ActionInvitationReissued,
 		audit.ActionInvitationCancelled,
 		audit.ActionInvitationAuthorizationRevoked,
+		audit.ActionInvitationAccepted,
 	} {
 		if !slices.Contains(users, action) {
 			t.Fatalf("users chip is missing invitation action %q", action)
