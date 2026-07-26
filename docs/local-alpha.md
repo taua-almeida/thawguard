@@ -42,7 +42,7 @@ unset THAWGUARD_SECRET_KEY
 
 Do not commit `.env`, tokens, webhook secrets, or local database files.
 
-`THAWGUARD_PUBLIC_URL` is Thawguard's canonical browser origin and the origin used for generated recovery links. Configure a root-only HTTPS URL with no credentials, query, or fragment. HTTP is accepted only for exact `localhost` or a literal loopback IP, as in the local value above. Internationalized and punycode (`xn--`) hostnames are currently unsupported; use an ordinary ASCII hostname.
+`THAWGUARD_PUBLIC_URL` is Thawguard's canonical browser origin and the origin used for generated recovery and invitation links. Configure a root-only HTTPS URL with no credentials, query, or fragment. HTTP is accepted only for exact `localhost` or a literal loopback IP, as in the local value above. Internationalized and punycode (`xn--`) hostnames are currently unsupported; use an ordinary ASCII hostname.
 
 ### 2. Start both services
 
@@ -98,6 +98,8 @@ In Forgejo:
 10. Correct any reported branch protection or required-context failure in Forgejo, rerun readiness, then use **Verify status posting** and **Activate enforcement**. Thawguard reports the required setup but does not configure Forgejo branch protection automatically.
 
 Admins can also open another enabled user's detail page in **Users & Access**, issue a one-hour manual recovery link, and share it through a trusted channel. Thawguard displays the bearer link once and stores only its digest. This local-alpha slice does not send email or expose a public forgot-password request form.
+
+To add a new person, use **Invite person** on **Users & Access**: stage the display name, email, optional global Admin, and per-repository roles, then hand the one-time invitation link to the invitee over a trusted channel. The link is single-use and valid for up to seven days, and Thawguard stores only its digest. It stops working earlier if the invitation is cancelled, the authorizing Admin loses Admin access, or staged repository access changes; there is no edit or reissue, so cancel the invitation and create a new one instead. The invitee chooses their own password at acceptance, no session is created, and they sign in through the ordinary login. No email is sent. The **Add local user** temporary-password fallback remains available.
 
 ### 6. Exercise the freeze lifecycle
 

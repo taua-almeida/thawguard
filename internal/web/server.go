@@ -38,6 +38,17 @@ const (
 	passwordRecoveryCSP                = "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self'"
 )
 
+const (
+	// invitationCreateMaxBodyBytes caps POST /users/invitations before any
+	// parsing. The form carries short identity fields plus three role
+	// checkboxes per configured repository (~30 bytes each), so this bounds
+	// hostile bodies while leaving room for thousands of staged grants.
+	invitationCreateMaxBodyBytes int64 = 256 << 10
+	// invitationAcceptMaxBodyBytes caps POST /invitations/accept, which only
+	// ever carries a CSRF token, the bearer, and a password.
+	invitationAcceptMaxBodyBytes int64 = 8 << 10
+)
+
 type Config struct {
 	AppName                              string
 	PublicURL                            string
@@ -108,6 +119,10 @@ type AuthService interface {
 	ChangePassword(ctx context.Context, params auth.ChangePasswordParams) (auth.Session, error)
 	IssuePasswordRecoveryToken(ctx context.Context, params auth.IssuePasswordRecoveryParams) (auth.PasswordRecoveryToken, error)
 	CompletePasswordRecovery(ctx context.Context, params auth.CompletePasswordRecoveryParams) error
+	CreateInvitation(ctx context.Context, params auth.CreateInvitationParams) (auth.InvitationCredential, error)
+	ListActiveInvitations(ctx context.Context) ([]auth.ActiveInvitation, error)
+	CancelInvitation(ctx context.Context, params auth.CancelInvitationParams) error
+	AcceptInvitation(ctx context.Context, token, password string) (auth.User, error)
 }
 
 type RepositoryStore interface {
@@ -315,12 +330,19 @@ func NewServer(cfg Config) *Server {
 
 func (s *Server) Routes() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if isPasswordRecoveryPath(r.URL.Path) {
+		if isPasswordRecoveryPath(r.URL.Path) || isInvitationSensitivePath(r.URL.Path) {
 			w.Header().Set("Cache-Control", "no-store")
 			w.Header().Set("Referrer-Policy", "no-referrer")
 			w.Header().Set("X-Frame-Options", "DENY")
 			w.Header().Set("X-Content-Type-Options", "nosniff")
 			w.Header().Set("Content-Security-Policy", passwordRecoveryCSP)
+		}
+		// Keep the literal invitation-creation endpoint out of the /users/{id}
+		// GET wildcard and give every unsupported method one truthful contract.
+		if r.URL.Path == "/users/invitations" && r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
 		}
 		s.mux.ServeHTTP(w, r)
 	})
@@ -336,6 +358,24 @@ func isPasswordRecoveryPath(path string) bool {
 	}
 	userID, suffix, ok := strings.Cut(rest, "/")
 	return ok && userID != "" && suffix == "password-recovery"
+}
+
+// isInvitationSensitivePath matches the invitation management and acceptance
+// routes whose every response, including method errors, must carry the
+// sensitive no-store header set: one-time bearer links and acceptance results
+// must never be cached, referred, framed, or sniffed. Rejected create and
+// cancel requests re-render the full Users & Access page under this strict
+// CSP, so that page must keep working without connect-src (no htmx polling).
+func isInvitationSensitivePath(path string) bool {
+	if path == "/users/invitations" || path == "/invitations/accept" {
+		return true
+	}
+	rest, ok := strings.CutPrefix(path, "/users/invitations/")
+	if !ok {
+		return false
+	}
+	invitationID, suffix, ok := strings.Cut(rest, "/")
+	return ok && invitationID != "" && suffix == "cancel"
 }
 
 func (s *Server) routes() {
@@ -394,6 +434,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /webhooks/forgejo", s.handleForgejoWebhook)
 	s.mux.HandleFunc("GET /users", s.handleUsers)
 	s.mux.HandleFunc("POST /users", s.handleCreateUser)
+	s.mux.HandleFunc("POST /users/invitations", s.handleCreateInvitation)
+	s.mux.HandleFunc("POST /users/invitations/{id}/cancel", s.handleCancelInvitation)
+	s.mux.HandleFunc("GET /invitations/accept", s.handleInvitationAccept)
+	s.mux.HandleFunc("POST /invitations/accept", s.handleInvitationAcceptPost)
 	s.mux.HandleFunc("GET /users/{id}", s.handleUserDetail)
 	s.mux.HandleFunc("POST /users/{id}/admin", s.handleSetUserAdmin)
 	s.mux.HandleFunc("POST /users/{id}/repository-access", s.handleSetUserRepositoryAccess)

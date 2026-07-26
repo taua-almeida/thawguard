@@ -144,7 +144,7 @@ func TestUsersPageShowsAccountStateAndResponsiveLabels(t *testing.T) {
 			t.Fatalf("expected users page to contain %q", want)
 		}
 	}
-	if strings.Contains(body, `action="/users/`) {
+	if strings.Contains(body, fmt.Sprintf(`action="/users/%d`, user.ID)) || strings.Contains(body, fmt.Sprintf(`action="/users/%d`, admin.User.ID)) {
 		t.Fatal("expected directory rows to remain navigation-only")
 	}
 

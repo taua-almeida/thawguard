@@ -20,6 +20,15 @@ type usersPageState struct {
 	CreateOpen        bool
 	CreateEmail       string
 	CreateDisplayName string
+
+	InviteOpen        bool
+	InviteEmail       string
+	InviteDisplayName string
+	InviteAdmin       bool
+	// InviteSelectedGrants holds the parseable "<repository id>:<role>" values
+	// from a rejected submission so the dialog re-renders those checkboxes
+	// checked. Bearer material is never part of this state.
+	InviteSelectedGrants map[string]bool
 }
 
 type usersRepositoryOption struct {
@@ -36,6 +45,7 @@ type usersUserView struct {
 	MustChangePassword bool
 	IsSelf             bool
 	IsAdmin            bool
+	HasLocalPassword   bool
 	RepositoryCount    int
 	ScopedRoleLabels   []string
 	AccessTitle        string
@@ -60,9 +70,15 @@ type usersPageData struct {
 	NoRepositories    bool
 	FormError         string
 	CreateOpen        bool
-	CreateError       string
 	CreateEmail       string
 	CreateDisplayName string
+
+	Invitations        []usersInvitationView
+	InviteOpen         bool
+	InviteEmail        string
+	InviteDisplayName  string
+	InviteAdmin        bool
+	InviteRepositories []usersInviteRepositoryView
 }
 
 type userGrantEvidenceView struct {
@@ -129,7 +145,14 @@ func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
 		s.renderUsersPage(w, r, http.StatusBadRequest, usersQuery{Search: strings.TrimSpace(r.URL.Query().Get("q"))}, usersPageState{FormError: err.Error()}, session)
 		return
 	}
-	s.renderUsersPage(w, r, http.StatusOK, query, usersPageState{}, session)
+	data, ok := s.loadUsersPageData(w, r, query, usersPageState{}, session)
+	if !ok {
+		return
+	}
+	if r.URL.Query().Get("notice") == "invitation-cancelled" {
+		data.Toasts = []toastView{{Message: "Invitation cancelled. Its email address is no longer reserved and can be invited again.", Tone: "success", DismissHref: "/users"}}
+	}
+	s.renderPageStatus(w, http.StatusOK, "layouts/users", data)
 }
 
 func usersQueryFromRequest(r *http.Request) (usersQuery, error) {
@@ -205,6 +228,11 @@ func (s *Server) loadUsersPageData(w http.ResponseWriter, r *http.Request, query
 			return usersPageData{}, false
 		}
 	}
+	invitations, err := s.cfg.AuthService.ListActiveInvitations(r.Context())
+	if err != nil {
+		s.renderErrorPage(w, http.StatusInternalServerError, false)
+		return usersPageData{}, false
+	}
 	data := usersPageData{
 		AppName:           s.cfg.AppName,
 		PageTitle:         "Users & Access",
@@ -218,9 +246,15 @@ func (s *Server) loadUsersPageData(w http.ResponseWriter, r *http.Request, query
 		NoRepositories:    len(repositories) == 0,
 		FormError:         state.FormError,
 		CreateOpen:        state.CreateOpen,
-		CreateError:       state.FormError,
 		CreateEmail:       state.CreateEmail,
 		CreateDisplayName: state.CreateDisplayName,
+
+		Invitations:        usersInvitationViews(invitations),
+		InviteOpen:         state.InviteOpen,
+		InviteEmail:        state.InviteEmail,
+		InviteDisplayName:  state.InviteDisplayName,
+		InviteAdmin:        state.InviteAdmin,
+		InviteRepositories: usersInviteRepositoryViews(repositories, state.InviteSelectedGrants),
 	}
 	data.Users = usersDirectoryViews(entries, session)
 	data.UserCount = len(data.Users)
@@ -250,6 +284,7 @@ func usersDirectoryViews(entries []auth.UserDirectoryEntry, session sessionState
 			MustChangePassword: entry.MustChangePassword,
 			IsSelf:             session.UserID != nil && *session.UserID == entry.ID,
 			IsAdmin:            entry.IsAdmin,
+			HasLocalPassword:   entry.HasLocalPassword,
 			RepositoryCount:    entry.RepositoryCount,
 		}
 		if entry.HasViewer {

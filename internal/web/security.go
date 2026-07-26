@@ -32,6 +32,7 @@ const (
 	setupCSRFPurpose            = "setup"
 	loginCSRFPurpose            = "login"
 	passwordRecoveryCSRFPurpose = "password-recovery"
+	invitationCSRFPurpose       = "invitation"
 )
 
 type sessionState struct {
@@ -259,6 +260,17 @@ func (s *Server) newPasswordRecoveryCSRFToken() (string, error) {
 
 func (s *Server) validPasswordRecoveryCSRFToken(r *http.Request) bool {
 	return s.validPreAuthCSRFToken(r, passwordRecoveryCSRFPurpose)
+}
+
+// Invitation acceptance is anonymous like password recovery, so its CSRF token
+// is cookie-free and purpose-bound: a token minted for setup, login, or
+// recovery never validates here.
+func (s *Server) newInvitationCSRFToken() (string, error) {
+	return s.newSignedCSRFToken(invitationCSRFPurpose)
+}
+
+func (s *Server) validInvitationCSRFToken(r *http.Request) bool {
+	return s.validPreAuthCSRFToken(r, invitationCSRFPurpose)
 }
 
 func (s *Server) newSignedCSRFToken(purpose string) (string, error) {

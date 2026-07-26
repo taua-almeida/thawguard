@@ -1210,10 +1210,18 @@ func (s *Server) handleDevPreviewUsers(w http.ResponseWriter, r *http.Request) {
 		{ID: 46, Owner: "aurora", Name: "ice-station"},
 		{ID: 47, Owner: "borealis", Name: "frost-api"},
 	}
+	pendingExpiresAt := time.Date(2026, 7, 24, 9, 30, 0, 0, time.UTC)
+	expiredExpiresAt := time.Date(2026, 7, 1, 17, 0, 0, 0, time.UTC)
+	invitations := []auth.ActiveInvitation{
+		{ID: "inv_AAAAAAAAAAAAAAAAAAAAAA", Email: "noor.glacia@example.test", DisplayName: "Noor Glacia", Lifecycle: auth.InvitationLifecyclePending, ExpiresAt: &pendingExpiresAt, RepositoryGrants: []auth.InvitationRepositoryGrant{{RepositoryID: 46, Role: auth.RoleViewer}, {RepositoryID: 46, Role: auth.RoleFreezer}}, ExpectedGrantCount: 2, ActualGrantCount: 2},
+		{ID: "inv_AAAAAAAAAAAAAAAAAAAAAQ", Email: "ivo.rime@example.test", DisplayName: "Ivo Rime", Lifecycle: auth.InvitationLifecycleExpired, ExpiresAt: &expiredExpiresAt, IsAdmin: true},
+		{ID: "inv_AAAAAAAAAAAAAAAAAAAAAg", Email: "sana.firn@example.test", DisplayName: "Sana Firn", Lifecycle: auth.InvitationLifecycleNeedsReplacement, RepositoryGrants: []auth.InvitationRepositoryGrant{{RepositoryID: 47, Role: auth.RoleThawApprover}}, ExpectedGrantCount: 2, ActualGrantCount: 1},
+	}
 	state := usersPageState{}
 	switch r.URL.Query().Get("variant") {
 	case "empty":
 		entries = nil
+		invitations = nil
 	case "create-error":
 		state = usersPageState{
 			FormError:         "a user with this email already exists",
@@ -1238,9 +1246,11 @@ func (s *Server) handleDevPreviewUsers(w http.ResponseWriter, r *http.Request) {
 		NoRepositories:    len(repositories) == 0,
 		FormError:         state.FormError,
 		CreateOpen:        state.CreateOpen,
-		CreateError:       state.FormError,
 		CreateEmail:       state.CreateEmail,
 		CreateDisplayName: state.CreateDisplayName,
+
+		Invitations:        usersInvitationViews(invitations),
+		InviteRepositories: usersInviteRepositoryViews(repositories, nil),
 	}
 	s.renderPage(w, "layouts/users", data)
 }

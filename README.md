@@ -70,7 +70,7 @@ The service creates `thawguard.db` by default. Override with `THAWGUARD_DB_PATH`
 
 Runtime configuration is environment-variable based. The binary does not currently parse CLI flags such as `--db` or `--addr`; use `THAWGUARD_DB_PATH` and `THAWGUARD_HTTP_ADDR` instead.
 
-`THAWGUARD_PUBLIC_URL` is the canonical browser origin and the origin used for generated recovery links. It must be a root-only HTTPS URL with no credentials, query, or fragment. HTTP is accepted only for the hostname `localhost` or a literal loopback IP address. Internationalized and punycode (`xn--`) hostnames are currently unsupported; configure an ordinary ASCII hostname.
+`THAWGUARD_PUBLIC_URL` is the canonical browser origin and the origin used for generated recovery and invitation links. It must be a root-only HTTPS URL with no credentials, query, or fragment. HTTP is accepted only for the hostname `localhost` or a literal loopback IP address. Internationalized and punycode (`xn--`) hostnames are currently unsupported; configure an ordinary ASCII hostname.
 
 For a Docker-based local alpha runbook, see [`docs/local-alpha.md`](docs/local-alpha.md).
 
@@ -100,11 +100,13 @@ Current local pages:
 - `/activity` primary chronological audit history for recent operator and system changes, with actor, action, affected target, outcome, timestamp, and curated sanitized details
 - `/webhooks` secondary webhook delivery diagnostics with filters, verification state, and sanitized local processing outcomes
 - `/publications` secondary status-publication diagnostics for latest desired statuses and recent posted or failed attempts
-- `/users` admin-only Users & Access directory; `/users/{id}` manages account state, global Admin access, per-repository Viewer, Freezer, and Thaw-approver grants, and one-hour manual password-recovery links for other enabled local-password users
+- `/users` admin-only Users & Access directory with invitation creation and the active-invitation list; `/invitations/accept` anonymous invitation acceptance; `/users/{id}` manages account state, global Admin access, per-repository Viewer, Freezer, and Thaw-approver grants, and one-hour manual password-recovery links for other enabled local-password users
 
-Admin is global installation management and can view every repository. Viewer, Freezer, and Thaw approver are granted per repository; any scoped grant permits reading that repository, while Freezer and Thaw approver permit only their matching actions. Admin does not imply either action role, including scheduled-freeze editing or Start Now. New local users begin active but with zero repository access and must replace their temporary password at first sign-in. If you bind beyond loopback after first-admin setup, keep Thawguard behind the network controls appropriate for your trusted team.
+Admin is global installation management and can view every repository. Viewer, Freezer, and Thaw approver are granted per repository; any scoped grant permits reading that repository, while Freezer and Thaw approver permit only their matching actions. Admin does not imply either action role, including scheduled-freeze editing or Start Now. Inviting a person is the primary way to add someone: the invitee chooses their own password when accepting and starts with exactly the staged access. Local users created through the temporary fallback begin active with zero repository access and must replace their temporary password at first sign-in. If you bind beyond loopback after first-admin setup, keep Thawguard behind the network controls appropriate for your trusted team.
 
 Admins can issue a manual recovery link for another enabled local-password user from Users & Access and share it through a trusted channel. The bearer link expires after one hour and is displayed only once. Email delivery and public forgot-password requests are not part of this flow.
+
+Invitations follow the same trusted-channel model. An Admin stages the identity, optional global Admin, and per-repository roles up front; Thawguard displays one single-use invitation link once, stores only its digest, and sends no email. The link is valid for up to seven days and stops working earlier if the invitation is cancelled, the authorizing Admin loses Admin access, or staged repository access changes. Invitations cannot be edited or reissued; cancel one and create a new one instead. Accepting creates the account with the invitee's chosen password but never signs them in; they sign in afterwards through the ordinary login.
 
 Activity and diagnostic pages render allowlisted, sanitized metadata only. They never display raw webhook payloads, request signatures or headers, secrets, tokens, passwords or hashes, raw forge response bodies, or session IDs. Activity retention, deep-history pagination, export, and deletion remain deferred.
 

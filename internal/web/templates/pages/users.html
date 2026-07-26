@@ -5,7 +5,10 @@
       <h1 class="m-0 text-page-title font-bold text-text">Users &amp; Access</h1>
       <p class="m-0 mt-1 text-sm text-text-muted">Who can sign in to Thawguard and what they can reach.</p>
     </div>
-    {{ template "ui/button" dict "Label" "Add local user" "Variant" "primary" "Icon" "tg-i-plus" "DialogTarget" "users-create-dialog" }}
+    <div class="flex flex-wrap gap-2">
+      {{ template "ui/button" dict "Label" "Invite person" "Variant" "primary" "Icon" "tg-i-plus" "DialogTarget" "users-invite-dialog" }}
+      {{ template "ui/button" dict "Label" "Add local user" "Variant" "secondary" "DialogTarget" "users-create-dialog" }}
+    </div>
   </header>
 
   {{ if .FormError }}<div role="alert">{{ template "ui/callout" dict "Tone" "danger" "Body" .FormError }}</div>{{ end }}

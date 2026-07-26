@@ -1,0 +1,16 @@
+{{ define "pages/invitation-issued" }}
+<h1 class="m-0 mb-3 text-base font-bold text-text">Invitation created</h1>
+<p class="m-0 mb-3 text-sm font-semibold text-text">{{ .DisplayName }}</p>
+<p class="m-0 mb-4"><code class="font-mono text-xs text-text-muted">{{ .Email }}</code></p>
+<p class="m-0 mb-4 text-sm text-text-muted">Copy this link now and hand it to the invitee over a channel you trust. No email was sent. Thawguard stores only the link's digest and cannot display it again. If you lose or close this page before sharing the link, cancel the invitation in Users &amp; Access and create a new one.</p>
+<div class="flex flex-col gap-1.5">
+  <label for="invitation-issued-link" class="text-sm font-semibold text-text">One-time invitation link</label>
+  <input id="invitation-issued-link" type="text" readonly value="{{ .InvitationLink }}" class="h-(--control-height) w-full rounded-control border border-border-input bg-surface px-3 font-mono text-sm text-text">
+</div>
+<p class="m-0 mt-3 text-sm text-text-muted">Valid for up to seven days, until {{ .ExpiresAt }}.</p>
+<div class="mt-4 flex flex-col gap-3">
+  {{ template "ui/callout" dict "Tone" "warning" "Body" "The link can stop working earlier if the invitation is cancelled, the authorizing Admin loses Admin access, staged repository access changes, or the link is replaced." }}
+  {{ template "ui/callout" dict "Tone" "neutral" "Body" "The invitee chooses their own password when they open the link. No account exists until they accept." }}
+</div>
+<div class="mt-4">{{ template "ui/button" dict "Label" "Back to Users & Access" "Variant" "secondary" "Href" "/users" }}</div>
+{{ end }}
