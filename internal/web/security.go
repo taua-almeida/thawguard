@@ -41,6 +41,7 @@ type sessionState struct {
 	Email              string
 	DisplayName        string
 	Grants             auth.Grants
+	HasLocalPassword   bool
 	MustChangePassword bool
 	ExpiresAt          time.Time
 }

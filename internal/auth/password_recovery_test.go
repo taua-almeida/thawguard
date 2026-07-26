@@ -572,7 +572,7 @@ func TestLoginSessionCASRejectsStaleHashAndDisabledUser(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := database.ExecContext(ctx, `UPDATE users SET password_hash = ? WHERE id = ?`, replacementHash, admin.User.ID); err != nil {
+	if _, err := database.ExecContext(ctx, `UPDATE local_credentials SET password_hash = ? WHERE user_id = ?`, replacementHash, admin.User.ID); err != nil {
 		t.Fatal(err)
 	}
 	_, err = service.insertSession(ctx, database, stale.User, stale.passwordHash, "stale-login-session", "stale-login-csrf")
@@ -614,7 +614,7 @@ func TestCommitPasswordChangeCASLeavesStateUntouchedAfterCredentialReplacement(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := database.ExecContext(ctx, `UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?`, replacementHash, target.ID); err != nil {
+	if _, err := database.ExecContext(ctx, `UPDATE local_credentials SET password_hash = ?, must_change_password = 0 WHERE user_id = ?`, replacementHash, target.ID); err != nil {
 		t.Fatal(err)
 	}
 	staleNewHash, err := HashPassword("stale self-service password")

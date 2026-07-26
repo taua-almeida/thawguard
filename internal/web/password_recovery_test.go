@@ -641,7 +641,7 @@ func TestPasswordRecoverySuccessCreatesNoSessionAndAppliesBackendEffects(t *test
 	}
 	var passwordHash string
 	var mustChange int
-	if err := fixture.database.QueryRowContext(fixture.ctx, `SELECT password_hash, must_change_password FROM users WHERE id = ?`, fixture.target.ID).Scan(&passwordHash, &mustChange); err != nil {
+	if err := fixture.database.QueryRowContext(fixture.ctx, `SELECT password_hash, must_change_password FROM local_credentials WHERE user_id = ?`, fixture.target.ID).Scan(&passwordHash, &mustChange); err != nil {
 		t.Fatal(err)
 	}
 	if mustChange != 0 || strings.Contains(body, passwordHash) {

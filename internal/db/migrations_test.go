@@ -93,7 +93,9 @@ func TestOpenAndApplyMigrationsAgainstSQLite(t *testing.T) {
 	assertTableExists(t, database, "user_roles")
 	assertColumnDoesNotExist(t, database, "users", "role")
 	assertColumnExists(t, database, "users", "disabled_at")
-	assertColumnExists(t, database, "users", "must_change_password")
+	assertColumnDoesNotExist(t, database, "users", "password_hash")
+	assertColumnDoesNotExist(t, database, "users", "must_change_password")
+	assertTableExists(t, database, "local_credentials")
 	assertTableExists(t, database, "password_recovery_tokens")
 	assertColumnExists(t, database, "repositories", "enforcement_state")
 	assertColumnExists(t, database, "repositories", "enforcement_failure_reason")
@@ -144,8 +146,8 @@ func TestLegacyAuthorizationStorageCleanupFreshDatabase(t *testing.T) {
 	assertColumnDoesNotExist(t, database, "users", "role")
 	const createdAt = "2026-07-23T09:00:00.000000000Z"
 	if _, err := database.ExecContext(ctx, `
-INSERT INTO users(id, email, display_name, password_hash, created_at, updated_at)
-VALUES (1, 'admin@example.test', 'Admin', 'hash', ?, ?);
+INSERT INTO users(id, email, display_name, created_at, updated_at)
+VALUES (1, 'admin@example.test', 'Admin', ?, ?);
 INSERT INTO user_roles(user_id, role, created_at)
 VALUES (1, 'admin', ?);`, createdAt, createdAt, createdAt); err != nil {
 		t.Fatalf("expected Admin storage to accept an explicit row: %v", err)
@@ -1063,7 +1065,11 @@ VALUES
 
 	var email, updatedAt string
 	var mustChangePassword int
-	if err := database.QueryRowContext(ctx, `SELECT email, must_change_password, updated_at FROM users WHERE id = 2`).Scan(&email, &mustChangePassword, &updatedAt); err != nil {
+	if err := database.QueryRowContext(ctx, `
+SELECT u.email, lc.must_change_password, u.updated_at
+FROM users u
+JOIN local_credentials lc ON lc.user_id = u.id
+WHERE u.id = 2`).Scan(&email, &mustChangePassword, &updatedAt); err != nil {
 		t.Fatal(err)
 	}
 	if email != "operator@example.test" || mustChangePassword != 1 || updatedAt != "2026-07-22T08:15:00.000000000Z" {
@@ -1446,10 +1452,10 @@ func TestInvitationsMigrationEnforcesShapesUniquenessAndCascades(t *testing.T) {
 
 	const timestamp = "2026-07-24T10:00:00.000000000Z"
 	if _, err := database.ExecContext(ctx, `
-INSERT INTO users(id, email, display_name, password_hash, created_at, updated_at)
+INSERT INTO users(id, email, display_name, created_at, updated_at)
 VALUES
-  (1, 'admin@example.test', 'Admin', 'hash-1', ?, ?),
-  (2, 'deletable@example.test', 'Deletable', 'hash-2', ?, ?);
+  (1, 'admin@example.test', 'Admin', ?, ?),
+  (2, 'deletable@example.test', 'Deletable', ?, ?);
 INSERT INTO user_roles(user_id, role, created_at)
 VALUES (1, 'admin', ?);
 INSERT INTO repositories(id, forge, base_url, owner, name, default_branch, active, created_at, updated_at)
@@ -1729,6 +1735,357 @@ WHERE id = ?
 	assertForeignKeyCheckClean(t, database)
 }
 
+func TestLocalCredentialSeparationMigrationPreserves0035DataAndAppliesOnce(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-local-credentials-upgrade-test.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentialIndex := migrationIndex(t, migrations, "0036_local_credential_separation.sql")
+	if err := ApplyMigrations(ctx, database, migrations[:credentialIndex]); err != nil {
+		t.Fatal(err)
+	}
+	assertTableExists(t, database, "invitations")
+	assertColumnExists(t, database, "users", "password_hash")
+	assertColumnExists(t, database, "users", "must_change_password")
+
+	const adminTimestamp = "2026-07-24T10:00:00.000000000Z"
+	const operatorCreatedAt = "2026-07-24T10:05:00.000000000Z"
+	const operatorUpdatedAt = "2026-07-24T11:00:00.000000000Z"
+	const retiredDisabledAt = "2026-07-24T12:00:00.000000000Z"
+	recoveryDigest := bytes.Repeat([]byte{0x36}, 32)
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO users(id, email, display_name, password_hash, disabled_at, must_change_password, created_at, updated_at)
+VALUES
+  (1, 'admin@example.test', 'Admin', 'hash-admin', NULL, 0, ?, ?),
+  (2, 'operator@example.test', 'Operator', 'hash-operator', NULL, 1, ?, ?),
+  (3, 'retired@example.test', 'Retired', 'hash-retired', ?, 0, ?, ?);
+INSERT INTO user_roles(user_id, role, created_at)
+VALUES (1, 'admin', ?);
+INSERT INTO repositories(id, forge, base_url, owner, name, default_branch, active, created_at, updated_at)
+VALUES (10, 'forgejo', 'https://forge.example.test', 'acme', 'api', 'main', 1, ?, ?);
+INSERT INTO repository_grants(repository_id, user_id, role, granted_by_user_id, granted_at)
+VALUES (10, 2, 'freezer', 1, ?);
+INSERT INTO sessions(id, user_id, csrf_token, expires_at, created_at)
+VALUES ('preserved-credential-session', 2, 'preserved-credential-csrf', '2026-07-25T10:00:00.000000000Z', ?);`,
+		adminTimestamp,
+		adminTimestamp,
+		operatorCreatedAt,
+		operatorUpdatedAt,
+		retiredDisabledAt,
+		adminTimestamp,
+		adminTimestamp,
+		adminTimestamp,
+		adminTimestamp,
+		adminTimestamp,
+		adminTimestamp,
+		adminTimestamp,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO password_recovery_tokens(user_id, token_digest, expires_at)
+VALUES (2, ?, 1784887200000000000)`, recoveryDigest); err != nil {
+		t.Fatal(err)
+	}
+	invitationDigest := bytes.Repeat([]byte{0x37}, 32)
+	pending := migrationInvitationRow{
+		ID:           testInvitationID('L', 'A'),
+		Status:       "pending",
+		Email:        "invited@example.test",
+		DisplayName:  "Invited User",
+		TokenDigest:  invitationDigest,
+		ExpiresAt:    int64(1785492000123456789),
+		IsAdmin:      0,
+		AuthorizedBy: 1,
+		Expected:     0,
+		CreatedAt:    adminTimestamp,
+		UpdatedAt:    adminTimestamp,
+	}
+	if err := insertMigrationInvitation(ctx, database, pending); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO audit_events(id, actor_user_id, action, subject_type, subject_id, details_json, created_at)
+VALUES (20, 1, 'user.created', 'user', '2', '{"actor_kind":"user"}', ?)`, adminTimestamp); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ApplyMigrations(ctx, database, migrations[:credentialIndex+1]); err != nil {
+		t.Fatal(err)
+	}
+	assertTableExists(t, database, "local_credentials")
+	assertColumnDoesNotExist(t, database, "users", "password_hash")
+	assertColumnDoesNotExist(t, database, "users", "must_change_password")
+
+	var credentialCount int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM local_credentials`).Scan(&credentialCount); err != nil {
+		t.Fatal(err)
+	}
+	if credentialCount != 3 {
+		t.Fatalf("expected one credential row per pre-existing user, got %d", credentialCount)
+	}
+	for _, want := range []struct {
+		userID     int64
+		hash       string
+		mustChange int
+		createdAt  string
+		updatedAt  string
+	}{
+		{userID: 1, hash: "hash-admin", mustChange: 0, createdAt: adminTimestamp, updatedAt: adminTimestamp},
+		{userID: 2, hash: "hash-operator", mustChange: 1, createdAt: operatorCreatedAt, updatedAt: operatorUpdatedAt},
+		{userID: 3, hash: "hash-retired", mustChange: 0, createdAt: adminTimestamp, updatedAt: adminTimestamp},
+	} {
+		var hash, createdAt, updatedAt string
+		var mustChange int
+		if err := database.QueryRowContext(ctx, `
+SELECT password_hash, must_change_password, created_at, updated_at
+FROM local_credentials
+WHERE user_id = ?`, want.userID).Scan(&hash, &mustChange, &createdAt, &updatedAt); err != nil {
+			t.Fatalf("credential row for user %d: %v", want.userID, err)
+		}
+		if hash != want.hash {
+			t.Fatalf("expected user %d password hash copied exactly", want.userID)
+		}
+		if mustChange != want.mustChange || createdAt != want.createdAt || updatedAt != want.updatedAt {
+			t.Fatalf("expected user %d credential metadata copied exactly, got must_change_password=%d created_at=%q updated_at=%q", want.userID, mustChange, createdAt, updatedAt)
+		}
+	}
+
+	var retiredEmail, retiredUpdatedAt string
+	var storedDisabledAt sql.NullString
+	if err := database.QueryRowContext(ctx, `SELECT email, disabled_at, updated_at FROM users WHERE id = 3`).Scan(&retiredEmail, &storedDisabledAt, &retiredUpdatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if retiredEmail != "retired@example.test" || !storedDisabledAt.Valid || storedDisabledAt.String != retiredDisabledAt || retiredUpdatedAt != adminTimestamp {
+		t.Fatalf("expected disabled account preserved, got email=%q disabled_at=%+v updated_at=%q", retiredEmail, storedDisabledAt, retiredUpdatedAt)
+	}
+
+	for _, check := range []struct {
+		name  string
+		query string
+		want  int
+	}{
+		{name: "users", query: `SELECT count(*) FROM users WHERE id IN (1, 2, 3)`, want: 3},
+		{name: "admins", query: `SELECT count(*) FROM user_roles WHERE user_id = 1 AND role = 'admin'`, want: 1},
+		{name: "grants", query: `SELECT count(*) FROM repository_grants WHERE repository_id = 10 AND user_id = 2 AND role = 'freezer' AND granted_by_user_id = 1`, want: 1},
+		{name: "sessions", query: `SELECT count(*) FROM sessions WHERE id = 'preserved-credential-session' AND user_id = 2 AND csrf_token = 'preserved-credential-csrf'`, want: 1},
+		{name: "recovery tokens", query: `SELECT count(*) FROM password_recovery_tokens WHERE user_id = 2 AND expires_at = 1784887200000000000`, want: 1},
+		{name: "invitations", query: `SELECT count(*) FROM invitations WHERE status = 'pending' AND canonical_email = 'invited@example.test' AND authorized_by_user_id = 1`, want: 1},
+		{name: "audits", query: `SELECT count(*) FROM audit_events WHERE id = 20 AND actor_user_id = 1 AND subject_type = 'user' AND subject_id = '2'`, want: 1},
+	} {
+		var got int
+		if err := database.QueryRowContext(ctx, check.query).Scan(&got); err != nil {
+			t.Fatalf("count preserved %s: %v", check.name, err)
+		}
+		if got != check.want {
+			t.Fatalf("expected %d preserved %s rows, got %d", check.want, check.name, got)
+		}
+	}
+	var storedRecoveryDigest []byte
+	if err := database.QueryRowContext(ctx, `SELECT token_digest FROM password_recovery_tokens WHERE user_id = 2`).Scan(&storedRecoveryDigest); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(storedRecoveryDigest, recoveryDigest) {
+		t.Fatal("expected password recovery digest preserved exactly")
+	}
+	var storedInvitationDigest []byte
+	if err := database.QueryRowContext(ctx, `SELECT token_digest FROM invitations WHERE id = ?`, pending.ID).Scan(&storedInvitationDigest); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(storedInvitationDigest, invitationDigest) {
+		t.Fatal("expected invitation digest preserved exactly")
+	}
+
+	if err := ApplyMigrations(ctx, database, migrations[:credentialIndex+1]); err != nil {
+		t.Fatal(err)
+	}
+	var applied int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = '0036_local_credential_separation'`).Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected local credential separation applied once, got %d", applied)
+	}
+	assertForeignKeyCheckClean(t, database)
+}
+
+func TestLocalCredentialsSchemaEnforcesShapesAndCascades(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-local-credentials-constraints-test.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+		t.Fatal(err)
+	}
+
+	const timestamp = "2026-07-24T10:00:00.000000000Z"
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO users(id, email, display_name, created_at, updated_at)
+VALUES
+  (0, 'zero@example.test', 'Zero', ?, ?),
+  (1, 'admin@example.test', 'Admin', ?, ?),
+  (2, 'passwordless@example.test', 'Passwordless', ?, ?),
+  (3, 'temporary@example.test', 'Temporary', ?, ?);`,
+		timestamp, timestamp, timestamp, timestamp, timestamp, timestamp, timestamp, timestamp,
+	); err != nil {
+		t.Fatalf("expected user rows to be valid without local credentials: %v", err)
+	}
+
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO local_credentials(user_id, password_hash, must_change_password, created_at, updated_at)
+VALUES (1, 'hash-admin', 0, ?, ?), (3, 'hash-temporary', 1, ?, ?)`,
+		timestamp, timestamp, timestamp, timestamp,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO local_credentials(user_id, password_hash, must_change_password, created_at, updated_at)
+VALUES (1, 'hash-second', 0, ?, ?)`, timestamp, timestamp); err == nil {
+		t.Fatal("expected second credential row for the same user to violate the primary key")
+	}
+
+	for _, rejected := range []struct {
+		name string
+		args []any
+	}{
+		{name: "missing parent user", args: []any{999, "hash-orphan", 0, timestamp, timestamp}},
+		{name: "non-positive user id", args: []any{0, "hash-zero", 0, timestamp, timestamp}},
+		{name: "empty password hash", args: []any{2, "", 0, timestamp, timestamp}},
+		{name: "blob password hash", args: []any{2, []byte{0x68}, 0, timestamp, timestamp}},
+		{name: "out-of-range forced-change flag", args: []any{2, "hash-flag", 2, timestamp, timestamp}},
+		{name: "text forced-change flag", args: []any{2, "hash-flag", "x", timestamp, timestamp}},
+		{name: "empty created timestamp", args: []any{2, "hash-created", 0, "", timestamp}},
+		{name: "blob created timestamp", args: []any{2, "hash-created", 0, []byte{0x74}, timestamp}},
+		{name: "empty updated timestamp", args: []any{2, "hash-updated", 0, timestamp, ""}},
+		{name: "blob updated timestamp", args: []any{2, "hash-updated", 0, timestamp, []byte{0x74}}},
+	} {
+		if _, err := database.ExecContext(ctx, `
+INSERT INTO local_credentials(user_id, password_hash, must_change_password, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?)`, rejected.args...); err == nil {
+			t.Fatalf("expected local_credentials to reject %s", rejected.name)
+		}
+	}
+	var passwordlessCredentials int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM local_credentials WHERE user_id = 2`).Scan(&passwordlessCredentials); err != nil {
+		t.Fatal(err)
+	}
+	if passwordlessCredentials != 0 {
+		t.Fatalf("expected rejected inserts to leave the passwordless user without credentials, got %d", passwordlessCredentials)
+	}
+
+	if _, err := database.ExecContext(ctx, `DELETE FROM users WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	var remaining int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM local_credentials WHERE user_id = 1`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("expected user deletion to cascade the credential row, got %d", remaining)
+	}
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM local_credentials`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 1 {
+		t.Fatalf("expected the other user's credential row to survive the cascade, got %d", remaining)
+	}
+	if _, err := database.ExecContext(ctx, `DELETE FROM users WHERE id = 2`); err != nil {
+		t.Fatalf("expected a credential-less user to remain deletable: %v", err)
+	}
+	assertForeignKeyCheckClean(t, database)
+}
+
+func TestLocalCredentialSeparationMigrationRejectsInvalidLegacyRows(t *testing.T) {
+	ctx := context.Background()
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentialIndex := migrationIndex(t, migrations, "0036_local_credential_separation.sql")
+
+	const validTimestamp = "2026-07-24T10:00:00.000000000Z"
+	cases := []struct {
+		name string
+		row  []any
+	}{
+		{name: "zero user id", row: []any{0, "hash-invalid", 0, validTimestamp, validTimestamp}},
+		{name: "negative user id", row: []any{-1, "hash-invalid", 0, validTimestamp, validTimestamp}},
+		{name: "blob password hash", row: []any{2, []byte{0x68, 0x61}, 0, validTimestamp, validTimestamp}},
+		{name: "empty password hash", row: []any{2, "", 0, validTimestamp, validTimestamp}},
+		{name: "text forced-change flag", row: []any{2, "hash-invalid", "x", validTimestamp, validTimestamp}},
+		{name: "out-of-range forced-change flag", row: []any{2, "hash-invalid", 2, validTimestamp, validTimestamp}},
+		{name: "empty created timestamp", row: []any{2, "hash-invalid", 0, "", validTimestamp}},
+		{name: "blob created timestamp", row: []any{2, "hash-invalid", 0, []byte{0x74}, validTimestamp}},
+		{name: "empty updated timestamp", row: []any{2, "hash-invalid", 0, validTimestamp, ""}},
+		{name: "blob updated timestamp", row: []any{2, "hash-invalid", 0, validTimestamp, []byte{0x74}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-invalid-legacy-test.db")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = database.Close() })
+			if err := ApplyMigrations(ctx, database, migrations[:credentialIndex]); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := database.ExecContext(ctx, `
+INSERT INTO users(id, email, display_name, password_hash, disabled_at, must_change_password, created_at, updated_at)
+VALUES (1, 'admin@example.test', 'Admin', 'hash-admin', NULL, 0, ?, ?)`, validTimestamp, validTimestamp); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := database.ExecContext(ctx, `
+INSERT INTO users(id, email, display_name, password_hash, disabled_at, must_change_password, created_at, updated_at)
+VALUES (?, 'invalid@example.test', 'Invalid', ?, NULL, ?, ?, ?)`,
+				tc.row...,
+			); err != nil {
+				t.Fatalf("expected the 0035-era schema to store the nonconforming legacy row: %v", err)
+			}
+
+			if err := ApplyMigrations(ctx, database, migrations[:credentialIndex+1]); err == nil {
+				t.Fatal("expected local credential separation to reject the nonconforming legacy row")
+			}
+
+			assertColumnExists(t, database, "users", "password_hash")
+			assertColumnExists(t, database, "users", "must_change_password")
+			assertTableDoesNotExist(t, database, "local_credentials")
+			var applied int
+			if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = '0036_local_credential_separation'`).Scan(&applied); err != nil {
+				t.Fatal(err)
+			}
+			if applied != 0 {
+				t.Fatalf("expected the failed migration to leave no schema record, got %d", applied)
+			}
+			var users int
+			if err := database.QueryRowContext(ctx, `SELECT count(*) FROM users`).Scan(&users); err != nil {
+				t.Fatal(err)
+			}
+			if users != 2 {
+				t.Fatalf("expected both seeded users to survive the rollback, got %d", users)
+			}
+			var adminHash string
+			if err := database.QueryRowContext(ctx, `SELECT password_hash FROM users WHERE id = 1`).Scan(&adminHash); err != nil {
+				t.Fatal(err)
+			}
+			if adminHash != "hash-admin" {
+				t.Fatal("expected the valid admin credential to stay in users after the rollback")
+			}
+		})
+	}
+}
+
 func TestUserAccountManagementMigrationPreservesUsersAndSessionsAndAppliesOnce(t *testing.T) {
 	ctx := context.Background()
 	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-test.db")))
@@ -1759,7 +2116,7 @@ VALUES ('existing-session', 301, 'csrf-token', '2027-01-01T00:00:00.000000000Z',
 	}
 	assertColumnExists(t, database, "users", "disabled_at")
 	assertColumnExists(t, database, "users", "must_change_password")
-	assertUserEnabledWithoutForcedPasswordChange(t, database, 301)
+	assertPre0036UserEnabledWithoutForcedPasswordChange(t, database, 301)
 	assertUserRoles(t, database, 301, []string{"admin", "viewer"})
 	var sessionCount int
 	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM sessions WHERE id = 'existing-session' AND user_id = 301 AND csrf_token = 'csrf-token'`).Scan(&sessionCount); err != nil {
@@ -1910,10 +2267,10 @@ func TestRepositoryGrantsSchemaEnforcesRolesKeysAndCascades(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := database.ExecContext(ctx, `
-INSERT INTO users(id, email, display_name, password_hash, created_at, updated_at)
+INSERT INTO users(id, email, display_name, created_at, updated_at)
 VALUES
-  (501, 'admin@example.test', 'Admin', 'hash', '2026-07-20T10:00:00.000000000Z', '2026-07-20T10:00:00.000000000Z'),
-  (502, 'lead@example.test', 'Lead', 'hash', '2026-07-20T10:00:00.000000000Z', '2026-07-20T10:00:00.000000000Z');
+  (501, 'admin@example.test', 'Admin', '2026-07-20T10:00:00.000000000Z', '2026-07-20T10:00:00.000000000Z'),
+  (502, 'lead@example.test', 'Lead', '2026-07-20T10:00:00.000000000Z', '2026-07-20T10:00:00.000000000Z');
 INSERT INTO repositories(id, forge, base_url, owner, name, default_branch, created_at, updated_at)
 VALUES
   (601, 'forgejo', 'https://forge.example.test', 'taua-almeida', 'thawguard', 'main', '2026-07-20T10:00:00.000000000Z', '2026-07-20T10:00:00.000000000Z'),
@@ -2033,6 +2390,24 @@ func migrationIndex(t *testing.T, migrations []Migration, name string) int {
 }
 
 func assertUserEnabledWithoutForcedPasswordChange(t *testing.T, database *sql.DB, userID int64) {
+	t.Helper()
+	var disabledAt sql.NullString
+	var mustChangePassword int
+	if err := database.QueryRow(`
+SELECT u.disabled_at, lc.must_change_password
+FROM users u
+JOIN local_credentials lc ON lc.user_id = u.id
+WHERE u.id = ?`, userID).Scan(&disabledAt, &mustChangePassword); err != nil {
+		t.Fatal(err)
+	}
+	if disabledAt.Valid || mustChangePassword != 0 {
+		t.Fatalf("expected user %d to stay enabled without forced password change, got disabled_at=%+v must_change_password=%d", userID, disabledAt, mustChangePassword)
+	}
+}
+
+// assertPre0036UserEnabledWithoutForcedPasswordChange reads the historical
+// users columns for prefix tests that stop before local credential separation.
+func assertPre0036UserEnabledWithoutForcedPasswordChange(t *testing.T, database *sql.DB, userID int64) {
 	t.Helper()
 	var disabledAt sql.NullString
 	var mustChangePassword int
@@ -2157,6 +2532,19 @@ func assertTableExists(t *testing.T, database *sql.DB, name string) {
 	if err := database.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, name).Scan(&found); err != nil {
 		t.Fatalf("expected table %s to exist: %v", name, err)
 	}
+}
+
+func assertTableDoesNotExist(t *testing.T, database *sql.DB, name string) {
+	t.Helper()
+	var found string
+	err := database.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, name).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Fatalf("expected table %s not to exist", name)
 }
 
 func assertUserRoles(t *testing.T, database *sql.DB, userID int64, want []string) {

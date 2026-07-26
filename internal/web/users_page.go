@@ -97,15 +97,18 @@ type userDetailPageData struct {
 	CSRFField   string
 	Toasts      []toastView
 
-	User               auth.User
-	IsSelf             bool
-	IsAdmin            bool
-	IsLastEnabledAdmin bool
-	AdminChecked       bool
-	Repositories       []userRepositoryAccessView
-	RepositoryCount    int
-	NoRepositories     bool
-	FormError          string
+	User    auth.User
+	IsSelf  bool
+	IsAdmin bool
+	// IsLastRecoveryAdmin marks the only enabled Admin with a local password.
+	// Demoting or disabling that account is blocked because it would leave the
+	// installation without local password recovery.
+	IsLastRecoveryAdmin bool
+	AdminChecked        bool
+	Repositories        []userRepositoryAccessView
+	RepositoryCount     int
+	NoRepositories      bool
+	FormError           string
 }
 
 func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
@@ -346,28 +349,28 @@ func (s *Server) loadUserDetailPageData(w http.ResponseWriter, r *http.Request, 
 		s.renderErrorPage(w, http.StatusInternalServerError, false)
 		return userDetailPageData{}, false
 	}
-	enabledAdmins := 0
+	recoveryAdmins := 0
 	for _, entry := range entries {
-		if entry.IsAdmin && !entry.Disabled() {
-			enabledAdmins++
+		if entry.IsAdmin && !entry.Disabled() && entry.HasLocalPassword {
+			recoveryAdmins++
 		}
 	}
 	isAdmin := user.IsAdmin
 	data := userDetailPageData{
-		AppName:            s.cfg.AppName,
-		PageTitle:          user.DisplayName,
-		ActivePage:         "users",
-		CurrentUser:        currentUserFromSession(session),
-		CSRFToken:          session.CSRFToken,
-		CSRFField:          csrfFormField,
-		User:               user,
-		IsSelf:             session.UserID != nil && *session.UserID == user.ID,
-		IsAdmin:            isAdmin,
-		IsLastEnabledAdmin: isAdmin && !user.Disabled() && enabledAdmins == 1,
-		AdminChecked:       isAdmin,
-		RepositoryCount:    len(repositories),
-		NoRepositories:     len(repositories) == 0,
-		FormError:          state.FormError,
+		AppName:             s.cfg.AppName,
+		PageTitle:           user.DisplayName,
+		ActivePage:          "users",
+		CurrentUser:         currentUserFromSession(session),
+		CSRFToken:           session.CSRFToken,
+		CSRFField:           csrfFormField,
+		User:                user,
+		IsSelf:              session.UserID != nil && *session.UserID == user.ID,
+		IsAdmin:             isAdmin,
+		IsLastRecoveryAdmin: isAdmin && !user.Disabled() && user.HasLocalPassword && recoveryAdmins == 1,
+		AdminChecked:        isAdmin,
+		RepositoryCount:     len(repositories),
+		NoRepositories:      len(repositories) == 0,
+		FormError:           state.FormError,
 	}
 	if state.AdminSubmitted {
 		data.AdminChecked = state.AdminValue

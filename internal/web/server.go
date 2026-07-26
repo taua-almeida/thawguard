@@ -1846,6 +1846,10 @@ func (s *Server) handleAccountPassword(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !session.HasLocalPassword {
+		s.renderErrorPage(w, http.StatusNotFound, false)
+		return
+	}
 	s.renderAccountPassword(w, "", http.StatusOK, session)
 }
 
@@ -1860,6 +1864,12 @@ func (s *Server) handleAccountPasswordPost(w http.ResponseWriter, r *http.Reques
 	}
 	if session.UserID == nil {
 		s.renderErrorPage(w, http.StatusForbidden, true)
+		return
+	}
+	// A credential-less account has no password page: reuse the styled 404 after
+	// authentication and CSRF checks so the route neither validates nor mutates.
+	if !session.HasLocalPassword {
+		s.renderErrorPage(w, http.StatusNotFound, false)
 		return
 	}
 	if r.PostFormValue("new_password") != r.PostFormValue("new_password_confirmation") {
@@ -2060,6 +2070,7 @@ func sessionStateFromAuth(session auth.Session) sessionState {
 		Email:              session.User.Email,
 		DisplayName:        session.User.DisplayName,
 		Grants:             session.Grants,
+		HasLocalPassword:   session.User.HasLocalPassword,
 		MustChangePassword: session.User.MustChangePassword,
 		ExpiresAt:          session.ExpiresAt,
 	}
@@ -2076,7 +2087,7 @@ func currentUserFromSession(session sessionState) currentUserView {
 		Email:                 session.Email,
 		DisplayName:           session.DisplayName,
 		RoleLabel:             roleLabel,
-		CanChangePassword:     session.UserID != nil,
+		CanChangePassword:     session.UserID != nil && session.HasLocalPassword,
 		IsAdmin:               session.UserID != nil && session.Grants.CanManageInstallation(),
 		CanManageInstallation: session.Grants.CanManageInstallation(),
 		HasRepositoryAccess:   session.Grants.HasRepositoryAccess(),

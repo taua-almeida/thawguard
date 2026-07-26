@@ -100,11 +100,11 @@ Current local pages:
 - `/activity` primary chronological audit history for recent operator and system changes, with actor, action, affected target, outcome, timestamp, and curated sanitized details
 - `/webhooks` secondary webhook delivery diagnostics with filters, verification state, and sanitized local processing outcomes
 - `/publications` secondary status-publication diagnostics for latest desired statuses and recent posted or failed attempts
-- `/users` admin-only Users & Access directory; `/users/{id}` manages account state, global Admin access, per-repository Viewer, Freezer, and Thaw-approver grants, and one-hour manual password-recovery links for other enabled users
+- `/users` admin-only Users & Access directory; `/users/{id}` manages account state, global Admin access, per-repository Viewer, Freezer, and Thaw-approver grants, and one-hour manual password-recovery links for other enabled local-password users
 
 Admin is global installation management and can view every repository. Viewer, Freezer, and Thaw approver are granted per repository; any scoped grant permits reading that repository, while Freezer and Thaw approver permit only their matching actions. Admin does not imply either action role, including scheduled-freeze editing or Start Now. New local users begin active but with zero repository access and must replace their temporary password at first sign-in. If you bind beyond loopback after first-admin setup, keep Thawguard behind the network controls appropriate for your trusted team.
 
-Admins can issue a manual recovery link from Users & Access and share it through a trusted channel. The bearer link expires after one hour and is displayed only once. Email delivery and public forgot-password requests are not part of this flow.
+Admins can issue a manual recovery link for another enabled local-password user from Users & Access and share it through a trusted channel. The bearer link expires after one hour and is displayed only once. Email delivery and public forgot-password requests are not part of this flow.
 
 Activity and diagnostic pages render allowlisted, sanitized metadata only. They never display raw webhook payloads, request signatures or headers, secrets, tokens, passwords or hashes, raw forge response bodies, or session IDs. Activity retention, deep-history pagination, export, and deletion remain deferred.
 

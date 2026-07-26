@@ -67,7 +67,7 @@ VALUES (?, ?, ?)`, record.ID, RoleAdmin, nowText); err != nil {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM user_roles WHERE user_id = ? AND role = ?`, record.ID, RoleAdmin); err != nil {
 			return User{}, fmt.Errorf("remove user admin: %w", err)
 		}
-		if err := s.ensureEnabledAdminRemains(ctx, tx, "the final enabled admin must keep the admin role"); err != nil {
+		if err := s.ensureEnabledAdminRemains(ctx, tx, "the final enabled admin with a local password must keep the admin role"); err != nil {
 			return User{}, err
 		}
 		if before {
@@ -142,7 +142,7 @@ func (s *Service) DisableUser(ctx context.Context, actorUserID int64, userID int
 	if _, err := tx.ExecContext(ctx, `UPDATE users SET disabled_at = ?, updated_at = ? WHERE id = ?`, nowText, nowText, record.ID); err != nil {
 		return User{}, fmt.Errorf("disable user: %w", err)
 	}
-	if err := s.ensureEnabledAdminRemains(ctx, tx, "the final enabled admin cannot be disabled"); err != nil {
+	if err := s.ensureEnabledAdminRemains(ctx, tx, "the final enabled admin with a local password cannot be disabled"); err != nil {
 		return User{}, err
 	}
 	if err := invalidateInvitationsAuthorizedBy(
@@ -235,6 +235,9 @@ func (s *Service) ChangePassword(ctx context.Context, params ChangePasswordParam
 		}
 		return Session{}, err
 	}
+	if !record.HasLocalPassword {
+		return Session{}, ValidationError{Message: "local password is not configured"}
+	}
 	currentOK, err := VerifyPassword(params.CurrentPassword, record.passwordHash)
 	if err != nil || !currentOK {
 		return Session{}, ValidationError{Message: "current password is incorrect"}
@@ -268,12 +271,22 @@ func (s *Service) commitPasswordChange(
 	defer tx.Rollback()
 
 	now := s.now().UTC()
+	nowText := now.Format(time.RFC3339Nano)
+	// The verified-hash CAS still guards the write: a concurrent change or
+	// reset invalidates record.passwordHash and this update matches no row.
 	result, err := tx.ExecContext(ctx, `
-UPDATE users
+UPDATE local_credentials
 SET password_hash = ?, must_change_password = 0, updated_at = ?
-WHERE id = ? AND password_hash = ? AND disabled_at IS NULL`,
+WHERE user_id = ?
+  AND password_hash = ?
+  AND EXISTS (
+    SELECT 1
+    FROM users u
+    WHERE u.id = local_credentials.user_id
+      AND u.disabled_at IS NULL
+  )`,
 		passwordHash,
-		now.Format(time.RFC3339Nano),
+		nowText,
 		record.ID,
 		record.passwordHash,
 	)
@@ -289,6 +302,9 @@ WHERE id = ? AND password_hash = ? AND disabled_at IS NULL`,
 	}
 	if updated != 1 {
 		return Session{}, fmt.Errorf("update user password affected %d rows", updated)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE users SET updated_at = ? WHERE id = ?`, nowText, record.ID); err != nil {
+		return Session{}, fmt.Errorf("update user after password change: %w", err)
 	}
 	if err := deleteUserSessions(ctx, tx, record.ID); err != nil {
 		return Session{}, err
@@ -347,9 +363,18 @@ func (s *Service) ResetPassword(ctx context.Context, params ResetPasswordParams)
 		}
 		return err
 	}
+	if !record.HasLocalPassword {
+		return ValidationError{Message: "local password is not configured"}
+	}
 	nowText := s.now().UTC().Format(time.RFC3339Nano)
-	if _, err := tx.ExecContext(ctx, `UPDATE users SET password_hash = ?, must_change_password = 1, updated_at = ? WHERE id = ?`, passwordHash, nowText, record.ID); err != nil {
+	if _, err := tx.ExecContext(ctx, `
+UPDATE local_credentials
+SET password_hash = ?, must_change_password = 1, updated_at = ?
+WHERE user_id = ?`, passwordHash, nowText, record.ID); err != nil {
 		return fmt.Errorf("reset user password: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE users SET updated_at = ? WHERE id = ?`, nowText, record.ID); err != nil {
+		return fmt.Errorf("update user after password reset: %w", err)
 	}
 	if err := deleteUserSessions(ctx, tx, record.ID); err != nil {
 		return err
@@ -367,16 +392,20 @@ func (s *Service) ResetPassword(ctx context.Context, params ResetPasswordParams)
 	return nil
 }
 
-// ensureEnabledAdminRemains enforces the final enabled admin invariant after
-// a mutation inside the same transaction, so a violating change rolls back.
+// ensureEnabledAdminRemains enforces the recovery invariant after a mutation
+// inside the same transaction, so a violating change rolls back: at least one
+// enabled Admin must hold a local credential, because only a local password
+// keeps self-hosted recovery possible. A credential-less Admin keeps full
+// Admin authority but does not satisfy this invariant.
 func (s *Service) ensureEnabledAdminRemains(ctx context.Context, q queryer, message string) error {
 	var count int
 	if err := q.QueryRowContext(ctx, `
 SELECT count(*)
 FROM users u
 JOIN user_roles ur ON ur.user_id = u.id AND ur.role = ?
+JOIN local_credentials lc ON lc.user_id = u.id
 WHERE u.disabled_at IS NULL`, RoleAdmin).Scan(&count); err != nil {
-		return fmt.Errorf("count enabled admins: %w", err)
+		return fmt.Errorf("count enabled local-password admins: %w", err)
 	}
 	if count == 0 {
 		return ValidationError{Message: message}

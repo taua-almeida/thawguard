@@ -40,7 +40,11 @@ func TestCreateFirstAdminBootstrapsOnlyEmptyDatabase(t *testing.T) {
 	}
 
 	var storedHash string
-	if err := database.QueryRowContext(ctx, `SELECT password_hash FROM users WHERE email = ?`, "admin@example.test").Scan(&storedHash); err != nil {
+	if err := database.QueryRowContext(ctx, `
+SELECT lc.password_hash
+FROM local_credentials lc
+JOIN users u ON u.id = lc.user_id
+WHERE u.email = ?`, "admin@example.test").Scan(&storedHash); err != nil {
 		t.Fatal(err)
 	}
 	if storedHash == "correct horse battery staple" {

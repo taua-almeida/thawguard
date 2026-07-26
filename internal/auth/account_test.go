@@ -312,6 +312,95 @@ WHERE u.disabled_at IS NULL`).Scan(&enabledAdmins); err != nil {
 	}
 }
 
+func TestCredentialLessAdminDoesNotSatisfyRecoveryInvariant(t *testing.T) {
+	ctx := context.Background()
+	database := newAuthTestDB(t, ctx)
+	service := NewService(database)
+	admin := mustCreateFirstAdmin(t, ctx, service)
+	credentialLess := mustCreateUser(t, ctx, service, "second@example.test", true)
+	removeLocalCredential(t, ctx, database, credentialLess.ID)
+
+	// A credential-less Admin keeps ordinary Admin authority.
+	member := mustCreateUser(t, ctx, service, "member@example.test", false)
+	if _, err := service.SetUserAdmin(ctx, SetUserAdminParams{ActorUserID: credentialLess.ID, UserID: member.ID, Admin: true}); err != nil {
+		t.Fatalf("expected credential-less admin to keep admin authority, got %v", err)
+	}
+	if _, err := service.SetUserAdmin(ctx, SetUserAdminParams{ActorUserID: credentialLess.ID, UserID: member.ID, Admin: false}); err != nil {
+		t.Fatal(err)
+	}
+
+	// It does not satisfy the recovery invariant: the sole local-credential
+	// admin can be neither demoted nor disabled while it is the only enabled
+	// admin holding a local password, even though another enabled admin exists.
+	if _, err := service.SetUserAdmin(ctx, SetUserAdminParams{ActorUserID: credentialLess.ID, UserID: admin.User.ID, Admin: false}); !IsValidationError(err) || !strings.Contains(err.Error(), "the final enabled admin with a local password must keep the admin role") {
+		t.Fatalf("expected demotion of the final local-credential admin to be rejected, got %v", err)
+	}
+	if _, err := service.DisableUser(ctx, credentialLess.ID, admin.User.ID); !IsValidationError(err) || !strings.Contains(err.Error(), "the final enabled admin with a local password cannot be disabled") {
+		t.Fatalf("expected disable of the final local-credential admin to be rejected, got %v", err)
+	}
+	loaded, err := service.userByID(ctx, database, admin.User.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.IsAdmin || loaded.Disabled() {
+		t.Fatalf("expected rejected mutations to leave the local-credential admin enabled, got %+v", loaded.User)
+	}
+
+	// The credential-less admin itself is not protected: it may be demoted,
+	// re-assigned Admin, and disabled while the local-credential admin remains.
+	if _, err := service.SetUserAdmin(ctx, SetUserAdminParams{ActorUserID: admin.User.ID, UserID: credentialLess.ID, Admin: false}); err != nil {
+		t.Fatalf("expected demotion of a credential-less admin to succeed, got %v", err)
+	}
+	if _, err := service.SetUserAdmin(ctx, SetUserAdminParams{ActorUserID: admin.User.ID, UserID: credentialLess.ID, Admin: true}); err != nil {
+		t.Fatalf("expected assigning admin to a credential-less account to succeed, got %v", err)
+	}
+	if _, err := service.DisableUser(ctx, admin.User.ID, credentialLess.ID); err != nil {
+		t.Fatalf("expected disabling a credential-less admin to succeed, got %v", err)
+	}
+}
+
+func TestConcurrentMixedMutationsCannotCommitZeroLocalCredentialAdmins(t *testing.T) {
+	ctx := context.Background()
+	database := newAuthTestDB(t, ctx)
+	service := NewService(database)
+	admin := mustCreateFirstAdmin(t, ctx, service)
+	secondAdmin := mustCreateUser(t, ctx, service, "second@example.test", true)
+	credentialLess := mustCreateUser(t, ctx, service, "third@example.test", true)
+	removeLocalCredential(t, ctx, database, credentialLess.ID)
+
+	// Race a disable and a demotion of the two local-credential admins plus a
+	// disable issued by the credential-less admin. Any subset may commit, but
+	// never one that leaves zero enabled admins with a local credential.
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		_, _ = service.DisableUser(ctx, admin.User.ID, secondAdmin.ID)
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = service.SetUserAdmin(ctx, SetUserAdminParams{ActorUserID: secondAdmin.ID, UserID: admin.User.ID, Admin: false})
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = service.DisableUser(ctx, credentialLess.ID, admin.User.ID)
+	}()
+	wg.Wait()
+
+	var localCredentialAdmins int
+	if err := database.QueryRowContext(ctx, `
+SELECT count(*)
+FROM users u
+JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'admin'
+JOIN local_credentials lc ON lc.user_id = u.id
+WHERE u.disabled_at IS NULL`).Scan(&localCredentialAdmins); err != nil {
+		t.Fatal(err)
+	}
+	if localCredentialAdmins < 1 {
+		t.Fatalf("expected at least one enabled admin with a local credential after concurrent mixed mutations, got %d", localCredentialAdmins)
+	}
+}
+
 func TestChangePasswordValidatesCurrentPasswordAndNewPassword(t *testing.T) {
 	ctx := context.Background()
 	database := newAuthTestDB(t, ctx)
@@ -410,7 +499,7 @@ func TestResetPasswordSetsForcedFlagRevokesSessionsAndPreservesState(t *testing.
 
 	var storedHash string
 	var mustChangePassword int
-	if err := database.QueryRowContext(ctx, `SELECT password_hash, must_change_password FROM users WHERE id = ?`, user.ID).Scan(&storedHash, &mustChangePassword); err != nil {
+	if err := database.QueryRowContext(ctx, `SELECT password_hash, must_change_password FROM local_credentials WHERE user_id = ?`, user.ID).Scan(&storedHash, &mustChangePassword); err != nil {
 		t.Fatal(err)
 	}
 	if storedHash == "temporary local password" || !strings.HasPrefix(storedHash, "$argon2id$") {

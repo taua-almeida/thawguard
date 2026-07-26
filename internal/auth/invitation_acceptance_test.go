@@ -186,7 +186,7 @@ func TestAcceptInvitationMaterializesStagedIdentityAuthorityAndExactAudits(t *te
 	assertAcceptanceAuditCount(t, ctx, database, user.ID, credential.InvitationID, 6)
 
 	var passwordHash string
-	if err := database.QueryRowContext(ctx, `SELECT password_hash FROM users WHERE id = ?`, user.ID).Scan(&passwordHash); err != nil {
+	if err := database.QueryRowContext(ctx, `SELECT password_hash FROM local_credentials WHERE user_id = ?`, user.ID).Scan(&passwordHash); err != nil {
 		t.Fatal(err)
 	}
 	assertInvitationAcceptanceSecretsAbsent(
@@ -442,9 +442,19 @@ func TestAcceptInvitationExpectedInvalidStatesShareOneErrorAndLeaveNoPartialStat
 			},
 			setup: func(t *testing.T, ctx context.Context, database *sql.DB, _ *Service, _ Session, _ InvitationCredential) {
 				now := time.Now().UTC().Format(time.RFC3339Nano)
+				result, err := database.ExecContext(ctx, `
+INSERT INTO users(email, display_name, created_at, updated_at)
+VALUES ('collision@example.test', 'Existing Collision', ?, ?)`, now, now)
+				if err != nil {
+					t.Fatal(err)
+				}
+				collidingID, err := result.LastInsertId()
+				if err != nil {
+					t.Fatal(err)
+				}
 				if _, err := database.ExecContext(ctx, `
-INSERT INTO users(email, display_name, password_hash, must_change_password, created_at, updated_at)
-VALUES ('collision@example.test', 'Existing Collision', 'hash', 0, ?, ?)`, now, now); err != nil {
+INSERT INTO local_credentials(user_id, password_hash, must_change_password, created_at, updated_at)
+VALUES (?, 'hash', 0, ?, ?)`, collidingID, now, now); err != nil {
 					t.Fatal(err)
 				}
 			},

@@ -65,7 +65,8 @@ SELECT
   u.email,
   u.display_name,
   u.disabled_at,
-  u.must_change_password,
+  lc.user_id IS NOT NULL AS has_local_password,
+  lc.must_change_password,
   u.created_at,
   u.updated_at,
   EXISTS (
@@ -77,6 +78,7 @@ SELECT
   EXISTS (SELECT 1 FROM repository_grants grants WHERE grants.user_id = u.id AND grants.role = 'freezer') AS has_freezer,
   EXISTS (SELECT 1 FROM repository_grants grants WHERE grants.user_id = u.id AND grants.role = 'thaw_approver') AS has_thaw_approver
 FROM users u
+LEFT JOIN local_credentials lc ON lc.user_id = u.id
 WHERE (
     ? = ''
     OR lower(u.display_name) LIKE ? ESCAPE '\'
@@ -119,13 +121,15 @@ ORDER BY lower(trim(u.display_name)), lower(u.email), u.id`, query.Search, patte
 
 func scanDirectoryEntry(row scanner, entry *UserDirectoryEntry, isAdmin, hasViewer, hasFreezer, hasThaw *int) error {
 	var disabledAt sql.NullString
-	var mustChange int
+	var hasLocalPassword int
+	var mustChange sql.NullInt64
 	var createdAt, updatedAt string
 	if err := row.Scan(
 		&entry.ID,
 		&entry.Email,
 		&entry.DisplayName,
 		&disabledAt,
+		&hasLocalPassword,
 		&mustChange,
 		&createdAt,
 		&updatedAt,
@@ -150,7 +154,8 @@ func scanDirectoryEntry(row scanner, entry *UserDirectoryEntry, isAdmin, hasView
 		return fmt.Errorf("parse directory user disabled_at: %w", err)
 	}
 	entry.DisabledAt = parsedDisabledAt
-	entry.MustChangePassword = mustChange != 0
+	entry.HasLocalPassword = hasLocalPassword != 0
+	entry.MustChangePassword = mustChange.Valid && mustChange.Int64 != 0
 	entry.CreatedAt = parsedCreatedAt
 	entry.UpdatedAt = parsedUpdatedAt
 	return nil

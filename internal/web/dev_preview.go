@@ -1192,18 +1192,19 @@ func (s *Server) handleDevPreviewUsers(w http.ResponseWriter, r *http.Request) {
 	}
 	selfID := int64(1)
 	session := sessionState{
-		CSRFToken:   "dev-preview-fictional-token",
-		UserID:      &selfID,
-		Email:       "mira.frost@example.test",
-		DisplayName: "Mira Frost",
-		Grants:      auth.NewGrants(true, nil),
+		CSRFToken:        "dev-preview-fictional-token",
+		UserID:           &selfID,
+		Email:            "mira.frost@example.test",
+		DisplayName:      "Mira Frost",
+		Grants:           auth.NewGrants(true, nil),
+		HasLocalPassword: true,
 	}
 	disabledAt := time.Date(2026, 7, 2, 16, 30, 0, 0, time.UTC)
 	entries := []auth.UserDirectoryEntry{
-		{User: auth.User{ID: 1, Email: "mira.frost@example.test", DisplayName: "Mira Frost", IsAdmin: true, CreatedAt: time.Date(2026, 5, 2, 9, 12, 0, 0, time.UTC)}, RepositoryCount: 2, HasFreezer: true},
-		{User: auth.User{ID: 2, Email: "kai.merid@example.test", DisplayName: "Kai Merid", CreatedAt: time.Date(2026, 6, 11, 14, 40, 0, 0, time.UTC)}, RepositoryCount: 2, HasViewer: true, HasThawApprover: true},
-		{User: auth.User{ID: 3, Email: "sten.hale@example.test", DisplayName: "Sten Hale", MustChangePassword: true, CreatedAt: time.Date(2026, 7, 4, 8, 5, 0, 0, time.UTC)}, RepositoryCount: 1, HasViewer: true},
-		{User: auth.User{ID: 4, Email: "lena.polar@example.test", DisplayName: "Lena Polar", IsAdmin: true, DisabledAt: &disabledAt, CreatedAt: time.Date(2026, 6, 20, 11, 25, 0, 0, time.UTC)}, RepositoryCount: 2, HasFreezer: true},
+		{User: auth.User{ID: 1, Email: "mira.frost@example.test", DisplayName: "Mira Frost", IsAdmin: true, HasLocalPassword: true, CreatedAt: time.Date(2026, 5, 2, 9, 12, 0, 0, time.UTC)}, RepositoryCount: 2, HasFreezer: true},
+		{User: auth.User{ID: 2, Email: "kai.merid@example.test", DisplayName: "Kai Merid", HasLocalPassword: true, CreatedAt: time.Date(2026, 6, 11, 14, 40, 0, 0, time.UTC)}, RepositoryCount: 2, HasViewer: true, HasThawApprover: true},
+		{User: auth.User{ID: 3, Email: "sten.hale@example.test", DisplayName: "Sten Hale", HasLocalPassword: true, MustChangePassword: true, CreatedAt: time.Date(2026, 7, 4, 8, 5, 0, 0, time.UTC)}, RepositoryCount: 1, HasViewer: true},
+		{User: auth.User{ID: 4, Email: "lena.polar@example.test", DisplayName: "Lena Polar", IsAdmin: true, HasLocalPassword: true, DisabledAt: &disabledAt, CreatedAt: time.Date(2026, 6, 20, 11, 25, 0, 0, time.UTC)}, RepositoryCount: 2, HasFreezer: true},
 	}
 	repositories := []domain.Repository{
 		{ID: 46, Owner: "aurora", Name: "ice-station"},

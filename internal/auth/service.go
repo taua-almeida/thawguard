@@ -17,11 +17,15 @@ import (
 const DefaultSessionTTL = 12 * time.Hour
 
 type User struct {
-	ID                 int64
-	Email              string
-	DisplayName        string
-	IsAdmin            bool
-	DisabledAt         *time.Time
+	ID          int64
+	Email       string
+	DisplayName string
+	IsAdmin     bool
+	DisabledAt  *time.Time
+	// HasLocalPassword reports whether a local_credentials row exists for the
+	// account. It is derived from the credential row's presence, never from
+	// hash contents. MustChangePassword is always false without a credential.
+	HasLocalPassword   bool
 	MustChangePassword bool
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
@@ -226,9 +230,10 @@ func (s *Service) SessionByID(ctx context.Context, id string) (Session, bool, er
 SELECT s.id, s.csrf_token, s.expires_at, s.created_at,
   u.id, u.email, u.display_name,
   EXISTS (SELECT 1 FROM user_roles admin_role WHERE admin_role.user_id = u.id AND admin_role.role = 'admin'),
-  u.disabled_at, u.must_change_password, u.created_at, u.updated_at
+  u.disabled_at, lc.user_id IS NOT NULL, lc.must_change_password, u.created_at, u.updated_at
 FROM sessions s
 JOIN users u ON u.id = s.user_id
+LEFT JOIN local_credentials lc ON lc.user_id = u.id
 WHERE s.id = ?`, id)
 	session, err := scanSession(row)
 	if err != nil {
@@ -283,8 +288,9 @@ func (s *Service) ListUsers(ctx context.Context) ([]User, error) {
 	rows, err := s.db.QueryContext(ctx, `
 SELECT u.id, u.email, u.display_name,
   EXISTS (SELECT 1 FROM user_roles admin_role WHERE admin_role.user_id = u.id AND admin_role.role = 'admin'),
-  u.disabled_at, u.must_change_password, u.created_at, u.updated_at
+  u.disabled_at, lc.user_id IS NOT NULL, lc.must_change_password, u.created_at, u.updated_at
 FROM users u
+LEFT JOIN local_credentials lc ON lc.user_id = u.id
 ORDER BY u.created_at ASC, u.id ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("list users: %w", err)
@@ -340,12 +346,16 @@ func (s *Service) userCount(ctx context.Context, q queryer) (int, error) {
 	return count, nil
 }
 
+// userByEmail serves local login only, so it requires a credential row via an
+// inner join: a credential-less account yields sql.ErrNoRows and the same
+// generic authentication failure as an unknown email.
 func (s *Service) userByEmail(ctx context.Context, email string) (userRecord, error) {
 	row := s.db.QueryRowContext(ctx, `
-SELECT u.id, u.email, u.display_name, u.password_hash,
+SELECT u.id, u.email, u.display_name, lc.password_hash,
   EXISTS (SELECT 1 FROM user_roles admin_role WHERE admin_role.user_id = u.id AND admin_role.role = 'admin'),
-  u.disabled_at, u.must_change_password, u.created_at, u.updated_at
+  u.disabled_at, lc.user_id IS NOT NULL, lc.must_change_password, u.created_at, u.updated_at
 FROM users u
+JOIN local_credentials lc ON lc.user_id = u.id
 WHERE u.email = ?`, email)
 	record, err := scanUserRecord(row)
 	if err != nil {
@@ -354,12 +364,16 @@ WHERE u.email = ?`, email)
 	return record, nil
 }
 
+// userByID retains credential-less accounts through a left join so account
+// management keeps working without a local password. Callers that mutate a
+// credential must check HasLocalPassword before trusting passwordHash.
 func (s *Service) userByID(ctx context.Context, q queryer, id int64) (userRecord, error) {
 	row := q.QueryRowContext(ctx, `
-SELECT u.id, u.email, u.display_name, u.password_hash,
+SELECT u.id, u.email, u.display_name, lc.password_hash,
   EXISTS (SELECT 1 FROM user_roles admin_role WHERE admin_role.user_id = u.id AND admin_role.role = 'admin'),
-  u.disabled_at, u.must_change_password, u.created_at, u.updated_at
+  u.disabled_at, lc.user_id IS NOT NULL, lc.must_change_password, u.created_at, u.updated_at
 FROM users u
+LEFT JOIN local_credentials lc ON lc.user_id = u.id
 WHERE u.id = ?`, id)
 	record, err := scanUserRecord(row)
 	if err != nil {
@@ -368,18 +382,26 @@ WHERE u.id = ?`, id)
 	return record, nil
 }
 
+// insertUser creates the account and exactly one local credential with the
+// same timestamps. Callers run it inside their transaction, so a credential
+// insertion failure rolls back the user row and every sibling write.
 func (s *Service) insertUser(ctx context.Context, q queryer, params CreateUserParams, passwordHash string, mustChangePassword bool, isAdmin bool) (User, error) {
 	now := s.now().UTC()
 	nowText := now.Format(time.RFC3339Nano)
 	result, err := q.ExecContext(ctx, `
-INSERT INTO users(email, display_name, password_hash, must_change_password, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?)`, params.Email, params.DisplayName, passwordHash, boolInt(mustChangePassword), nowText, nowText)
+INSERT INTO users(email, display_name, created_at, updated_at)
+VALUES (?, ?, ?, ?)`, params.Email, params.DisplayName, nowText, nowText)
 	if err != nil {
 		return User{}, createUserError(err)
 	}
 	id, err := result.LastInsertId()
 	if err != nil {
 		return User{}, fmt.Errorf("created user id: %w", err)
+	}
+	if _, err := q.ExecContext(ctx, `
+INSERT INTO local_credentials(user_id, password_hash, must_change_password, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?)`, id, passwordHash, boolInt(mustChangePassword), nowText, nowText); err != nil {
+		return User{}, fmt.Errorf("create user local credential: %w", err)
 	}
 	if isAdmin {
 		if _, err := q.ExecContext(ctx, `
@@ -388,7 +410,16 @@ VALUES (?, 'admin', ?)`, id, nowText); err != nil {
 			return User{}, fmt.Errorf("create user Admin row: %w", err)
 		}
 	}
-	return User{ID: id, Email: params.Email, DisplayName: params.DisplayName, IsAdmin: isAdmin, MustChangePassword: mustChangePassword, CreatedAt: now, UpdatedAt: now}, nil
+	return User{
+		ID:                 id,
+		Email:              params.Email,
+		DisplayName:        params.DisplayName,
+		IsAdmin:            isAdmin,
+		HasLocalPassword:   true,
+		MustChangePassword: mustChangePassword,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}, nil
 }
 
 func boolInt(value bool) int {
@@ -416,7 +447,8 @@ func (s *Service) insertSession(
 INSERT INTO sessions(id, user_id, csrf_token, expires_at, created_at)
 SELECT ?, u.id, ?, ?, ?
 FROM users u
-WHERE u.id = ? AND u.password_hash = ? AND u.disabled_at IS NULL`,
+JOIN local_credentials lc ON lc.user_id = u.id
+WHERE u.id = ? AND lc.password_hash = ? AND u.disabled_at IS NULL`,
 		sessionID,
 		csrfToken,
 		expiresAt.Format(time.RFC3339Nano),
@@ -451,10 +483,11 @@ func scanUser(row scanner) (User, error) {
 	var user User
 	var isAdmin int
 	var disabledAt sql.NullString
-	var mustChangePassword int
+	var hasLocalPassword int
+	var mustChangePassword sql.NullInt64
 	var createdAt string
 	var updatedAt string
-	if err := row.Scan(&user.ID, &user.Email, &user.DisplayName, &isAdmin, &disabledAt, &mustChangePassword, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&user.ID, &user.Email, &user.DisplayName, &isAdmin, &disabledAt, &hasLocalPassword, &mustChangePassword, &createdAt, &updatedAt); err != nil {
 		return User{}, err
 	}
 	parsedCreatedAt, err := parseTime(createdAt)
@@ -471,7 +504,8 @@ func scanUser(row scanner) (User, error) {
 	}
 	user.IsAdmin = isAdmin != 0
 	user.DisabledAt = parsedDisabledAt
-	user.MustChangePassword = mustChangePassword != 0
+	user.HasLocalPassword = hasLocalPassword != 0
+	user.MustChangePassword = mustChangePassword.Valid && mustChangePassword.Int64 != 0
 	user.CreatedAt = parsedCreatedAt
 	user.UpdatedAt = parsedUpdatedAt
 	return user, nil
@@ -479,12 +513,14 @@ func scanUser(row scanner) (User, error) {
 
 func scanUserRecord(row scanner) (userRecord, error) {
 	var record userRecord
+	var passwordHash sql.NullString
 	var isAdmin int
 	var disabledAt sql.NullString
-	var mustChangePassword int
+	var hasLocalPassword int
+	var mustChangePassword sql.NullInt64
 	var createdAt string
 	var updatedAt string
-	if err := row.Scan(&record.ID, &record.Email, &record.DisplayName, &record.passwordHash, &isAdmin, &disabledAt, &mustChangePassword, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&record.ID, &record.Email, &record.DisplayName, &passwordHash, &isAdmin, &disabledAt, &hasLocalPassword, &mustChangePassword, &createdAt, &updatedAt); err != nil {
 		return userRecord{}, err
 	}
 	parsedCreatedAt, err := parseTime(createdAt)
@@ -499,9 +535,11 @@ func scanUserRecord(row scanner) (userRecord, error) {
 	if err != nil {
 		return userRecord{}, fmt.Errorf("parse user disabled_at: %w", err)
 	}
+	record.passwordHash = passwordHash.String
 	record.IsAdmin = isAdmin != 0
 	record.DisabledAt = parsedDisabledAt
-	record.MustChangePassword = mustChangePassword != 0
+	record.HasLocalPassword = hasLocalPassword != 0
+	record.MustChangePassword = mustChangePassword.Valid && mustChangePassword.Int64 != 0
 	record.CreatedAt = parsedCreatedAt
 	record.UpdatedAt = parsedUpdatedAt
 	return record, nil
@@ -513,10 +551,11 @@ func scanSession(row scanner) (Session, error) {
 	var expiresAt string
 	var sessionCreatedAt string
 	var disabledAt sql.NullString
-	var mustChangePassword int
+	var hasLocalPassword int
+	var mustChangePassword sql.NullInt64
 	var userCreatedAt string
 	var userUpdatedAt string
-	if err := row.Scan(&session.ID, &session.CSRFToken, &expiresAt, &sessionCreatedAt, &session.User.ID, &session.User.Email, &session.User.DisplayName, &isAdmin, &disabledAt, &mustChangePassword, &userCreatedAt, &userUpdatedAt); err != nil {
+	if err := row.Scan(&session.ID, &session.CSRFToken, &expiresAt, &sessionCreatedAt, &session.User.ID, &session.User.Email, &session.User.DisplayName, &isAdmin, &disabledAt, &hasLocalPassword, &mustChangePassword, &userCreatedAt, &userUpdatedAt); err != nil {
 		return Session{}, err
 	}
 	parsedExpiresAt, err := parseTime(expiresAt)
@@ -543,7 +582,8 @@ func scanSession(row scanner) (Session, error) {
 	session.CreatedAt = parsedSessionCreatedAt
 	session.User.IsAdmin = isAdmin != 0
 	session.User.DisabledAt = parsedDisabledAt
-	session.User.MustChangePassword = mustChangePassword != 0
+	session.User.HasLocalPassword = hasLocalPassword != 0
+	session.User.MustChangePassword = mustChangePassword.Valid && mustChangePassword.Int64 != 0
 	session.User.CreatedAt = parsedUserCreatedAt
 	session.User.UpdatedAt = parsedUserUpdatedAt
 	return session, nil

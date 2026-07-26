@@ -9,17 +9,17 @@
     {{ if .User.Disabled }}
     <form method="post" action="/users/{{ .User.ID }}/enable"><input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">{{ template "ui/button" dict "Label" "Re-enable" "Variant" "secondary" "Type" "submit" }}</form>
     {{ else }}
-    <form method="post" action="/users/{{ .User.ID }}/disable"><input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">{{ template "ui/button" dict "Label" "Disable" "Variant" "secondary" "Type" "submit" "Disabled" .IsLastEnabledAdmin }}</form>
+    <form method="post" action="/users/{{ .User.ID }}/disable"><input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">{{ template "ui/button" dict "Label" "Disable" "Variant" "secondary" "Type" "submit" "Disabled" .IsLastRecoveryAdmin }}</form>
     {{ end }}
   </header>
 
   {{ if .FormError }}<div role="alert">{{ template "ui/callout" dict "Tone" "danger" "Body" .FormError }}</div>{{ end }}
-  {{ if .IsLastEnabledAdmin }}{{ template "ui/callout" dict "Tone" "warning" "Body" "This is the final enabled Admin. Thawguard will not disable this account or remove its Admin role until another enabled Admin exists." }}{{ end }}
+  {{ if .IsLastRecoveryAdmin }}{{ template "ui/callout" dict "Tone" "warning" "Body" "This is the final enabled Admin with a local password. Thawguard will not disable this account or remove its Admin role until another enabled Admin with a local password exists." }}{{ end }}
 
   <section class="rounded-panel border border-border bg-surface p-(--card-spacing) shadow-card" aria-labelledby="user-sign-in-title">
     <div class="flex flex-wrap items-start justify-between gap-3">
-      <div><h2 id="user-sign-in-title" class="m-0 text-lg font-bold text-text">Sign-in</h2><p class="m-0 mt-1 text-sm text-text-muted">Password{{ if .User.MustChangePassword }} · temporary password must be changed at next sign-in{{ end }}</p></div>
-      {{ if .IsSelf }}<a class="text-sm font-semibold text-accent-strong no-underline hover:underline" href="/account/password">Change your password</a>{{ else if .User.Disabled }}<p class="m-0 text-sm text-text-muted">Re-enable this account before issuing a recovery link.</p>{{ else }}{{ template "ui/button" dict "Label" "Issue recovery link" "Variant" "secondary" "Icon" "tg-i-key" "DialogTarget" "user-password-recovery" }}{{ end }}
+      <div><h2 id="user-sign-in-title" class="m-0 text-lg font-bold text-text">Sign-in</h2><p class="m-0 mt-1 text-sm text-text-muted">{{ if .User.HasLocalPassword }}Password{{ if .User.MustChangePassword }} · temporary password must be changed at next sign-in{{ end }}{{ else }}No local password configured{{ end }}</p></div>
+      {{ if .User.HasLocalPassword }}{{ if .IsSelf }}<a class="text-sm font-semibold text-accent-strong no-underline hover:underline" href="/account/password">Change your password</a>{{ else if .User.Disabled }}<p class="m-0 text-sm text-text-muted">Re-enable this account before issuing a recovery link.</p>{{ else }}{{ template "ui/button" dict "Label" "Issue recovery link" "Variant" "secondary" "Icon" "tg-i-key" "DialogTarget" "user-password-recovery" }}{{ end }}{{ end }}
     </div>
   </section>
 
@@ -28,8 +28,8 @@
     <p class="m-0 mt-1 text-sm text-text-muted">Manages repositories, connections, people, and access across the whole installation, and can view every repository. Not repository-scoped. To freeze or approve thaws, an Admin still needs those roles per repository below.</p>
     <form method="post" action="/users/{{ .User.ID }}/admin" class="mt-4 flex flex-wrap items-end justify-between gap-3">
       <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
-      {{ if .IsLastEnabledAdmin }}<input type="hidden" name="admin" value="1">{{ end }}
-      {{ template "ui/checkbox" dict "ID" "user-admin" "Name" "admin" "Value" "1" "Label" "Admin" "Checked" .AdminChecked "Disabled" .IsLastEnabledAdmin "Hint" "Removing Admin preserves every repository grant." }}
+      {{ if .IsLastRecoveryAdmin }}<input type="hidden" name="admin" value="1">{{ end }}
+      {{ template "ui/checkbox" dict "ID" "user-admin" "Name" "admin" "Value" "1" "Label" "Admin" "Checked" .AdminChecked "Disabled" .IsLastRecoveryAdmin "Hint" "Removing Admin preserves every repository grant." }}
       {{ template "ui/button" dict "Label" "Save Admin access" "Variant" "secondary" "Type" "submit" }}
     </form>
   </section>
@@ -52,7 +52,7 @@
   </section>
 </div>
 
-{{ if and (not .IsSelf) (not .User.Disabled) }}
+{{ if and (not .IsSelf) (not .User.Disabled) .User.HasLocalPassword }}
 <dialog id="user-password-recovery" class="m-auto w-[min(32rem,90vw)] rounded-panel border border-border bg-surface p-6 text-text shadow-card" aria-labelledby="user-password-recovery-title">
   <h2 id="user-password-recovery-title" class="m-0 text-base font-bold">Issue recovery link</h2>
   <p class="m-0 mt-2 text-sm font-semibold text-text">{{ .User.DisplayName }} · <code class="font-mono text-xs text-text-muted">{{ .User.Email }}</code></p>

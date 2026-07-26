@@ -100,13 +100,13 @@ func TestFinalEnabledAdminValidationIsRenderedSafely(t *testing.T) {
 
 	form := url.Values{csrfFormField: {admin.CSRFToken}}
 	recorder := postAccountForm(t, server, fmt.Sprintf("/users/%d/disable", admin.User.ID), adminCookie, form)
-	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "the final enabled admin cannot be disabled") {
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "the final enabled admin with a local password cannot be disabled") {
 		t.Fatalf("expected final admin disable validation, status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
 
 	form = url.Values{csrfFormField: {admin.CSRFToken}}
 	recorder = postAccountForm(t, server, fmt.Sprintf("/users/%d/admin", admin.User.ID), adminCookie, form)
-	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "the final enabled admin must keep the admin role") {
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "the final enabled admin with a local password must keep the admin role") {
 		t.Fatalf("expected final admin role validation, status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
 }
@@ -446,6 +446,134 @@ func TestAccountMutationInternalErrorsRemainGeneric(t *testing.T) {
 	body := recorder.Body.String()
 	if recorder.Code != http.StatusInternalServerError || !strings.Contains(body, "Something went wrong") || strings.Contains(body, "audit_events") {
 		t.Fatalf("expected generic internal error, status=%d body=%q", recorder.Code, body)
+	}
+}
+
+func TestCredentialLessSessionAccountPasswordReturnsStyled404(t *testing.T) {
+	ctx := context.Background()
+	database := newWebTestDB(t, ctx)
+	authService := auth.NewService(database)
+	mustSetupWebAdmin(t, ctx, authService)
+	user := mustCreateWebUser(t, ctx, authService, "solo@example.test", false)
+	session, err := authService.Login(ctx, auth.LoginParams{Email: "solo@example.test", Password: accountWebTestPassword})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// There is no production credential-removal API; model a future OIDC-only
+	// account by deleting the credential row directly.
+	if _, err := database.ExecContext(ctx, `DELETE FROM local_credentials WHERE user_id = ?`, user.ID); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(Config{AppName: "Thawguard", AuthService: authService})
+	cookie := &http.Cookie{Name: sessionCookieName, Value: session.ID}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/account/password", nil)
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNotFound || !strings.Contains(recorder.Body.String(), "Page not found") {
+		t.Fatalf("expected styled 404 for credential-less GET, status=%d", recorder.Code)
+	}
+
+	// Authentication and CSRF precedence stay ahead of the 404.
+	recorder = postAccountForm(t, server, "/account/password", cookie, url.Values{csrfFormField: {"invalid-token"}})
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected invalid CSRF to stay forbidden, got %d", recorder.Code)
+	}
+
+	form := url.Values{
+		"current_password":          {accountWebTestPassword},
+		"new_password":              {"a brand new local password"},
+		"new_password_confirmation": {"a brand new local password"},
+		csrfFormField:               {session.CSRFToken},
+	}
+	recorder = postAccountForm(t, server, "/account/password", cookie, form)
+	if recorder.Code != http.StatusNotFound || !strings.Contains(recorder.Body.String(), "Page not found") {
+		t.Fatalf("expected styled 404 for credential-less POST, status=%d", recorder.Code)
+	}
+	var credentialRows int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM local_credentials WHERE user_id = ?`, user.ID).Scan(&credentialRows); err != nil {
+		t.Fatal(err)
+	}
+	if credentialRows != 0 {
+		t.Fatalf("expected rejected POST to create no credential, got %d rows", credentialRows)
+	}
+	// ChangePassword revokes and rotates sessions, so a surviving session
+	// proves the handler never called it.
+	if _, found, err := authService.SessionByID(ctx, session.ID); err != nil || !found {
+		t.Fatalf("expected session to survive rejected POST, found=%v err=%v", found, err)
+	}
+
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, "/", nil)
+	request.AddCookie(cookie)
+	server.Routes().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected dashboard for credential-less session, got %d", recorder.Code)
+	}
+	if strings.Contains(recorder.Body.String(), `href="/account/password"`) {
+		t.Fatal("expected credential-less session to omit the change-password link")
+	}
+}
+
+func TestUserDetailCredentialStateGatesRecoveryControlsAndWarning(t *testing.T) {
+	ctx := context.Background()
+	database := newWebTestDB(t, ctx)
+	authService := auth.NewService(database)
+	admin := mustSetupWebAdmin(t, ctx, authService)
+	credentialLess := mustCreateWebUser(t, ctx, authService, "second@example.test", true)
+	if _, err := database.ExecContext(ctx, `DELETE FROM local_credentials WHERE user_id = ?`, credentialLess.ID); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(Config{AppName: "Thawguard", AuthService: authService})
+	adminCookie := &http.Cookie{Name: sessionCookieName, Value: admin.ID}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/users/%d", credentialLess.ID), nil)
+	request.AddCookie(adminCookie)
+	server.Routes().ServeHTTP(recorder, request)
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected credential-less user detail, got %d", recorder.Code)
+	}
+	if !strings.Contains(body, "No local password configured") {
+		t.Fatal("expected neutral credential-less sign-in copy")
+	}
+	for _, unwanted := range []string{
+		"Issue recovery link",
+		`id="user-password-recovery"`,
+		"final enabled Admin with a local password",
+	} {
+		if strings.Contains(body, unwanted) {
+			t.Fatalf("expected credential-less admin detail to omit %q", unwanted)
+		}
+	}
+	// A credential-less Admin never locks the disable and demote controls.
+	if strings.Contains(renderedControlTag(t, body, "user-admin"), " disabled") {
+		t.Fatal("expected credential-less admin demotion control to stay enabled")
+	}
+
+	// The first admin is the only enabled Admin with a local password, so its
+	// own detail page warns even though another enabled Admin exists.
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, fmt.Sprintf("/users/%d", admin.User.ID), nil)
+	request.AddCookie(adminCookie)
+	server.Routes().ServeHTTP(recorder, request)
+	body = recorder.Body.String()
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected admin self detail, got %d", recorder.Code)
+	}
+	for _, want := range []string{
+		"final enabled Admin with a local password",
+		"Change your password",
+		">Password",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected recovery-admin self detail to contain %q", want)
+		}
+	}
+	if !strings.Contains(renderedControlTag(t, body, "user-admin"), " disabled") {
+		t.Fatal("expected the final recovery admin demotion control to be locked")
 	}
 }
 

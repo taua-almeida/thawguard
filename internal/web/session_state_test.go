@@ -7,13 +7,14 @@ import (
 	"github.com/taua-almeida/thawguard/internal/auth"
 )
 
-func TestSessionStateFromAuthCarriesGrants(t *testing.T) {
+func TestSessionStateFromAuthCarriesGrantsAndCredentialState(t *testing.T) {
 	session := auth.Session{
 		ID:        "session-id",
 		CSRFToken: "csrf-token",
 		User: auth.User{
-			ID:    7,
-			Email: "lead@example.test",
+			ID:               7,
+			Email:            "lead@example.test",
+			HasLocalPassword: true,
 		},
 		Grants:    auth.NewGrants(false, map[int64]auth.RoleSet{3: {auth.RoleFreezer}}),
 		ExpiresAt: time.Now().UTC().Add(time.Hour),
@@ -25,6 +26,12 @@ func TestSessionStateFromAuthCarriesGrants(t *testing.T) {
 	}
 	if state.Grants.CanViewRepository(4) || state.Grants.CanFreezeRepository(4) {
 		t.Fatalf("expected web session state grants not to bleed into another repository, got %+v", state.Grants)
+	}
+	if !state.HasLocalPassword || state.MustChangePassword {
+		t.Fatalf("expected local-password session state without a forced change, got %+v", state)
+	}
+	if !currentUserFromSession(state).CanChangePassword {
+		t.Fatal("expected a local-password session to allow changing the password")
 	}
 }
 

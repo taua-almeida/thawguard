@@ -75,6 +75,9 @@ func (s *Service) IssuePasswordRecoveryToken(ctx context.Context, params IssuePa
 	if target.Disabled() {
 		return PasswordRecoveryToken{}, ValidationError{Message: "password recovery requires an enabled user"}
 	}
+	if !target.HasLocalPassword {
+		return PasswordRecoveryToken{}, ValidationError{Message: "local password is not configured"}
+	}
 
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO password_recovery_tokens(user_id, token_digest, expires_at)
@@ -187,10 +190,19 @@ WHERE user_id = ?
 		return fmt.Errorf("claim password recovery token affected %d rows", claimed)
 	}
 
+	// Recovery only rewrites an existing credential row. A token whose account
+	// lost its credential resolves to the same generic invalid-token result.
+	nowText := now.Format(time.RFC3339Nano)
 	result, err = tx.ExecContext(ctx, `
-UPDATE users
+UPDATE local_credentials
 SET password_hash = ?, must_change_password = 0, updated_at = ?
-WHERE id = ? AND disabled_at IS NULL`, passwordHash, now.Format(time.RFC3339Nano), userID)
+WHERE user_id = ?
+  AND EXISTS (
+    SELECT 1
+    FROM users u
+    WHERE u.id = local_credentials.user_id
+      AND u.disabled_at IS NULL
+  )`, passwordHash, nowText, userID)
 	if err != nil {
 		return fmt.Errorf("update recovered password: %w", err)
 	}
@@ -203,6 +215,9 @@ WHERE id = ? AND disabled_at IS NULL`, passwordHash, now.Format(time.RFC3339Nano
 	}
 	if updated != 1 {
 		return fmt.Errorf("update recovered password affected %d rows", updated)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE users SET updated_at = ? WHERE id = ?`, nowText, userID); err != nil {
+		return fmt.Errorf("update user after password recovery: %w", err)
 	}
 	if err := deleteUserSessions(ctx, tx, userID); err != nil {
 		return err
@@ -228,6 +243,7 @@ func (s *Service) preflightPasswordRecovery(ctx context.Context, digest [sha256.
 SELECT tokens.user_id
 FROM password_recovery_tokens tokens
 JOIN users u ON u.id = tokens.user_id
+JOIN local_credentials lc ON lc.user_id = u.id
 WHERE tokens.token_digest = ?
   AND tokens.expires_at > ?
   AND u.disabled_at IS NULL`, digest[:], now.UnixNano()).Scan(&userID)
