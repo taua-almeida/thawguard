@@ -33,6 +33,7 @@ type passwordRecoveryWebFixture struct {
 	database *sql.DB
 	service  *auth.Service
 	server   *Server
+	logs     *bytes.Buffer
 	admin    auth.Session
 	target   auth.User
 }
@@ -749,6 +750,7 @@ func newPasswordRecoveryWebFixture(t *testing.T) *passwordRecoveryWebFixture {
 	service := auth.NewService(database)
 	admin := mustSetupWebAdmin(t, ctx, service)
 	target := mustCreateWebUser(t, ctx, service, "recovery-target@example.test", false)
+	logger, logs := newRejectionLogSink()
 	return &passwordRecoveryWebFixture{
 		ctx:      ctx,
 		database: database,
@@ -757,7 +759,9 @@ func newPasswordRecoveryWebFixture(t *testing.T) *passwordRecoveryWebFixture {
 			AppName:     "Thawguard",
 			PublicURL:   passwordRecoveryWebPublicURL,
 			AuthService: service,
+			Logger:      logger,
 		}),
+		logs:   logs,
 		admin:  admin,
 		target: target,
 	}

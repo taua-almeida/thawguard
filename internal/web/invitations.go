@@ -87,6 +87,7 @@ func (s *Server) handleCreateInvitation(w http.ResponseWriter, r *http.Request) 
 	// capped body.
 	r.Body = http.MaxBytesReader(w, r.Body, invitationCreateMaxBodyBytes)
 	if !s.validInvitationOrigin(r) {
+		s.logRequestRejected(r, originRejectionReason(r))
 		s.renderInvitationMessage(
 			w,
 			http.StatusForbidden,
@@ -204,6 +205,7 @@ func (s *Server) handleInvitationAccept(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleInvitationAcceptPost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, invitationAcceptMaxBodyBytes)
 	if !s.validInvitationOrigin(r) {
+		s.logRequestRejected(r, originRejectionReason(r))
 		s.renderInvitationAcceptForbidden(w)
 		return
 	}
@@ -228,6 +230,7 @@ func (s *Server) handleInvitationAcceptPost(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if !s.validInvitationCSRFToken(r) {
+		s.logRequestRejected(r, reasonCSRFInvalid)
 		s.renderInvitationAcceptForbidden(w)
 		return
 	}

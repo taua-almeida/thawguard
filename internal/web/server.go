@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -78,6 +79,9 @@ type Config struct {
 	PullRequestStore       PullRequestStore
 	EnforcementService     EnforcementService
 	ReconciliationJobStore ReconciliationJobStore
+	// Logger receives the targeted request-rejection diagnostics described in
+	// request_diagnostics.go. Optional: a nil Logger discards them.
+	Logger *slog.Logger
 	// DevMode registers development-only routes (the component gallery
 	// under /dev/preview). Must stay false in production.
 	DevMode bool
@@ -323,7 +327,17 @@ func NewServer(cfg Config) *Server {
 	if cfg.PublicURL == "" {
 		cfg.PublicURL = "http://localhost:8080"
 	}
-	s := &Server{cfg: cfg, mux: http.NewServeMux(), sessions: newSessionStore(), csrfKey: newCSRFSigningKey()}
+	if cfg.Logger == nil {
+		// Discard rather than slog.Default: an embedded or test server must not
+		// emit rejection diagnostics into output its owner never asked for.
+		cfg.Logger = slog.New(slog.DiscardHandler)
+	}
+	s := &Server{
+		cfg:      cfg,
+		mux:      http.NewServeMux(),
+		sessions: newSessionStore(),
+		csrfKey:  newCSRFSigningKey(),
+	}
 	s.routes()
 	return s
 }

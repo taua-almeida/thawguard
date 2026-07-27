@@ -123,6 +123,7 @@ func (a *App) Run(ctx context.Context) error {
 			PullRequestStore:                     pullRequestStore,
 			EnforcementService:                   enforcementService,
 			ReconciliationJobStore:               jobStore,
+			Logger:                               a.logger,
 			DevMode:                              a.cfg.DevMode,
 		}).Routes(),
 		ReadHeaderTimeout: 5 * time.Second,

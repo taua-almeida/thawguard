@@ -30,6 +30,7 @@ type invitationWebFixture struct {
 	database     *sql.DB
 	service      *auth.Service
 	server       *Server
+	logs         *bytes.Buffer
 	admin        auth.Session
 	repositoryID int64
 }
@@ -41,10 +42,12 @@ func newInvitationWebFixture(t *testing.T) *invitationWebFixture {
 	service := auth.NewService(database)
 	admin := mustSetupWebAdmin(t, ctx, service)
 	repositoryID := mustInsertWebRepository(t, ctx, database)
+	logger, logs := newRejectionLogSink()
 	server := NewServer(Config{
 		AppName:     "Thawguard",
 		PublicURL:   passwordRecoveryWebPublicURL,
 		AuthService: service,
+		Logger:      logger,
 		RepositoryStore: &fakeRepositoryStore{repositories: []domain.Repository{{
 			ID:    repositoryID,
 			Owner: "taua-almeida",
@@ -56,6 +59,7 @@ func newInvitationWebFixture(t *testing.T) *invitationWebFixture {
 		database:     database,
 		service:      service,
 		server:       server,
+		logs:         logs,
 		admin:        admin,
 		repositoryID: repositoryID,
 	}

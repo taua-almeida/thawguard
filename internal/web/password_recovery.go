@@ -46,6 +46,7 @@ type authPasswordRecoveryIssuedData struct {
 func (s *Server) handleIssuePasswordRecovery(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, passwordRecoveryMaxBodyBytes)
 	if !s.validPasswordRecoveryOrigin(r) {
+		s.logRequestRejected(r, originRejectionReason(r))
 		s.renderPasswordRecoveryMessage(
 			w,
 			http.StatusForbidden,
@@ -112,6 +113,7 @@ func (s *Server) handlePasswordRecovery(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handlePasswordRecoveryPost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, passwordRecoveryMaxBodyBytes)
 	if !s.validPasswordRecoveryOrigin(r) {
+		s.logRequestRejected(r, originRejectionReason(r))
 		s.renderPasswordRecoveryForbidden(w)
 		return
 	}
@@ -136,6 +138,7 @@ func (s *Server) handlePasswordRecoveryPost(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if !s.validPasswordRecoveryCSRFToken(r) {
+		s.logRequestRejected(r, reasonCSRFInvalid)
 		s.renderPasswordRecoveryForbidden(w)
 		return
 	}
