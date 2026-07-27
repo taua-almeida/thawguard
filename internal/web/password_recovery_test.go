@@ -466,6 +466,7 @@ func TestPasswordRecoveryOriginAndCSRFFailuresLeaveBearerUsable(t *testing.T) {
 	}{
 		{name: "missing Origin", csrf: csrfToken},
 		{name: "wrong Origin", origins: []string{"https://hostile.example.test"}, csrf: csrfToken},
+		{name: "null Origin", origins: []string{"null"}, csrf: csrfToken},
 		{name: "multiple Origin", origins: []string{passwordRecoveryWebPublicURL, passwordRecoveryWebPublicURL}, csrf: csrfToken},
 		{name: "wrong CSRF purpose", origins: []string{passwordRecoveryWebPublicURL}, csrf: mustSignedCSRFToken(t, fixture.server, loginCSRFPurpose)},
 	} {
@@ -896,7 +897,7 @@ func assertPasswordRecoveryHeaders(t *testing.T, header http.Header) {
 	t.Helper()
 	wants := map[string]string{
 		"Cache-Control":           "no-store",
-		"Referrer-Policy":         "no-referrer",
+		"Referrer-Policy":         "same-origin",
 		"X-Frame-Options":         "DENY",
 		"X-Content-Type-Options":  "nosniff",
 		"Content-Security-Policy": passwordRecoveryCSP,

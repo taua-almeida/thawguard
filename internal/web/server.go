@@ -332,7 +332,12 @@ func (s *Server) Routes() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if isPasswordRecoveryPath(r.URL.Path) || isInvitationSensitivePath(r.URL.Path) {
 			w.Header().Set("Cache-Control", "no-store")
-			w.Header().Set("Referrer-Policy", "no-referrer")
+			// no-referrer makes browsers serialize Origin as "null" for form
+			// posts initiated by these sensitive documents, so exact-Origin
+			// validation rejects acceptance, recovery, and validation retries.
+			// same-origin still sends no referrer off this origin, and referrers
+			// never carry the URL fragment that holds the bearer.
+			w.Header().Set("Referrer-Policy", "same-origin")
 			w.Header().Set("X-Frame-Options", "DENY")
 			w.Header().Set("X-Content-Type-Options", "nosniff")
 			w.Header().Set("Content-Security-Policy", passwordRecoveryCSP)
@@ -363,9 +368,10 @@ func isPasswordRecoveryPath(path string) bool {
 // isInvitationSensitivePath matches the invitation management and acceptance
 // routes whose every response, including method errors, must carry the
 // sensitive no-store header set: one-time bearer links and acceptance results
-// must never be cached, referred, framed, or sniffed. Rejected create and
-// cancel requests re-render the full Users & Access page under this strict
-// CSP, so that page must keep working without connect-src (no htmx polling).
+// must never be cached, referred off this origin, framed, or sniffed. Rejected
+// create and cancel requests re-render the full Users & Access page under this
+// strict CSP, so that page must keep working without connect-src (no htmx
+// polling).
 func isInvitationSensitivePath(path string) bool {
 	if path == "/users/invitations" || path == "/invitations/accept" {
 		return true

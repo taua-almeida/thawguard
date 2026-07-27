@@ -559,6 +559,7 @@ func TestInvitationCreateGatesLeaveNoSideEffects(t *testing.T) {
 	}{
 		{name: "missing origin", origins: nil, cookie: fixture.adminCookie(), form: baseForm, wantStatus: http.StatusForbidden, wantBody: "Invitation not created"},
 		{name: "wrong origin", origins: []string{"https://evil.example.test"}, cookie: fixture.adminCookie(), form: baseForm, wantStatus: http.StatusForbidden, wantBody: "Invitation not created"},
+		{name: "null origin", origins: []string{"null"}, cookie: fixture.adminCookie(), form: baseForm, wantStatus: http.StatusForbidden, wantBody: "Invitation not created"},
 		{name: "duplicated origin", origins: []string{passwordRecoveryWebPublicURL, passwordRecoveryWebPublicURL}, cookie: fixture.adminCookie(), form: baseForm, wantStatus: http.StatusForbidden, wantBody: "Invitation not created"},
 		{name: "no session", origins: []string{passwordRecoveryWebPublicURL}, cookie: nil, form: baseForm, wantStatus: http.StatusForbidden, wantBody: "forbidden"},
 		{
@@ -760,6 +761,39 @@ func TestInvitationCreateValidationPreservesSafeStateNeverBearer(t *testing.T) {
 			t.Fatalf("invitations = %d, want only the pre-existing reservation", got)
 		}
 	})
+}
+
+// TestInvitationCreateResubmissionAfterValidationIssuesOneBearer follows the
+// admin path a browser takes after a rejected invitation form: the validation
+// rerender carries the sensitive headers, and correcting the form under the
+// same session and canonical Origin must still create the invitation once.
+func TestInvitationCreateResubmissionAfterValidationIssuesOneBearer(t *testing.T) {
+	fixture := newInvitationWebFixture(t)
+	grant := fmt.Sprintf("%d:viewer", fixture.repositoryID)
+	correctedForm := func() url.Values {
+		return fixture.invitationCreateForm("resubmitted@example.test", "Resubmitting Person", grant)
+	}
+
+	rejected := correctedForm()
+	rejected.Add("repository_grants", "abc")
+	validation := postPasswordRecoveryForm(t, fixture.server, "/users/invitations", fixture.adminCookie(), rejected, []string{passwordRecoveryWebPublicURL})
+	if validation.Code != http.StatusBadRequest || !strings.Contains(validation.Body.String(), `id="users-invite-dialog" open`) {
+		t.Fatalf("validation rerender status=%d body=%q", validation.Code, validation.Body.String())
+	}
+	assertPasswordRecoveryHeaders(t, validation.Header())
+
+	created := postPasswordRecoveryForm(t, fixture.server, "/users/invitations", fixture.adminCookie(), correctedForm(), []string{passwordRecoveryWebPublicURL})
+	if created.Code != http.StatusOK {
+		t.Fatalf("corrected resubmission status=%d body=%q", created.Code, created.Body.String())
+	}
+	body := created.Body.String()
+	token := invitationTokenFromLink(t, issuedInvitationLink(t, body))
+	if got := strings.Count(body, token); got != 1 {
+		t.Fatalf("corrected resubmission displayed the bearer %d times, want 1", got)
+	}
+	if got := fixture.countInvitations(t); got != 1 {
+		t.Fatalf("invitations = %d, want 1 after a rejected then corrected submission", got)
+	}
 }
 
 func TestInvitationCancelAcrossLifecycleStatesTombstonesAndAudits(t *testing.T) {
