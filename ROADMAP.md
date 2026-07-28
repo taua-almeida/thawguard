@@ -17,9 +17,10 @@ Documented in [docs/scheduled-freezes.md](docs/scheduled-freezes.md).
 
 ## Next: Organization readiness
 
-- [Design organization identity and onboarding](https://github.com/taua-almeida/thawguard/issues/5), including configurable company SSO with a safe local recovery path.
-- Define repository-scoped Viewer access for verified repository members who do not yet have a Thawguard account.
-- Add secure email invitations and password recovery using expiring, single-use links.
+- **Shipped:** repository-scoped authorization and Users & Access management under the [organization identity and onboarding](https://github.com/taua-almeida/thawguard/issues/5) milestone.
+- **Shipped:** [manual invitation and password-recovery links](https://github.com/taua-almeida/thawguard/issues/11), including atomic invitation acceptance and replay-safe replacement. SMTP delivery and public recovery requests remain separate decisions.
+- **Next:** [one configurable company OIDC connection](https://github.com/taua-almeida/thawguard/issues/13) alongside the required local recovery path.
+- Then define repository-scoped Viewer access for verified repository members who do not yet have a Thawguard account.
 - Preserve explicit Freezer, Thaw approver, and Administrator grants; elevated roles will not be assigned automatically.
 
 ## Next: GitHub connectivity
