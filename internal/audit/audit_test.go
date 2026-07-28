@@ -348,6 +348,7 @@ func TestScopedActionClassificationCoversEveryKnownAction(t *testing.T) {
 		"user.password_recovery_completed":           adminOnly,
 		"invitation.created":                         adminOnly,
 		"invitation.reissued":                        adminOnly,
+		"invitation.replaced":                        adminOnly,
 		"invitation.cancelled":                       adminOnly,
 		"invitation.authorization_revoked":           adminOnly,
 		"invitation.accepted":                        adminOnly,
@@ -403,6 +404,7 @@ func TestScopedActionClassificationKeepsInvitationRepositorySpoofsAdminOnly(t *t
 	for i, action := range []string{
 		ActionInvitationCreated,
 		ActionInvitationReissued,
+		ActionInvitationReplaced,
 		ActionInvitationCancelled,
 		ActionInvitationAuthorizationRevoked,
 		ActionInvitationAccepted,
@@ -430,7 +432,7 @@ func TestScopedActionClassificationKeepsInvitationRepositorySpoofsAdminOnly(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(unrestricted) != 5 {
+	if len(unrestricted) != 6 {
 		t.Fatalf("expected unrestricted Administrator scope to retain all invitation actions, got %d", len(unrestricted))
 	}
 }

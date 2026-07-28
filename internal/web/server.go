@@ -48,6 +48,11 @@ const (
 	// invitationAcceptMaxBodyBytes caps POST /invitations/accept, which only
 	// ever carries a CSRF token, the bearer, and a password.
 	invitationAcceptMaxBodyBytes int64 = 8 << 10
+	// invitationReplaceMaxBodyBytes caps POST
+	// /users/invitations/{id}/replace. Replacement takes no client-supplied
+	// state at all: the identity, Admin flag, staged access, and expiry are
+	// derived server-side, so the body only ever carries a CSRF token.
+	invitationReplaceMaxBodyBytes int64 = 8 << 10
 )
 
 type Config struct {
@@ -126,6 +131,7 @@ type AuthService interface {
 	CreateInvitation(ctx context.Context, params auth.CreateInvitationParams) (auth.InvitationCredential, error)
 	ListActiveInvitations(ctx context.Context) ([]auth.ActiveInvitation, error)
 	CancelInvitation(ctx context.Context, params auth.CancelInvitationParams) error
+	ReplaceInvitationLink(ctx context.Context, params auth.ReplaceInvitationLinkParams) (auth.InvitationLinkReplacement, error)
 	AcceptInvitation(ctx context.Context, token, password string) (auth.User, error)
 }
 
@@ -382,9 +388,10 @@ func isPasswordRecoveryPath(path string) bool {
 // isInvitationSensitivePath matches the invitation management and acceptance
 // routes whose every response, including method errors, must carry the
 // sensitive no-store header set: one-time bearer links and acceptance results
-// must never be cached, referred off this origin, framed, or sniffed. Rejected
-// create and cancel requests re-render the full Users & Access page under this
-// strict CSP, so that page must keep working without connect-src (no htmx
+// must never be cached, referred off this origin, framed, or sniffed. Create
+// and replace deliver their one-time link inside the full Users & Access page,
+// and rejected create, cancel, and replace requests re-render that same page
+// under this strict CSP, so it must keep working without connect-src (no htmx
 // polling).
 func isInvitationSensitivePath(path string) bool {
 	if path == "/users/invitations" || path == "/invitations/accept" {
@@ -395,7 +402,7 @@ func isInvitationSensitivePath(path string) bool {
 		return false
 	}
 	invitationID, suffix, ok := strings.Cut(rest, "/")
-	return ok && invitationID != "" && suffix == "cancel"
+	return ok && invitationID != "" && (suffix == "cancel" || suffix == "replace")
 }
 
 func (s *Server) routes() {
@@ -456,6 +463,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /users", s.handleCreateUser)
 	s.mux.HandleFunc("POST /users/invitations", s.handleCreateInvitation)
 	s.mux.HandleFunc("POST /users/invitations/{id}/cancel", s.handleCancelInvitation)
+	s.mux.HandleFunc("POST /users/invitations/{id}/replace", s.handleReplaceInvitationLink)
 	s.mux.HandleFunc("GET /invitations/accept", s.handleInvitationAccept)
 	s.mux.HandleFunc("POST /invitations/accept", s.handleInvitationAcceptPost)
 	s.mux.HandleFunc("GET /users/{id}", s.handleUserDetail)
@@ -2225,6 +2233,7 @@ var activityActionDefinitions = map[string]activityActionDefinition{
 	audit.ActionUserPasswordRecoveryCompleted:      {Label: "Password recovery", Outcome: "Completed", OutcomeClass: "ok"},
 	audit.ActionInvitationCreated:                  {Label: "Invitation", Outcome: "Created", OutcomeClass: "ok"},
 	audit.ActionInvitationReissued:                 {Label: "Invitation credential", Outcome: "Reissued", OutcomeClass: "warning"},
+	audit.ActionInvitationReplaced:                 {Label: "Invitation link", Outcome: "Replaced", OutcomeClass: "warning"},
 	audit.ActionInvitationCancelled:                {Label: "Invitation", Outcome: "Cancelled", OutcomeClass: "warning"},
 	audit.ActionInvitationAuthorizationRevoked:     {Label: "Invitation credential", Outcome: "Revoked", OutcomeClass: "warning"},
 	audit.ActionInvitationAccepted:                 {Label: "Invitation", Outcome: "Accepted", OutcomeClass: "ok"},
@@ -2384,6 +2393,11 @@ func activityEventViewForEvent(repositories map[int64]domain.Repository, users m
 	case audit.ActionInvitationReissued:
 		view.Target = activityInvitationTarget(event)
 		view.Detail = "Credential reissued; expires " + activityTimeOrUnavailable(details, "expires_at", false) + "."
+	case audit.ActionInvitationReplaced:
+		view.Target = activityInvitationTarget(event)
+		view.Detail = "Replaced " + activityInvitationIDOrUnavailable(details, "replaced_invitation_id") +
+			"; the earlier link stopped working and surviving staged access was carried forward. Expires " +
+			activityTimeOrUnavailable(details, "expires_at", false) + "."
 	case audit.ActionInvitationCancelled:
 		view.Target = activityInvitationTarget(event)
 		view.Detail = "Invitation cancelled; staged identity and credential redacted."
@@ -2690,6 +2704,17 @@ func activityInvitationTarget(event audit.Event) string {
 		return "Invitation unavailable"
 	}
 	return "Invitation " + event.SubjectID
+}
+
+// activityInvitationIDOrUnavailable renders a canonical invitation ID stored in
+// a detail field. Anything that is not a canonical ID is refused rather than
+// echoed, so a malformed row cannot put arbitrary stored text on the page.
+func activityInvitationIDOrUnavailable(details activityDetails, key string) string {
+	value, ok := activityTextDetail(details, key, 64)
+	if !ok || !auth.ValidInvitationID(value) {
+		return "an earlier invitation"
+	}
+	return "invitation " + value
 }
 
 func activityInvitationAuthorizationRevokedDetail(details activityDetails) string {

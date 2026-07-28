@@ -3,8 +3,8 @@
 <p class="m-0 mb-4 text-sm text-text-muted">Use the invitation link from your Admin to choose a local password and create your account.</p>
 {{ if .FormError }}<div class="mb-4">{{ template "ui/callout" dict "Tone" "danger" "Body" .FormError }}</div>{{ end }}
 {{ if .Bootstrap }}
-<noscript><div role="alert">{{ template "ui/callout" dict "Tone" "warning" "Body" "JavaScript is required to use this link safely. Enable JavaScript and reopen the original link, or ask an Admin to cancel this invitation and create a new one." }}</div></noscript>
-<div id="invitation-accept-unavailable" role="alert" hidden>{{ template "ui/callout" dict "Tone" "danger" "Body" "This invitation link is invalid or no longer available. It may have expired, been cancelled, already been used, or been replaced. Ask an Admin to cancel the invitation and create a new one." }}</div>
+<noscript><div role="alert">{{ template "ui/callout" dict "Tone" "warning" "Body" "JavaScript is required to use this link safely. Enable JavaScript and reopen the original link, or ask an Admin for a replacement invitation link." }}</div></noscript>
+<div id="invitation-accept-unavailable" role="alert" hidden>{{ template "ui/callout" dict "Tone" "danger" "Body" "This invitation link is invalid or no longer available. It may have expired, been cancelled, already been used, or been replaced. Try signing in with your invited email address, or ask an Admin to check your account or active invitation." }}</div>
 {{ end }}
 <form id="invitation-accept-form" method="post" action="/invitations/accept" class="flex flex-col gap-4"{{ if .Bootstrap }} hidden{{ end }}>
   <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">

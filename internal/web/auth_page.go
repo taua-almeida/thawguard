@@ -1,6 +1,9 @@
 package web
 
-import "net/http"
+import (
+	"bytes"
+	"net/http"
+)
 
 // Auth-shell view models: one typed struct per screen, mirroring the
 // dashboard_page.go pattern. Theme stays "" in production so the pages follow
@@ -64,6 +67,25 @@ func (s *Server) renderPageStatus(w http.ResponseWriter, status int, name string
 		w.WriteHeader(status)
 	}
 	_ = pageTemplates.ExecuteTemplate(w, name, data)
+}
+
+// renderPageBuffered renders into memory and writes nothing until the whole
+// page succeeded. Streaming a page that carries one-time bearer material is
+// unsafe: a template failure halfway through would already have committed a
+// 200 and part of the secret, leaving no way to answer truthfully. It reports
+// whether the response was written, so the caller can fall back without having
+// touched the ResponseWriter.
+func (s *Server) renderPageBuffered(w http.ResponseWriter, status int, name string, data any) bool {
+	var page bytes.Buffer
+	if err := pageTemplates.ExecuteTemplate(&page, name, data); err != nil {
+		return false
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if status != http.StatusOK {
+		w.WriteHeader(status)
+	}
+	_, _ = w.Write(page.Bytes())
+	return true
 }
 
 // errorPageContent maps a status code to the heading and copy on the generic

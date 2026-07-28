@@ -12,7 +12,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/domain"
 )
 
-const invalidInvitationMessage = "This invitation link is invalid or no longer available. It may have expired, been cancelled, already been used, or been replaced. Ask an Admin to cancel the invitation and create a new one."
+const invalidInvitationMessage = "This invitation link is invalid or no longer available. It may have expired, been cancelled, already been used, or been replaced. Try signing in with your invited email address, or ask an Admin to check your account or active invitation."
 
 type authInvitationAcceptData struct {
 	AppName         string
@@ -35,14 +35,20 @@ type authInvitationMessageData struct {
 	ActionLabel string
 }
 
-type usersInvitationIssuedData struct {
-	AppName        string
-	PageTitle      string
-	Theme          string
+// usersInvitationResultView carries a freshly minted invitation link to
+// exactly one buffered Users & Access response. It is built from the value the
+// service already returned, never from a read, and it is never stored: the
+// bearer lives in this struct and in the escaped input value it renders into,
+// and nowhere else.
+type usersInvitationResultView struct {
+	Heading        string
 	DisplayName    string
 	Email          string
 	InvitationLink string
 	ExpiresAt      string
+	// Replaced marks a replacement rather than a first issue, which adds the
+	// statement that the previous link is already dead.
+	Replaced bool
 }
 
 // usersInvitationView is the Active invitations row model. It never carries
@@ -52,8 +58,7 @@ type usersInvitationView struct {
 	Email          string
 	LifecycleLabel string
 	LifecycleTone  string
-	// LifecycleDetail explains a dead link and names the only remedy:
-	// cancel and recreate.
+	// LifecycleDetail explains a dead link and names the remedy: replace it.
 	LifecycleDetail  string
 	ExpiresAt        string
 	IsAdmin          bool
@@ -64,6 +69,17 @@ type usersInvitationView struct {
 	// pending, unexpired link can still be drifted.
 	DriftWarning string
 	CancelPath   string
+	ReplacePath  string
+	// The confirmation dialog for each action is rendered once per invitation,
+	// outside the duplicated desktop and mobile rows, so both breakpoints
+	// address the same element. ConfirmHref is the no-JavaScript path to the
+	// same dialog.
+	CancelDialogID     string
+	CancelConfirmHref  string
+	CancelOpen         bool
+	ReplaceDialogID    string
+	ReplaceConfirmHref string
+	ReplaceOpen        bool
 }
 
 type usersInviteRepositoryView struct {
@@ -115,6 +131,13 @@ func (s *Server) handleCreateInvitation(w http.ResponseWriter, r *http.Request) 
 		s.renderUsersPage(w, r, http.StatusBadRequest, usersQuery{}, preserved, session)
 		return
 	}
+	// The page behind the result dialog is loaded before the mutation, so the
+	// success path performs no read at all once a bearer exists. A snapshot
+	// failure aborts before anything is created.
+	page, ok := s.loadUsersPageData(w, r, usersQuery{}, usersPageState{}, session)
+	if !ok {
+		return
+	}
 	credential, err := s.cfg.AuthService.CreateInvitation(r.Context(), auth.CreateInvitationParams{
 		ActorUserID:      *session.UserID,
 		Email:            form.Email,
@@ -124,14 +147,16 @@ func (s *Server) handleCreateInvitation(w http.ResponseWriter, r *http.Request) 
 	})
 	switch {
 	case err == nil:
-		s.renderPageStatus(w, http.StatusOK, "layouts/invitation-issued", usersInvitationIssuedData{
-			AppName:        s.cfg.AppName,
-			PageTitle:      "Invitation created",
+		page.InvitationResult = &usersInvitationResultView{
+			Heading:        "Invitation created",
 			DisplayName:    form.DisplayName,
 			Email:          form.Email,
-			InvitationLink: s.cfg.PublicURL + "/invitations/accept#token=" + credential.Token,
+			InvitationLink: s.invitationAcceptLink(credential.Token),
 			ExpiresAt:      credential.ExpiresAt.UTC().Format("2006-01-02 15:04 UTC"),
-		})
+		}
+		if !s.renderPageBuffered(w, http.StatusOK, "layouts/users", page) {
+			s.renderInvitationUndisplayedLink(w, "Invitation created")
+		}
 	case auth.IsValidationError(err):
 		preserved.FormError = err.Error()
 		s.renderUsersPage(w, r, http.StatusBadRequest, usersQuery{}, preserved, session)
@@ -142,11 +167,126 @@ func (s *Server) handleCreateInvitation(w http.ResponseWriter, r *http.Request) 
 			w,
 			http.StatusInternalServerError,
 			"Invitation result unconfirmed",
-			"Thawguard could not confirm whether the invitation was created, and no link is available. Inspect Active invitations before retrying. If the invitation appears there, cancel it and create a new one, because its link was never displayed.",
+			"Thawguard could not confirm whether the invitation was created, and no link is available. Inspect Active invitations before retrying. If the invitation appears there, replace its link, because the original was never displayed.",
 			"/users",
 			"Back to Users & Access",
 		)
 	}
+}
+
+// handleReplaceInvitationLink retires one invitation and issues a new one in
+// its place. The old invitation ID in the path is the replay fence: once the
+// service has retired it, a refreshed or replayed POST targets an ID that no
+// longer accepts replacement, so it cannot rotate the link that was just
+// shown. Nothing about the new invitation is client-supplied.
+func (s *Server) handleReplaceInvitationLink(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.AuthService == nil {
+		http.Error(w, "auth service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	// The cap is installed before any parsing; requireAdminForm parses the
+	// capped body.
+	r.Body = http.MaxBytesReader(w, r.Body, invitationReplaceMaxBodyBytes)
+	invitationID := r.PathValue("id")
+	if !auth.ValidInvitationID(invitationID) {
+		s.renderErrorPage(w, http.StatusNotFound, false)
+		return
+	}
+	if !s.validInvitationOrigin(r) {
+		s.logRequestRejected(r, originRejectionReason(r))
+		s.renderInvitationMessage(
+			w,
+			http.StatusForbidden,
+			"Invitation link not replaced",
+			"This request could not be verified. Return to Users & Access and try again.",
+			"/users",
+			"Back to Users & Access",
+		)
+		return
+	}
+	session, ok := s.requireAdminForm(w, r)
+	if !ok || session.UserID == nil {
+		return
+	}
+	if r.URL.RawQuery != "" || r.URL.ForceQuery || !onlyInvitationReplaceFields(r.PostForm) {
+		s.renderInvitationMessage(
+			w,
+			http.StatusBadRequest,
+			"Invitation link not replaced",
+			"This request could not be processed. Return to Users & Access and replace the invitation link again.",
+			"/users",
+			"Back to Users & Access",
+		)
+		return
+	}
+	page, ok := s.loadUsersPageData(w, r, usersQuery{}, usersPageState{}, session)
+	if !ok {
+		return
+	}
+	replacement, err := s.cfg.AuthService.ReplaceInvitationLink(r.Context(), auth.ReplaceInvitationLinkParams{
+		ActorUserID:  *session.UserID,
+		InvitationID: invitationID,
+	})
+	switch {
+	case err == nil:
+		page.InvitationResult = &usersInvitationResultView{
+			Heading:        "Invitation link replaced",
+			DisplayName:    replacement.DisplayName,
+			Email:          replacement.Email,
+			InvitationLink: s.invitationAcceptLink(replacement.Token),
+			ExpiresAt:      replacement.ExpiresAt.UTC().Format("2006-01-02 15:04 UTC"),
+			Replaced:       true,
+		}
+		if !s.renderPageBuffered(w, http.StatusOK, "layouts/users", page) {
+			s.renderInvitationUndisplayedLink(w, "Invitation link replaced")
+		}
+	case auth.IsValidationError(err):
+		// Expected staleness: the invitation was already accepted, cancelled,
+		// or replaced. The refreshed Active invitations list shows the current
+		// state, and no link was created.
+		s.renderUsersPage(w, r, http.StatusBadRequest, usersQuery{}, usersPageState{FormError: err.Error()}, session)
+	default:
+		// The outcome is unknown and no link is available. Do not claim a
+		// rollback happened, and do not let the Admin keep trusting a link
+		// that may already be retired.
+		s.renderInvitationMessage(
+			w,
+			http.StatusInternalServerError,
+			"Replacement result unconfirmed",
+			"Thawguard could not confirm whether this invitation link was replaced, and no link is available. Stop using the previous link. Reload Users & Access and replace the active invitation again.",
+			"/users",
+			"Back to Users & Access",
+		)
+	}
+}
+
+// renderInvitationUndisplayedLink answers a committed create or replacement
+// whose page could not be rendered. The invitation exists and its link is
+// already unrecoverable, so the only truthful remedy is another replacement.
+func (s *Server) renderInvitationUndisplayedLink(w http.ResponseWriter, heading string) {
+	s.renderInvitationMessage(
+		w,
+		http.StatusInternalServerError,
+		heading+" but not displayed",
+		"The invitation is active, but Thawguard could not display its link and cannot show it again. Reload Users & Access and replace the link for that invitation.",
+		"/users",
+		"Back to Users & Access",
+	)
+}
+
+// invitationAcceptLink puts the bearer in the URL fragment so it is never sent
+// to the server as a path or query value.
+func (s *Server) invitationAcceptLink(token string) string {
+	return s.cfg.PublicURL + "/invitations/accept#token=" + token
+}
+
+// onlyInvitationReplaceFields enforces that replacement carries the CSRF token
+// and nothing else. Identity, the Admin flag, staged access, expiry, and the
+// bearer are all derived server-side, so any additional field is a sign the
+// request did not come from the confirmation dialog.
+func onlyInvitationReplaceFields(form url.Values) bool {
+	values, ok := form[csrfFormField]
+	return ok && len(values) == 1 && len(form) == 1
 }
 
 func (s *Server) handleCancelInvitation(w http.ResponseWriter, r *http.Request) {
@@ -278,7 +418,7 @@ func (s *Server) handleInvitationAcceptPost(w http.ResponseWriter, r *http.Reque
 			w,
 			http.StatusInternalServerError,
 			"Acceptance result unconfirmed",
-			"Thawguard could not confirm whether your account was created. Try signing in with your invited email address and the password you chose. If sign-in fails, ask an Admin to cancel this invitation and create a new one.",
+			"Thawguard could not confirm whether your account was created. Try signing in with your invited email address and the password you chose. If sign-in fails, ask an Admin for a new invitation link.",
 			"/login",
 			"Go to sign-in",
 		)
@@ -380,14 +520,22 @@ func (s *Server) validInvitationOrigin(r *http.Request) bool {
 	return len(origins) == 1 && origins[0] == s.cfg.PublicURL
 }
 
-func usersInvitationViews(invitations []auth.ActiveInvitation) []usersInvitationView {
+func usersInvitationViews(invitations []auth.ActiveInvitation, state usersPageState) []usersInvitationView {
 	views := make([]usersInvitationView, 0, len(invitations))
 	for _, invitation := range invitations {
+		confirming := state.ConfirmInvitationID == invitation.ID
 		view := usersInvitationView{
-			DisplayName: invitation.DisplayName,
-			Email:       invitation.Email,
-			IsAdmin:     invitation.IsAdmin,
-			CancelPath:  "/users/invitations/" + invitation.ID + "/cancel",
+			DisplayName:        invitation.DisplayName,
+			Email:              invitation.Email,
+			IsAdmin:            invitation.IsAdmin,
+			CancelPath:         "/users/invitations/" + invitation.ID + "/cancel",
+			ReplacePath:        "/users/invitations/" + invitation.ID + "/replace",
+			CancelDialogID:     "invitation-cancel-" + invitation.ID,
+			CancelConfirmHref:  "/users?confirm=cancel&invitation=" + invitation.ID + "#invitation-cancel-" + invitation.ID,
+			CancelOpen:         confirming && state.ConfirmAction == "cancel",
+			ReplaceDialogID:    "invitation-replace-" + invitation.ID,
+			ReplaceConfirmHref: "/users?confirm=replace&invitation=" + invitation.ID + "#invitation-replace-" + invitation.ID,
+			ReplaceOpen:        confirming && state.ConfirmAction == "replace",
 		}
 		switch invitation.Lifecycle {
 		case auth.InvitationLifecyclePending:
@@ -396,17 +544,17 @@ func usersInvitationViews(invitations []auth.ActiveInvitation) []usersInvitation
 		case auth.InvitationLifecycleExpired:
 			view.LifecycleLabel = "Expired"
 			view.LifecycleTone = "warning"
-			view.LifecycleDetail = "The link no longer works. Cancel this invitation and create a new one."
+			view.LifecycleDetail = "The link no longer works. Replace it to issue a new link with a fresh seven-day expiry."
 		case auth.InvitationLifecycleNeedsReplacement:
 			view.LifecycleLabel = "Needs replacement"
 			view.LifecycleTone = "danger"
-			view.LifecycleDetail = "The link was invalidated because the authorizing Admin lost Admin access. Cancel this invitation and create a new one."
+			view.LifecycleDetail = "The link was invalidated because the authorizing Admin lost Admin access. Replace it to issue a new link authorized by you."
 		}
 		if invitation.ExpiresAt != nil {
 			view.ExpiresAt = invitation.ExpiresAt.UTC().Format("2006-01-02 15:04 UTC")
 		}
 		if invitation.AccessDrift() {
-			view.DriftWarning = "Staged repository access changed after this invitation was created. Cancel it and create a new one."
+			view.DriftWarning = "Staged repository access changed after this invitation was created. Replace the link to keep the access that still exists; access for deleted repositories cannot be restored."
 		}
 		repositoryIDs := make(map[int64]bool)
 		stagedRoles := make(map[auth.Role]bool)
@@ -466,7 +614,7 @@ func (s *Server) renderInvitationAcceptBadRequest(w http.ResponseWriter) {
 		w,
 		http.StatusBadRequest,
 		"Invitation request not processed",
-		"This invitation request could not be processed. Ask an Admin to cancel the invitation and create a new one if the problem continues.",
+		"This invitation request could not be processed. Ask an Admin for a new invitation link if the problem continues.",
 		"",
 		"",
 	)

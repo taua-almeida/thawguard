@@ -5,12 +5,12 @@
       <h2 class="m-0 text-lg font-bold text-text">Active invitations</h2>
       {{ if eq (len .Invitations) 1 }}{{ template "ui/badge" dict "Label" "1 invitation" }}{{ else }}{{ template "ui/badge" dict "Label" (printf "%d invitations" (len .Invitations)) }}{{ end }}
     </div>
-    <p class="m-0 mt-1 text-xs text-text-muted">Invitation links are displayed once. If a link is lost, cancel the invitation and create a new one.</p>
+    <p class="m-0 mt-1 text-xs text-text-muted">Invitation links are displayed once. If a link is lost or stops working, replace it: the person, Admin setting, and staged access that still exists are kept, and a new link is shown once.</p>
   </div>
   {{ if .Invitations }}
   <div class="hidden overflow-x-auto md:block">
     <table class="w-full border-collapse text-sm">
-      <caption class="sr-only">Invited people, invitation status, staged access, and cancel actions</caption>
+      <caption class="sr-only">Invited people, invitation status, staged access, and replace or cancel actions</caption>
       <thead><tr class="bg-surface-muted text-left">
         <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Person</th>
         <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Status</th>
@@ -35,10 +35,10 @@
             {{ if .DriftWarning }}<p class="m-0 mt-2 text-xs font-semibold text-warning" role="alert">{{ .DriftWarning }}</p>{{ end }}
           </td>
           <td class="px-4 py-4">
-            <form method="post" action="{{ .CancelPath }}">
-              <input type="hidden" name="{{ $.CSRFField }}" value="{{ $.CSRFToken }}">
-              {{ template "ui/button" dict "Label" "Cancel invitation" "Variant" "danger" "Size" "sm" "Type" "submit" }}
-            </form>
+            <div class="flex flex-wrap gap-2">
+              {{ template "ui/button" dict "Label" "Replace link" "Variant" "secondary" "Size" "sm" "Href" .ReplaceConfirmHref "DialogTarget" .ReplaceDialogID }}
+              {{ template "ui/button" dict "Label" "Cancel invitation" "Variant" "danger" "Size" "sm" "Href" .CancelConfirmHref "DialogTarget" .CancelDialogID }}
+            </div>
           </td>
         </tr>
         {{ end }}
@@ -56,20 +56,47 @@
       {{ if .LifecycleDetail }}<p class="m-0 mt-2 text-xs text-text-muted">{{ .LifecycleDetail }}</p>{{ end }}
       {{ if .ScopedRoleLabels }}<div class="mt-2 flex flex-wrap gap-1.5">{{ range .ScopedRoleLabels }}{{ template "ui/badge" dict "Label" . }}{{ end }}</div>{{ end }}
       {{ if .DriftWarning }}<p class="m-0 mt-2 text-xs font-semibold text-warning" role="alert">{{ .DriftWarning }}</p>{{ end }}
-      <form method="post" action="{{ .CancelPath }}" class="mt-4">
-        <input type="hidden" name="{{ $.CSRFField }}" value="{{ $.CSRFToken }}">
-        {{ template "ui/button" dict "Label" "Cancel invitation" "Variant" "danger" "Size" "sm" "Type" "submit" }}
-      </form>
+      <div class="mt-4 flex flex-wrap gap-2">
+        {{ template "ui/button" dict "Label" "Replace link" "Variant" "secondary" "Size" "sm" "Href" .ReplaceConfirmHref "DialogTarget" .ReplaceDialogID }}
+        {{ template "ui/button" dict "Label" "Cancel invitation" "Variant" "danger" "Size" "sm" "Href" .CancelConfirmHref "DialogTarget" .CancelDialogID }}
+      </div>
     </article>
     {{ end }}
   </div>
+
+  {{/* One confirmation dialog per invitation, rendered outside the duplicated
+       desktop and mobile rows so both breakpoints address the same element and
+       no dialog id is emitted twice. */}}
+  {{ range .Invitations }}
+  {{ template "ui/modal" dict
+     "ID" .ReplaceDialogID
+     "Open" .ReplaceOpen
+     "Title" (printf "Replace the invitation link for %s?" .Email)
+     "Body" "The current link stops working immediately and a new link is shown once. The Admin setting and the staged repository access that still exists are preserved, and a fresh seven-day expiry starts. Staged access for repositories that were deleted cannot be restored."
+     "ConfirmLabel" "Replace link"
+     "ConfirmVariant" "primary"
+     "CancelLabel" "Keep current link"
+     "Action" .ReplacePath
+     "CSRFField" $.CSRFField
+     "CSRFToken" $.CSRFToken }}
+  {{ template "ui/modal" dict
+     "ID" .CancelDialogID
+     "Open" .CancelOpen
+     "Title" (printf "Cancel the invitation for %s?" .Email)
+     "Body" "The invitation link becomes unusable and this person can no longer accept it. The email address is released, so it can be invited again."
+     "ConfirmLabel" "Cancel invitation"
+     "CancelLabel" "Keep invitation"
+     "Action" .CancelPath
+     "CSRFField" $.CSRFField
+     "CSRFToken" $.CSRFToken }}
+  {{ end }}
   {{ else }}
-  <div class="p-(--card-spacing)">{{ template "ui/empty-state" dict "Title" "No active invitations" "Hint" "Each invitation link is displayed once at creation and handed to the invitee over a channel you trust." "Icon" "tg-i-users" }}</div>
+  <div class="p-(--card-spacing)">{{ template "ui/empty-state" dict "Title" "No active invitations" "Hint" "Each invitation link is displayed once when it is created or replaced, and handed to the invitee over a channel you trust." "Icon" "tg-i-users" }}</div>
   {{ end }}
 </section>
 
 <section class="rounded-panel border border-border bg-surface shadow-card" aria-label="People">
-  <form method="get" action="/users" class="grid gap-3 border-b border-border p-(--card-spacing) md:grid-cols-[minmax(0,1fr)_minmax(14rem,20rem)_auto] md:items-end">
+  <form method="get" action="/users" class="grid items-end gap-3 border-b border-border p-(--card-spacing) md:grid-cols-3">
     {{ template "ui/input" dict "ID" "users-search" "Name" "q" "Label" "Search people" "Value" .Query.Search "Placeholder" "Name or email" "Maxlength" "120" }}
     {{ template "ui/select" dict "ID" "users-repository" "Name" "repo" "Label" "Repository" "Options" .RepositoryOptions }}
     <div class="flex gap-2">
@@ -97,7 +124,7 @@
       </tr></thead>
       <tbody>
         {{ range .Users }}
-        <tr class="border-t border-border align-top{{ if .Disabled }} opacity-70{{ end }}">
+        <tr class="border-t border-border align-top">
           <td class="px-4 py-4">
             <a class="font-semibold text-accent-strong no-underline hover:underline" href="/users/{{ .ID }}">{{ .DisplayName }}</a>{{ if .IsSelf }} <span class="rounded-pill bg-accent-soft px-2 py-0.5 text-xs font-semibold text-accent-strong">you</span>{{ end }}
             <p class="m-0 mt-1"><code class="font-mono text-xs text-text-muted">{{ .Email }}</code></p>
@@ -116,7 +143,7 @@
   </div>
   <div class="flex flex-col gap-3 p-(--card-spacing) md:hidden">
     {{ range .Users }}
-    <article class="rounded-card border border-border p-4{{ if .Disabled }} opacity-70{{ end }}">
+    <article class="rounded-card border border-border p-4">
       <div class="flex flex-wrap items-start justify-between gap-2">
         <div><a class="font-bold text-accent-strong no-underline hover:underline" href="/users/{{ .ID }}">{{ .DisplayName }}</a>{{ if .IsSelf }} <span class="rounded-pill bg-accent-soft px-2 py-0.5 text-xs font-semibold text-accent-strong">you</span>{{ end }}<p class="m-0 mt-1"><code class="font-mono text-xs text-text-muted">{{ .Email }}</code></p></div>
         {{ if .Disabled }}{{ template "ui/badge" dict "Label" "Disabled" "Tone" "warning" }}{{ else }}{{ template "ui/badge" dict "Label" "Active" "Tone" "success" }}{{ end }}
@@ -132,9 +159,9 @@
   {{ end }}
 </section>
 
-<dialog id="users-create-dialog"{{ if .CreateOpen }} open{{ end }} class="m-auto w-[min(32rem,90vw)] rounded-panel border border-border bg-surface p-6 text-text shadow-card" aria-labelledby="users-create-dialog-title">
+<dialog id="users-create-dialog"{{ if .CreateOpen }} open{{ end }} class="m-auto w-[min(28rem,90vw)] rounded-panel border border-border bg-surface p-6 text-text shadow-card" aria-labelledby="users-create-dialog-title" aria-describedby="users-create-dialog-body">
   <h2 id="users-create-dialog-title" class="m-0 text-base font-bold">Add local user</h2>
-  <p class="m-0 mt-2 text-sm text-text-muted"><strong>Temporary fallback workflow.</strong> Create an active user with no repository access and a temporary password. They must change it at first sign-in. Prefer Invite person so they choose their own password.</p>
+  <p id="users-create-dialog-body" class="m-0 mt-2 text-sm text-text-muted"><strong>Temporary fallback workflow.</strong> Create an active user with no repository access and a temporary password. They must change it at first sign-in. Prefer Invite person so they choose their own password.</p>
   {{ if and .CreateOpen .FormError }}<div class="mt-4" role="alert">{{ template "ui/callout" dict "Tone" "danger" "Body" .FormError }}</div>{{ end }}
   <form method="post" action="/users">
     <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
@@ -147,9 +174,9 @@
   </form>
 </dialog>
 
-<dialog id="users-invite-dialog"{{ if .InviteOpen }} open{{ end }} class="m-auto w-full max-w-md rounded-panel border border-border bg-surface p-6 text-text shadow-card" aria-labelledby="users-invite-dialog-title">
+<dialog id="users-invite-dialog"{{ if .InviteOpen }} open{{ end }} class="m-auto w-[min(28rem,90vw)] rounded-panel border border-border bg-surface p-6 text-text shadow-card" aria-labelledby="users-invite-dialog-title" aria-describedby="users-invite-dialog-body">
   <h2 id="users-invite-dialog-title" class="m-0 text-base font-bold">Invite person</h2>
-  <p class="m-0 mt-2 text-sm text-text-muted">Creates a one-time invitation link, valid for up to seven days. The link is displayed once; hand it to the invitee over a channel you trust. They choose their own password. No email is sent.</p>
+  <p id="users-invite-dialog-body" class="m-0 mt-2 text-sm text-text-muted">Creates a one-time invitation link, valid for up to seven days. The link is displayed once; hand it to the invitee over a channel you trust. They choose their own password. No email is sent.</p>
   {{ if and .InviteOpen .FormError }}<div class="mt-4" role="alert">{{ template "ui/callout" dict "Tone" "danger" "Body" .FormError }}</div>{{ end }}
   <form method="post" action="/users/invitations">
     <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
@@ -177,4 +204,34 @@
     <div class="mt-5 flex flex-row-reverse gap-2">{{ template "ui/button" dict "Label" "Create invitation link" "Variant" "primary" "Type" "submit" }}{{ template "ui/button" dict "Label" "Cancel" "Variant" "secondary" "Type" "submit" "Dismiss" true }}</div>
   </form>
 </dialog>
+
+{{/* The one-time invitation link. This block renders on exactly one buffered
+     create or replace response; the Users & Access page behind it is the
+     pre-mutation snapshot, so closing the dialog reloads /users rather than
+     returning to a stale document. The bearer appears once, in the readonly
+     input value, and nowhere else. */}}
+{{ with .InvitationResult }}
+<dialog id="invitation-result-dialog" open data-invitation-result class="m-auto w-[min(28rem,90vw)] rounded-panel border border-border bg-surface p-6 text-text shadow-card" aria-labelledby="invitation-result-title" aria-describedby="invitation-result-guidance">
+  <h2 id="invitation-result-title" class="m-0 text-base font-bold">{{ .Heading }}</h2>
+  <p class="m-0 mt-2 text-sm font-semibold text-text">{{ .DisplayName }}</p>
+  <p class="m-0 mt-1"><code class="font-mono text-xs text-text-muted">{{ .Email }}</code></p>
+  <p id="invitation-result-guidance" class="m-0 mt-3 text-sm text-text-muted">Copy this link now and hand it to the invitee over a channel you trust. No email was sent. Thawguard stores only the link's digest and cannot display it again. If you lose it, replace the link in Active invitations.</p>
+  <div class="mt-4 flex flex-col gap-1.5">
+    <label for="invitation-issued-link" class="text-sm font-semibold text-text">One-time invitation link</label>
+    <input id="invitation-issued-link" type="text" readonly autofocus value="{{ .InvitationLink }}" data-invitation-link class="h-(--control-height) w-full rounded-control border border-border-input bg-surface px-3 font-mono text-sm text-text">
+    <div class="flex flex-wrap items-center gap-2">
+      <button type="button" hidden data-invitation-copy class="inline-flex items-center justify-center gap-2 rounded-control border font-semibold no-underline transition-colors disabled:pointer-events-none disabled:opacity-50 border-border-input bg-surface text-text hover:bg-surface-muted h-8 px-3 text-xs">Copy link</button>
+      <p class="m-0 text-xs text-text-muted" data-invitation-copy-hint>Select the link and copy it manually.</p>
+    </div>
+    <p class="m-0 text-xs text-text-muted" role="status" aria-live="polite" data-invitation-copy-status></p>
+  </div>
+  <p class="m-0 mt-3 text-sm text-text-muted">Valid for up to seven days, until {{ .ExpiresAt }}.</p>
+  <div class="mt-4 flex flex-col gap-3">
+    {{ if .Replaced }}{{ template "ui/callout" dict "Tone" "warning" "Body" "The previous link for this invitation stopped working. Only the link above can be accepted." }}{{ end }}
+    {{ template "ui/callout" dict "Tone" "warning" "Body" "The link can stop working earlier if the invitation is cancelled or replaced, the authorizing Admin loses Admin access, or staged repository access changes." }}
+    {{ template "ui/callout" dict "Tone" "neutral" "Body" "The invitee chooses their own password when they open the link. No account exists until they accept." }}
+  </div>
+  <div class="mt-5 flex flex-row-reverse">{{ template "ui/button" dict "Label" "Done" "Variant" "primary" "Href" "/users" }}</div>
+</dialog>
+{{ end }}
 {{ end }}

@@ -64,6 +64,7 @@ const (
 	ActionUserPasswordRecoveryCompleted      = "user.password_recovery_completed"
 	ActionInvitationCreated                  = "invitation.created"
 	ActionInvitationReissued                 = "invitation.reissued"
+	ActionInvitationReplaced                 = "invitation.replaced"
 	ActionInvitationCancelled                = "invitation.cancelled"
 	ActionInvitationAuthorizationRevoked     = "invitation.authorization_revoked"
 	ActionInvitationAccepted                 = "invitation.accepted"
@@ -135,6 +136,7 @@ func KnownActions() []string {
 		ActionUserPasswordRecoveryCompleted,
 		ActionInvitationCreated,
 		ActionInvitationReissued,
+		ActionInvitationReplaced,
 		ActionInvitationCancelled,
 		ActionInvitationAuthorizationRevoked,
 		ActionInvitationAccepted,

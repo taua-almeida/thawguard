@@ -1249,7 +1249,7 @@ func (s *Server) handleDevPreviewUsers(w http.ResponseWriter, r *http.Request) {
 		CreateEmail:       state.CreateEmail,
 		CreateDisplayName: state.CreateDisplayName,
 
-		Invitations:        usersInvitationViews(invitations),
+		Invitations:        usersInvitationViews(invitations, state),
 		InviteRepositories: usersInviteRepositoryViews(repositories, nil),
 	}
 	s.renderPage(w, "layouts/users", data)

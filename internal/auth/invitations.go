@@ -56,6 +56,28 @@ type CancelInvitationParams struct {
 	InvitationID string
 }
 
+// ReplaceInvitationLinkParams carries no authority fields on purpose:
+// replacement preserves whatever the retired invitation already stages, so a
+// caller cannot smuggle an Admin flag or a repository grant through it.
+type ReplaceInvitationLinkParams struct {
+	ActorUserID  int64
+	InvitationID string
+}
+
+// InvitationLinkReplacement describes the invitation that took over from
+// ReplacedInvitationID. Token is the only copy of the new bearer that will ever
+// exist; the row keeps a digest.
+type InvitationLinkReplacement struct {
+	ReplacedInvitationID string
+	InvitationID         string
+	Email                string
+	DisplayName          string
+	IsAdmin              bool
+	RepositoryGrants     []InvitationRepositoryGrant
+	Token                string
+	ExpiresAt            time.Time
+}
+
 type InvitationCredential struct {
 	InvitationID string
 	Token        string
@@ -280,6 +302,178 @@ WHERE id = ?
 		return InvitationCredential{}, fmt.Errorf("commit invitation reissue: %w", err)
 	}
 	return InvitationCredential{InvitationID: normalized.InvitationID, Token: token, ExpiresAt: expiresAt}, nil
+}
+
+// ReplaceInvitationLink retires one active invitation and issues a brand-new
+// invitation carrying the retired invitation's email, display name, Admin
+// flag, and the staged repository grants whose repositories still exist when
+// the transaction owns SQLite's writer slot.
+//
+// The retired invitation ID is the replay fence. Once it is tombstoned, a
+// refresh, a double submit, or a replayed POST against the same ID finds
+// nothing to replace and cannot rotate the link that was just handed out. That
+// is why this is one transaction and not a Cancel followed by a Create: the
+// email reservation must move between the two rows without ever being free,
+// and any later failure must roll both sides back.
+func (s *Service) ReplaceInvitationLink(ctx context.Context, params ReplaceInvitationLinkParams) (InvitationLinkReplacement, error) {
+	if s == nil || s.db == nil {
+		return InvitationLinkReplacement{}, errors.New("auth service has no database")
+	}
+	if !ValidInvitationID(params.InvitationID) {
+		return InvitationLinkReplacement{}, ValidationError{Message: "invitation was not found"}
+	}
+	invitationID, err := newInvitationID()
+	if err != nil {
+		return InvitationLinkReplacement{}, err
+	}
+	token, err := randomToken(invitationBearerBytes)
+	if err != nil {
+		return InvitationLinkReplacement{}, err
+	}
+	digest := sha256.Sum256([]byte(token))
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return InvitationLinkReplacement{}, fmt.Errorf("begin invitation link replacement: %w", err)
+	}
+	defer tx.Rollback()
+
+	// BeginTx is deferred in SQLite, so this actor lock is the first write and
+	// every authoritative read plus the clock sample below happen after this
+	// transaction owns the writer slot.
+	if err := s.lockEnabledAdminActor(ctx, tx, params.ActorUserID); err != nil {
+		return InvitationLinkReplacement{}, err
+	}
+	replaced, err := loadReplaceableInvitation(ctx, tx, params.InvitationID)
+	if err != nil {
+		return InvitationLinkReplacement{}, err
+	}
+	switch replaced.Status {
+	// Expired and drifted invitations are ordinary pending rows, so an Admin
+	// can recover from either without restaging identity.
+	case invitationStatusPending, invitationStatusReissue:
+	case invitationStatusAccepted, invitationStatusCancelled:
+		return InvitationLinkReplacement{}, ValidationError{Message: "invitation link cannot be replaced"}
+	default:
+		return InvitationLinkReplacement{}, fmt.Errorf("invitation %q has unsupported status %q", params.InvitationID, replaced.Status)
+	}
+	if !replaced.CanonicalEmail.Valid || !replaced.DisplayName.Valid || !replaced.IsAdmin.Valid || !replaced.ExpectedGrantCount.Valid {
+		return InvitationLinkReplacement{}, errors.New("active invitation row is malformed")
+	}
+	email := replaced.CanonicalEmail.String
+	displayName := replaced.DisplayName.String
+	if email != normalizeEmail(email) ||
+		displayName != strings.TrimSpace(displayName) ||
+		validateLocalIdentity(email, displayName) != nil ||
+		(replaced.IsAdmin.Int64 != 0 && replaced.IsAdmin.Int64 != 1) ||
+		replaced.ExpectedGrantCount.Int64 < 0 {
+		return InvitationLinkReplacement{}, errors.New("active invitation row is malformed")
+	}
+	isAdmin := replaced.IsAdmin.Int64 != 0
+	if err := rejectInvitationUserCollision(ctx, tx, email); err != nil {
+		return InvitationLinkReplacement{}, err
+	}
+	var actualBefore int64
+	if err := tx.QueryRowContext(ctx, `
+SELECT count(*)
+FROM invitation_repository_grants
+WHERE invitation_id = ?`, params.InvitationID).Scan(&actualBefore); err != nil {
+		return InvitationLinkReplacement{}, fmt.Errorf("count staged invitation repository grants: %w", err)
+	}
+	grants, err := loadSurvivingInvitationRepositoryGrants(ctx, tx, params.InvitationID)
+	if err != nil {
+		return InvitationLinkReplacement{}, err
+	}
+
+	now := s.now().UTC()
+	expiresAt := persistedInvitationExpiry(now)
+	nowText := now.Format(time.RFC3339Nano)
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM invitation_repository_grants WHERE invitation_id = ?`, params.InvitationID); err != nil {
+		return InvitationLinkReplacement{}, fmt.Errorf("delete replaced invitation repository grants: %w", err)
+	}
+	// Redacting the retired row first releases the active-email reservation so
+	// the new row can claim it inside this same transaction.
+	result, err := tx.ExecContext(ctx, `
+UPDATE invitations
+SET status = ?,
+    canonical_email = NULL,
+    display_name = NULL,
+    token_digest = NULL,
+    expires_at = NULL,
+    is_admin = NULL,
+    authorized_by_user_id = NULL,
+    expected_repository_grant_count = NULL,
+    updated_at = ?
+WHERE id = ?
+  AND status IN (?, ?)`,
+		invitationStatusCancelled,
+		nowText,
+		params.InvitationID,
+		invitationStatusPending,
+		invitationStatusReissue,
+	)
+	if err != nil {
+		return InvitationLinkReplacement{}, fmt.Errorf("retire replaced invitation: %w", err)
+	}
+	if err := requireOneAffectedRow(result, "retire replaced invitation"); err != nil {
+		return InvitationLinkReplacement{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO invitations(
+  id,
+  status,
+  canonical_email,
+  display_name,
+  token_digest,
+  expires_at,
+  is_admin,
+  authorized_by_user_id,
+  expected_repository_grant_count,
+  created_at,
+  updated_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		invitationID,
+		invitationStatusPending,
+		email,
+		displayName,
+		digest[:],
+		expiresAt.UnixNano(),
+		boolInt(isAdmin),
+		params.ActorUserID,
+		len(grants),
+		nowText,
+		nowText,
+	); err != nil {
+		return InvitationLinkReplacement{}, fmt.Errorf("create replacement invitation: %w", err)
+	}
+	if err := insertInvitationRepositoryGrants(ctx, tx, invitationID, grants); err != nil {
+		return InvitationLinkReplacement{}, err
+	}
+	if err := recordInvitationAudit(ctx, tx, audit.ActionInvitationReplaced, params.ActorUserID, invitationID, map[string]string{
+		"replaced_invitation_id":                 params.InvitationID,
+		"expires_at":                             expiresAt.Format(time.RFC3339Nano),
+		"administrator":                          strconv.FormatBool(isAdmin),
+		"repository_grant_count_before_expected": strconv.FormatInt(replaced.ExpectedGrantCount.Int64, 10),
+		"repository_grant_count_before_actual":   strconv.FormatInt(actualBefore, 10),
+		"repository_grant_count_after":           strconv.Itoa(len(grants)),
+	}); err != nil {
+		return InvitationLinkReplacement{}, fmt.Errorf("record invitation link replacement audit event: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return InvitationLinkReplacement{}, fmt.Errorf("commit invitation link replacement: %w", err)
+	}
+	return InvitationLinkReplacement{
+		ReplacedInvitationID: params.InvitationID,
+		InvitationID:         invitationID,
+		Email:                email,
+		DisplayName:          displayName,
+		IsAdmin:              isAdmin,
+		RepositoryGrants:     grants,
+		Token:                token,
+		ExpiresAt:            expiresAt,
+	}, nil
 }
 
 func (s *Service) CancelInvitation(ctx context.Context, params CancelInvitationParams) error {
@@ -771,6 +965,75 @@ WHERE id = ?`, invitationID).Scan(
 		return managedInvitation{}, fmt.Errorf("load invitation: %w", err)
 	}
 	return invitation, nil
+}
+
+// replaceableInvitation is the managed shape plus the display name, because
+// replacement copies the staged identity forward instead of restaging it.
+type replaceableInvitation struct {
+	Status             string
+	CanonicalEmail     sql.NullString
+	DisplayName        sql.NullString
+	IsAdmin            sql.NullInt64
+	ExpectedGrantCount sql.NullInt64
+}
+
+func loadReplaceableInvitation(ctx context.Context, q queryer, invitationID string) (replaceableInvitation, error) {
+	var invitation replaceableInvitation
+	err := q.QueryRowContext(ctx, `
+SELECT status, canonical_email, display_name, is_admin, expected_repository_grant_count
+FROM invitations
+WHERE id = ?`, invitationID).Scan(
+		&invitation.Status,
+		&invitation.CanonicalEmail,
+		&invitation.DisplayName,
+		&invitation.IsAdmin,
+		&invitation.ExpectedGrantCount,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return replaceableInvitation{}, ValidationError{Message: "invitation was not found"}
+	}
+	if err != nil {
+		return replaceableInvitation{}, fmt.Errorf("load invitation: %w", err)
+	}
+	return invitation, nil
+}
+
+// loadSurvivingInvitationRepositoryGrants returns the staged grants whose
+// repository still exists, in the same canonical order acceptance uses. Grants
+// pointing at a deleted repository are dropped rather than copied: they can
+// never be materialized, and carrying them forward would leave the replacement
+// permanently drifted.
+func loadSurvivingInvitationRepositoryGrants(
+	ctx context.Context,
+	q queryer,
+	invitationID string,
+) ([]InvitationRepositoryGrant, error) {
+	rows, err := q.QueryContext(ctx, `
+SELECT staged.repository_id, staged.role
+FROM invitation_repository_grants staged
+JOIN repositories ON repositories.id = staged.repository_id
+WHERE staged.invitation_id = ?
+ORDER BY staged.repository_id, staged.role`, invitationID)
+	if err != nil {
+		return nil, fmt.Errorf("load surviving invitation repository grants: %w", err)
+	}
+	defer rows.Close()
+
+	grants := make([]InvitationRepositoryGrant, 0)
+	for rows.Next() {
+		var grant InvitationRepositoryGrant
+		if err := rows.Scan(&grant.RepositoryID, &grant.Role); err != nil {
+			return nil, fmt.Errorf("scan surviving invitation repository grant: %w", err)
+		}
+		if grant.RepositoryID <= 0 || !grant.Role.ValidForRepository() {
+			return nil, errors.New("staged invitation repository grant is malformed")
+		}
+		grants = append(grants, grant)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("load surviving invitation repository grant rows: %w", err)
+	}
+	return grants, nil
 }
 
 func normalizeCreateInvitationParams(params CreateInvitationParams) (CreateInvitationParams, error) {

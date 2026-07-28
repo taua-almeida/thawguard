@@ -31,6 +31,11 @@ export function initDialogs() {
     if (!(dialog instanceof HTMLDialogElement)) {
       return;
     }
+    // Only now that the dialog exists is it safe to suppress the opener's own
+    // action. An opener may be a real link to the server-rendered dialog state
+    // (confirmations work without JS); if that dialog is missing from this
+    // page, the navigation must still happen.
+    event.preventDefault();
     dialog.showModal();
     dialog.addEventListener("close", () => opener.focus(), { once: true });
   });

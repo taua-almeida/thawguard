@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 	"html"
+	"html/template"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
@@ -185,6 +186,91 @@ FROM invitations WHERE id = ?`, invitationID).Scan(&status, &nulls[0], &nulls[1]
 	}
 }
 
+// mustPendingInvitationID returns the single live invitation, which is what
+// makes "the replacement was not rotated" checkable: a replay that minted
+// another row would leave two.
+func (f *invitationWebFixture) mustPendingInvitationID(t *testing.T) string {
+	t.Helper()
+	var invitationID string
+	if err := f.database.QueryRowContext(f.ctx, `SELECT id FROM invitations WHERE status = 'pending'`).Scan(&invitationID); err != nil {
+		t.Fatal(err)
+	}
+	return invitationID
+}
+
+func (f *invitationWebFixture) invitationTokenDigest(t *testing.T, invitationID string) []byte {
+	t.Helper()
+	var digest []byte
+	if err := f.database.QueryRowContext(f.ctx, `SELECT token_digest FROM invitations WHERE id = ?`, invitationID).Scan(&digest); err != nil {
+		t.Fatal(err)
+	}
+	return digest
+}
+
+func sha256Sum(value string) []byte {
+	digest := sha256.Sum256([]byte(value))
+	return digest[:]
+}
+
+func (f *invitationWebFixture) invitationIsAdmin(t *testing.T, invitationID string) bool {
+	t.Helper()
+	var isAdmin int64
+	if err := f.database.QueryRowContext(f.ctx, `SELECT is_admin FROM invitations WHERE id = ?`, invitationID).Scan(&isAdmin); err != nil {
+		t.Fatal(err)
+	}
+	return isAdmin != 0
+}
+
+// usersDialogWidth is the width every /users dialog shares. The design requires
+// Add local user, Invite person, and the one-time result to match, and the
+// min() keeps a gutter at 390px that a bare w-full would not: a modal <dialog>
+// sizes against the viewport, so width:100% renders edge to edge.
+const usersDialogWidth = `w-[min(28rem,90vw)]`
+
+// assertSingleOpenInvitationResult pins the one-time delivery contract: the
+// result dialog is rendered once, already open, on exactly the response that
+// carries the bearer.
+func assertSingleOpenInvitationResult(t *testing.T, body string) {
+	t.Helper()
+	if got := strings.Count(body, "data-invitation-result"); got != 1 {
+		t.Fatalf("result dialog rendered %d times, want exactly one", got)
+	}
+	if !strings.Contains(body, `id="invitation-result-dialog" open data-invitation-result`) {
+		t.Fatal("result dialog must be server-rendered open so it works without JavaScript")
+	}
+	if got := strings.Count(body, `aria-label="Active invitations"`); got != 1 {
+		t.Fatal("the one-time link must be delivered over the signed-in Users & Access shell")
+	}
+	if link := renderedControlTag(t, body, "invitation-issued-link"); !strings.Contains(link, "autofocus") {
+		t.Fatal("the one-time link must receive focus so the no-JavaScript result scrolls into view")
+	}
+	if tag := renderedControlTag(t, body, "invitation-result-dialog"); !strings.Contains(tag, usersDialogWidth) {
+		t.Fatalf("result dialog width must match the other /users dialogs: %s", tag)
+	}
+	for _, id := range []string{"invitation-result-title", "invitation-result-guidance"} {
+		if got := strings.Count(body, fmt.Sprintf(`id=%q`, id)); got != 1 {
+			t.Fatalf("result dialog target %s rendered %d times, want exactly once", id, got)
+		}
+	}
+}
+
+func TestUsersPageRequiredUtilitiesAreCompiled(t *testing.T) {
+	cssBytes, err := fs.ReadFile(webassets.StaticFS(), "app.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := string(cssBytes)
+	for _, want := range []string{
+		`.items-end{align-items:flex-end}`,
+		`.md\:grid-cols-3{grid-template-columns:repeat(3,minmax(0,1fr))}`,
+		`.w-\[min\(28rem\,90vw\)\]{width:min(28rem,90vw)}`,
+	} {
+		if !strings.Contains(css, want) {
+			t.Fatalf("compiled app.css is missing required /users utility %q", want)
+		}
+	}
+}
+
 func issuedInvitationLink(t *testing.T, body string) string {
 	t.Helper()
 	match := issuedInvitationLinkPattern.FindStringSubmatch(body)
@@ -281,6 +367,9 @@ func TestInvitationRouteSecurityHeaderMatrix(t *testing.T) {
 		{method: http.MethodDelete, path: "/users/invitations", wantStatus: http.StatusMethodNotAllowed, wantAllow: true},
 		{method: http.MethodPost, path: "/users/invitations/inv_AAAAAAAAAAAAAAAAAAAAAA/cancel", wantStatus: http.StatusForbidden, wantBody: "forbidden"},
 		{method: http.MethodPost, path: "/users/invitations/not-an-id/cancel", wantStatus: http.StatusNotFound},
+		{method: http.MethodPost, path: "/users/invitations/inv_AAAAAAAAAAAAAAAAAAAAAA/replace", wantStatus: http.StatusForbidden, wantBody: "Invitation link not replaced"},
+		{method: http.MethodPost, path: "/users/invitations/not-an-id/replace", wantStatus: http.StatusNotFound},
+		{method: http.MethodGet, path: "/users/invitations/inv_AAAAAAAAAAAAAAAAAAAAAA/replace", wantStatus: http.StatusNotFound, wantBody: "Page not found"},
 		// GET on the cancel path falls through to the "GET /" catch-all 404
 		// page; the sensitive headers still apply.
 		{method: http.MethodGet, path: "/users/invitations/inv_AAAAAAAAAAAAAAAAAAAAAA/cancel", wantStatus: http.StatusNotFound, wantBody: "Page not found"},
@@ -340,6 +429,15 @@ func TestInvitationAcceptBootstrapServesTokenlessFormWithoutCookies(t *testing.T
 	}
 	if !strings.Contains(body, "JavaScript is required to use this link safely.") {
 		t.Fatal("expected explicit no-JavaScript guidance")
+	}
+	if got := strings.Count(strings.ToLower(body), "ask an admin for a replacement invitation link"); got != 1 {
+		t.Fatalf("replacement guidance rendered %d times, want only the no-JavaScript state", got)
+	}
+	if !strings.Contains(body, "Try signing in with your invited email address, or ask an Admin to check your account or active invitation.") {
+		t.Fatal("invalid-fragment guidance must cover terminal accepted invitations truthfully")
+	}
+	if strings.Contains(body, "cancel this invitation and create a new one") {
+		t.Fatal("acceptance guidance must preserve replacement semantics")
 	}
 	if strings.Contains(body, "#token=") {
 		t.Fatal("bootstrap page must never mention the fragment bearer")
@@ -466,13 +564,15 @@ func TestInvitationCreateDisplaysOneTimeCanonicalLink(t *testing.T) {
 		"cannot display it again.",
 		"Valid for up to seven days, until",
 		"The link can stop working earlier if the invitation is cancelled",
-		"If you lose or close this page before sharing the link, cancel the invitation in Users &amp; Access and create a new one.",
+		"If you lose it, replace the link in Active invitations.",
+		"No email was sent.",
 		"No account exists until they accept.",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("issued page missing %q", want)
 		}
 	}
+	assertSingleOpenInvitationResult(t, body)
 
 	var invitationID string
 	var digest []byte
@@ -517,7 +617,7 @@ func TestInvitationCreateUnknownOutcomeClaimsNoRollbackAndRevealsNoLink(t *testi
 		"Invitation result unconfirmed",
 		"could not confirm whether the invitation was created",
 		"Inspect Active invitations before retrying",
-		"cancel it and create a new one",
+		"replace its link, because the original was never displayed",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("unknown create response missing %q", want)
@@ -907,6 +1007,303 @@ func TestInvitationCancelStaleUnknownAndBrokenOutcomes(t *testing.T) {
 	}
 }
 
+func TestInvitationReplaceIssuesOneTimeLinkOverUsersShellAndFencesReplay(t *testing.T) {
+	fixture := newInvitationWebFixture(t)
+	const goneRepositoryID = 94
+	mustInsertWebRepositoryID(t, fixture.ctx, fixture.database, goneRepositoryID, "deleted-before-replacement")
+	original := fixture.mustCreateServiceInvitation(t, "replace-me@example.test", true,
+		auth.InvitationRepositoryGrant{RepositoryID: fixture.repositoryID, Role: auth.RoleFreezer},
+		auth.InvitationRepositoryGrant{RepositoryID: goneRepositoryID, Role: auth.RoleViewer},
+	)
+	fixture.deleteRepository(t, goneRepositoryID)
+
+	replaceForm := url.Values{csrfFormField: {fixture.admin.CSRFToken}}
+	replacePath := "/users/invitations/" + original.InvitationID + "/replace"
+	recorder := postAccountForm(t, fixture.server, replacePath, fixture.adminCookie(), replaceForm)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%q", recorder.Code, recorder.Body.String())
+	}
+	assertPasswordRecoveryHeaders(t, recorder.Header())
+	body := recorder.Body.String()
+	assertSingleOpenInvitationResult(t, body)
+	for _, want := range []string{
+		"Invitation link replaced",
+		"replace-me@example.test",
+		"The previous link for this invitation stopped working. Only the link above can be accepted.",
+		"No email was sent.",
+		"Valid for up to seven days, until",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("replacement response missing %q", want)
+		}
+	}
+	link := issuedInvitationLink(t, body)
+	token := invitationTokenFromLink(t, link)
+	if strings.Count(body, token) != 1 {
+		t.Fatalf("bearer appeared %d times, want exactly once", strings.Count(body, token))
+	}
+	if strings.Contains(body, original.Token) {
+		t.Fatal("the retired bearer must never be echoed")
+	}
+	if cookies := strings.Join(recorder.Header().Values("Set-Cookie"), " "); strings.Contains(cookies, token) {
+		t.Fatal("bearer leaked into a cookie")
+	}
+
+	fixture.assertInvitationTombstone(t, original.InvitationID, "cancelled")
+	replacementID := fixture.mustPendingInvitationID(t)
+	if replacementID == original.InvitationID {
+		t.Fatal("replacement must mint a new canonical invitation ID")
+	}
+	wantDigest := sha256.Sum256([]byte(token))
+	if !bytes.Equal(fixture.invitationTokenDigest(t, replacementID), wantDigest[:]) {
+		t.Fatal("stored digest does not match the displayed bearer")
+	}
+	if !fixture.invitationIsAdmin(t, replacementID) {
+		t.Fatal("replacement dropped the invitation's Admin flag")
+	}
+	// The grant for the deleted repository cannot survive; the other one must.
+	if got := fixture.countStagedGrants(t, replacementID); got != 1 {
+		t.Fatalf("replacement copied %d staged grants, want the 1 surviving grant", got)
+	}
+	if got := countAuditAction(t, fixture.ctx, fixture.database, audit.ActionInvitationReplaced); got != 1 {
+		t.Fatalf("invitation.replaced audit rows = %d, want 1", got)
+	}
+	assertInvitationAuditDoesNotContain(t, fixture, token, original.Token, "replace-me@example.test", link)
+
+	// Refreshing or replaying the POST targets the retired ID, which no longer
+	// accepts replacement, so the link just handed out cannot be rotated.
+	replay := postAccountForm(t, fixture.server, replacePath, fixture.adminCookie(), replaceForm)
+	if replay.Code != http.StatusBadRequest || !strings.Contains(replay.Body.String(), "invitation link cannot be replaced") {
+		t.Fatalf("replayed replacement status=%d body=%q", replay.Code, replay.Body.String())
+	}
+	for _, forbidden := range []string{"#token=", "data-invitation-result", token} {
+		if strings.Contains(replay.Body.String(), forbidden) {
+			t.Fatalf("replayed replacement revealed %q", forbidden)
+		}
+	}
+	if got := fixture.mustPendingInvitationID(t); got != replacementID {
+		t.Fatal("replaying the retired POST rotated the live invitation")
+	}
+	if !bytes.Equal(fixture.invitationTokenDigest(t, replacementID), wantDigest[:]) {
+		t.Fatal("replaying the retired POST rotated the live bearer")
+	}
+
+	later := getUsersPage(t, fixture.server, "/users", fixture.adminCookie(), false)
+	if later.Code != http.StatusOK {
+		t.Fatalf("users page status = %d", later.Code)
+	}
+	if strings.Contains(later.Body.String(), token) || strings.Contains(later.Body.String(), "#token=") {
+		t.Fatal("bearer must never be reproduced after the one-time response")
+	}
+
+	if _, err := fixture.service.AcceptInvitation(fixture.ctx, original.Token, invitedWebTestPassword); err == nil {
+		t.Fatal("the retired bearer is still accepted")
+	}
+	accepted, err := fixture.service.AcceptInvitation(fixture.ctx, token, invitedWebTestPassword)
+	if err != nil {
+		t.Fatalf("replacement bearer rejected: %v", err)
+	}
+	if !accepted.IsAdmin || accepted.Email != "replace-me@example.test" {
+		t.Fatalf("replacement lost the staged identity or authority: %+v", accepted)
+	}
+}
+
+func TestInvitationReplaceReportsCommittedLinkWhenBufferedRenderFails(t *testing.T) {
+	fixture := newInvitationWebFixture(t)
+	original := fixture.mustCreateServiceInvitation(t, "undisplayed-replacement@example.test", false)
+
+	brokenTemplates, err := template.New("").Funcs(templateFuncs).ParseFS(templateFS,
+		"templates/layouts/*.html",
+		"templates/pages/*.html",
+		"templates/components/*.html",
+		"templates/components/primitives/*.html",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := brokenTemplates.Parse(`{{ define "layouts/users" }}{{ .MissingField }}{{ end }}`); err != nil {
+		t.Fatal(err)
+	}
+	originalTemplates := pageTemplates
+	pageTemplates = brokenTemplates
+	t.Cleanup(func() { pageTemplates = originalTemplates })
+
+	recorder := postAccountForm(
+		t,
+		fixture.server,
+		"/users/invitations/"+original.InvitationID+"/replace",
+		fixture.adminCookie(),
+		url.Values{csrfFormField: {fixture.admin.CSRFToken}},
+	)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body=%q", recorder.Code, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{
+		"Invitation link replaced but not displayed",
+		"The invitation is active",
+		"cannot show it again",
+		"replace the link for that invitation",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("undisplayed replacement response missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{"#token=", "data-invitation-result", "undisplayed-replacement@example.test"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("undisplayed replacement response revealed %q", forbidden)
+		}
+	}
+	fixture.assertInvitationTombstone(t, original.InvitationID, "cancelled")
+	if replacementID := fixture.mustPendingInvitationID(t); replacementID == original.InvitationID {
+		t.Fatal("render failure rolled back or reused the retired invitation")
+	}
+	if got := countAuditAction(t, fixture.ctx, fixture.database, audit.ActionInvitationReplaced); got != 1 {
+		t.Fatalf("invitation.replaced audit rows = %d, want 1", got)
+	}
+}
+
+func TestInvitationResultStaticScriptProtectsOneTimeDeliveryLifecycle(t *testing.T) {
+	scriptBytes, err := fs.ReadFile(webassets.StaticFS(), "js/main.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(scriptBytes)
+
+	for _, want := range []string{
+		"upgradeOpenDialogs();\ninitInvitationResult();",
+		`history.replaceState(null, "", "/users");`,
+		"navigator.clipboard?.writeText",
+		"manualHint.hidden = false;",
+		"link.focus();",
+		"link.select();",
+		`window.addEventListener("pagehide"`,
+		`link.value = "";`,
+		`dialog.addEventListener("close", () => {
+    if (dialog.open) return;
+    location.replace("/users");
+  });`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("invitation result script missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{"localStorage", "sessionStorage", "document.cookie", "console."} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("invitation result script must not use %q", forbidden)
+		}
+	}
+}
+
+func TestInvitationReplaceRejectsUnsupportedRequestShapes(t *testing.T) {
+	fixture := newInvitationWebFixture(t)
+	guarded := fixture.mustCreateServiceInvitation(t, "guarded-replace@example.test", false)
+	replacePath := "/users/invitations/" + guarded.InvitationID + "/replace"
+	csrf := url.Values{csrfFormField: {fixture.admin.CSRFToken}}
+
+	extraField := url.Values{csrfFormField: {fixture.admin.CSRFToken}, "is_admin": {"1"}}
+	if got := postAccountForm(t, fixture.server, replacePath, fixture.adminCookie(), extraField); got.Code != http.StatusBadRequest {
+		t.Fatalf("client-submitted authority status=%d, want 400", got.Code)
+	}
+	if got := postAccountForm(t, fixture.server, replacePath+"?notice=x", fixture.adminCookie(), csrf); got.Code != http.StatusBadRequest {
+		t.Fatalf("query-carrying replacement status=%d, want 400", got.Code)
+	}
+	if got := postAccountForm(t, fixture.server, replacePath, fixture.adminCookie(), url.Values{}); got.Code != http.StatusForbidden {
+		t.Fatalf("missing-CSRF replacement status=%d, want 403", got.Code)
+	}
+	if got := postAccountForm(t, fixture.server, "/users/invitations/not-an-id/replace", fixture.adminCookie(), csrf); got.Code != http.StatusNotFound {
+		t.Fatalf("malformed invitation ID status=%d, want 404", got.Code)
+	}
+	if got := postAccountForm(t, fixture.server, "/users/invitations/inv_AAAAAAAAAAAAAAAAAAAAAA/replace", fixture.adminCookie(), csrf); got.Code != http.StatusBadRequest {
+		t.Fatalf("unknown invitation status=%d, want 400", got.Code)
+	}
+
+	mustCreateWebUser(t, fixture.ctx, fixture.service, "replace-viewer@example.test", false)
+	viewerSession, err := fixture.service.Login(fixture.ctx, auth.LoginParams{Email: "replace-viewer@example.test", Password: accountWebTestPassword})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonAdmin := postAccountForm(t, fixture.server, replacePath,
+		&http.Cookie{Name: sessionCookieName, Value: viewerSession.ID},
+		url.Values{csrfFormField: {viewerSession.CSRFToken}})
+	if nonAdmin.Code != http.StatusForbidden {
+		t.Fatalf("non-admin replacement status=%d, want 403", nonAdmin.Code)
+	}
+
+	if got := fixture.invitationStatus(t, guarded.InvitationID); got != "pending" {
+		t.Fatalf("guarded invitation status = %q after rejected replacements", got)
+	}
+	if got := fixture.invitationTokenDigest(t, guarded.InvitationID); !bytes.Equal(got, sha256Sum(guarded.Token)) {
+		t.Fatal("a rejected replacement rotated the live bearer")
+	}
+	if got := countAuditAction(t, fixture.ctx, fixture.database, audit.ActionInvitationReplaced); got != 0 {
+		t.Fatalf("rejected replacements wrote %d audit rows", got)
+	}
+}
+
+func TestInvitationConfirmationsRenderServerSideWithoutJavaScript(t *testing.T) {
+	fixture := newInvitationWebFixture(t)
+	invitation := fixture.mustCreateServiceInvitation(t, "confirm@example.test", false)
+
+	for _, action := range []string{"replace", "cancel"} {
+		recorder := getUsersPage(t, fixture.server, "/users?confirm="+action+"&invitation="+invitation.InvitationID, fixture.adminCookie(), false)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("%s confirmation status=%d", action, recorder.Code)
+		}
+		body := recorder.Body.String()
+		open := fmt.Sprintf(`id="invitation-%s-%s" open`, action, invitation.InvitationID)
+		if !strings.Contains(body, open) {
+			t.Fatalf("%s confirmation dialog was not rendered open", action)
+		}
+		other := "replace"
+		if action == "replace" {
+			other = "cancel"
+		}
+		if strings.Contains(body, fmt.Sprintf(`id="invitation-%s-%s" open`, other, invitation.InvitationID)) {
+			t.Fatalf("%s confirmation also opened the %s dialog", action, other)
+		}
+	}
+
+	replaceBody := getUsersPage(t, fixture.server, "/users?confirm=replace&invitation="+invitation.InvitationID, fixture.adminCookie(), false).Body.String()
+	for _, want := range []string{
+		"The current link stops working immediately and a new link is shown once.",
+		"The Admin setting and the staged repository access that still exists are preserved, and a fresh seven-day expiry starts.",
+		"Staged access for repositories that were deleted cannot be restored.",
+	} {
+		if !strings.Contains(replaceBody, want) {
+			t.Fatalf("replace confirmation missing %q", want)
+		}
+	}
+	cancelBody := getUsersPage(t, fixture.server, "/users?confirm=cancel&invitation="+invitation.InvitationID, fixture.adminCookie(), false).Body.String()
+	for _, want := range []string{
+		"The invitation link becomes unusable and this person can no longer accept it.",
+		"The email address is released, so it can be invited again.",
+	} {
+		if !strings.Contains(cancelBody, want) {
+			t.Fatalf("cancel confirmation missing %q", want)
+		}
+	}
+
+	// Contradictory, partial, or malformed confirmation state is rejected
+	// rather than narrowed to whichever value happened to parse.
+	for _, query := range []string{
+		"?confirm=replace",
+		"?invitation=" + invitation.InvitationID,
+		"?confirm=replace&confirm=cancel&invitation=" + invitation.InvitationID,
+		"?confirm=replace&invitation=" + invitation.InvitationID + "&invitation=inv_AAAAAAAAAAAAAAAAAAAAAA",
+		"?confirm=delete&invitation=" + invitation.InvitationID,
+		"?confirm=replace&invitation=not-an-id",
+	} {
+		recorder := getUsersPage(t, fixture.server, "/users"+query, fixture.adminCookie(), false)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("confirmation query %q status=%d, want 400", query, recorder.Code)
+		}
+		if strings.Contains(recorder.Body.String(), " open") {
+			t.Fatalf("confirmation query %q opened a dialog", query)
+		}
+	}
+}
+
 func TestInvitationAcceptGatesLeaveBearerUsable(t *testing.T) {
 	fixture := newInvitationWebFixture(t)
 	credential := fixture.mustCreateServiceInvitation(t, "gate-invitee@example.test", false)
@@ -1292,7 +1689,7 @@ func TestInvitationAcceptUnknownOutcomeIsOperationalWithoutBearer(t *testing.T) 
 		"Acceptance result unconfirmed",
 		"could not confirm whether your account was created",
 		"Try signing in with your invited email address and the password you chose",
-		"If sign-in fails, ask an Admin to cancel this invitation and create a new one",
+		"If sign-in fails, ask an Admin for a new invitation link",
 		`href="/login"`,
 	} {
 		if !strings.Contains(body, want) {
@@ -1339,9 +1736,9 @@ func TestUsersPageShowsActiveInvitationsAndInviteDialogs(t *testing.T) {
 		"Pending",
 		"Expired",
 		"Needs replacement",
-		"The link no longer works. Cancel this invitation and create a new one.",
-		"The link was invalidated because the authorizing Admin lost Admin access. Cancel this invitation and create a new one.",
-		"Staged repository access changed after this invitation was created. Cancel it and create a new one.",
+		"The link no longer works. Replace it to issue a new link with a fresh seven-day expiry.",
+		"The link was invalidated because the authorizing Admin lost Admin access. Replace it to issue a new link authorized by you.",
+		"Staged repository access changed after this invitation was created. Replace the link to keep the access that still exists; access for deleted repositories cannot be restored.",
 		"Expires ",
 		"2 repositories",
 		"1 repository",
@@ -1350,6 +1747,7 @@ func TestUsersPageShowsActiveInvitationsAndInviteDialogs(t *testing.T) {
 		"Freezer",
 		"Thaw approver",
 		"Cancel invitation",
+		"Replace link",
 		"Invite person",
 		"Add local user",
 		"Temporary fallback workflow.",
@@ -1363,10 +1761,57 @@ func TestUsersPageShowsActiveInvitationsAndInviteDialogs(t *testing.T) {
 			t.Fatalf("users page missing %q", want)
 		}
 	}
-	for _, invitationID := range []string{pending.InvitationID, expired.InvitationID, needsReplacement.InvitationID, drifted.InvitationID} {
-		if got := strings.Count(body, "/users/invitations/"+invitationID+"/cancel"); got != 2 {
-			t.Fatalf("cancel action for %s rendered %d times, want desktop and mobile", invitationID, got)
+	// Both entry-point dialogs share the result dialog's width and name their
+	// own explanatory paragraph, so a screen reader hears why Add local user is
+	// the fallback and Invite person is the default.
+	for _, dialogID := range []string{"users-create-dialog", "users-invite-dialog"} {
+		tag := renderedControlTag(t, body, dialogID)
+		if !strings.Contains(tag, usersDialogWidth) {
+			t.Fatalf("%s width must match the other /users dialogs: %s", dialogID, tag)
 		}
+		if !strings.Contains(tag, fmt.Sprintf(`aria-labelledby=%q`, dialogID+"-title")) ||
+			!strings.Contains(tag, fmt.Sprintf(`aria-describedby=%q`, dialogID+"-body")) {
+			t.Fatalf("%s must name its own title and description: %s", dialogID, tag)
+		}
+		for _, suffix := range []string{"-title", "-body"} {
+			id := dialogID + suffix
+			if got := strings.Count(body, fmt.Sprintf(`id=%q`, id)); got != 1 {
+				t.Fatalf("%s target %s rendered %d times, want exactly once", dialogID, id, got)
+			}
+		}
+	}
+	for _, invitationID := range []string{pending.InvitationID, expired.InvitationID, needsReplacement.InvitationID, drifted.InvitationID} {
+		for _, action := range []string{"cancel", "replace"} {
+			// The trigger is a real link to the server-rendered confirmation
+			// state, duplicated across the desktop row and the mobile card.
+			href := fmt.Sprintf(
+				`href="/users?confirm=%s&amp;invitation=%s#invitation-%s-%s"`,
+				action,
+				invitationID,
+				action,
+				invitationID,
+			)
+			if got := strings.Count(body, href); got != 2 {
+				t.Fatalf("%s trigger for %s rendered %d times, want desktop and mobile", action, invitationID, got)
+			}
+			// The dialog it controls is rendered once, outside both loops, so
+			// the duplicated triggers cannot produce duplicate ids.
+			dialogID := fmt.Sprintf(`id="invitation-%s-%s"`, action, invitationID)
+			if got := strings.Count(body, dialogID); got != 1 {
+				t.Fatalf("%s dialog for %s rendered %d times, want exactly one", action, invitationID, got)
+			}
+			// The POST lives only on the confirm button inside that dialog.
+			post := fmt.Sprintf(`action="/users/invitations/%s/%s"`, invitationID, action)
+			if got := strings.Count(body, post); got != 1 {
+				t.Fatalf("%s form for %s rendered %d times, want exactly one", action, invitationID, got)
+			}
+		}
+		if strings.Contains(body, "open") && strings.Contains(body, `id="invitation-cancel-`+invitationID+`" open`) {
+			t.Fatalf("confirmation dialog for %s must stay closed without a confirmation request", invitationID)
+		}
+	}
+	if strings.Contains(body, "Resend") {
+		t.Fatal("replacement must never be labelled Resend")
 	}
 	if strings.Contains(body, "#token=") {
 		t.Fatal("users page rendered bearer material")
@@ -1388,8 +1833,8 @@ func TestUsersPageShowsActiveInvitationsAndInviteDialogs(t *testing.T) {
 	}
 	for _, want := range []string{
 		"No active invitations",
-		"Each invitation link is displayed once at creation and handed to the invitee over a channel you trust.",
-		"Invitation links are displayed once. If a link is lost, cancel the invitation and create a new one.",
+		"Each invitation link is displayed once when it is created or replaced, and handed to the invitee over a channel you trust.",
+		"Invitation links are displayed once. If a link is lost or stops working, replace it: the person, Admin setting, and staged access that still exists are kept, and a new link is shown once.",
 		"No repositories are configured yet, so this invitation grants no repository access. Access can be granted after the person joins.",
 	} {
 		if !strings.Contains(empty.Body.String(), want) {

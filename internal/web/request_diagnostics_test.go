@@ -135,6 +135,11 @@ func TestSensitiveOriginRejectionsUseFixedMuxRoutes(t *testing.T) {
 		route string
 	}{
 		{name: "invitation create", path: "/users/invitations", route: "/users/invitations"},
+		{
+			name:  "invitation replace",
+			path:  "/users/invitations/inv_AAAAAAAAAAAAAAAAAAAAAA/replace",
+			route: "/users/invitations/{id}/replace",
+		},
 		{name: "invitation accept", path: "/invitations/accept", route: "/invitations/accept"},
 		{name: "recovery issue", path: "/users/7/password-recovery", route: "/users/{id}/password-recovery"},
 		{name: "recovery completion", path: "/password-recovery", route: "/password-recovery"},

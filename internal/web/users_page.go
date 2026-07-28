@@ -3,6 +3,7 @@ package web
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -29,6 +30,13 @@ type usersPageState struct {
 	// from a rejected submission so the dialog re-renders those checkboxes
 	// checked. Bearer material is never part of this state.
 	InviteSelectedGrants map[string]bool
+
+	// ConfirmAction and ConfirmInvitationID open one invitation confirmation
+	// dialog server-side. They come from GET /users query values so the
+	// confirmation step works without JavaScript; with JavaScript the trigger
+	// link is intercepted and the already-rendered dialog opens in place.
+	ConfirmAction       string
+	ConfirmInvitationID string
 }
 
 type usersRepositoryOption struct {
@@ -73,6 +81,10 @@ type usersPageData struct {
 	CreateEmail       string
 	CreateDisplayName string
 
+	// InvitationResult is the one-time link view attached to a single buffered
+	// create or replace response. It is nil on every other render, so a later
+	// GET /users can never reproduce a bearer.
+	InvitationResult   *usersInvitationResultView
 	Invitations        []usersInvitationView
 	InviteOpen         bool
 	InviteEmail        string
@@ -145,7 +157,12 @@ func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
 		s.renderUsersPage(w, r, http.StatusBadRequest, usersQuery{Search: strings.TrimSpace(r.URL.Query().Get("q"))}, usersPageState{FormError: err.Error()}, session)
 		return
 	}
-	data, ok := s.loadUsersPageData(w, r, query, usersPageState{}, session)
+	state, confirmErr := invitationConfirmationState(r.URL.Query())
+	if confirmErr != "" {
+		s.renderUsersPage(w, r, http.StatusBadRequest, query, usersPageState{FormError: confirmErr}, session)
+		return
+	}
+	data, ok := s.loadUsersPageData(w, r, query, state, session)
 	if !ok {
 		return
 	}
@@ -170,6 +187,28 @@ func usersQueryFromRequest(r *http.Request) (usersQuery, error) {
 	}
 	query.RepositoryID = repositoryID
 	return query, nil
+}
+
+// invitationConfirmationState reads the no-JavaScript confirmation request.
+// Both values must be present together, appear once, name a supported action,
+// and carry a canonical invitation ID; anything else is rejected rather than
+// silently narrowed, so a malformed link can never open a confirmation dialog
+// bound to the wrong invitation.
+func invitationConfirmationState(query url.Values) (usersPageState, string) {
+	action, invitationID := query["confirm"], query["invitation"]
+	if len(action) == 0 && len(invitationID) == 0 {
+		return usersPageState{}, ""
+	}
+	if len(action) != 1 || len(invitationID) != 1 {
+		return usersPageState{}, "the confirmation request is invalid"
+	}
+	if action[0] != "replace" && action[0] != "cancel" {
+		return usersPageState{}, "the confirmation request is invalid"
+	}
+	if !auth.ValidInvitationID(invitationID[0]) {
+		return usersPageState{}, "the confirmation request is invalid"
+	}
+	return usersPageState{ConfirmAction: action[0], ConfirmInvitationID: invitationID[0]}, ""
 }
 
 func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
@@ -249,7 +288,7 @@ func (s *Server) loadUsersPageData(w http.ResponseWriter, r *http.Request, query
 		CreateEmail:       state.CreateEmail,
 		CreateDisplayName: state.CreateDisplayName,
 
-		Invitations:        usersInvitationViews(invitations),
+		Invitations:        usersInvitationViews(invitations, state),
 		InviteOpen:         state.InviteOpen,
 		InviteEmail:        state.InviteEmail,
 		InviteDisplayName:  state.InviteDisplayName,

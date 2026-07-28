@@ -20,6 +20,59 @@ import { applyLocalDatetimes, initLocalDatetimes } from "./datetime.js";
 initDialogs();
 initLocalDatetimes();
 upgradeOpenDialogs();
+initInvitationResult();
+
+// One-time invitation link delivery (creation and replacement).
+//
+// Everything here reduces incidental exposure of a link the server will never
+// show again: an explicit-click clipboard copy with a manual-copy fallback,
+// the POST URL swapped out of history so a reload cannot resubmit, the input
+// cleared on pagehide so a BFCache restore has nothing to show, and a fresh
+// GET /users on close because the page behind the dialog is a pre-mutation
+// snapshot. None of this is the replay fence — the retired invitation ID on
+// the server is. Nothing is stored, sent, read back from the clipboard, or
+// logged.
+//
+// This runs after upgradeOpenDialogs() on purpose. Chromium may dispatch the
+// upgrade's close event after the dialog has already been reopened, so the
+// close handler also checks the dialog's current state before navigating.
+function initInvitationResult() {
+  const dialog = document.querySelector("dialog[data-invitation-result]");
+  if (!(dialog instanceof HTMLDialogElement)) return;
+  const link = dialog.querySelector("[data-invitation-link]");
+  const copy = dialog.querySelector("[data-invitation-copy]");
+  const status = dialog.querySelector("[data-invitation-copy-status]");
+  const manualHint = dialog.querySelector("[data-invitation-copy-hint]");
+
+  history.replaceState(null, "", "/users");
+
+  if (link && copy && navigator.clipboard?.writeText) {
+    copy.hidden = false;
+    if (manualHint) manualHint.hidden = true;
+    copy.addEventListener("click", () => {
+      navigator.clipboard.writeText(link.value).then(
+        () => {
+          if (status) status.textContent = "Link copied.";
+        },
+        () => {
+          if (manualHint) manualHint.hidden = false;
+          if (status) status.textContent = "Copying failed. The link is selected — copy it manually.";
+          link.focus();
+          link.select();
+        },
+      );
+    });
+  }
+
+  window.addEventListener("pagehide", () => {
+    if (link) link.value = "";
+  });
+
+  dialog.addEventListener("close", () => {
+    if (dialog.open) return;
+    location.replace("/users");
+  });
+}
 
 // Freeze-form branch filtering and selection echo. All hooks are declarative
 // data-* attributes and every listener is delegated, so htmx swaps need no
