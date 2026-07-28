@@ -261,6 +261,7 @@ func TestUsersPageRequiredUtilitiesAreCompiled(t *testing.T) {
 	}
 	css := string(cssBytes)
 	for _, want := range []string{
+		`.break-words{overflow-wrap:break-word}`,
 		`.items-end{align-items:flex-end}`,
 		`.md\:grid-cols-3{grid-template-columns:repeat(3,minmax(0,1fr))}`,
 		`.w-\[min\(28rem\,90vw\)\]{width:min(28rem,90vw)}`,

@@ -2,9 +2,9 @@
 <div class="flex flex-col gap-6">
   <div><a class="text-sm font-semibold text-accent-strong no-underline hover:underline" href="/users">← Users &amp; Access</a></div>
   <header class="flex flex-wrap items-start justify-between gap-3">
-    <div>
-      <div class="flex flex-wrap items-center gap-2"><h1 class="m-0 text-page-title font-bold text-text">{{ .User.DisplayName }}</h1>{{ if .User.Disabled }}{{ template "ui/badge" dict "Label" "Disabled" "Tone" "warning" }}{{ else }}{{ template "ui/badge" dict "Label" "Active" "Tone" "success" }}{{ end }}{{ if .User.MustChangePassword }}{{ template "ui/badge" dict "Label" "Must change password" "Tone" "neutral" "Icon" "tg-i-key" }}{{ end }}</div>
-      <p class="m-0 mt-1"><code class="font-mono text-sm text-text-muted">{{ .User.Email }}</code></p>
+    <div class="min-w-0">
+      <div class="flex min-w-0 flex-wrap items-center gap-2"><h1 class="m-0 min-w-0 break-words text-page-title font-bold text-text">{{ .User.DisplayName }}</h1>{{ if .User.Disabled }}{{ template "ui/badge" dict "Label" "Disabled" "Tone" "warning" }}{{ else }}{{ template "ui/badge" dict "Label" "Active" "Tone" "success" }}{{ end }}{{ if .User.MustChangePassword }}{{ template "ui/badge" dict "Label" "Must change password" "Tone" "neutral" "Icon" "tg-i-key" }}{{ end }}</div>
+      <p class="m-0 mt-1 break-words"><code class="font-mono text-sm text-text-muted">{{ .User.Email }}</code></p>
     </div>
     {{ if .User.Disabled }}
     <form method="post" action="/users/{{ .User.ID }}/enable"><input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">{{ template "ui/button" dict "Label" "Re-enable" "Variant" "secondary" "Type" "submit" }}</form>
@@ -55,7 +55,7 @@
 {{ if and (not .IsSelf) (not .User.Disabled) .User.HasLocalPassword }}
 <dialog id="user-password-recovery" class="m-auto w-[min(32rem,90vw)] rounded-panel border border-border bg-surface p-6 text-text shadow-card" aria-labelledby="user-password-recovery-title">
   <h2 id="user-password-recovery-title" class="m-0 text-base font-bold">Issue recovery link</h2>
-  <p class="m-0 mt-2 text-sm font-semibold text-text">{{ .User.DisplayName }} · <code class="font-mono text-xs text-text-muted">{{ .User.Email }}</code></p>
+  <p class="m-0 mt-2 break-words text-sm font-semibold text-text">{{ .User.DisplayName }} · <code class="font-mono text-xs text-text-muted">{{ .User.Email }}</code></p>
   <p class="m-0 mt-2 text-sm text-text-muted">Create a one-hour bearer link. Anyone with this link can set this person&rsquo;s password until it expires. Share it through a trusted channel.</p>
   <form method="post" action="/users/{{ .User.ID }}/password-recovery"><input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}"><div class="mt-5 flex flex-row-reverse gap-2">{{ template "ui/button" dict "Label" "Issue recovery link" "Variant" "primary" "Type" "submit" }}{{ template "ui/button" dict "Label" "Cancel" "Variant" "secondary" "Type" "submit" "Dismiss" true }}</div></form>
 </dialog>
