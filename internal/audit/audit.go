@@ -69,6 +69,7 @@ const (
 	ActionInvitationAuthorizationRevoked     = "invitation.authorization_revoked"
 	ActionInvitationAccepted                 = "invitation.accepted"
 	ActionOIDCConnectionDraftSaved           = "oidc_connection.draft_saved"
+	ActionOIDCConnectionMetadataChecked      = "oidc_connection.metadata_checked"
 
 	ActorKindPasswordRecoveryLink = "recovery_link"
 	ActorKindInvitationLink       = "invitation_link"
@@ -143,6 +144,7 @@ func KnownActions() []string {
 		ActionInvitationAuthorizationRevoked,
 		ActionInvitationAccepted,
 		ActionOIDCConnectionDraftSaved,
+		ActionOIDCConnectionMetadataChecked,
 	}
 }
 

@@ -14,6 +14,7 @@
 @source "../../internal/web/templates/layouts/dev-preview-auth.html";
 @source "../../internal/web/templates/layouts/authentication.html";
 @source "../../internal/web/templates/components/primitives";
+@source "../../internal/web/templates/components/company-oidc-setup-health.html";
 @source "../../internal/web/templates/pages/dev-preview.html";
 @source "../../internal/web/templates/pages/dev-preview-auth.html";
 @source "../../internal/web/templates/pages/repositories.html";
@@ -251,6 +252,29 @@
  * inherits it from layouts/base.html without repeating responsive classes.
  */
 @layer components {
+  /* htmx's built-in inline indicator rules are disabled by layouts/base.html. */
+  .htmx-indicator {
+    display: none;
+  }
+
+  .htmx-request .htmx-indicator,
+  .htmx-request.htmx-indicator {
+    display: block;
+  }
+
+  .oidc-check-result.htmx-request .oidc-check-content {
+    display: none;
+  }
+
+  .oidc-issuer-trailing-slash {
+    display: inline-block;
+    padding: 0.0625rem 0.5rem 0.0625rem 0;
+    border-radius: 0 var(--radius-control) var(--radius-control) 0;
+    color: var(--color-danger);
+    background: var(--color-danger-soft);
+    font-weight: 700;
+  }
+
   .skip-link {
     position: fixed;
     z-index: 100;

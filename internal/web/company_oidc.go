@@ -2,6 +2,7 @@ package web
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -10,7 +11,17 @@ import (
 	"github.com/taua-almeida/thawguard/internal/companyoidc"
 )
 
-const companyOIDCDraftMaxBodyBytes int64 = 32 << 10
+const (
+	companyOIDCDraftMaxBodyBytes int64 = 32 << 10
+	companyOIDCCheckMaxBodyBytes int64 = 8 << 10
+	companyOIDCCheckPath               = "/settings/authentication/oidc/check"
+
+	companyOIDCCheckStaleNotice       = "oidc-check-stale"
+	companyOIDCCheckUnknownNotice     = "oidc-check-unknown"
+	companyOIDCCheckUnavailableNotice = "oidc-check-unavailable"
+	companyOIDCCheckAuthorityNotice   = "oidc-check-authority"
+	companyOIDCCheckSupersededNotice  = "oidc-check-superseded"
+)
 
 type companyOIDCFormView struct {
 	ProviderLabel    string
@@ -40,6 +51,30 @@ type authenticationPageData struct {
 	TerminalHeading     string
 	TerminalMessage     string
 	TerminalTone        string
+	SetupHealth         companyOIDCSetupHealthView
+}
+
+type companyOIDCSetupHealthView struct {
+	Heading            string
+	Summary            string
+	Tone               string
+	CheckedAt          string
+	CandidateSummary   string
+	Rows               [4]companyOIDCSetupCheckRowView
+	ShowIssuerMismatch bool
+	SavedIssuer        companyOIDCIssuerView
+	ObservedIssuer     companyOIDCIssuerView
+}
+
+type companyOIDCSetupCheckRowView struct {
+	Label  string
+	Status string
+	Tone   string
+}
+
+type companyOIDCIssuerView struct {
+	Prefix           string
+	HasTrailingSlash bool
 }
 
 func (s *Server) handleAuthenticationSettings(w http.ResponseWriter, r *http.Request) {
@@ -185,6 +220,62 @@ func (s *Server) handleCompanyOIDCDraftSave(w http.ResponseWriter, r *http.Reque
 	}
 }
 
+func (s *Server) handleCompanyOIDCCheck(w http.ResponseWriter, r *http.Request) {
+	w.Header().Add("Vary", "HX-Request")
+	r.Body = http.MaxBytesReader(w, r.Body, companyOIDCCheckMaxBodyBytes)
+	if !s.validExactPublicOrigin(r) {
+		s.logRequestRejected(r, originRejectionReason(r))
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	session, ok := s.requireAdminForm(w, r)
+	if !ok || session.UserID == nil {
+		return
+	}
+	if err := parseCompanyOIDCCheckForm(r.URL, r.PostForm); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if !s.cfg.CompanyOIDCSecretEncryptionConfigured {
+		s.redirectCompanyOIDCCheck(w, r, companyOIDCCheckUnavailableNotice)
+		return
+	}
+	if s.cfg.CompanyOIDCService == nil {
+		s.redirectCompanyOIDCCheck(w, r, companyOIDCCheckUnknownNotice)
+		return
+	}
+
+	check, err := s.cfg.CompanyOIDCService.Check(r.Context(), *session.UserID)
+	if err != nil {
+		notice := companyOIDCCheckUnknownNotice
+		switch {
+		case errors.Is(err, companyoidc.ErrCheckStale), errors.Is(err, companyoidc.ErrNoDraft):
+			notice = companyOIDCCheckStaleNotice
+		case errors.Is(err, companyoidc.ErrConfiguration):
+			notice = companyOIDCCheckUnavailableNotice
+		case errors.Is(err, companyoidc.ErrAuthorization):
+			notice = companyOIDCCheckAuthorityNotice
+		}
+		s.redirectCompanyOIDCCheck(w, r, notice)
+		return
+	}
+	if !isHXRequest(r) {
+		http.Redirect(w, r, "/settings/authentication", http.StatusSeeOther)
+		return
+	}
+
+	connection, found, currentErr := s.cfg.CompanyOIDCService.Current(r.Context())
+	if currentErr != nil {
+		s.redirectCompanyOIDCCheck(w, r, companyOIDCCheckUnknownNotice)
+		return
+	}
+	if !found || connection.Revision != check.ConfigRevision || connection.SetupCheck == nil {
+		s.redirectCompanyOIDCCheck(w, r, companyOIDCCheckSupersededNotice)
+		return
+	}
+	s.renderPage(w, "components/company-oidc-setup-health", companyOIDCSetupHealth(connection))
+}
+
 func (s *Server) renderAuthenticationRead(w http.ResponseWriter, r *http.Request, status int, session sessionState) {
 	connection, found, ok := s.currentCompanyOIDCConnection(w, r, session)
 	if !ok {
@@ -193,6 +284,10 @@ func (s *Server) renderAuthenticationRead(w http.ResponseWriter, r *http.Request
 	data := s.authenticationPageBase(session)
 	data.Connection = connection
 	data.HasConnection = found
+	if found {
+		data.SetupHealth = companyOIDCSetupHealth(connection)
+	}
+	data.Toasts = companyOIDCNoticeToasts(r.URL.Query())
 	s.renderPageStatus(w, status, "layouts/authentication", data)
 }
 
@@ -300,4 +395,147 @@ func canonicalExpectedRevision(value string) (int64, error) {
 
 func domainsFromTextarea(value string) []string {
 	return strings.Split(value, "\n")
+}
+
+func parseCompanyOIDCCheckForm(requestURL *url.URL, values url.Values) error {
+	if requestURL.RawQuery != "" || requestURL.ForceQuery {
+		return errors.New("query values are not allowed")
+	}
+	if len(values) != 1 || len(values[csrfFormField]) != 1 {
+		return errors.New("check form must contain exactly one CSRF field")
+	}
+	return nil
+}
+
+func (s *Server) redirectCompanyOIDCCheck(w http.ResponseWriter, r *http.Request, notice string) {
+	s.redirectCompanyOIDCCheckLocation(w, r, companyOIDCNoticeLocation(notice))
+}
+
+func (s *Server) redirectCompanyOIDCCheckLocation(w http.ResponseWriter, r *http.Request, location string) {
+	if isHXRequest(r) {
+		w.Header().Set("HX-Redirect", location)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	http.Redirect(w, r, location, http.StatusSeeOther)
+}
+
+func isCompanyOIDCCheckHX(r *http.Request) bool {
+	return r.URL.Path == companyOIDCCheckPath && isHXRequest(r)
+}
+
+func companyOIDCNoticeLocation(notice string) string {
+	switch notice {
+	case companyOIDCCheckStaleNotice,
+		companyOIDCCheckUnknownNotice,
+		companyOIDCCheckUnavailableNotice,
+		companyOIDCCheckAuthorityNotice,
+		companyOIDCCheckSupersededNotice:
+		return "/settings/authentication?notice=" + notice
+	default:
+		return "/settings/authentication?notice=" + companyOIDCCheckUnknownNotice
+	}
+}
+
+func companyOIDCNoticeToasts(values url.Values) []toastView {
+	if len(values) != 1 || len(values["notice"]) != 1 {
+		return nil
+	}
+	message := ""
+	tone := "warning"
+	switch values.Get("notice") {
+	case companyOIDCCheckStaleNotice:
+		message = "The saved Draft changed before this check could be recorded. Run Check configuration again."
+	case companyOIDCCheckUnknownNotice:
+		message = "Thawguard could not confirm whether a current check was recorded. Inspect the saved evidence before retrying."
+		tone = "danger"
+	case companyOIDCCheckUnavailableNotice:
+		message = "Metadata checking is unavailable until client-secret encryption is configured."
+	case companyOIDCCheckAuthorityNotice:
+		message = "Administrator authority changed before this check could be recorded."
+		tone = "danger"
+	case companyOIDCCheckSupersededNotice:
+		message = "The check completed, then the saved OIDC state changed. Review the current Authentication settings before taking another action."
+	default:
+		return nil
+	}
+	return []toastView{{Message: message, Tone: tone, DismissHref: "/settings/authentication"}}
+}
+
+func companyOIDCSetupHealth(connection companyoidc.Connection) companyOIDCSetupHealthView {
+	check := connection.SetupCheck
+	view := companyOIDCSetupHealthView{
+		Heading: "Never checked",
+		Summary: "Run a fresh check against the explicitly saved Draft. Client credentials and sign-in are not tested.",
+		Tone:    "info",
+	}
+	if check == nil && connection.Revision > 1 {
+		view.Heading = "Never checked since last saved edit"
+		view.Summary = "This saved revision has no current check result. Run a fresh check against the saved Draft."
+	}
+	for i, row := range companyoidc.SetupCheckRows(check) {
+		view.Rows[i] = companyOIDCSetupCheckRowView{Label: row.Label, Status: "Not checked", Tone: "neutral"}
+		switch row.State {
+		case companyoidc.SetupCheckRowPassed:
+			view.Rows[i].Status = "Passed"
+			view.Rows[i].Tone = "success"
+		case companyoidc.SetupCheckRowFailed:
+			view.Rows[i].Status = "Failed"
+			view.Rows[i].Tone = "danger"
+		}
+	}
+	if check == nil {
+		return view
+	}
+
+	view.CheckedAt = check.CheckedAt.UTC().Format("2006-01-02 15:04:05 UTC")
+	if check.ResultCode == companyoidc.SetupCheckVerified {
+		view.Heading = "Discovery verified"
+		view.Summary = "Thawguard confirmed that provider metadata and public-key candidates were read. Company sign-in remains Draft."
+		view.Tone = "success"
+		if check.PublicKeyCandidateCount != nil {
+			view.CandidateSummary = fmt.Sprintf("Supported public-key candidates published: %d.", *check.PublicKeyCandidateCount)
+		}
+		return view
+	}
+
+	view.Heading = "Check failed"
+	view.Tone = "danger"
+	view.Summary = companyOIDCCheckFailureSummary(check.ResultCode)
+	if check.ResultCode == companyoidc.SetupCheckIssuerMismatch && check.ObservedIssuer != nil {
+		view.ShowIssuerMismatch = true
+		view.SavedIssuer = companyOIDCIssuerDisplay(connection.Issuer)
+		view.ObservedIssuer = companyOIDCIssuerDisplay(*check.ObservedIssuer)
+	}
+	return view
+}
+
+func companyOIDCCheckFailureSummary(code companyoidc.SetupCheckResultCode) string {
+	switch code {
+	case companyoidc.SetupCheckDiscoveryUnavailable:
+		return "The discovery document was not available from a direct HTTP 200 response."
+	case companyoidc.SetupCheckDiscoveryInvalid:
+		return "The discovery response was not a bounded JSON object with the required content type."
+	case companyoidc.SetupCheckIssuerInvalid:
+		return "The discovery document published an invalid issuer."
+	case companyoidc.SetupCheckIssuerMismatch:
+		return "The published issuer did not exactly match the saved issuer."
+	case companyoidc.SetupCheckMetadataIncompatible:
+		return "The provider did not publish the required authorization-code metadata."
+	case companyoidc.SetupCheckJWKSUnavailable:
+		return "The advertised JWK Set was not available from a direct HTTP 200 response."
+	case companyoidc.SetupCheckJWKSInvalid:
+		return "The advertised JWK Set was not a valid bounded JSON key set."
+	case companyoidc.SetupCheckJWKSNoCandidate:
+		return "The JWK Set was readable but did not publish a supported RSA public-key candidate."
+	default:
+		return "The saved provider metadata could not be checked."
+	}
+}
+
+func companyOIDCIssuerDisplay(issuer string) companyOIDCIssuerView {
+	if strings.HasSuffix(issuer, "/") {
+		return companyOIDCIssuerView{Prefix: strings.TrimSuffix(issuer, "/"), HasTrailingSlash: true}
+	}
+	return companyOIDCIssuerView{Prefix: issuer}
 }

@@ -38,6 +38,7 @@ const scheduledFreezeReasonMaxLength = 500
 const (
 	passwordRecoveryMaxBodyBytes int64 = 8 << 10
 	sensitiveFormCSP                   = "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self'"
+	authenticationCSP                  = sensitiveFormCSP + "; connect-src 'self'"
 )
 
 const (
@@ -142,6 +143,7 @@ type CompanyOIDCService interface {
 	Current(ctx context.Context) (companyoidc.Connection, bool, error)
 	Create(ctx context.Context, actorUserID int64, input companyoidc.CreateInput) error
 	Edit(ctx context.Context, actorUserID int64, input companyoidc.EditInput) error
+	Check(ctx context.Context, actorUserID int64) (companyoidc.SetupCheck, error)
 }
 
 type RepositoryStore interface {
@@ -359,8 +361,7 @@ func NewServer(cfg Config) *Server {
 
 func (s *Server) Routes() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if isAuthenticationSettingsPath(r.URL.Path) ||
-			isPasswordRecoveryPath(r.URL.Path) ||
+		if isAuthenticationSettingsPath(r.URL.Path) || isPasswordRecoveryPath(r.URL.Path) ||
 			isInvitationSensitivePath(r.URL.Path) {
 			w.Header().Set("Cache-Control", "no-store")
 			// no-referrer makes browsers serialize Origin as "null" for form
@@ -371,7 +372,11 @@ func (s *Server) Routes() http.Handler {
 			w.Header().Set("Referrer-Policy", "same-origin")
 			w.Header().Set("X-Frame-Options", "DENY")
 			w.Header().Set("X-Content-Type-Options", "nosniff")
-			w.Header().Set("Content-Security-Policy", sensitiveFormCSP)
+			csp := sensitiveFormCSP
+			if isAuthenticationSettingsPath(r.URL.Path) {
+				csp = authenticationCSP
+			}
+			w.Header().Set("Content-Security-Policy", csp)
 		}
 		// Keep the literal invitation-creation endpoint out of the /users/{id}
 		// GET wildcard and give every unsupported method one truthful contract.
@@ -478,6 +483,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /settings/authentication", s.handleAuthenticationSettings)
 	s.mux.HandleFunc("GET /settings/authentication/edit", s.handleAuthenticationSettingsEdit)
 	s.mux.HandleFunc("POST /settings/authentication/oidc", s.handleCompanyOIDCDraftSave)
+	s.mux.HandleFunc("POST /settings/authentication/oidc/check", s.handleCompanyOIDCCheck)
 	s.mux.HandleFunc("POST /users", s.handleCreateUser)
 	s.mux.HandleFunc("POST /users/invitations", s.handleCreateInvitation)
 	s.mux.HandleFunc("POST /users/invitations/{id}/cancel", s.handleCancelInvitation)
@@ -2058,11 +2064,17 @@ func (s *Server) requireThawRepository(w http.ResponseWriter, r *http.Request, s
 func (s *Server) requireFormWithGate(w http.ResponseWriter, r *http.Request, allowForced, requireAdmin bool) (sessionState, bool) {
 	session, ok, err := s.currentSession(r)
 	if err != nil {
+		if r.URL.Path == companyOIDCCheckPath {
+			s.redirectCompanyOIDCCheck(w, r, companyOIDCCheckUnknownNotice)
+			return sessionState{}, false
+		}
 		internalServerError(w)
 		return sessionState{}, false
 	}
 	if !ok {
-		if isPasswordRecoveryPath(r.URL.Path) {
+		if isCompanyOIDCCheckHX(r) {
+			s.redirectCompanyOIDCCheckLocation(w, r, "/login")
+		} else if isPasswordRecoveryPath(r.URL.Path) {
 			s.renderPasswordRecoveryForbidden(w)
 		} else {
 			http.Error(w, "forbidden", http.StatusForbidden)
@@ -2070,11 +2082,19 @@ func (s *Server) requireFormWithGate(w http.ResponseWriter, r *http.Request, all
 		return sessionState{}, false
 	}
 	if !allowForced && session.MustChangePassword {
-		http.Redirect(w, r, "/account/password", http.StatusSeeOther)
+		if isCompanyOIDCCheckHX(r) {
+			s.redirectCompanyOIDCCheckLocation(w, r, "/account/password")
+		} else {
+			http.Redirect(w, r, "/account/password", http.StatusSeeOther)
+		}
 		return sessionState{}, false
 	}
 	if requireAdmin && !session.Grants.CanManageInstallation() {
-		s.renderErrorPage(w, http.StatusForbidden, false)
+		if isCompanyOIDCCheckHX(r) {
+			s.redirectCompanyOIDCCheck(w, r, companyOIDCCheckAuthorityNotice)
+		} else {
+			s.renderErrorPage(w, http.StatusForbidden, false)
+		}
 		return sessionState{}, false
 	}
 	if err := r.ParseForm(); err != nil {
@@ -2268,6 +2288,7 @@ var activityActionDefinitions = map[string]activityActionDefinition{
 	audit.ActionInvitationAuthorizationRevoked:     {Label: "Invitation credential", Outcome: "Revoked", OutcomeClass: "warning"},
 	audit.ActionInvitationAccepted:                 {Label: "Invitation", Outcome: "Accepted", OutcomeClass: "ok"},
 	audit.ActionOIDCConnectionDraftSaved:           {Label: "Company sign-in Draft saved", Outcome: "Saved", OutcomeClass: "ok"},
+	audit.ActionOIDCConnectionMetadataChecked:      {Label: "OIDC metadata check", Outcome: "Checked", OutcomeClass: "ok"},
 }
 
 func activityEventViews(repositories []domain.Repository, users []auth.User, events []audit.Event) []activityEventView {
@@ -2290,7 +2311,7 @@ func activityEventViewForEvent(repositories map[int64]domain.Repository, users m
 	if !detailsOK || !actionOK {
 		return fallbackActivityEventView(users, event, details, detailsOK, forceUnknownInvitationActor)
 	}
-	if activityHasDuplicateAcceptanceDetails(event.Action, event.DetailsJSON) {
+	if activityHasDuplicateGuardedDetails(event.Action, event.DetailsJSON) {
 		return fallbackActivityEventView(users, event, details, true, forceUnknownInvitationActor)
 	}
 	if !activityInvitationAcceptanceDetailsValid(event, details) {
@@ -2446,6 +2467,13 @@ func activityEventViewForEvent(repositories map[int64]domain.Repository, users m
 		}
 		view.Target = "Company OIDC connection"
 		view.Detail = detail
+	case audit.ActionOIDCConnectionMetadataChecked:
+		detail, ok := activityOIDCMetadataCheckedDetail(event, details)
+		if !ok {
+			return fallbackActivityEventView(users, event, details, true, forceUnknownInvitationActor)
+		}
+		view.Target = "Company OIDC connection"
+		view.Detail = detail
 	case audit.ActionRepositoryGrantAdded:
 		view.Target = activityRepositoryTarget(repositories, event, details, "")
 		if provenance, ok := activityExactStringDetail(details, "provenance"); ok && provenance == "invitation_acceptance" {
@@ -2499,8 +2527,8 @@ func parseActivityDetails(raw string) (activityDetails, bool) {
 	return details, true
 }
 
-func activityHasDuplicateAcceptanceDetails(action, raw string) bool {
-	if strings.TrimSpace(raw) == "" || !activityHasAcceptanceSensitiveDetails(action) {
+func activityHasDuplicateGuardedDetails(action, raw string) bool {
+	if strings.TrimSpace(raw) == "" || !activityHasGuardedDetails(action) {
 		return false
 	}
 	decoder := json.NewDecoder(strings.NewReader(raw))
@@ -2523,7 +2551,7 @@ func activityHasDuplicateAcceptanceDetails(action, raw string) bool {
 		if err := decoder.Decode(&value); err != nil {
 			return true
 		}
-		if !activityAcceptanceSensitiveDetail(action, key) {
+		if !activityGuardedDetail(action, key) {
 			continue
 		}
 		if _, duplicate := seen[key]; duplicate {
@@ -2536,19 +2564,20 @@ func activityHasDuplicateAcceptanceDetails(action, raw string) bool {
 	return err != nil || !ok || delimiter != '}'
 }
 
-func activityHasAcceptanceSensitiveDetails(action string) bool {
+func activityHasGuardedDetails(action string) bool {
 	switch action {
 	case audit.ActionInvitationAccepted,
 		audit.ActionUserCreated,
 		audit.ActionUserRolesUpdated,
-		audit.ActionRepositoryGrantAdded:
+		audit.ActionRepositoryGrantAdded,
+		audit.ActionOIDCConnectionMetadataChecked:
 		return true
 	default:
 		return false
 	}
 }
 
-func activityAcceptanceSensitiveDetail(action, key string) bool {
+func activityGuardedDetail(action, key string) bool {
 	switch action {
 	case audit.ActionInvitationAccepted:
 		return key == "actor_kind" || key == "accepted_user_id"
@@ -2558,6 +2587,8 @@ func activityAcceptanceSensitiveDetail(action, key string) bool {
 		return key == "actor_kind" || key == "provenance" || key == "roles_before" || key == "roles_after"
 	case audit.ActionRepositoryGrantAdded:
 		return key == "actor_kind" || key == "provenance" || key == "user_id" || key == "role"
+	case audit.ActionOIDCConnectionMetadataChecked:
+		return key == "revision" || key == "result_code"
 	default:
 		return false
 	}
@@ -2972,6 +3003,36 @@ func activityOIDCDraftSavedDetail(event audit.Event, details activityDetails) (s
 		domainLabel = "allowed domain"
 	}
 	return fmt.Sprintf("Revision %d saved; %s; %d %s.", revision, secretDetail, domainCount, domainLabel), true
+}
+
+func activityOIDCMetadataCheckedDetail(event audit.Event, details activityDetails) (string, bool) {
+	if event.SubjectType != audit.SubjectTypeOIDCConnection || event.SubjectID != "1" || len(details) != 2 {
+		return "", false
+	}
+	var revision int64
+	if raw, ok := details["revision"]; !ok || json.Unmarshal(raw, &revision) != nil || revision <= 0 {
+		return "", false
+	}
+	var resultCode string
+	if raw, ok := details["result_code"]; !ok || json.Unmarshal(raw, &resultCode) != nil {
+		return "", false
+	}
+	result := companyoidc.SetupCheckResultCode(resultCode)
+	if !result.Valid() {
+		return "", false
+	}
+	resultCopy := map[companyoidc.SetupCheckResultCode]string{
+		companyoidc.SetupCheckVerified:             "provider metadata and public-key candidates were read",
+		companyoidc.SetupCheckDiscoveryUnavailable: "discovery was unavailable",
+		companyoidc.SetupCheckDiscoveryInvalid:     "discovery was invalid",
+		companyoidc.SetupCheckIssuerInvalid:        "the published issuer was invalid",
+		companyoidc.SetupCheckIssuerMismatch:       "the published issuer did not match",
+		companyoidc.SetupCheckMetadataIncompatible: "required authorization-code metadata was incompatible",
+		companyoidc.SetupCheckJWKSUnavailable:      "the JWK Set was unavailable",
+		companyoidc.SetupCheckJWKSInvalid:          "the JWK Set was invalid",
+		companyoidc.SetupCheckJWKSNoCandidate:      "no supported public-key candidate was published",
+	}[result]
+	return fmt.Sprintf("Revision %d checked; %s.", revision, resultCopy), true
 }
 
 func activitySetupCheckDetail(details activityDetails) string {

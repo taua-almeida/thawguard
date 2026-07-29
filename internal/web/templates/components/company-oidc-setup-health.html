@@ -1,0 +1,23 @@
+{{ define "components/company-oidc-setup-health" }}
+<section id="oidc-setup-health" class="oidc-check-result min-h-44 rounded-card border border-border bg-surface-muted p-4" aria-label="OIDC metadata check result" aria-live="polite">
+  <div class="htmx-indicator" role="status">
+    {{ template "ui/callout" dict "Tone" "info" "Title" "Checking provider metadata" "Body" "Reading fresh discovery metadata and public-key candidates. This can take up to 10 seconds." "Icon" "tg-i-info" }}
+  </div>
+  <div class="oidc-check-content">
+    {{ template "ui/callout" dict "Tone" .Tone "Title" .Heading "Body" .Summary }}
+    {{ if .CandidateSummary }}<p class="m-0 mt-3 text-sm font-semibold text-success">{{ .CandidateSummary }}</p>{{ end }}
+    {{ if .ShowIssuerMismatch }}
+    <dl class="mt-3 grid min-w-0 grid-cols-1 gap-3 rounded-card border border-danger bg-surface p-3 sm:grid-cols-2">
+      <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-danger">Saved issuer</dt><dd class="m-0 mt-1 break-all font-mono text-sm text-text"><code>{{ .SavedIssuer.Prefix }}{{ if .SavedIssuer.HasTrailingSlash }}<span class="oidc-issuer-trailing-slash">/</span>{{ end }}</code></dd></div>
+      <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-danger">Published issuer</dt><dd class="m-0 mt-1 break-all font-mono text-sm text-text"><code>{{ .ObservedIssuer.Prefix }}{{ if .ObservedIssuer.HasTrailingSlash }}<span class="oidc-issuer-trailing-slash">/</span>{{ end }}</code></dd></div>
+    </dl>
+    {{ end }}
+    <ol class="m-0 mt-4 grid list-none grid-cols-1 gap-2 p-0 sm:grid-cols-2">
+      {{ range .Rows }}
+      <li class="flex min-w-0 items-center justify-between gap-3 rounded-card border border-border bg-surface px-3 py-2 text-sm"><span class="min-w-0 font-semibold text-text">{{ .Label }}</span>{{ template "ui/badge" dict "Label" .Status "Tone" .Tone }}</li>
+      {{ end }}
+    </ol>
+    {{ if .CheckedAt }}<p class="m-0 mt-3 text-xs text-text-muted">Completed {{ .CheckedAt }}. This result applies only to the saved revision.</p>{{ end }}
+  </div>
+</section>
+{{ end }}

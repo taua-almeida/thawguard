@@ -9,8 +9,17 @@
 
   <nav class="rounded-panel border border-border bg-surface p-3" aria-label="Company sign-in setup progress">
     <ol class="m-0 grid list-none grid-cols-1 gap-2 p-0 sm:grid-cols-2 lg:grid-cols-4">
+      {{ if and .HasConnection (not .ShowForm) }}
+      <li class="flex min-w-0 items-center gap-2 rounded-card bg-success-soft px-3 py-2 text-sm font-semibold text-success"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-success-soft text-success"><svg class="h-3.5 w-3.5" aria-hidden="true"><use href="#tg-i-check"></use></svg></span><span>Configure</span></li>
+      {{ if .EncryptionAvailable }}
+      <li class="flex min-w-0 items-center gap-2 rounded-card bg-accent-soft px-3 py-2 text-sm font-semibold text-accent-strong" aria-current="step"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-accent text-xs text-on-accent">2</span><span class="min-w-0">Verify metadata <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Saved Draft</span></span></li>
+      {{ else }}
+      <li class="flex min-w-0 items-center gap-2 rounded-card bg-surface-muted px-3 py-2 text-sm text-text-muted" aria-disabled="true"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-neutral-soft text-xs">2</span><span class="min-w-0">Verify metadata <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Encryption unavailable</span></span></li>
+      {{ end }}
+      {{ else }}
       <li class="flex min-w-0 items-center gap-2 rounded-card bg-accent-soft px-3 py-2 text-sm font-semibold text-accent-strong" aria-current="step"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-accent text-xs text-on-accent">1</span><span>Configure</span></li>
-      <li class="flex min-w-0 items-center gap-2 rounded-card bg-surface-muted px-3 py-2 text-sm text-text-muted" aria-disabled="true"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-neutral-soft text-xs">2</span><span class="min-w-0">Verify metadata <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Unavailable</span></span></li>
+      <li class="flex min-w-0 items-center gap-2 rounded-card bg-surface-muted px-3 py-2 text-sm text-text-muted" aria-disabled="true"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-neutral-soft text-xs">2</span><span class="min-w-0">Verify metadata <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Available after save</span></span></li>
+      {{ end }}
       <li class="flex min-w-0 items-center gap-2 rounded-card bg-surface-muted px-3 py-2 text-sm text-text-muted" aria-disabled="true"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-neutral-soft text-xs">3</span><span class="min-w-0">Test sign-in <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Not implemented</span></span></li>
       <li class="flex min-w-0 items-center gap-2 rounded-card bg-surface-muted px-3 py-2 text-sm text-text-muted" aria-disabled="true"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-neutral-soft text-xs">4</span><span class="min-w-0">Enable <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Not implemented</span></span></li>
     </ol>
@@ -31,7 +40,7 @@
       <div class="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h2 id="oidc-draft-form-title" class="m-0 text-lg font-bold text-text">{{ if .Editing }}Edit company OIDC Draft{{ else }}Configure company OIDC Draft{{ end }}</h2>
-          <p class="m-0 mt-1 text-sm text-text-muted">Provider metadata checks and company sign-in are not available in this version.</p>
+          <p class="m-0 mt-1 text-sm text-text-muted">Save this Draft before checking its public provider metadata.</p>
         </div>
         <span class="inline-flex rounded-pill bg-neutral-soft px-2.5 py-1 text-xs font-semibold text-text">Draft</span>
       </div>
@@ -60,7 +69,7 @@
       <div class="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h2 id="saved-oidc-draft-title" class="m-0 text-lg font-bold text-text">Company OIDC connection</h2>
-          <p class="m-0 mt-1 text-sm text-text-muted">Provider metadata has not been checked. Metadata checking is not available in this version.</p>
+          <p class="m-0 mt-1 text-sm text-text-muted">Metadata health reflects only the explicitly saved revision.</p>
         </div>
         <span class="inline-flex rounded-pill bg-neutral-soft px-2.5 py-1 text-xs font-semibold text-text">Draft</span>
       </div>
@@ -72,7 +81,16 @@
         <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Client secret</dt><dd class="m-0 mt-1 flex items-center gap-2 text-sm font-semibold text-success"><svg class="h-4 w-4 flex-none" aria-hidden="true"><use href="#tg-i-check"></use></svg>Client secret stored</dd></div>
         <div class="min-w-0 sm:col-span-2"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Allowed domains</dt><dd class="m-0 mt-2 flex min-w-0 flex-wrap gap-2">{{ range .Connection.Domains }}<span class="max-w-full break-all rounded-pill border border-border bg-surface-muted px-2.5 py-1 font-mono text-xs text-text">{{ . }}</span>{{ end }}</dd></div>
       </dl>
-      {{ if .EncryptionAvailable }}<div class="mt-5">{{ template "ui/button" dict "Label" "Edit draft" "Variant" "secondary" "Href" "/settings/authentication/edit" "Icon" "tg-i-key" }}</div>{{ end }}
+      <div class="mt-5">{{ template "components/company-oidc-setup-health" .SetupHealth }}</div>
+      {{ if .EncryptionAvailable }}
+      <div class="mt-5 flex flex-wrap items-center gap-3">
+        <form method="post" action="/settings/authentication/oidc/check" hx-post="/settings/authentication/oidc/check" hx-target="#oidc-setup-health" hx-swap="outerHTML" hx-indicator="#oidc-setup-health" hx-disabled-elt="find button">
+          <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+          {{ template "ui/button" dict "Label" "Check configuration" "Variant" "primary" "Type" "submit" "Icon" "tg-i-check" }}
+        </form>
+        {{ template "ui/button" dict "Label" "Edit draft" "Variant" "secondary" "Href" "/settings/authentication/edit" "Icon" "tg-i-key" }}
+      </div>
+      {{ end }}
     </section>
     {{ else }}
     <section class="flex min-h-72 flex-col items-center justify-center rounded-panel border border-border bg-surface px-5 py-10 text-center shadow-card" aria-labelledby="no-oidc-connection-title">

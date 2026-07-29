@@ -353,6 +353,7 @@ func TestScopedActionClassificationCoversEveryKnownAction(t *testing.T) {
 		"invitation.authorization_revoked":           adminOnly,
 		"invitation.accepted":                        adminOnly,
 		"oidc_connection.draft_saved":                adminOnly,
+		"oidc_connection.metadata_checked":           adminOnly,
 	}
 
 	classified := map[string]string{}
@@ -438,19 +439,19 @@ func TestScopedActionClassificationKeepsInvitationRepositorySpoofsAdminOnly(t *t
 	}
 }
 
-func TestOIDCDraftAuditIsAdministratorOnlyDespiteRepositoryDetail(t *testing.T) {
+func TestOIDCAuditIsAdministratorOnlyDespiteRepositoryDetail(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t, ctx)
-	insertRawEvent(
-		t,
-		ctx,
-		store,
-		ActionOIDCConnectionDraftSaved,
-		SubjectTypeOIDCConnection,
-		"1",
-		`{"revision":1,"secret_replaced":false,"domain_count":1,"repository_id":"7"}`,
-		time.Date(2026, 7, 28, 10, 0, 0, 0, time.UTC),
-	)
+	base := time.Date(2026, 7, 28, 10, 0, 0, 0, time.UTC)
+	for i, event := range []struct {
+		action  string
+		details string
+	}{
+		{action: ActionOIDCConnectionDraftSaved, details: `{"revision":1,"secret_replaced":false,"domain_count":1,"repository_id":"7"}`},
+		{action: ActionOIDCConnectionMetadataChecked, details: `{"revision":1,"result_code":"verified","repository_id":"7"}`},
+	} {
+		insertRawEvent(t, ctx, store, event.action, SubjectTypeOIDCConnection, "1", event.details, base.Add(time.Duration(i)*time.Second))
+	}
 
 	bounded, err := store.ListForScope(ctx, repositoryscope.IDs(7), 10)
 	if err != nil {
@@ -463,7 +464,7 @@ func TestOIDCDraftAuditIsAdministratorOnlyDespiteRepositoryDetail(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(all) != 1 || all[0].Action != ActionOIDCConnectionDraftSaved {
+	if len(all) != 2 || all[0].Action != ActionOIDCConnectionMetadataChecked || all[1].Action != ActionOIDCConnectionDraftSaved {
 		t.Fatalf("Administrator scope did not retain company OIDC activity: %+v", all)
 	}
 }

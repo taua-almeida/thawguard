@@ -352,7 +352,7 @@ func TestEncryptionUnavailableStillAllowsReadsAndRejectsMutations(t *testing.T) 
 	if err := fixture.service.Create(fixture.ctx, fixture.adminID, validCreateInput(testClientSecret)); err != nil {
 		t.Fatal(err)
 	}
-	withoutEncryption := NewService(fixture.database, nil)
+	withoutEncryption := NewService(fixture.database, nil, nil)
 	if connection, found, err := withoutEncryption.Current(fixture.ctx); err != nil || !found {
 		t.Fatalf("read without encryption: found=%v connection=%+v err=%v", found, connection, err)
 	}
@@ -361,7 +361,7 @@ func TestEncryptionUnavailableStillAllowsReadsAndRejectsMutations(t *testing.T) 
 	}
 
 	emptyFixture := newServiceFixture(t)
-	withoutEncryption = NewService(emptyFixture.database, nil)
+	withoutEncryption = NewService(emptyFixture.database, nil, nil)
 	if err := withoutEncryption.Create(emptyFixture.ctx, emptyFixture.adminID, validCreateInput(testClientSecret)); !errors.Is(err, ErrConfiguration) {
 		t.Fatalf("expected create configuration error, got %v", err)
 	}
@@ -374,7 +374,7 @@ func TestEncryptionUnavailableStillAllowsReadsAndRejectsMutations(t *testing.T) 
 func TestEncryptionErrorsDoNotExposeSubmittedSecret(t *testing.T) {
 	fixture := newServiceFixture(t)
 	secret := "secret canary from encryption error"
-	service := NewService(fixture.database, leakingErrorStore{secret: secret})
+	service := NewService(fixture.database, leakingErrorStore{secret: secret}, nil)
 	err := service.Create(fixture.ctx, fixture.adminID, validCreateInput(secret))
 	if err == nil || strings.Contains(err.Error(), secret) {
 		t.Fatalf("encryption error leaked the secret: %v", err)
@@ -681,7 +681,7 @@ func newServiceFixture(t *testing.T) *serviceFixture {
 		adminID:     1,
 		nextUserID:  2,
 	}
-	fixture.service = NewService(database, secretStore)
+	fixture.service = NewService(database, secretStore, nil)
 	fixture.insertAdminWithID(t, fixture.adminID, "admin@example.test")
 	return fixture
 }
