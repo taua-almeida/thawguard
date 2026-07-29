@@ -99,6 +99,7 @@ func TestOpenAndApplyMigrationsAgainstSQLite(t *testing.T) {
 	assertTableExists(t, database, "company_oidc_connections")
 	assertTableExists(t, database, "company_oidc_allowed_domains")
 	assertTableExists(t, database, "company_oidc_setup_checks")
+	assertTableExists(t, database, "company_oidc_test_transactions")
 	assertTableExists(t, database, "password_recovery_tokens")
 	assertColumnExists(t, database, "repositories", "enforcement_state")
 	assertColumnExists(t, database, "repositories", "enforcement_failure_reason")
@@ -2435,6 +2436,227 @@ VALUES (1, ?, ?, ?, ?, ?)`, revision, code, observed, count, checkedAt)
 	if checks != 0 {
 		t.Fatalf("expected connection deletion to cascade current evidence, got %d rows", checks)
 	}
+	assertForeignKeyCheckClean(t, database)
+}
+
+func TestCompanyOIDCTestTransactionsMigrationPreservesExact0038DataAndAppliesOnce(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-company-oidc-test-transaction-upgrade.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transactionIndex := migrationIndex(t, migrations, "0039_company_oidc_test_transactions.sql")
+	if err := ApplyMigrations(ctx, database, migrations[:transactionIndex]); err != nil {
+		t.Fatal(err)
+	}
+	assertTableExists(t, database, "company_oidc_setup_checks")
+	assertTableDoesNotExist(t, database, "company_oidc_test_transactions")
+
+	const timestamp = "2026-07-29T10:00:00.000000000Z"
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO users(id, email, display_name, created_at, updated_at)
+VALUES (1, 'admin@example.test', 'Admin', ?, ?);
+INSERT INTO user_roles(user_id, role, created_at)
+VALUES (1, 'admin', ?);
+INSERT INTO sessions(id, user_id, csrf_token, expires_at, created_at)
+VALUES ('preserved-session', 1, 'preserved-csrf', '2026-07-30T10:00:00Z', ?);
+INSERT INTO company_oidc_connections(
+  id, provider_label, issuer, client_id, client_secret_ciphertext, revision, created_at, updated_at
+)
+VALUES (1, 'Preserved IdP', 'https://id.example.test', 'preserved-client', x'0102', 4, ?, ?);
+INSERT INTO company_oidc_allowed_domains(connection_id, domain)
+VALUES (1, 'example.test');
+INSERT INTO company_oidc_setup_checks(
+  connection_id, config_revision, result_code, observed_issuer,
+  public_key_candidate_count, checked_at
+)
+VALUES (1, 4, 'verified', NULL, 2, ?);
+INSERT INTO audit_events(id, actor_user_id, action, subject_type, subject_id, details_json, created_at)
+VALUES (39, 1, 'oidc_connection.metadata_checked', 'oidc_connection', '1',
+  '{"revision":4,"result_code":"verified"}', ?);`,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ApplyMigrations(ctx, database, migrations[:transactionIndex+1]); err != nil {
+		t.Fatal(err)
+	}
+	assertTableExists(t, database, "company_oidc_test_transactions")
+	for _, check := range []struct {
+		name  string
+		query string
+		want  int
+	}{
+		{name: "user", query: `SELECT count(*) FROM users WHERE id = 1 AND email = 'admin@example.test'`, want: 1},
+		{name: "role", query: `SELECT count(*) FROM user_roles WHERE user_id = 1 AND role = 'admin'`, want: 1},
+		{name: "session", query: `SELECT count(*) FROM sessions WHERE id = 'preserved-session'`, want: 1},
+		{name: "connection", query: `SELECT count(*) FROM company_oidc_connections WHERE id = 1 AND revision = 4`, want: 1},
+		{name: "domain", query: `SELECT count(*) FROM company_oidc_allowed_domains WHERE domain = 'example.test'`, want: 1},
+		{name: "setup check", query: `SELECT count(*) FROM company_oidc_setup_checks WHERE result_code = 'verified'`, want: 1},
+		{name: "audit", query: `SELECT count(*) FROM audit_events WHERE id = 39 AND actor_user_id = 1`, want: 1},
+		{name: "test transactions", query: `SELECT count(*) FROM company_oidc_test_transactions`, want: 0},
+	} {
+		var got int
+		if err := database.QueryRowContext(ctx, check.query).Scan(&got); err != nil {
+			t.Fatalf("count preserved %s: %v", check.name, err)
+		}
+		if got != check.want {
+			t.Fatalf("expected %d preserved %s rows, got %d", check.want, check.name, got)
+		}
+	}
+
+	if err := ApplyMigrations(ctx, database, migrations[:transactionIndex+1]); err != nil {
+		t.Fatal(err)
+	}
+	var applied int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = '0039_company_oidc_test_transactions'`).Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected company OIDC Test transaction migration applied once, got %d", applied)
+	}
+	assertForeignKeyCheckClean(t, database)
+}
+
+func TestCompanyOIDCTestTransactionSchemaConstrainsProtectedOneTimeState(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-company-oidc-test-transaction-constraints.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+		t.Fatal(err)
+	}
+
+	const createdAt = "2026-07-29T10:00:00.000000000Z"
+	const expiresAt = "2026-07-29T10:10:00.000000000Z"
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO users(id, email, display_name, created_at, updated_at)
+VALUES
+  (1, 'admin@example.test', 'Admin', ?, ?),
+  (2, 'second@example.test', 'Second Admin', ?, ?);
+INSERT INTO company_oidc_connections(
+  id, provider_label, issuer, client_id, client_secret_ciphertext, revision, created_at, updated_at
+)
+VALUES (1, 'Example IdP', 'https://id.example.test', 'client-id', x'01', 3, ?, ?)`,
+		createdAt,
+		createdAt,
+		createdAt,
+		createdAt,
+		createdAt,
+		createdAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	insert := func(state, session, nonce, verifier any, actor any, revision any, created, expires any) error {
+		_, err := database.ExecContext(ctx, `
+INSERT INTO company_oidc_test_transactions(
+  state_digest, connection_id, config_revision, actor_user_id,
+  session_binding_digest, nonce_digest, pkce_verifier_ciphertext,
+  created_at, expires_at
+)
+VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)`,
+			state,
+			revision,
+			actor,
+			session,
+			nonce,
+			verifier,
+			created,
+			expires,
+		)
+		return err
+	}
+
+	state := bytes.Repeat([]byte{0x11}, 32)
+	session := bytes.Repeat([]byte{0x22}, 32)
+	nonce := bytes.Repeat([]byte{0x33}, 32)
+	verifier := bytes.Repeat([]byte{0x44}, 72)
+	if err := insert(state, session, nonce, verifier, 1, 3, createdAt, expiresAt); err != nil {
+		t.Fatal(err)
+	}
+	for _, rejected := range []struct {
+		name     string
+		state    any
+		session  any
+		nonce    any
+		verifier any
+		actor    any
+		revision any
+		created  any
+		expires  any
+	}{
+		{name: "text state", state: strings.Repeat("s", 32), session: bytes.Repeat([]byte{0x51}, 32), nonce: nonce, verifier: verifier, actor: 1, revision: 3, created: createdAt, expires: expiresAt},
+		{name: "short state", state: bytes.Repeat([]byte{0x12}, 31), session: bytes.Repeat([]byte{0x52}, 32), nonce: nonce, verifier: verifier, actor: 1, revision: 3, created: createdAt, expires: expiresAt},
+		{name: "short session digest", state: bytes.Repeat([]byte{0x13}, 32), session: bytes.Repeat([]byte{0x53}, 31), nonce: nonce, verifier: verifier, actor: 1, revision: 3, created: createdAt, expires: expiresAt},
+		{name: "short nonce digest", state: bytes.Repeat([]byte{0x14}, 32), session: bytes.Repeat([]byte{0x54}, 32), nonce: bytes.Repeat([]byte{0x34}, 31), verifier: verifier, actor: 1, revision: 3, created: createdAt, expires: expiresAt},
+		{name: "text verifier", state: bytes.Repeat([]byte{0x15}, 32), session: bytes.Repeat([]byte{0x55}, 32), nonce: nonce, verifier: "plaintext", actor: 1, revision: 3, created: createdAt, expires: expiresAt},
+		{name: "oversized verifier", state: bytes.Repeat([]byte{0x16}, 32), session: bytes.Repeat([]byte{0x56}, 32), nonce: nonce, verifier: bytes.Repeat([]byte{0x45}, 513), actor: 1, revision: 3, created: createdAt, expires: expiresAt},
+		{name: "zero revision", state: bytes.Repeat([]byte{0x17}, 32), session: bytes.Repeat([]byte{0x57}, 32), nonce: nonce, verifier: verifier, actor: 1, revision: 0, created: createdAt, expires: expiresAt},
+		{name: "missing actor", state: bytes.Repeat([]byte{0x18}, 32), session: bytes.Repeat([]byte{0x58}, 32), nonce: nonce, verifier: verifier, actor: 999, revision: 3, created: createdAt, expires: expiresAt},
+		{name: "noncanonical created time", state: bytes.Repeat([]byte{0x19}, 32), session: bytes.Repeat([]byte{0x59}, 32), nonce: nonce, verifier: verifier, actor: 1, revision: 3, created: "2026-07-29T10:00:00Z", expires: expiresAt},
+		{name: "expiry not after creation", state: bytes.Repeat([]byte{0x1a}, 32), session: bytes.Repeat([]byte{0x5a}, 32), nonce: nonce, verifier: verifier, actor: 1, revision: 3, created: createdAt, expires: createdAt},
+	} {
+		if err := insert(
+			rejected.state,
+			rejected.session,
+			rejected.nonce,
+			rejected.verifier,
+			rejected.actor,
+			rejected.revision,
+			rejected.created,
+			rejected.expires,
+		); err == nil {
+			t.Fatalf("expected schema to reject %s", rejected.name)
+		}
+	}
+	if err := insert(bytes.Repeat([]byte{0x20}, 32), session, nonce, verifier, 2, 3, createdAt, expiresAt); err == nil {
+		t.Fatal("expected one active transaction per session binding")
+	}
+
+	if _, err := database.ExecContext(ctx, `DELETE FROM users WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	var transactions int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM company_oidc_test_transactions`).Scan(&transactions); err != nil {
+		t.Fatal(err)
+	}
+	if transactions != 0 {
+		t.Fatalf("expected actor deletion to cascade Test transaction, got %d", transactions)
+	}
+
+	if err := insert(bytes.Repeat([]byte{0x21}, 32), bytes.Repeat([]byte{0x61}, 32), nonce, verifier, 2, 3, createdAt, expiresAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `DELETE FROM company_oidc_connections WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM company_oidc_test_transactions`).Scan(&transactions); err != nil {
+		t.Fatal(err)
+	}
+	if transactions != 0 {
+		t.Fatalf("expected connection deletion to cascade Test transaction, got %d", transactions)
+	}
+	assertIndexExists(t, database, "idx_company_oidc_test_transactions_expires_at")
 	assertForeignKeyCheckClean(t, database)
 }
 

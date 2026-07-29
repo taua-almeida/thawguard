@@ -2,10 +2,12 @@ package companyoidc
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/url"
@@ -74,6 +76,7 @@ type Service struct {
 	db      *sql.DB
 	secrets secrets.Store
 	check   func(context.Context, string) SetupCheckReport
+	random  io.Reader
 	now     func() time.Time
 }
 
@@ -86,6 +89,7 @@ func NewService(
 		db:      db,
 		secrets: secretStore,
 		check:   check,
+		random:  rand.Reader,
 		now:     func() time.Time { return time.Now().UTC() },
 	}
 }
