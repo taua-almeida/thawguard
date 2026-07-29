@@ -102,7 +102,7 @@ func (s *Server) handleCreateInvitation(w http.ResponseWriter, r *http.Request) 
 	// The cap is installed before any parsing; requireAdminForm parses the
 	// capped body.
 	r.Body = http.MaxBytesReader(w, r.Body, invitationCreateMaxBodyBytes)
-	if !s.validInvitationOrigin(r) {
+	if !s.validExactPublicOrigin(r) {
 		s.logRequestRejected(r, originRejectionReason(r))
 		s.renderInvitationMessage(
 			w,
@@ -192,7 +192,7 @@ func (s *Server) handleReplaceInvitationLink(w http.ResponseWriter, r *http.Requ
 		s.renderErrorPage(w, http.StatusNotFound, false)
 		return
 	}
-	if !s.validInvitationOrigin(r) {
+	if !s.validExactPublicOrigin(r) {
 		s.logRequestRejected(r, originRejectionReason(r))
 		s.renderInvitationMessage(
 			w,
@@ -344,7 +344,7 @@ func (s *Server) handleInvitationAccept(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) handleInvitationAcceptPost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, invitationAcceptMaxBodyBytes)
-	if !s.validInvitationOrigin(r) {
+	if !s.validExactPublicOrigin(r) {
 		s.logRequestRejected(r, originRejectionReason(r))
 		s.renderInvitationAcceptForbidden(w)
 		return
@@ -513,11 +513,6 @@ func onlyInvitationAcceptFields(form url.Values) bool {
 		}
 	}
 	return true
-}
-
-func (s *Server) validInvitationOrigin(r *http.Request) bool {
-	origins := r.Header.Values("Origin")
-	return len(origins) == 1 && origins[0] == s.cfg.PublicURL
 }
 
 func usersInvitationViews(invitations []auth.ActiveInvitation, state usersPageState) []usersInvitationView {

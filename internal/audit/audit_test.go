@@ -352,6 +352,7 @@ func TestScopedActionClassificationCoversEveryKnownAction(t *testing.T) {
 		"invitation.cancelled":                       adminOnly,
 		"invitation.authorization_revoked":           adminOnly,
 		"invitation.accepted":                        adminOnly,
+		"oidc_connection.draft_saved":                adminOnly,
 	}
 
 	classified := map[string]string{}
@@ -434,6 +435,36 @@ func TestScopedActionClassificationKeepsInvitationRepositorySpoofsAdminOnly(t *t
 	}
 	if len(unrestricted) != 6 {
 		t.Fatalf("expected unrestricted Administrator scope to retain all invitation actions, got %d", len(unrestricted))
+	}
+}
+
+func TestOIDCDraftAuditIsAdministratorOnlyDespiteRepositoryDetail(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	insertRawEvent(
+		t,
+		ctx,
+		store,
+		ActionOIDCConnectionDraftSaved,
+		SubjectTypeOIDCConnection,
+		"1",
+		`{"revision":1,"secret_replaced":false,"domain_count":1,"repository_id":"7"}`,
+		time.Date(2026, 7, 28, 10, 0, 0, 0, time.UTC),
+	)
+
+	bounded, err := store.ListForScope(ctx, repositoryscope.IDs(7), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bounded) != 0 {
+		t.Fatalf("bounded repository scope exposed company OIDC activity: %+v", bounded)
+	}
+	all, err := store.List(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 1 || all[0].Action != ActionOIDCConnectionDraftSaved {
+		t.Fatalf("Administrator scope did not retain company OIDC activity: %+v", all)
 	}
 }
 

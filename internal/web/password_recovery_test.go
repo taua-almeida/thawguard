@@ -904,7 +904,7 @@ func assertPasswordRecoveryHeaders(t *testing.T, header http.Header) {
 		"Referrer-Policy":         "same-origin",
 		"X-Frame-Options":         "DENY",
 		"X-Content-Type-Options":  "nosniff",
-		"Content-Security-Policy": passwordRecoveryCSP,
+		"Content-Security-Policy": sensitiveFormCSP,
 	}
 	for name, want := range wants {
 		if got := header.Get(name); got != want {

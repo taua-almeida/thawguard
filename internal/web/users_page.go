@@ -144,12 +144,8 @@ func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "auth service is not configured", http.StatusServiceUnavailable)
 		return
 	}
-	session, ok := s.requireView(w, r)
+	session, ok := s.requireAdminView(w, r)
 	if !ok {
-		return
-	}
-	if !session.Grants.CanManageInstallation() {
-		s.renderErrorPage(w, http.StatusForbidden, false)
 		return
 	}
 	query, err := usersQueryFromRequest(r)
@@ -361,12 +357,8 @@ func (s *Server) handleUserDetail(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "auth service is not configured", http.StatusServiceUnavailable)
 		return
 	}
-	session, ok := s.requireView(w, r)
+	session, ok := s.requireAdminView(w, r)
 	if !ok {
-		return
-	}
-	if !session.Grants.CanManageInstallation() {
-		s.renderErrorPage(w, http.StatusForbidden, false)
 		return
 	}
 	userID, ok := userIDFromPath(r)

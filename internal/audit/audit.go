@@ -68,16 +68,18 @@ const (
 	ActionInvitationCancelled                = "invitation.cancelled"
 	ActionInvitationAuthorizationRevoked     = "invitation.authorization_revoked"
 	ActionInvitationAccepted                 = "invitation.accepted"
+	ActionOIDCConnectionDraftSaved           = "oidc_connection.draft_saved"
 
 	ActorKindPasswordRecoveryLink = "recovery_link"
 	ActorKindInvitationLink       = "invitation_link"
 
-	SubjectTypeRepository    = "repository"
-	SubjectTypeSchedule      = "schedule"
-	SubjectTypeBranchFreeze  = "branch_freeze"
-	SubjectTypeThawException = "thaw_exception"
-	SubjectTypeUser          = "user"
-	SubjectTypeInvitation    = "invitation"
+	SubjectTypeRepository     = "repository"
+	SubjectTypeSchedule       = "schedule"
+	SubjectTypeBranchFreeze   = "branch_freeze"
+	SubjectTypeThawException  = "thaw_exception"
+	SubjectTypeUser           = "user"
+	SubjectTypeInvitation     = "invitation"
+	SubjectTypeOIDCConnection = "oidc_connection"
 )
 
 // KnownActions returns every audit action the application currently writes.
@@ -140,6 +142,7 @@ func KnownActions() []string {
 		ActionInvitationCancelled,
 		ActionInvitationAuthorizationRevoked,
 		ActionInvitationAccepted,
+		ActionOIDCConnectionDraftSaved,
 	}
 }
 
@@ -219,9 +222,9 @@ var thawExceptionSubjectActions = []string{
 	ActionThawExceptionSharedHeadApproved,
 }
 
-// User and invitation actions are deliberately absent from every family:
-// identity administration stays admin-only even when details carry a
-// repository_id.
+// User, invitation, and company OIDC actions are deliberately absent from
+// every family: identity administration stays admin-only even when details
+// carry a repository_id.
 
 // scopedAuditEventsSQL derives a nullable associated_repository_id for
 // every audit event entirely inside SQL, so read scopes filter before

@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func TestTailwindSourcesCoverEveryPageTemplate(t *testing.T) {
+func TestTailwindSourcesCoverEveryPageTemplateAndAuthenticationLayout(t *testing.T) {
 	source, err := os.ReadFile("styles/app.css")
 	if err != nil {
 		t.Fatal(err)
@@ -24,5 +24,9 @@ func TestTailwindSourcesCoverEveryPageTemplate(t *testing.T) {
 		if !strings.Contains(string(source), want) {
 			t.Errorf("Tailwind source list is missing %s", filepath.Base(page))
 		}
+	}
+	authenticationLayout := `@source "../../internal/web/templates/layouts/authentication.html";`
+	if !strings.Contains(string(source), authenticationLayout) {
+		t.Fatalf("Tailwind source list is missing %s", authenticationLayout)
 	}
 }

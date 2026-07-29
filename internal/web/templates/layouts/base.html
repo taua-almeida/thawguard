@@ -10,7 +10,7 @@
     Toasts (slice with Message/Tone/DismissHref, rendered via ui/toast).
 
   ActivePage keys: dashboard, freezes, scheduled, thaws, repositories,
-  activity, publications, webhooks, users.
+  activity, publications, webhooks, users, authentication.
 */}}
 {{ define "shell/nav-item" }}<a class="shell-nav-item{{ if eq .Key .Active }} is-active{{ end }}" href="{{ .Href }}"{{ if eq .Key .Active }} aria-current="page"{{ end }}><svg aria-hidden="true"><use href="#{{ .Icon }}"></use></svg><span class="shell-nav-label">{{ .Label }}</span></a>{{ end }}
 
@@ -32,6 +32,7 @@
         {{ if .CurrentUser.IsAdmin }}
         <p class="shell-nav-group-title">Admin</p>
         {{ template "shell/nav-item" dict "Href" "/users" "Icon" "tg-i-users" "Label" "Users & Access" "Key" "users" "Active" .ActivePage }}
+        {{ template "shell/nav-item" dict "Href" "/settings/authentication" "Icon" "tg-i-key" "Label" "Authentication" "Key" "authentication" "Active" .ActivePage }}
         {{ end }}
 {{ end }}
 
@@ -98,7 +99,7 @@
         {{ template "shell/chip-item" dict "Href" "/activity" "Label" "Activity" "Key" "activity" "Active" .ActivePage }}
         {{ template "shell/chip-item" dict "Href" "/publications" "Label" "Status publishing" "Key" "publications" "Active" .ActivePage }}
         {{ template "shell/chip-item" dict "Href" "/webhooks" "Label" "Webhook Log" "Key" "webhooks" "Active" .ActivePage }}
-        {{ if .CurrentUser.IsAdmin }}{{ template "shell/chip-item" dict "Href" "/users" "Label" "Users" "Key" "users" "Active" .ActivePage }}{{ end }}
+        {{ if .CurrentUser.IsAdmin }}{{ template "shell/chip-item" dict "Href" "/users" "Label" "Users" "Key" "users" "Active" .ActivePage }}{{ template "shell/chip-item" dict "Href" "/settings/authentication" "Label" "Authentication" "Key" "authentication" "Active" .ActivePage }}{{ end }}
       </nav>
       <main id="main" class="shell-main">
         <div id="toasts" class="flex flex-col gap-2{{ if .Toasts }} mb-4{{ end }}">

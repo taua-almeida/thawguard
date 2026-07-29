@@ -2918,9 +2918,35 @@ func TestActivityMappingsCoverEveryKnownAuditAction(t *testing.T) {
 			event.SubjectID = "inv_" + strings.Repeat("A", 22)
 			event.DetailsJSON = `{"actor_kind":"invitation_link","accepted_user_id":"1"}`
 		}
+		if action == audit.ActionOIDCConnectionDraftSaved {
+			event.SubjectType = audit.SubjectTypeOIDCConnection
+			event.SubjectID = "1"
+			event.DetailsJSON = `{"revision":1,"secret_replaced":false,"domain_count":1}`
+		}
 		view := activityEventViewForEvent(nil, nil, event)
 		if view.ActionLabel == "Unrecognized activity" || view.ActionLabel == "" || view.Outcome == "" || view.Target == "" || view.Detail == "" {
 			t.Fatalf("audit action %q lacks a complete curated activity mapping: %+v", action, view)
+		}
+	}
+}
+
+func TestActivityOIDCDraftPresentationIgnoresSensitiveUnexpectedDetails(t *testing.T) {
+	actorID := int64(7)
+	event := audit.Event{
+		ActorUserID: &actorID,
+		Action:      audit.ActionOIDCConnectionDraftSaved,
+		SubjectType: audit.SubjectTypeOIDCConnection,
+		SubjectID:   "1",
+		DetailsJSON: `{"revision":2,"secret_replaced":true,"domain_count":1,"issuer":"issuer-canary","client_secret":"secret-canary"}`,
+	}
+	view := activityEventViewForEvent(nil, nil, event)
+	if view.ActionLabel != "Unrecognized activity" {
+		t.Fatalf("unexpected OIDC details should fail closed: %+v", view)
+	}
+	visible := view.ActionLabel + " " + view.Target + " " + view.Detail
+	for _, canary := range []string{"issuer-canary", "secret-canary"} {
+		if strings.Contains(visible, canary) {
+			t.Fatalf("OIDC Activity presentation exposed %q: %q", canary, visible)
 		}
 	}
 }
@@ -2983,6 +3009,8 @@ func TestActivityMappingCoversCurrentFamilies(t *testing.T) {
 		{name: "invitation cancelled", action: audit.ActionInvitationCancelled, subjectType: audit.SubjectTypeInvitation, subjectID: invitationID, details: `{}`, outcome: "Cancelled", contains: []string{"Invitation " + invitationID, "staged identity and credential redacted"}},
 		{name: "invitation authorization revoked", action: audit.ActionInvitationAuthorizationRevoked, subjectType: audit.SubjectTypeInvitation, subjectID: invitationID, details: `{"reason":"authorizer_disabled"}`, outcome: "Revoked", contains: []string{"Invitation " + invitationID, "authorizing Administrator was disabled"}},
 		{name: "invitation accepted", action: audit.ActionInvitationAccepted, subjectType: audit.SubjectTypeInvitation, subjectID: invitationID, details: `{"actor_kind":"invitation_link","accepted_user_id":"42"}`, outcome: "Accepted", contains: []string{"Invitation link", "Ada Operator (User #42)", "local account was created"}},
+		{name: "company OIDC Draft created", action: audit.ActionOIDCConnectionDraftSaved, actorUserID: &userActorID, subjectType: audit.SubjectTypeOIDCConnection, subjectID: "1", details: `{"revision":1,"secret_replaced":false,"domain_count":2}`, outcome: "Saved", contains: []string{"Company sign-in Draft saved", "Company OIDC connection", "Revision 1 saved", "client secret stored", "2 allowed domains"}},
+		{name: "company OIDC Draft updated", action: audit.ActionOIDCConnectionDraftSaved, actorUserID: &userActorID, subjectType: audit.SubjectTypeOIDCConnection, subjectID: "1", details: `{"revision":2,"secret_replaced":true,"domain_count":1}`, outcome: "Saved", contains: []string{"Revision 2 saved", "client secret replaced", "1 allowed domain"}},
 		{name: "invitation user created", action: audit.ActionUserCreated, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"invitation_link","onboarding":"invitation","sign_in":"password"}`, outcome: "Created", contains: []string{"Invitation link", "Ada Operator (User #42)", "Created from an invitation", "password sign-in enabled", "no password change is required"}},
 		{name: "invitation Admin applied", action: audit.ActionUserRolesUpdated, actorUserID: &userActorID, subjectType: audit.SubjectTypeUser, subjectID: "42", details: `{"actor_kind":"user","provenance":"invitation_acceptance","roles_before":"none","roles_after":"admin"}`, outcome: "Changed", contains: []string{"Ada Operator", "Admin authority applied during invitation acceptance"}},
 		{name: "invitation repository grant applied", action: audit.ActionRepositoryGrantAdded, actorUserID: &userActorID, subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"actor_kind":"user","provenance":"invitation_acceptance","user_id":"42","role":"freezer"}`, outcome: "Granted", contains: []string{"Ada Operator", "Freezer role applied to Ada Operator (User #42) during invitation acceptance"}},
@@ -3428,7 +3456,7 @@ func TestActivityFilterActionsGroupKnownActions(t *testing.T) {
 	prefixes := map[string][]string{
 		"freeze":       {"branch_freeze.", "freeze_schedule.", "schedule.", "thaw_exception."},
 		"repositories": {"repository.", "repository_grant."},
-		"users":        {"user.", "invitation.", "repository_grant."},
+		"users":        {"user.", "invitation.", "oidc_connection.", "repository_grant."},
 	}
 	for filter, allowed := range prefixes {
 		actions := activityFilterActions(filter)
@@ -3454,6 +3482,7 @@ func TestActivityFilterActionsGroupKnownActions(t *testing.T) {
 		audit.ActionInvitationCancelled,
 		audit.ActionInvitationAuthorizationRevoked,
 		audit.ActionInvitationAccepted,
+		audit.ActionOIDCConnectionDraftSaved,
 	} {
 		if !slices.Contains(users, action) {
 			t.Fatalf("users chip is missing invitation action %q", action)

@@ -96,6 +96,8 @@ func TestOpenAndApplyMigrationsAgainstSQLite(t *testing.T) {
 	assertColumnDoesNotExist(t, database, "users", "password_hash")
 	assertColumnDoesNotExist(t, database, "users", "must_change_password")
 	assertTableExists(t, database, "local_credentials")
+	assertTableExists(t, database, "company_oidc_connections")
+	assertTableExists(t, database, "company_oidc_allowed_domains")
 	assertTableExists(t, database, "password_recovery_tokens")
 	assertColumnExists(t, database, "repositories", "enforcement_state")
 	assertColumnExists(t, database, "repositories", "enforcement_failure_reason")
@@ -2084,6 +2086,188 @@ VALUES (?, 'invalid@example.test', 'Invalid', ?, NULL, ?, ?, ?)`,
 			}
 		})
 	}
+}
+
+func TestCompanyOIDCDraftMigrationPreservesExact0036DataAndAppliesOnce(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-company-oidc-upgrade-test.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oidcIndex := migrationIndex(t, migrations, "0037_company_oidc_draft.sql")
+	if err := ApplyMigrations(ctx, database, migrations[:oidcIndex]); err != nil {
+		t.Fatal(err)
+	}
+	assertTableExists(t, database, "local_credentials")
+	assertTableDoesNotExist(t, database, "company_oidc_connections")
+
+	const timestamp = "2026-07-28T10:00:00.000000000Z"
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO users(id, email, display_name, created_at, updated_at)
+VALUES (1, 'admin@example.test', 'Admin', ?, ?);
+INSERT INTO local_credentials(user_id, password_hash, must_change_password, created_at, updated_at)
+VALUES (1, 'preserved-hash', 0, ?, ?);
+INSERT INTO user_roles(user_id, role, created_at)
+VALUES (1, 'admin', ?);
+INSERT INTO sessions(id, user_id, csrf_token, expires_at, created_at)
+VALUES ('preserved-session', 1, 'preserved-csrf', '2026-07-29T10:00:00.000000000Z', ?);
+INSERT INTO audit_events(id, actor_user_id, action, subject_type, subject_id, details_json, created_at)
+VALUES (37, 1, 'user.password_changed', 'user', '1', '{}', ?);`,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ApplyMigrations(ctx, database, migrations[:oidcIndex+1]); err != nil {
+		t.Fatal(err)
+	}
+	assertTableExists(t, database, "company_oidc_connections")
+	assertTableExists(t, database, "company_oidc_allowed_domains")
+	for _, check := range []struct {
+		name  string
+		query string
+		want  int
+	}{
+		{name: "user", query: `SELECT count(*) FROM users WHERE id = 1 AND email = 'admin@example.test'`, want: 1},
+		{name: "credential", query: `SELECT count(*) FROM local_credentials WHERE user_id = 1 AND password_hash = 'preserved-hash'`, want: 1},
+		{name: "role", query: `SELECT count(*) FROM user_roles WHERE user_id = 1 AND role = 'admin'`, want: 1},
+		{name: "session", query: `SELECT count(*) FROM sessions WHERE id = 'preserved-session' AND csrf_token = 'preserved-csrf'`, want: 1},
+		{name: "audit", query: `SELECT count(*) FROM audit_events WHERE id = 37 AND actor_user_id = 1`, want: 1},
+		{name: "OIDC connections", query: `SELECT count(*) FROM company_oidc_connections`, want: 0},
+		{name: "OIDC domains", query: `SELECT count(*) FROM company_oidc_allowed_domains`, want: 0},
+	} {
+		var got int
+		if err := database.QueryRowContext(ctx, check.query).Scan(&got); err != nil {
+			t.Fatalf("count preserved %s: %v", check.name, err)
+		}
+		if got != check.want {
+			t.Fatalf("expected %d preserved %s rows, got %d", check.want, check.name, got)
+		}
+	}
+
+	if err := ApplyMigrations(ctx, database, migrations[:oidcIndex+1]); err != nil {
+		t.Fatal(err)
+	}
+	var applied int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = '0037_company_oidc_draft'`).Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected company OIDC Draft migration applied once, got %d", applied)
+	}
+	assertForeignKeyCheckClean(t, database)
+}
+
+func TestCompanyOIDCDraftSchemaEnforcesSingletonDomainsAndRevision(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-company-oidc-constraints-test.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyMigrations(ctx, database, migrations); err != nil {
+		t.Fatal(err)
+	}
+
+	const timestamp = "2026-07-28T10:00:00.000000000Z"
+	insertConnection := func(id any, revision any, ciphertext any) error {
+		_, err := database.ExecContext(ctx, `
+INSERT INTO company_oidc_connections(
+  id, provider_label, issuer, client_id, client_secret_ciphertext, revision, created_at, updated_at
+)
+VALUES (?, 'Example IdP', 'https://id.example.test', 'client-id', ?, ?, ?, ?)`,
+			id,
+			ciphertext,
+			revision,
+			timestamp,
+			timestamp,
+		)
+		return err
+	}
+	if err := insertConnection(1, 1, []byte{1, 2, 3}); err != nil {
+		t.Fatal(err)
+	}
+	if err := insertConnection(2, 1, []byte{4}); err == nil {
+		t.Fatal("expected singleton id constraint to reject connection id 2")
+	}
+	if _, err := database.ExecContext(ctx, `UPDATE company_oidc_connections SET revision = 0 WHERE id = 1`); err == nil {
+		t.Fatal("expected non-positive revision to be rejected")
+	}
+	if _, err := database.ExecContext(ctx, `UPDATE company_oidc_connections SET revision = 'next' WHERE id = 1`); err == nil {
+		t.Fatal("expected text revision to be rejected")
+	}
+	if _, err := database.ExecContext(ctx, `UPDATE company_oidc_connections SET client_secret_ciphertext = 'plaintext' WHERE id = 1`); err == nil {
+		t.Fatal("expected text client-secret storage to be rejected")
+	}
+	for _, rejected := range []struct {
+		name  string
+		query string
+		value string
+	}{
+		{name: "created_at without fractional seconds", query: `UPDATE company_oidc_connections SET created_at = ? WHERE id = 1`, value: "2026-07-28T10:00:00Z"},
+		{name: "created_at with offset", query: `UPDATE company_oidc_connections SET created_at = ? WHERE id = 1`, value: "2026-07-28T10:00:00.000000000+00:00"},
+		{name: "updated_at with short fraction", query: `UPDATE company_oidc_connections SET updated_at = ? WHERE id = 1`, value: "2026-07-28T10:00:00.123Z"},
+		{name: "updated_at without T", query: `UPDATE company_oidc_connections SET updated_at = ? WHERE id = 1`, value: "2026-07-28 10:00:00.000000000Z"},
+	} {
+		if _, err := database.ExecContext(ctx, rejected.query, rejected.value); err == nil {
+			t.Fatalf("expected non-canonical %s %q to be rejected", rejected.name, rejected.value)
+		}
+	}
+
+	if _, err := database.ExecContext(ctx, `INSERT INTO company_oidc_allowed_domains(connection_id, domain) VALUES (1, 'example.test')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO company_oidc_allowed_domains(connection_id, domain) VALUES (1, 'example.test')`); err == nil {
+		t.Fatal("expected duplicate normalized domain to violate the primary key")
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO company_oidc_allowed_domains(connection_id, domain) VALUES (1, 'Example.test')`); err == nil {
+		t.Fatal("expected mixed-case domain to be rejected")
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO company_oidc_allowed_domains(connection_id, domain) VALUES (2, 'orphan.example')`); err == nil {
+		t.Fatal("expected missing singleton parent to be rejected")
+	}
+	if _, err := database.ExecContext(ctx, `DELETE FROM company_oidc_connections WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	var domains int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM company_oidc_allowed_domains`).Scan(&domains); err != nil {
+		t.Fatal(err)
+	}
+	if domains != 0 {
+		t.Fatalf("expected connection deletion to cascade domains, got %d", domains)
+	}
+
+	for _, rejected := range []struct {
+		name       string
+		id         any
+		revision   any
+		ciphertext any
+	}{
+		{name: "zero revision", id: 1, revision: 0, ciphertext: []byte{1}},
+		{name: "negative revision", id: 1, revision: -1, ciphertext: []byte{1}},
+		{name: "empty ciphertext", id: 1, revision: 1, ciphertext: []byte{}},
+		{name: "text ciphertext", id: 1, revision: 1, ciphertext: "ciphertext"},
+	} {
+		if err := insertConnection(rejected.id, rejected.revision, rejected.ciphertext); err == nil {
+			t.Fatalf("expected schema to reject %s", rejected.name)
+		}
+	}
+	assertForeignKeyCheckClean(t, database)
 }
 
 func TestUserAccountManagementMigrationPreservesUsersAndSessionsAndAppliesOnce(t *testing.T) {

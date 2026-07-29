@@ -45,7 +45,7 @@ type authPasswordRecoveryIssuedData struct {
 
 func (s *Server) handleIssuePasswordRecovery(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, passwordRecoveryMaxBodyBytes)
-	if !s.validPasswordRecoveryOrigin(r) {
+	if !s.validExactPublicOrigin(r) {
 		s.logRequestRejected(r, originRejectionReason(r))
 		s.renderPasswordRecoveryMessage(
 			w,
@@ -112,7 +112,7 @@ func (s *Server) handlePasswordRecovery(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) handlePasswordRecoveryPost(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, passwordRecoveryMaxBodyBytes)
-	if !s.validPasswordRecoveryOrigin(r) {
+	if !s.validExactPublicOrigin(r) {
 		s.logRequestRejected(r, originRejectionReason(r))
 		s.renderPasswordRecoveryForbidden(w)
 		return
@@ -202,11 +202,6 @@ func onlyPasswordRecoveryFields(form url.Values) bool {
 		}
 	}
 	return true
-}
-
-func (s *Server) validPasswordRecoveryOrigin(r *http.Request) bool {
-	origins := r.Header.Values("Origin")
-	return len(origins) == 1 && origins[0] == s.cfg.PublicURL
 }
 
 func (s *Server) renderPasswordRecoveryForbidden(w http.ResponseWriter) {

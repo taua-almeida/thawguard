@@ -399,7 +399,7 @@ func TestInvitationRouteSecurityHeaderMatrix(t *testing.T) {
 		t.Run("not sensitive "+path, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			fixture.server.Routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
-			if recorder.Header().Get("Content-Security-Policy") == passwordRecoveryCSP {
+			if recorder.Header().Get("Content-Security-Policy") == sensitiveFormCSP {
 				t.Fatalf("path %s must not adopt the sensitive bearer CSP", path)
 			}
 		})

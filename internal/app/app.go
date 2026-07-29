@@ -10,6 +10,7 @@ import (
 
 	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/auth"
+	"github.com/taua-almeida/thawguard/internal/companyoidc"
 	"github.com/taua-almeida/thawguard/internal/config"
 	"github.com/taua-almeida/thawguard/internal/db"
 	"github.com/taua-almeida/thawguard/internal/domain"
@@ -72,6 +73,7 @@ func (a *App) Run(ctx context.Context) error {
 		return err
 	}
 	repositorySetup := repositorysetup.NewServiceWithSecrets(database, secretStore)
+	companyOIDCService := companyoidc.NewService(database, secretStore)
 	repositoryStore := repository.NewStore(database)
 	setupCheckStore := setupcheck.NewStore(database)
 	webhookDeliveryStore := webhook.NewDeliveryStore(database)
@@ -103,28 +105,30 @@ func (a *App) Run(ctx context.Context) error {
 	server := &http.Server{
 		Addr: a.cfg.HTTPAddr,
 		Handler: web.NewServer(web.Config{
-			AppName:                              "Thawguard",
-			PublicURL:                            publicURL,
-			RepositoryStore:                      repositorySetup,
-			RepositorySecretEncryptionConfigured: secretStore != nil,
-			SetupCheckStore:                      setupCheckStore,
-			SetupCheckRunner:                     setupCheckRunner,
-			FreezeStore:                          freezeStoreForWeb,
-			ScheduledFreezeStore:                 freezeStoreForWeb,
-			ScheduleStore:                        scheduleStore,
-			AuditStore:                           auditStore,
-			ThawExceptionStore:                   thawExceptionStore,
-			StatusDecisionStore:                  thawApprovalStore,
-			StatusPublicationStore:               statusPublicationStore,
-			WebhookRepositoryStore:               repositorySetup,
-			WebhookDeliveryStore:                 webhookDeliveryStore,
-			PullRequestWebhookProcessor:          pullRequestWebhookProcessor,
-			AuthService:                          authService,
-			PullRequestStore:                     pullRequestStore,
-			EnforcementService:                   enforcementService,
-			ReconciliationJobStore:               jobStore,
-			Logger:                               a.logger,
-			DevMode:                              a.cfg.DevMode,
+			AppName:                               "Thawguard",
+			PublicURL:                             publicURL,
+			RepositoryStore:                       repositorySetup,
+			RepositorySecretEncryptionConfigured:  secretStore != nil,
+			CompanyOIDCService:                    companyOIDCService,
+			CompanyOIDCSecretEncryptionConfigured: secretStore != nil,
+			SetupCheckStore:                       setupCheckStore,
+			SetupCheckRunner:                      setupCheckRunner,
+			FreezeStore:                           freezeStoreForWeb,
+			ScheduledFreezeStore:                  freezeStoreForWeb,
+			ScheduleStore:                         scheduleStore,
+			AuditStore:                            auditStore,
+			ThawExceptionStore:                    thawExceptionStore,
+			StatusDecisionStore:                   thawApprovalStore,
+			StatusPublicationStore:                statusPublicationStore,
+			WebhookRepositoryStore:                repositorySetup,
+			WebhookDeliveryStore:                  webhookDeliveryStore,
+			PullRequestWebhookProcessor:           pullRequestWebhookProcessor,
+			AuthService:                           authService,
+			PullRequestStore:                      pullRequestStore,
+			EnforcementService:                    enforcementService,
+			ReconciliationJobStore:                jobStore,
+			Logger:                                a.logger,
+			DevMode:                               a.cfg.DevMode,
 		}).Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,

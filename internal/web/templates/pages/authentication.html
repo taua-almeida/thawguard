@@ -1,0 +1,89 @@
+{{ define "pages/authentication" }}
+<div class="flex min-w-0 flex-col gap-6">
+  <header>
+    <h1 class="m-0 text-page-title font-bold text-text">Authentication</h1>
+    <p class="m-0 mt-1 text-sm text-text-muted">Prepare one company sign-in connection without changing how anyone signs in.</p>
+  </header>
+
+  <div role="note">{{ template "ui/callout" dict "Tone" "info" "Title" "Draft only." "Body" "Saving this configuration does not change sign-in. Local password sign-in remains available." "Icon" "tg-i-info" }}</div>
+
+  <nav class="rounded-panel border border-border bg-surface p-3" aria-label="Company sign-in setup progress">
+    <ol class="m-0 grid list-none grid-cols-1 gap-2 p-0 sm:grid-cols-2 lg:grid-cols-4">
+      <li class="flex min-w-0 items-center gap-2 rounded-card bg-accent-soft px-3 py-2 text-sm font-semibold text-accent-strong" aria-current="step"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-accent text-xs text-on-accent">1</span><span>Configure</span></li>
+      <li class="flex min-w-0 items-center gap-2 rounded-card bg-surface-muted px-3 py-2 text-sm text-text-muted" aria-disabled="true"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-neutral-soft text-xs">2</span><span class="min-w-0">Verify metadata <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Unavailable</span></span></li>
+      <li class="flex min-w-0 items-center gap-2 rounded-card bg-surface-muted px-3 py-2 text-sm text-text-muted" aria-disabled="true"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-neutral-soft text-xs">3</span><span class="min-w-0">Test sign-in <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Not implemented</span></span></li>
+      <li class="flex min-w-0 items-center gap-2 rounded-card bg-surface-muted px-3 py-2 text-sm text-text-muted" aria-disabled="true"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-neutral-soft text-xs">4</span><span class="min-w-0">Enable <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Not implemented</span></span></li>
+    </ol>
+  </nav>
+
+  {{ if .TerminalHeading }}
+  <section class="rounded-panel border border-border bg-surface p-5 shadow-card">
+    <div role="alert">{{ template "ui/callout" dict "Tone" .TerminalTone "Title" .TerminalHeading "Body" .TerminalMessage }}</div>
+    <div class="mt-4">{{ template "ui/button" dict "Label" "Reload Draft" "Variant" "secondary" "Href" "/settings/authentication" }}</div>
+  </section>
+  {{ else }}
+    {{ if not .EncryptionAvailable }}
+    <div role="alert">{{ template "ui/callout" dict "Tone" "warning" "Title" "Client-secret encryption unavailable" "Body" "Configure THAWGUARD_SECRET_KEY and restart Thawguard before creating or editing this Draft. Saved non-secret configuration remains readable." }}</div>
+    {{ end }}
+
+    {{ if .ShowForm }}
+    <section class="min-w-0 rounded-panel border border-border bg-surface p-4 shadow-card sm:p-6" aria-labelledby="oidc-draft-form-title">
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 id="oidc-draft-form-title" class="m-0 text-lg font-bold text-text">{{ if .Editing }}Edit company OIDC Draft{{ else }}Configure company OIDC Draft{{ end }}</h2>
+          <p class="m-0 mt-1 text-sm text-text-muted">Provider metadata checks and company sign-in are not available in this version.</p>
+        </div>
+        <span class="inline-flex rounded-pill bg-neutral-soft px-2.5 py-1 text-xs font-semibold text-text">Draft</span>
+      </div>
+      {{ if .FormError }}<div class="mt-4" role="alert">{{ template "ui/callout" dict "Tone" "danger" "Body" .FormError }}</div>{{ end }}
+      <form method="post" action="/settings/authentication/oidc" class="mt-5 flex min-w-0 flex-col gap-4">
+        <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+        <input type="hidden" name="expected_revision" value="{{ .Form.ExpectedRevision }}">
+        {{ template "ui/input" dict "ID" "oidc-provider-label" "Name" "provider_label" "Label" "Provider label" "Value" .Form.ProviderLabel "Maxlength" 80 "Required" true "Autocomplete" "organization" }}
+        {{ template "ui/input" dict "ID" "oidc-issuer" "Name" "issuer" "Label" "Issuer" "Value" .Form.Issuer "Maxlength" 2048 "Required" true "Autocomplete" "off" "Mono" true "Hint" "Enter the exact HTTPS issuer identifier. It is stored as submitted after outer ASCII whitespace is removed." }}
+        {{ template "ui/input" dict "ID" "oidc-client-id" "Name" "client_id" "Label" "Client ID" "Value" .Form.ClientID "Maxlength" 512 "Required" true "Autocomplete" "off" "Mono" true }}
+        <div class="flex flex-col gap-1.5">
+          <label for="oidc-client-secret" class="text-sm font-semibold text-text">{{ if .Editing }}Replace client secret{{ else }}Client secret<span class="text-danger" aria-hidden="true"> *</span>{{ end }}</label>
+          <p id="oidc-client-secret-hint" class="m-0 text-xs text-text-muted">{{ if .Editing }}Leave blank to keep the stored secret. A non-empty value always replaces it.{{ else }}Stored encrypted and never shown again after saving.{{ end }}</p>
+          <input id="oidc-client-secret" name="client_secret" type="password" class="h-(--control-height) w-full rounded-control border border-border-input bg-surface px-3 text-sm text-text placeholder:text-text-muted" maxlength="4096" autocomplete="new-password" aria-describedby="oidc-client-secret-hint"{{ if not .Editing }} required{{ end }}>
+        </div>
+        <div class="flex flex-col gap-1.5">
+          <label for="oidc-allowed-domains" class="text-sm font-semibold text-text">Allowed domains<span class="text-danger" aria-hidden="true"> *</span></label>
+          <p id="oidc-allowed-domains-hint" class="m-0 text-xs text-text-muted">One exact DNS domain per line. Domains are stored for a later admission flow and are not evaluated in this Draft.</p>
+          <textarea id="oidc-allowed-domains" name="allowed_domains" class="min-h-32 w-full resize-y rounded-control border border-border-input bg-surface px-3 py-2 font-mono text-sm text-text placeholder:text-text-muted" maxlength="5200" rows="5" required aria-describedby="oidc-allowed-domains-hint">{{ .Form.DomainsText }}</textarea>
+        </div>
+        <div>{{ template "ui/button" dict "Label" "Save draft" "Variant" "primary" "Type" "submit" }}</div>
+      </form>
+    </section>
+    {{ else if .HasConnection }}
+    <section class="min-w-0 rounded-panel border border-border bg-surface p-4 shadow-card sm:p-6" aria-labelledby="saved-oidc-draft-title">
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 id="saved-oidc-draft-title" class="m-0 text-lg font-bold text-text">Company OIDC connection</h2>
+          <p class="m-0 mt-1 text-sm text-text-muted">Provider metadata has not been checked. Metadata checking is not available in this version.</p>
+        </div>
+        <span class="inline-flex rounded-pill bg-neutral-soft px-2.5 py-1 text-xs font-semibold text-text">Draft</span>
+      </div>
+      <dl class="mt-5 grid min-w-0 grid-cols-1 gap-x-6 gap-y-4 sm:grid-cols-2">
+        <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Provider label</dt><dd class="m-0 mt-1 break-words text-sm font-semibold text-text">{{ .Connection.ProviderLabel }}</dd></div>
+        <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Revision</dt><dd class="m-0 mt-1 text-sm text-text">{{ .Connection.Revision }}</dd></div>
+        <div class="min-w-0 sm:col-span-2"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Issuer</dt><dd class="m-0 mt-1 break-all font-mono text-sm text-text">{{ .Connection.Issuer }}</dd></div>
+        <div class="min-w-0 sm:col-span-2"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Client ID</dt><dd class="m-0 mt-1 break-all font-mono text-sm text-text">{{ .Connection.ClientID }}</dd></div>
+        <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Client secret</dt><dd class="m-0 mt-1 flex items-center gap-2 text-sm font-semibold text-success"><svg class="h-4 w-4 flex-none" aria-hidden="true"><use href="#tg-i-check"></use></svg>Client secret stored</dd></div>
+        <div class="min-w-0 sm:col-span-2"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Allowed domains</dt><dd class="m-0 mt-2 flex min-w-0 flex-wrap gap-2">{{ range .Connection.Domains }}<span class="max-w-full break-all rounded-pill border border-border bg-surface-muted px-2.5 py-1 font-mono text-xs text-text">{{ . }}</span>{{ end }}</dd></div>
+      </dl>
+      {{ if .EncryptionAvailable }}<div class="mt-5">{{ template "ui/button" dict "Label" "Edit draft" "Variant" "secondary" "Href" "/settings/authentication/edit" "Icon" "tg-i-key" }}</div>{{ end }}
+    </section>
+    {{ else }}
+    <section class="flex min-h-72 flex-col items-center justify-center rounded-panel border border-border bg-surface px-5 py-10 text-center shadow-card" aria-labelledby="no-oidc-connection-title">
+      <span class="flex size-14 items-center justify-center rounded-pill bg-accent-soft text-accent-strong" aria-hidden="true"><svg class="h-7 w-7"><use href="#tg-i-key"></use></svg></span>
+      <h2 id="no-oidc-connection-title" class="m-0 mt-4 text-lg font-bold text-text">No company connection configured</h2>
+      <p class="m-0 mt-2 max-w-2xl text-sm text-text-muted">Local-password sign-in remains unchanged. Saving a connection prepares an inactive Draft and does not turn on company sign-in.</p>
+      {{ if .EncryptionAvailable }}<div class="mt-5">{{ template "ui/button" dict "Label" "Configure OIDC" "Variant" "primary" "Href" "/settings/authentication/edit" "Icon" "tg-i-key" }}</div>{{ end }}
+    </section>
+    {{ end }}
+  {{ end }}
+
+  <p class="m-0 text-sm text-text-muted">Company OIDC can later establish identity. Repository access is managed separately.</p>
+</div>
+{{ end }}

@@ -17,6 +17,7 @@ import (
 
 	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/auth"
+	"github.com/taua-almeida/thawguard/internal/companyoidc"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/freeze"
 	"github.com/taua-almeida/thawguard/internal/jobs"
@@ -36,7 +37,7 @@ const scheduledFreezeReasonMaxLength = 500
 
 const (
 	passwordRecoveryMaxBodyBytes int64 = 8 << 10
-	passwordRecoveryCSP                = "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self'"
+	sensitiveFormCSP                   = "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self'"
 )
 
 const (
@@ -70,14 +71,16 @@ type Config struct {
 	AuditStore    AuditStore
 	// ThawExceptionStore feeds the dashboard's active-thaws stat; optional
 	// (the stat degrades to zero when absent).
-	ThawExceptionStore          ThawExceptionStore
-	StatusDecisionStore         StatusDecisionStore
-	StatusPublicationStore      StatusPublicationStore
-	WebhookRepositoryStore      WebhookRepositoryStore
-	WebhookDeliveryStore        WebhookDeliveryStore
-	PullRequestWebhookProcessor PullRequestWebhookProcessor
-	WebhookMaxBodyBytes         int64
-	AuthService                 AuthService
+	ThawExceptionStore                    ThawExceptionStore
+	StatusDecisionStore                   StatusDecisionStore
+	StatusPublicationStore                StatusPublicationStore
+	WebhookRepositoryStore                WebhookRepositoryStore
+	WebhookDeliveryStore                  WebhookDeliveryStore
+	PullRequestWebhookProcessor           PullRequestWebhookProcessor
+	WebhookMaxBodyBytes                   int64
+	AuthService                           AuthService
+	CompanyOIDCService                    CompanyOIDCService
+	CompanyOIDCSecretEncryptionConfigured bool
 	// PullRequestStore feeds the freeze-impact preview from the
 	// webhook-synced local cache; optional (the preview degrades to the
 	// zero state when absent).
@@ -133,6 +136,12 @@ type AuthService interface {
 	CancelInvitation(ctx context.Context, params auth.CancelInvitationParams) error
 	ReplaceInvitationLink(ctx context.Context, params auth.ReplaceInvitationLinkParams) (auth.InvitationLinkReplacement, error)
 	AcceptInvitation(ctx context.Context, token, password string) (auth.User, error)
+}
+
+type CompanyOIDCService interface {
+	Current(ctx context.Context) (companyoidc.Connection, bool, error)
+	Create(ctx context.Context, actorUserID int64, input companyoidc.CreateInput) error
+	Edit(ctx context.Context, actorUserID int64, input companyoidc.EditInput) error
 }
 
 type RepositoryStore interface {
@@ -350,17 +359,19 @@ func NewServer(cfg Config) *Server {
 
 func (s *Server) Routes() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if isPasswordRecoveryPath(r.URL.Path) || isInvitationSensitivePath(r.URL.Path) {
+		if isAuthenticationSettingsPath(r.URL.Path) ||
+			isPasswordRecoveryPath(r.URL.Path) ||
+			isInvitationSensitivePath(r.URL.Path) {
 			w.Header().Set("Cache-Control", "no-store")
 			// no-referrer makes browsers serialize Origin as "null" for form
-			// posts initiated by these sensitive documents, so exact-Origin
-			// validation rejects acceptance, recovery, and validation retries.
+			// posts initiated by sensitive documents, so exact-Origin validation
+			// rejects same-origin saves, acceptance, recovery, and validation retries.
 			// same-origin still sends no referrer off this origin, and referrers
 			// never carry the URL fragment that holds the bearer.
 			w.Header().Set("Referrer-Policy", "same-origin")
 			w.Header().Set("X-Frame-Options", "DENY")
 			w.Header().Set("X-Content-Type-Options", "nosniff")
-			w.Header().Set("Content-Security-Policy", passwordRecoveryCSP)
+			w.Header().Set("Content-Security-Policy", sensitiveFormCSP)
 		}
 		// Keep the literal invitation-creation endpoint out of the /users/{id}
 		// GET wildcard and give every unsupported method one truthful contract.
@@ -371,6 +382,10 @@ func (s *Server) Routes() http.Handler {
 		}
 		s.mux.ServeHTTP(w, r)
 	})
+}
+
+func isAuthenticationSettingsPath(path string) bool {
+	return path == "/settings/authentication" || strings.HasPrefix(path, "/settings/authentication/")
 }
 
 func isPasswordRecoveryPath(path string) bool {
@@ -460,6 +475,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /webhooks", s.handleWebhooks)
 	s.mux.HandleFunc("POST /webhooks/forgejo", s.handleForgejoWebhook)
 	s.mux.HandleFunc("GET /users", s.handleUsers)
+	s.mux.HandleFunc("GET /settings/authentication", s.handleAuthenticationSettings)
+	s.mux.HandleFunc("GET /settings/authentication/edit", s.handleAuthenticationSettingsEdit)
+	s.mux.HandleFunc("POST /settings/authentication/oidc", s.handleCompanyOIDCDraftSave)
 	s.mux.HandleFunc("POST /users", s.handleCreateUser)
 	s.mux.HandleFunc("POST /users/invitations", s.handleCreateInvitation)
 	s.mux.HandleFunc("POST /users/invitations/{id}/cancel", s.handleCancelInvitation)
@@ -2082,6 +2100,18 @@ func (s *Server) requireView(w http.ResponseWriter, r *http.Request) (sessionSta
 	return s.requireViewWithGate(w, r, false)
 }
 
+func (s *Server) requireAdminView(w http.ResponseWriter, r *http.Request) (sessionState, bool) {
+	session, ok := s.requireView(w, r)
+	if !ok {
+		return sessionState{}, false
+	}
+	if !session.Grants.CanManageInstallation() {
+		s.renderErrorPage(w, http.StatusForbidden, false)
+		return sessionState{}, false
+	}
+	return session, true
+}
+
 func (s *Server) requireViewWithGate(w http.ResponseWriter, r *http.Request, allowForced bool) (sessionState, bool) {
 	session, ok, err := s.currentSession(r)
 	if err != nil {
@@ -2237,6 +2267,7 @@ var activityActionDefinitions = map[string]activityActionDefinition{
 	audit.ActionInvitationCancelled:                {Label: "Invitation", Outcome: "Cancelled", OutcomeClass: "warning"},
 	audit.ActionInvitationAuthorizationRevoked:     {Label: "Invitation credential", Outcome: "Revoked", OutcomeClass: "warning"},
 	audit.ActionInvitationAccepted:                 {Label: "Invitation", Outcome: "Accepted", OutcomeClass: "ok"},
+	audit.ActionOIDCConnectionDraftSaved:           {Label: "Company sign-in Draft saved", Outcome: "Saved", OutcomeClass: "ok"},
 }
 
 func activityEventViews(repositories []domain.Repository, users []auth.User, events []audit.Event) []activityEventView {
@@ -2408,6 +2439,13 @@ func activityEventViewForEvent(repositories map[int64]domain.Repository, users m
 		acceptedUserID, _ := activityCanonicalPositiveInt64StringDetail(details, "accepted_user_id")
 		view.Target = activityUserTarget(users, strconv.FormatInt(acceptedUserID, 10))
 		view.Detail = "Invitation accepted and the local account was created."
+	case audit.ActionOIDCConnectionDraftSaved:
+		detail, ok := activityOIDCDraftSavedDetail(event, details)
+		if !ok {
+			return fallbackActivityEventView(users, event, details, true, forceUnknownInvitationActor)
+		}
+		view.Target = "Company OIDC connection"
+		view.Detail = detail
 	case audit.ActionRepositoryGrantAdded:
 		view.Target = activityRepositoryTarget(repositories, event, details, "")
 		if provenance, ok := activityExactStringDetail(details, "provenance"); ok && provenance == "invitation_acceptance" {
@@ -2905,6 +2943,35 @@ func activityCredentialDetail(details activityDetails, key, credential string) s
 		return credential + " set; the value remains hidden."
 	}
 	return credential + " configuration recorded; the value remains hidden."
+}
+
+func activityOIDCDraftSavedDetail(event audit.Event, details activityDetails) (string, bool) {
+	if event.SubjectType != audit.SubjectTypeOIDCConnection || event.SubjectID != "1" || len(details) != 3 {
+		return "", false
+	}
+	var revision int64
+	if raw, ok := details["revision"]; !ok || json.Unmarshal(raw, &revision) != nil || revision <= 0 {
+		return "", false
+	}
+	var secretReplaced bool
+	if raw, ok := details["secret_replaced"]; !ok || json.Unmarshal(raw, &secretReplaced) != nil {
+		return "", false
+	}
+	var domainCount int
+	if raw, ok := details["domain_count"]; !ok || json.Unmarshal(raw, &domainCount) != nil || domainCount < 1 || domainCount > 20 {
+		return "", false
+	}
+	secretDetail := "existing client secret retained"
+	if revision == 1 {
+		secretDetail = "client secret stored"
+	} else if secretReplaced {
+		secretDetail = "client secret replaced"
+	}
+	domainLabel := "allowed domains"
+	if domainCount == 1 {
+		domainLabel = "allowed domain"
+	}
+	return fmt.Sprintf("Revision %d saved; %s; %d %s.", revision, secretDetail, domainCount, domainLabel), true
 }
 
 func activitySetupCheckDetail(details activityDetails) string {

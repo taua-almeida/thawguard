@@ -47,6 +47,11 @@ type sessionState struct {
 	ExpiresAt          time.Time
 }
 
+func (s *Server) validExactPublicOrigin(r *http.Request) bool {
+	origins := r.Header.Values("Origin")
+	return len(origins) == 1 && origins[0] == s.cfg.PublicURL
+}
+
 func (s sessionState) auditActor() domain.Actor {
 	role := "no_repository_access"
 	if s.Grants.CanManageInstallation() {

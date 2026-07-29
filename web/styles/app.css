@@ -12,6 +12,7 @@
 @source "../../internal/web/templates/layouts/auth.html";
 @source "../../internal/web/templates/layouts/dev-preview.html";
 @source "../../internal/web/templates/layouts/dev-preview-auth.html";
+@source "../../internal/web/templates/layouts/authentication.html";
 @source "../../internal/web/templates/components/primitives";
 @source "../../internal/web/templates/pages/dev-preview.html";
 @source "../../internal/web/templates/pages/dev-preview-auth.html";
@@ -63,6 +64,7 @@
 @source "../../internal/web/templates/pages/setup.html";
 @source "../../internal/web/templates/pages/account-password.html";
 @source "../../internal/web/templates/pages/error.html";
+@source "../../internal/web/templates/pages/authentication.html";
 
 /*
  * Semantic tokens - LIGHT values (the default theme).
