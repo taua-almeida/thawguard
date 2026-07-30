@@ -2,11 +2,7 @@ package companyoidc
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"io"
-	"math"
-	"math/big"
 	"mime"
 	"net/http"
 	"net/url"
@@ -89,10 +85,11 @@ func (c *Checker) Check(ctx context.Context, issuer string) SetupCheckReport {
 		return SetupCheckReport{ResultCode: SetupCheckJWKSInvalid}
 	}
 
-	candidates, ok := supportedRSACandidateCount(jwksBody)
-	if !ok {
+	jwks, err := parseJWKS(jwksBody)
+	if err != nil {
 		return SetupCheckReport{ResultCode: SetupCheckJWKSInvalid}
 	}
+	candidates := int64(len(jwks.keys))
 	if candidates == 0 {
 		return SetupCheckReport{
 			ResultCode:              SetupCheckJWKSNoCandidate,
@@ -148,44 +145,12 @@ func discoveryURL(issuer string) string {
 	return strings.TrimSuffix(issuer, "/") + "/.well-known/openid-configuration"
 }
 
-func decodeJSONObject(body []byte) (map[string]json.RawMessage, bool) {
-	var object map[string]json.RawMessage
-	if err := json.Unmarshal(body, &object); err != nil || object == nil {
-		return nil, false
-	}
-	return object, true
-}
-
-func requiredJSONString(object map[string]json.RawMessage, key string) (string, bool) {
-	raw, ok := object[key]
-	if !ok {
-		return "", false
-	}
-	var value string
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return "", false
-	}
-	return value, true
-}
-
-func requiredStringSlice(object map[string]json.RawMessage, key string) ([]string, bool) {
-	raw, ok := object[key]
-	if !ok {
-		return nil, false
-	}
-	var values []string
-	if err := json.Unmarshal(raw, &values); err != nil || values == nil {
-		return nil, false
-	}
-	return values, true
-}
-
 func validExactIssuer(value string) bool {
 	normalized, err := normalizeIssuer(value)
 	return err == nil && normalized == value
 }
 
-func compatibleDiscoveryMetadata(discovery map[string]json.RawMessage) (string, bool) {
+func compatibleDiscoveryMetadata(discovery map[string]jsonRawMessage) (string, bool) {
 	authorizationEndpoint, authorizationOK := requiredJSONString(discovery, "authorization_endpoint")
 	tokenEndpoint, tokenOK := requiredJSONString(discovery, "token_endpoint")
 	jwksURI, jwksOK := requiredJSONString(discovery, "jwks_uri")
@@ -226,93 +191,4 @@ func validHTTPSProviderURL(value string) bool {
 		return false
 	}
 	return true
-}
-
-func supportedRSACandidateCount(body []byte) (int64, bool) {
-	jwks, ok := decodeJSONObject(body)
-	if !ok {
-		return 0, false
-	}
-	rawKeys, ok := jwks["keys"]
-	if !ok {
-		return 0, false
-	}
-	var keys []json.RawMessage
-	if err := json.Unmarshal(rawKeys, &keys); err != nil || len(keys) == 0 {
-		return 0, false
-	}
-
-	var candidates int64
-	for _, rawKey := range keys {
-		var key map[string]json.RawMessage
-		if err := json.Unmarshal(rawKey, &key); err != nil || key == nil {
-			return 0, false
-		}
-		if supportedRSACandidate(key) {
-			candidates++
-		}
-	}
-	return candidates, true
-}
-
-func supportedRSACandidate(key map[string]json.RawMessage) bool {
-	kty, ok := requiredJSONString(key, "kty")
-	if !ok || kty != "RSA" {
-		return false
-	}
-	modulusText, ok := requiredJSONString(key, "n")
-	if !ok {
-		return false
-	}
-	exponentText, ok := requiredJSONString(key, "e")
-	if !ok {
-		return false
-	}
-	modulus, ok := canonicalBase64URLUInt(modulusText)
-	if !ok || new(big.Int).SetBytes(modulus).BitLen() < 2048 || modulus[len(modulus)-1]&1 == 0 {
-		return false
-	}
-	exponentBytes, ok := canonicalBase64URLUInt(exponentText)
-	if !ok || len(exponentBytes) > 4 {
-		return false
-	}
-	exponent := new(big.Int).SetBytes(exponentBytes).Uint64()
-	if exponent < 3 || exponent > math.MaxInt32 || exponent&1 == 0 {
-		return false
-	}
-
-	if value, present := key["alg"]; present && !exactJSONString(value, "RS256") {
-		return false
-	}
-	if value, present := key["use"]; present && !exactJSONString(value, "sig") {
-		return false
-	}
-	if value, present := key["key_ops"]; present {
-		var operations []string
-		if err := json.Unmarshal(value, &operations); err != nil || len(operations) != 1 || operations[0] != "verify" {
-			return false
-		}
-	}
-	for _, privateField := range []string{"d", "p", "q", "dp", "dq", "qi", "oth"} {
-		if _, present := key[privateField]; present {
-			return false
-		}
-	}
-	return true
-}
-
-func canonicalBase64URLUInt(value string) ([]byte, bool) {
-	decoded, err := base64.RawURLEncoding.DecodeString(value)
-	if err != nil || len(decoded) == 0 || decoded[0] == 0 {
-		return nil, false
-	}
-	if base64.RawURLEncoding.EncodeToString(decoded) != value {
-		return nil, false
-	}
-	return decoded, true
-}
-
-func exactJSONString(raw json.RawMessage, wanted string) bool {
-	var value string
-	return json.Unmarshal(raw, &value) == nil && value == wanted
 }

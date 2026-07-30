@@ -2531,6 +2531,105 @@ VALUES (39, 1, 'oidc_connection.metadata_checked', 'oidc_connection', '1',
 	assertForeignKeyCheckClean(t, database)
 }
 
+func TestCompanyOIDCSetupCheckPolicyRefreshInvalidatesExact0039EvidenceAndAppliesOnce(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-company-oidc-policy-refresh.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshIndex := migrationIndex(t, migrations, "0040_company_oidc_setup_check_policy_refresh.sql")
+	if err := ApplyMigrations(ctx, database, migrations[:refreshIndex]); err != nil {
+		t.Fatal(err)
+	}
+
+	const timestamp = "2026-07-29T10:00:00.000000000Z"
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO users(id, email, display_name, created_at, updated_at)
+VALUES (1, 'admin@example.test', 'Admin', ?, ?);
+INSERT INTO user_roles(user_id, role, created_at)
+VALUES (1, 'admin', ?);
+INSERT INTO sessions(id, user_id, csrf_token, expires_at, created_at)
+VALUES ('preserved-session', 1, 'preserved-csrf', '2026-07-30T10:00:00Z', ?);
+INSERT INTO company_oidc_connections(
+  id, provider_label, issuer, client_id, client_secret_ciphertext, revision, created_at, updated_at
+)
+VALUES (1, 'Preserved IdP', 'https://id.example.test', 'preserved-client', x'0102', 4, ?, ?);
+INSERT INTO company_oidc_allowed_domains(connection_id, domain)
+VALUES (1, 'example.test');
+INSERT INTO company_oidc_setup_checks(
+  connection_id, config_revision, result_code, observed_issuer,
+  public_key_candidate_count, checked_at
+)
+VALUES (1, 4, 'verified', NULL, 2, ?);
+INSERT INTO company_oidc_test_transactions(
+  state_digest, connection_id, config_revision, actor_user_id,
+  session_binding_digest, nonce_digest, pkce_verifier_ciphertext,
+  created_at, expires_at
+)
+VALUES (x'1111111111111111111111111111111111111111111111111111111111111111', 1, 4, 1,
+  x'2222222222222222222222222222222222222222222222222222222222222222',
+  x'3333333333333333333333333333333333333333333333333333333333333333',
+  x'0102', ?, '2026-07-29T10:10:00.000000000Z');
+INSERT INTO audit_events(id, actor_user_id, action, subject_type, subject_id, details_json, created_at)
+VALUES (40, 1, 'oidc_connection.metadata_checked', 'oidc_connection', '1',
+  '{"revision":4,"result_code":"verified"}', ?);`,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ApplyMigrations(ctx, database, migrations[:refreshIndex+1]); err != nil {
+		t.Fatal(err)
+	}
+	for _, check := range []struct {
+		name  string
+		query string
+		want  int
+	}{
+		{name: "user", query: `SELECT count(*) FROM users WHERE id = 1 AND email = 'admin@example.test'`, want: 1},
+		{name: "role", query: `SELECT count(*) FROM user_roles WHERE user_id = 1 AND role = 'admin'`, want: 1},
+		{name: "session", query: `SELECT count(*) FROM sessions WHERE id = 'preserved-session'`, want: 1},
+		{name: "Draft and encrypted secret", query: `SELECT count(*) FROM company_oidc_connections WHERE id = 1 AND revision = 4 AND client_secret_ciphertext = x'0102'`, want: 1},
+		{name: "domain", query: `SELECT count(*) FROM company_oidc_allowed_domains WHERE domain = 'example.test'`, want: 1},
+		{name: "audit history", query: `SELECT count(*) FROM audit_events WHERE id = 40 AND actor_user_id = 1`, want: 1},
+		{name: "setup evidence", query: `SELECT count(*) FROM company_oidc_setup_checks`, want: 0},
+		{name: "test transactions", query: `SELECT count(*) FROM company_oidc_test_transactions`, want: 0},
+	} {
+		var got int
+		if err := database.QueryRowContext(ctx, check.query).Scan(&got); err != nil {
+			t.Fatalf("count %s: %v", check.name, err)
+		}
+		if got != check.want {
+			t.Fatalf("expected %d %s rows, got %d", check.want, check.name, got)
+		}
+	}
+
+	if err := ApplyMigrations(ctx, database, migrations[:refreshIndex+1]); err != nil {
+		t.Fatal(err)
+	}
+	var applied int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = '0040_company_oidc_setup_check_policy_refresh'`).Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected policy-refresh migration applied once, got %d", applied)
+	}
+	assertForeignKeyCheckClean(t, database)
+}
+
 func TestCompanyOIDCTestTransactionSchemaConstrainsProtectedOneTimeState(t *testing.T) {
 	ctx := context.Background()
 	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-company-oidc-test-transaction-constraints.db")))

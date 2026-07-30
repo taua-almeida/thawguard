@@ -1,6 +1,7 @@
 package companyoidc
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -38,7 +39,10 @@ func TestCheckerVerifiesSameHostAndCrossHostJWKS(t *testing.T) {
 		provider := newTLSOIDCProvider(t, "/tenant")
 		provider.discoveryContentType = "application/json; charset=utf-8"
 		provider.jwksContentType = "application/jwk-set+json; charset=utf-8"
-		provider.jwksBody = mustJSON(t, map[string]any{"keys": []any{validRSAJWK(), validRSAJWK()}})
+		provider.jwksBody = mustJSON(t, map[string]any{"keys": []any{
+			validRSAJWK("provider-signing-2026-01"),
+			validRSAJWK("provider-signing-2026-02"),
+		}})
 
 		report := NewChecker(trustedTransport(t, provider.server)).Check(context.Background(), provider.issuer)
 		assertCheckReport(t, report, SetupCheckVerified, "", 2)
@@ -153,6 +157,71 @@ func TestCheckerRejectsInvalidUTF8BeforeJSONDecoding(t *testing.T) {
 	})
 }
 
+func TestCheckerRejectsDuplicateJSONMembers(t *testing.T) {
+	t.Run("discovery", func(t *testing.T) {
+		provider := newTLSOIDCProvider(t, "")
+		provider.discoveryBody = []byte(fmt.Sprintf(`{
+  "issuer":%q,
+  "issuer":%q,
+  "authorization_endpoint":%q,
+  "token_endpoint":%q,
+  "jwks_uri":%q,
+  "response_types_supported":["code"],
+  "subject_types_supported":["public"],
+  "id_token_signing_alg_values_supported":["RS256"]
+}`,
+			provider.issuer,
+			provider.issuer,
+			provider.issuer+"/authorize",
+			provider.issuer+"/token",
+			provider.server.URL+"/jwks",
+		))
+
+		report := NewChecker(trustedTransport(t, provider.server)).Check(context.Background(), provider.issuer)
+		assertCheckReport(t, report, SetupCheckDiscoveryInvalid, "", -1)
+		if provider.jwksRequests.Load() != 0 {
+			t.Fatal("duplicate discovery member triggered a JWKS request")
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		body []byte
+	}{
+		{name: "JWKS object", body: []byte(`{"keys":[{"kty":"EC"}],"keys":[{"kty":"EC"}]}`)},
+		{name: "nested JWK", body: []byte(`{"keys":[{"kty":"RSA","kty":"EC"}]}`)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			provider := newTLSOIDCProvider(t, "")
+			provider.jwksBody = tc.body
+			report := NewChecker(trustedTransport(t, provider.server)).Check(context.Background(), provider.issuer)
+			assertCheckReport(t, report, SetupCheckJWKSInvalid, "", -1)
+		})
+	}
+}
+
+func TestCheckerPreservesValidLargeNumbersInUnsupportedExtensions(t *testing.T) {
+	provider := newTLSOIDCProvider(t, "")
+	discovery := mustJSON(t, validDiscoveryDocument(provider.issuer, provider.server.URL+"/jwks"))
+	provider.discoveryBody = appendRawJSONObjectMember(t, discovery, `"extension":1e400`)
+	jwks := mustJSON(t, map[string]any{"keys": []any{validRSAJWK()}})
+	jwks = appendRawJSONObjectMember(t, jwks, `"extension":1e400`)
+	provider.jwksBody = bytes.Replace(jwks, []byte(`"kid":"provider-signing-2026-primary"`), []byte(`"kid":"provider-signing-2026-primary","extension":1e400`), 1)
+
+	report := NewChecker(trustedTransport(t, provider.server)).Check(context.Background(), provider.issuer)
+	assertCheckReport(t, report, SetupCheckVerified, "", 1)
+}
+
+func TestCheckerAcceptsIgnoredDiscoveryArrayExtension(t *testing.T) {
+	provider := newTLSOIDCProvider(t, "")
+	discovery := validDiscoveryDocument(provider.issuer, provider.server.URL+"/jwks")
+	discovery["extension"] = make([]int, maxJWKSKeys+1)
+	provider.discoveryBody = mustJSON(t, discovery)
+
+	report := NewChecker(trustedTransport(t, provider.server)).Check(context.Background(), provider.issuer)
+	assertCheckReport(t, report, SetupCheckVerified, "", 1)
+}
+
 func TestCheckerIssuerValidationKeepsTerminalSlashIdentityExact(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -246,6 +315,22 @@ func TestCheckerJWKSFailureCodesAndShapes(t *testing.T) {
 		{name: "empty keys", configure: func(provider *testOIDCProvider) { provider.jwksBody = []byte(`{"keys":[]}`) }, want: SetupCheckJWKSInvalid, count: -1},
 		{name: "malformed key", configure: func(provider *testOIDCProvider) { provider.jwksBody = []byte(`{"keys":[7]}`) }, want: SetupCheckJWKSInvalid, count: -1},
 		{name: "unsupported set", configure: func(provider *testOIDCProvider) { provider.jwksBody = []byte(`{"keys":[{"kty":"EC","crv":"P-256"}]}`) }, want: SetupCheckJWKSNoCandidate, count: 0},
+		{name: "all kidless", configure: func(provider *testOIDCProvider) {
+			key := validRSAJWK("removed")
+			delete(key, "kid")
+			provider.jwksBody = mustJSON(t, map[string]any{"keys": []any{key}})
+		}, want: SetupCheckJWKSNoCandidate, count: 0},
+		{name: "duplicate eligible kid", configure: func(provider *testOIDCProvider) {
+			provider.jwksBody = mustJSON(t, map[string]any{"keys": []any{
+				validRSAJWK("same-provider-key"), validRSAJWK("same-provider-key"),
+			}})
+		}, want: SetupCheckJWKSInvalid, count: -1},
+		{name: "mixed supported and unsupported", configure: func(provider *testOIDCProvider) {
+			provider.jwksBody = mustJSON(t, map[string]any{"keys": []any{
+				map[string]any{"kty": "EC", "kid": "unsupported-ec"},
+				validRSAJWK("eligible-rsa"),
+			}})
+		}, want: SetupCheckVerified, count: 1},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -314,7 +399,8 @@ func TestSupportedRSACandidatePredicateAndNumericBoundaries(t *testing.T) {
 			if !ok {
 				t.Fatal("test key did not decode")
 			}
-			if got := supportedRSACandidate(object); got != tc.want {
+			_, _, got := eligibleRSAKey(object)
+			if got != tc.want {
 				t.Fatalf("supportedRSACandidate = %v, want %v; key=%s", got, tc.want, raw)
 			}
 		})
@@ -537,9 +623,14 @@ func validDiscoveryDocument(issuer, jwksURI string) map[string]any {
 	}
 }
 
-func validRSAJWK() map[string]any {
+func validRSAJWK(keyIDs ...string) map[string]any {
+	kid := "provider-signing-2026-primary"
+	if len(keyIDs) > 0 {
+		kid = keyIDs[0]
+	}
 	return map[string]any{
 		"kty": "RSA",
+		"kid": kid,
 		"n":   base64.RawURLEncoding.EncodeToString(testModulus(0x80, 0x01)),
 		"e":   encodeUInt(65537),
 	}
@@ -573,6 +664,18 @@ func withIgnoredInvalidUTF8String(t *testing.T, document []byte) []byte {
 	result := slices.Clone(document[:len(document)-1])
 	result = append(result, []byte(`,"ignored":"`)...)
 	result = append(result, 0xff, '"', '}')
+	return result
+}
+
+func appendRawJSONObjectMember(t *testing.T, document []byte, member string) []byte {
+	t.Helper()
+	if len(document) == 0 || document[len(document)-1] != '}' {
+		t.Fatalf("test JSON document is not an object: %q", document)
+	}
+	result := slices.Clone(document[:len(document)-1])
+	result = append(result, ',')
+	result = append(result, member...)
+	result = append(result, '}')
 	return result
 }
 

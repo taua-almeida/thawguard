@@ -3,6 +3,7 @@ module github.com/taua-almeida/thawguard
 go 1.26.3
 
 require (
+	github.com/go-jose/go-jose/v4 v4.1.4
 	golang.org/x/crypto v0.45.0
 	modernc.org/sqlite v1.53.0
 )
