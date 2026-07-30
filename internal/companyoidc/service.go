@@ -73,11 +73,29 @@ var (
 )
 
 type Service struct {
-	db      *sql.DB
-	secrets secrets.Store
-	check   func(context.Context, string) SetupCheckReport
-	random  io.Reader
-	now     func() time.Time
+	db        *sql.DB
+	secrets   secrets.Store
+	check     func(context.Context, string) SetupCheckReport
+	checker   *Checker
+	publicURL string
+	random    io.Reader
+	now       func() time.Time
+}
+
+func NewServiceWithChecker(
+	db *sql.DB,
+	secretStore secrets.Store,
+	checker *Checker,
+	publicURL string,
+) *Service {
+	var check func(context.Context, string) SetupCheckReport
+	if checker != nil {
+		check = checker.Check
+	}
+	service := NewService(db, secretStore, check)
+	service.checker = checker
+	service.publicURL = publicURL
+	return service
 }
 
 func NewService(

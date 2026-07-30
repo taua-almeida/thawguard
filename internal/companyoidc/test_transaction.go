@@ -6,11 +6,13 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"time"
 
+	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/secrets"
 )
 
@@ -39,15 +41,17 @@ type TestSignInInitiationInput struct {
 	ActorUserID      int64
 	SessionID        string
 	ExpectedRevision int64
+	TokenEndpoint    string
+	JWKSURI          string
+	RedirectURI      string
 }
 
 type TestSignInInitiation struct {
-	State          string
-	Nonce          string
-	PKCEChallenge  string
-	Issuer         string
-	ClientID       string
-	ConfigRevision int64
+	State         string
+	Nonce         string
+	PKCEChallenge string
+	Issuer        string
+	ClientID      string
 }
 
 type testSignInClaimInput struct {
@@ -56,12 +60,18 @@ type testSignInClaimInput struct {
 }
 
 type testSignInClaim struct {
-	Issuer         string
-	ClientID       string
-	PKCEVerifier   string
-	NonceDigest    [sha256.Size]byte
-	ConfigRevision int64
-	CreatedAt      time.Time
+	actorUserID            int64
+	sessionID              string
+	issuer                 string
+	clientID               string
+	clientSecretCiphertext []byte
+	pkceCiphertext         []byte
+	tokenEndpoint          string
+	jwksURI                string
+	redirectURI            string
+	nonceDigest            [sha256.Size]byte
+	configRevision         int64
+	createdAt              time.Time
 }
 
 type testSignInMaterial struct {
@@ -72,10 +82,11 @@ type testSignInMaterial struct {
 }
 
 type testSignInSnapshot struct {
-	issuer   string
-	clientID string
-	revision int64
-	ready    bool
+	issuer                 string
+	clientID               string
+	clientSecretCiphertext []byte
+	revision               int64
+	ready                  bool
 }
 
 type testTransactionRecord struct {
@@ -84,11 +95,14 @@ type testTransactionRecord struct {
 	sessionBindingDigest [sha256.Size]byte
 	nonceDigest          [sha256.Size]byte
 	pkceCiphertext       []byte
+	tokenEndpoint        string
+	jwksURI              string
+	redirectURI          string
 	createdAt            time.Time
 	expiresAt            time.Time
 }
 
-func (s *Service) PrepareTestSignIn(
+func (s *Service) prepareTestSignIn(
 	ctx context.Context,
 	input TestSignInInitiationInput,
 ) (TestSignInInitiation, error) {
@@ -100,6 +114,10 @@ func (s *Service) PrepareTestSignIn(
 	}
 	if input.ActorUserID <= 0 || input.ExpectedRevision <= 0 || !validTestSessionID(input.SessionID) {
 		return TestSignInInitiation{}, ErrTestSignInAuthorization
+	}
+	if !validHTTPSProviderURL(input.TokenEndpoint) || !validHTTPSProviderURL(input.JWKSURI) ||
+		!s.validTestSignInRedirectURI(input.RedirectURI) {
+		return TestSignInInitiation{}, ErrTestSignInUnavailable
 	}
 
 	material, err := newTestSignInMaterial(s.random)
@@ -160,15 +178,18 @@ func (s *Service) PrepareTestSignIn(
 INSERT INTO company_oidc_test_transactions(
   state_digest, connection_id, config_revision, actor_user_id,
   session_binding_digest, nonce_digest, pkce_verifier_ciphertext,
-  created_at, expires_at
+  token_endpoint, jwks_uri, redirect_uri, created_at, expires_at
 )
-VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)`,
+VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		stateDigest[:],
 		snapshot.revision,
 		input.ActorUserID,
 		sessionDigest[:],
 		nonceDigest[:],
 		verifierCiphertext,
+		input.TokenEndpoint,
+		input.JWKSURI,
+		input.RedirectURI,
 		formatCompanyOIDCTime(now),
 		formatCompanyOIDCTime(now.Add(testSignInTransactionTTL)),
 	); err != nil {
@@ -179,12 +200,11 @@ VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)`,
 	}
 
 	return TestSignInInitiation{
-		State:          material.state,
-		Nonce:          material.nonce,
-		PKCEChallenge:  material.pkceChallenge,
-		Issuer:         snapshot.issuer,
-		ClientID:       snapshot.clientID,
-		ConfigRevision: snapshot.revision,
+		State:         material.state,
+		Nonce:         material.nonce,
+		PKCEChallenge: material.pkceChallenge,
+		Issuer:        snapshot.issuer,
+		ClientID:      snapshot.clientID,
 	}, nil
 }
 
@@ -268,29 +288,25 @@ func (s *Service) claimTestSignIn(
 	if err := deleteTestTransaction(ctx, tx, stateDigest); err != nil {
 		return testSignInClaim{}, ErrTestTransactionUnavailable
 	}
+	if err := recordTestSignInClaimed(ctx, tx, record.actorUserID, record.configRevision); err != nil {
+		return testSignInClaim{}, ErrTestTransactionUnavailable
+	}
 	if err := tx.Commit(); err != nil {
 		return testSignInClaim{}, ErrTestTransactionOutcomeUnknown
 	}
-	if s.secrets == nil {
-		return testSignInClaim{}, ErrTestTransactionUnavailable
-	}
-
-	plaintext, err := s.secrets.Decrypt(ctx, record.pkceCiphertext)
-	if err != nil {
-		return testSignInClaim{}, ErrTestTransactionUnavailable
-	}
-	defer clear(plaintext)
-	verifier := string(plaintext)
-	if !canonicalTestToken(verifier) {
-		return testSignInClaim{}, ErrTestTransactionUnavailable
-	}
 	return testSignInClaim{
-		Issuer:         snapshot.issuer,
-		ClientID:       snapshot.clientID,
-		PKCEVerifier:   verifier,
-		NonceDigest:    record.nonceDigest,
-		ConfigRevision: snapshot.revision,
-		CreatedAt:      record.createdAt,
+		actorUserID:            record.actorUserID,
+		sessionID:              input.SessionID,
+		issuer:                 snapshot.issuer,
+		clientID:               snapshot.clientID,
+		clientSecretCiphertext: snapshot.clientSecretCiphertext,
+		pkceCiphertext:         record.pkceCiphertext,
+		tokenEndpoint:          record.tokenEndpoint,
+		jwksURI:                record.jwksURI,
+		redirectURI:            record.redirectURI,
+		nonceDigest:            record.nonceDigest,
+		configRevision:         snapshot.revision,
+		createdAt:              record.createdAt,
 	}, nil
 }
 
@@ -411,7 +427,7 @@ func loadTestSignInSnapshot(
 	var observedIssuer, checkedAt sql.NullString
 	var candidateCount sql.NullInt64
 	err := tx.QueryRowContext(ctx, `
-SELECT c.issuer, c.client_id, c.revision,
+SELECT c.issuer, c.client_id, c.client_secret_ciphertext, c.revision,
   sc.config_revision, sc.result_code, sc.observed_issuer,
   sc.public_key_candidate_count, sc.checked_at
 FROM company_oidc_connections c
@@ -419,6 +435,7 @@ LEFT JOIN company_oidc_setup_checks sc ON sc.connection_id = c.id
 WHERE c.id = 1`).Scan(
 		&snapshot.issuer,
 		&snapshot.clientID,
+		&snapshot.clientSecretCiphertext,
 		&snapshot.revision,
 		&checkRevision,
 		&resultCode,
@@ -434,7 +451,8 @@ WHERE c.id = 1`).Scan(
 	}
 	issuer, issuerErr := normalizeIssuer(snapshot.issuer)
 	clientID, clientIDErr := normalizeClientID(snapshot.clientID)
-	if issuerErr != nil || issuer != snapshot.issuer || clientIDErr != nil || clientID != snapshot.clientID || snapshot.revision <= 0 {
+	if issuerErr != nil || issuer != snapshot.issuer || clientIDErr != nil || clientID != snapshot.clientID ||
+		len(snapshot.clientSecretCiphertext) == 0 || len(snapshot.clientSecretCiphertext) > 8192 || snapshot.revision <= 0 {
 		return testSignInSnapshot{}, true, errMalformedTestSignInSnapshot
 	}
 	if !checkRevision.Valid && !resultCode.Valid && !observedIssuer.Valid && !candidateCount.Valid && !checkedAt.Valid {
@@ -475,7 +493,7 @@ func loadTestTransaction(
 	var createdAt, expiresAt string
 	err := tx.QueryRowContext(ctx, `
 SELECT config_revision, actor_user_id, session_binding_digest, nonce_digest,
-  pkce_verifier_ciphertext, created_at, expires_at
+  pkce_verifier_ciphertext, token_endpoint, jwks_uri, redirect_uri, created_at, expires_at
 FROM company_oidc_test_transactions
 WHERE state_digest = ?`, stateDigest[:]).Scan(
 		&record.configRevision,
@@ -483,6 +501,9 @@ WHERE state_digest = ?`, stateDigest[:]).Scan(
 		&sessionDigest,
 		&nonceDigest,
 		&record.pkceCiphertext,
+		&record.tokenEndpoint,
+		&record.jwksURI,
+		&record.redirectURI,
 		&createdAt,
 		&expiresAt,
 	)
@@ -494,7 +515,9 @@ WHERE state_digest = ?`, stateDigest[:]).Scan(
 	}
 	if record.configRevision <= 0 || record.actorUserID <= 0 ||
 		len(sessionDigest) != sha256.Size || len(nonceDigest) != sha256.Size ||
-		len(record.pkceCiphertext) < 1 || len(record.pkceCiphertext) > testSignInMaxCiphertext {
+		len(record.pkceCiphertext) < 1 || len(record.pkceCiphertext) > testSignInMaxCiphertext ||
+		!validHTTPSProviderURL(record.tokenEndpoint) || !validHTTPSProviderURL(record.jwksURI) ||
+		!validTestSignInRedirectURI(record.redirectURI) {
 		return testTransactionRecord{}, true, errors.New("company OIDC Test sign-in transaction is malformed")
 	}
 	copy(record.sessionBindingDigest[:], sessionDigest)
@@ -508,6 +531,37 @@ WHERE state_digest = ?`, stateDigest[:]).Scan(
 		return testTransactionRecord{}, true, errors.New("company OIDC Test sign-in transaction is malformed")
 	}
 	return record, true, nil
+}
+
+func recordTestSignInClaimed(
+	ctx context.Context,
+	tx *sql.Tx,
+	actorUserID int64,
+	revision int64,
+) error {
+	details, err := json.Marshal(struct {
+		Revision  int64  `json:"revision"`
+		Binding   string `json:"binding"`
+		Authority string `json:"authority"`
+	}{
+		Revision:  revision,
+		Binding:   "exact_session",
+		Authority: "current_administrator",
+	})
+	if err != nil {
+		return errors.New("encode company OIDC Test sign-in claimed audit evidence")
+	}
+	actor := actorUserID
+	if err := audit.NewStoreTx(tx).Record(ctx, audit.Event{
+		ActorUserID: &actor,
+		Action:      audit.ActionOIDCConnectionTestSignInClaimed,
+		SubjectType: audit.SubjectTypeOIDCConnection,
+		SubjectID:   fmt.Sprintf("%d", singletonConnectionID),
+		DetailsJSON: string(details),
+	}); err != nil {
+		return errors.New("record company OIDC Test sign-in claimed audit event")
+	}
+	return nil
 }
 
 func cleanupExpiredTestTransactions(ctx context.Context, tx *sql.Tx, now time.Time) error {

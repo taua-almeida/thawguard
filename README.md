@@ -70,7 +70,9 @@ The service creates `thawguard.db` by default. Override with `THAWGUARD_DB_PATH`
 
 Runtime configuration is environment-variable based. The binary does not currently parse CLI flags such as `--db` or `--addr`; use `THAWGUARD_DB_PATH` and `THAWGUARD_HTTP_ADDR` instead.
 
-`THAWGUARD_PUBLIC_URL` is the canonical browser origin and the origin used for generated recovery and invitation links. It must be a root-only HTTPS URL with no credentials, query, or fragment. HTTP is accepted only for the hostname `localhost` or a literal loopback IP address. Internationalized and punycode (`xn--`) hostnames are currently unsupported; configure an ordinary ASCII hostname.
+`THAWGUARD_PUBLIC_URL` is the canonical browser origin, the basis for browser cookie security, and the origin used for generated recovery, invitation, and OIDC callback URLs. It must be a root-only HTTPS URL with no credentials, query, or fragment. HTTP is accepted only for the hostname `localhost` or a literal loopback IP address. Internationalized and punycode (`xn--`) hostnames are currently unsupported; configure an ordinary ASCII hostname.
+
+The company OIDC provider must register the exact callback URI `${THAWGUARD_PUBLIC_URL}/settings/authentication/oidc/callback`. Test sign-in requests only the `openid` scope and verifies the saved client credentials, authorization-code flow, and signed ID token. A successful test leaves the connection Draft and disabled; it creates no identity, user, or Thawguard session. Thawguard does not bundle a provider or imply that a live provider is available in local development.
 
 For a Docker-based local alpha runbook, see [`docs/local-alpha.md`](docs/local-alpha.md).
 

@@ -544,7 +544,7 @@ func (s *Server) handleDisableUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if *session.UserID == target.ID {
-		clearSessionCookie(w, r)
+		s.clearSessionCookie(w, r)
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}

@@ -41,52 +41,22 @@ func (c *Checker) Check(ctx context.Context, issuer string) SetupCheckReport {
 	runCtx, cancel := context.WithTimeout(ctx, setupCheckTimeout)
 	defer cancel()
 
-	discoveryBody, status := c.readJSON(
-		runCtx,
-		discoveryURL(issuer),
-		"application/json",
-	)
-	if status == fetchUnavailable {
-		return SetupCheckReport{ResultCode: SetupCheckDiscoveryUnavailable}
-	}
-	if status == fetchInvalid {
-		return SetupCheckReport{ResultCode: SetupCheckDiscoveryInvalid}
-	}
-
-	discovery, ok := decodeJSONObject(discoveryBody)
-	if !ok {
-		return SetupCheckReport{ResultCode: SetupCheckDiscoveryInvalid}
-	}
-	observedIssuer, ok := requiredJSONString(discovery, "issuer")
-	if !ok || !validExactIssuer(observedIssuer) {
-		return SetupCheckReport{ResultCode: SetupCheckIssuerInvalid}
-	}
-	if observedIssuer != issuer {
+	discovery := c.discover(runCtx, issuer, false)
+	if discovery.resultCode == SetupCheckIssuerMismatch {
 		return SetupCheckReport{
-			ResultCode:     SetupCheckIssuerMismatch,
-			ObservedIssuer: new(observedIssuer),
+			ResultCode:     discovery.resultCode,
+			ObservedIssuer: new(discovery.observedIssuer),
 		}
 	}
-
-	jwksURI, ok := compatibleDiscoveryMetadata(discovery)
-	if !ok {
-		return SetupCheckReport{ResultCode: SetupCheckMetadataIncompatible}
+	if discovery.resultCode != SetupCheckVerified {
+		return SetupCheckReport{ResultCode: discovery.resultCode}
 	}
-	jwksBody, status := c.readJSON(
-		runCtx,
-		jwksURI,
-		"application/json",
-		"application/jwk-set+json",
-	)
+
+	jwks, status := c.fetchJWKS(runCtx, discovery.metadata.jwksURI)
 	if status == fetchUnavailable {
 		return SetupCheckReport{ResultCode: SetupCheckJWKSUnavailable}
 	}
 	if status == fetchInvalid {
-		return SetupCheckReport{ResultCode: SetupCheckJWKSInvalid}
-	}
-
-	jwks, err := parseJWKS(jwksBody)
-	if err != nil {
 		return SetupCheckReport{ResultCode: SetupCheckJWKSInvalid}
 	}
 	candidates := int64(len(jwks.keys))
@@ -100,6 +70,58 @@ func (c *Checker) Check(ctx context.Context, issuer string) SetupCheckReport {
 		ResultCode:              SetupCheckVerified,
 		PublicKeyCandidateCount: new(candidates),
 	}
+}
+
+type discoveryMetadata struct {
+	authorizationEndpoint string
+	tokenEndpoint         string
+	jwksURI               string
+}
+
+type discoveryCheck struct {
+	metadata       discoveryMetadata
+	resultCode     SetupCheckResultCode
+	observedIssuer string
+}
+
+func (c *Checker) discover(ctx context.Context, issuer string, testSignIn bool) discoveryCheck {
+	body, status := c.readJSON(ctx, discoveryURL(issuer), "application/json")
+	if status == fetchUnavailable {
+		return discoveryCheck{resultCode: SetupCheckDiscoveryUnavailable}
+	}
+	if status == fetchInvalid {
+		return discoveryCheck{resultCode: SetupCheckDiscoveryInvalid}
+	}
+
+	document, ok := decodeJSONObject(body)
+	if !ok {
+		return discoveryCheck{resultCode: SetupCheckDiscoveryInvalid}
+	}
+	observedIssuer, ok := requiredJSONString(document, "issuer")
+	if !ok || !validExactIssuer(observedIssuer) {
+		return discoveryCheck{resultCode: SetupCheckIssuerInvalid}
+	}
+	if observedIssuer != issuer {
+		return discoveryCheck{resultCode: SetupCheckIssuerMismatch, observedIssuer: observedIssuer}
+	}
+
+	metadata, ok := compatibleDiscoveryMetadata(document)
+	if !ok || testSignIn && !testSignInCompatibleDiscovery(document) {
+		return discoveryCheck{resultCode: SetupCheckMetadataIncompatible}
+	}
+	return discoveryCheck{metadata: metadata, resultCode: SetupCheckVerified}
+}
+
+func (c *Checker) fetchJWKS(ctx context.Context, jwksURI string) (trustedJWKS, fetchStatus) {
+	body, status := c.readJSON(ctx, jwksURI, "application/json", "application/jwk-set+json")
+	if status != fetchOK {
+		return trustedJWKS{}, status
+	}
+	jwks, err := parseJWKS(body)
+	if err != nil {
+		return trustedJWKS{}, fetchInvalid
+	}
+	return jwks, fetchOK
 }
 
 type fetchStatus uint8
@@ -150,7 +172,7 @@ func validExactIssuer(value string) bool {
 	return err == nil && normalized == value
 }
 
-func compatibleDiscoveryMetadata(discovery map[string]jsonRawMessage) (string, bool) {
+func compatibleDiscoveryMetadata(discovery map[string]jsonRawMessage) (discoveryMetadata, bool) {
 	authorizationEndpoint, authorizationOK := requiredJSONString(discovery, "authorization_endpoint")
 	tokenEndpoint, tokenOK := requiredJSONString(discovery, "token_endpoint")
 	jwksURI, jwksOK := requiredJSONString(discovery, "jwks_uri")
@@ -158,31 +180,69 @@ func compatibleDiscoveryMetadata(discovery map[string]jsonRawMessage) (string, b
 		!validHTTPSProviderURL(authorizationEndpoint) ||
 		!validHTTPSProviderURL(tokenEndpoint) ||
 		!validHTTPSProviderURL(jwksURI) {
-		return "", false
+		return discoveryMetadata{}, false
 	}
 
 	responseTypes, ok := requiredStringSlice(discovery, "response_types_supported")
 	if !ok || !slices.Contains(responseTypes, "code") {
-		return "", false
+		return discoveryMetadata{}, false
 	}
 	subjectTypes, ok := requiredStringSlice(discovery, "subject_types_supported")
 	if !ok || (!slices.Contains(subjectTypes, "public") && !slices.Contains(subjectTypes, "pairwise")) {
-		return "", false
+		return discoveryMetadata{}, false
 	}
 	signingAlgorithms, ok := requiredStringSlice(discovery, "id_token_signing_alg_values_supported")
 	if !ok || !slices.Contains(signingAlgorithms, "RS256") {
-		return "", false
+		return discoveryMetadata{}, false
 	}
 	if _, present := discovery["grant_types_supported"]; present {
 		grantTypes, ok := requiredStringSlice(discovery, "grant_types_supported")
 		if !ok || !slices.Contains(grantTypes, "authorization_code") {
-			return "", false
+			return discoveryMetadata{}, false
 		}
 	}
-	return jwksURI, true
+	return discoveryMetadata{
+		authorizationEndpoint: authorizationEndpoint,
+		tokenEndpoint:         tokenEndpoint,
+		jwksURI:               jwksURI,
+	}, true
+}
+
+func testSignInCompatibleDiscovery(discovery map[string]jsonRawMessage) bool {
+	scopes, ok := requiredStringSlice(discovery, "scopes_supported")
+	if !ok || !slices.Contains(scopes, "openid") {
+		return false
+	}
+	if _, present := discovery["token_endpoint_auth_methods_supported"]; present {
+		methods, ok := requiredStringSlice(discovery, "token_endpoint_auth_methods_supported")
+		if !ok || !slices.Contains(methods, "client_secret_basic") {
+			return false
+		}
+	}
+	if _, present := discovery["response_modes_supported"]; present {
+		modes, ok := requiredStringSlice(discovery, "response_modes_supported")
+		if !ok || !slices.Contains(modes, "query") {
+			return false
+		}
+	}
+	if _, present := discovery["code_challenge_methods_supported"]; present {
+		methods, ok := requiredStringSlice(discovery, "code_challenge_methods_supported")
+		if !ok || !slices.Contains(methods, "S256") {
+			return false
+		}
+	}
+	return true
 }
 
 func validHTTPSProviderURL(value string) bool {
+	if len(value) < len("https://a") || len(value) > 2048 {
+		return false
+	}
+	for i := range len(value) {
+		if value[i] < 0x21 || value[i] > 0x7e {
+			return false
+		}
+	}
 	parsed, err := url.Parse(value)
 	if err != nil || parsed.Opaque != "" || parsed.Host == "" || parsed.Hostname() == "" {
 		return false

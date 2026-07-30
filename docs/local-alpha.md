@@ -42,7 +42,11 @@ unset THAWGUARD_SECRET_KEY
 
 Do not commit `.env`, tokens, webhook secrets, or local database files.
 
-`THAWGUARD_PUBLIC_URL` is Thawguard's canonical browser origin and the origin used for generated recovery and invitation links. Configure a root-only HTTPS URL with no credentials, query, or fragment. HTTP is accepted only for exact `localhost` or a literal loopback IP, as in the local value above. Internationalized and punycode (`xn--`) hostnames are currently unsupported; use an ordinary ASCII hostname.
+`THAWGUARD_PUBLIC_URL` is Thawguard's canonical browser origin, determines browser cookie and OIDC callback security, and supplies the origin for generated recovery and invitation links. Configure a root-only HTTPS URL with no credentials, query, or fragment. HTTP is accepted only for exact `localhost` or a literal loopback IP, as in the local value above. Internationalized and punycode (`xn--`) hostnames are currently unsupported; use an ordinary ASCII hostname.
+
+For company OIDC, register `${THAWGUARD_PUBLIC_URL}/settings/authentication/oidc/callback` as the exact provider callback URI. Test sign-in requests only `openid` and verifies the saved client credentials, authorization-code redirect, and signed ID token. It does not create an identity, user, or Thawguard session, and the connection remains Draft and disabled. The local stack includes no OIDC provider and does not imply that a live provider is available.
+
+Test sign-in consumes its one-time state and records the claimed Activity event atomically. Provider network work cannot be atomic with SQLite, so a process interruption may leave a truthful claimed event without a completed event. Thawguard records a completed event before showing any terminal Test sign-in result.
 
 ### 2. Start both services
 

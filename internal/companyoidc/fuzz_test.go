@@ -70,3 +70,31 @@ func FuzzNumericDateBoundaries(f *testing.F) {
 		}
 	})
 }
+
+func FuzzAuthorizationResponseBoundaries(f *testing.F) {
+	const state = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	for _, raw := range []string{
+		"state=" + state + "&code=authorization-code",
+		"state=" + state + "&error=access_denied",
+		"state=" + state + "&code=one&code=two",
+		"state=" + state + "&code=%ZZ",
+		"state=" + state + "&extension=ignored",
+		"",
+	} {
+		f.Add(raw)
+	}
+
+	f.Fuzz(func(t *testing.T, raw string) {
+		if len(raw) > testSignInMaxRawQueryBytes+1 {
+			return
+		}
+		extracted, stateOK := TestSignInStateFromRawQuery(raw)
+		if stateOK && !canonicalTestToken(extracted) {
+			t.Fatal("state extraction accepted noncanonical state")
+		}
+		response, valid := parseAuthorizationResponse(raw, state)
+		if valid && (response.code == "") == (response.providerError == "") {
+			t.Fatal("authorization response did not contain exactly one terminal value")
+		}
+	})
+}

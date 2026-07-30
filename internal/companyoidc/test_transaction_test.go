@@ -19,6 +19,12 @@ import (
 
 const testSignInSessionID = "test-sign-in-local-session"
 
+const (
+	testSignInTokenEndpoint = "https://id.example.test/token"
+	testSignInJWKSURI       = "https://id.example.test/jwks"
+	testSignInRedirectURI   = "http://localhost:8080" + TestSignInCallbackPath
+)
+
 var testSignInNow = time.Date(2026, 7, 29, 14, 30, 0, 123456789, time.UTC)
 
 func TestTestSignInMaterialUsesCanonicalRandomTokensAndS256(t *testing.T) {
@@ -125,10 +131,13 @@ func TestPrepareTestSignInPersistsOnlyBoundProtectedMaterial(t *testing.T) {
 	if err := fixture.database.QueryRow(`SELECT count(*) FROM audit_events`).Scan(&auditsBefore); err != nil {
 		t.Fatal(err)
 	}
-	initiation, err := fixture.service.PrepareTestSignIn(fixture.ctx, TestSignInInitiationInput{
+	initiation, err := fixture.service.prepareTestSignIn(fixture.ctx, TestSignInInitiationInput{
 		ActorUserID:      fixture.adminID,
 		SessionID:        testSignInSessionID,
 		ExpectedRevision: 1,
+		TokenEndpoint:    testSignInTokenEndpoint,
+		JWKSURI:          testSignInJWKSURI,
+		RedirectURI:      testSignInRedirectURI,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -139,7 +148,7 @@ func TestPrepareTestSignInPersistsOnlyBoundProtectedMaterial(t *testing.T) {
 	if initiation.State != wantState || initiation.Nonce != wantNonce ||
 		initiation.PKCEChallenge != pkceS256Challenge(wantVerifier) ||
 		initiation.Issuer != "https://id.example.test/tenant" ||
-		initiation.ClientID != "client-id" || initiation.ConfigRevision != 1 {
+		initiation.ClientID != "client-id" {
 		t.Fatalf("unexpected initiation result: %#v", initiation)
 	}
 	if _, exposed := reflect.TypeOf(initiation).FieldByName("PKCEVerifier"); exposed {
@@ -148,11 +157,12 @@ func TestPrepareTestSignInPersistsOnlyBoundProtectedMaterial(t *testing.T) {
 
 	var stateDigest, sessionDigest, nonceDigest, ciphertext []byte
 	var connectionID, revision, actorID int64
+	var tokenEndpoint, jwksURI, redirectURI string
 	var createdAtText, expiresAtText string
 	if err := fixture.database.QueryRow(`
 SELECT state_digest, connection_id, config_revision, actor_user_id,
   session_binding_digest, nonce_digest, pkce_verifier_ciphertext,
-  created_at, expires_at
+  token_endpoint, jwks_uri, redirect_uri, created_at, expires_at
 FROM company_oidc_test_transactions`).Scan(
 		&stateDigest,
 		&connectionID,
@@ -161,6 +171,9 @@ FROM company_oidc_test_transactions`).Scan(
 		&sessionDigest,
 		&nonceDigest,
 		&ciphertext,
+		&tokenEndpoint,
+		&jwksURI,
+		&redirectURI,
 		&createdAtText,
 		&expiresAtText,
 	); err != nil {
@@ -176,6 +189,9 @@ FROM company_oidc_test_transactions`).Scan(
 	}
 	if connectionID != 1 || revision != 1 || actorID != fixture.adminID {
 		t.Fatalf("unexpected transaction binding: connection=%d revision=%d actor=%d", connectionID, revision, actorID)
+	}
+	if tokenEndpoint != testSignInTokenEndpoint || jwksURI != testSignInJWKSURI || redirectURI != testSignInRedirectURI {
+		t.Fatalf("unexpected pinned protocol metadata: token=%q jwks=%q redirect=%q", tokenEndpoint, jwksURI, redirectURI)
 	}
 	createdAt, err := parseCompanyOIDCTime(createdAtText)
 	if err != nil {
@@ -231,7 +247,7 @@ func TestPrepareTestSignInRequiresReadyExactDraftAndCurrentAdministratorSession(
 	t.Run("missing Draft", func(t *testing.T) {
 		fixture := newServiceFixture(t)
 		prepareTestSignInSession(t, fixture, fixture.adminID)
-		_, err := fixture.service.PrepareTestSignIn(fixture.ctx, validTestSignInInput(fixture.adminID, 1))
+		_, err := fixture.service.prepareTestSignIn(fixture.ctx, validTestSignInInput(fixture.adminID, 1))
 		if !errors.Is(err, ErrNoDraft) {
 			t.Fatalf("expected missing Draft, got %v", err)
 		}
@@ -241,7 +257,7 @@ func TestPrepareTestSignInRequiresReadyExactDraftAndCurrentAdministratorSession(
 		fixture := newServiceFixture(t)
 		createTestSignInDraft(t, fixture)
 		prepareTestSignInSession(t, fixture, fixture.adminID)
-		_, err := fixture.service.PrepareTestSignIn(fixture.ctx, validTestSignInInput(fixture.adminID, 1))
+		_, err := fixture.service.prepareTestSignIn(fixture.ctx, validTestSignInInput(fixture.adminID, 1))
 		if !errors.Is(err, ErrTestSignInUnavailable) {
 			t.Fatalf("expected unavailable Test sign-in, got %v", err)
 		}
@@ -251,7 +267,7 @@ func TestPrepareTestSignInRequiresReadyExactDraftAndCurrentAdministratorSession(
 		fixture := newServiceFixture(t)
 		configureTestSignInDraft(t, fixture, SetupCheckJWKSUnavailable)
 		prepareTestSignInSession(t, fixture, fixture.adminID)
-		_, err := fixture.service.PrepareTestSignIn(fixture.ctx, validTestSignInInput(fixture.adminID, 1))
+		_, err := fixture.service.prepareTestSignIn(fixture.ctx, validTestSignInInput(fixture.adminID, 1))
 		if !errors.Is(err, ErrTestSignInUnavailable) {
 			t.Fatalf("expected failed metadata evidence rejection, got %v", err)
 		}
@@ -264,7 +280,7 @@ func TestPrepareTestSignInRequiresReadyExactDraftAndCurrentAdministratorSession(
 		if _, err := fixture.database.Exec(`UPDATE company_oidc_setup_checks SET config_revision = 2 WHERE connection_id = 1`); err != nil {
 			t.Fatal(err)
 		}
-		_, err := fixture.service.PrepareTestSignIn(fixture.ctx, validTestSignInInput(fixture.adminID, 1))
+		_, err := fixture.service.prepareTestSignIn(fixture.ctx, validTestSignInInput(fixture.adminID, 1))
 		if !errors.Is(err, ErrTestSignInUnavailable) {
 			t.Fatalf("expected stale evidence rejection, got %v", err)
 		}
@@ -274,7 +290,7 @@ func TestPrepareTestSignInRequiresReadyExactDraftAndCurrentAdministratorSession(
 		fixture := newServiceFixture(t)
 		configureReadyTestSignInDraft(t, fixture)
 		prepareTestSignInSession(t, fixture, fixture.adminID)
-		_, err := fixture.service.PrepareTestSignIn(fixture.ctx, validTestSignInInput(fixture.adminID, 2))
+		_, err := fixture.service.prepareTestSignIn(fixture.ctx, validTestSignInInput(fixture.adminID, 2))
 		if !errors.Is(err, ErrTestSignInUnavailable) {
 			t.Fatalf("expected revision fence rejection, got %v", err)
 		}
@@ -332,7 +348,7 @@ func TestPrepareTestSignInRequiresReadyExactDraftAndCurrentAdministratorSession(
 			configureReadyTestSignInDraft(t, fixture)
 			prepareTestSignInSession(t, fixture, fixture.adminID)
 			tc.mutate(t, fixture)
-			_, err := fixture.service.PrepareTestSignIn(fixture.ctx, validTestSignInInput(fixture.adminID, 1))
+			_, err := fixture.service.prepareTestSignIn(fixture.ctx, validTestSignInInput(fixture.adminID, 1))
 			if !errors.Is(err, ErrTestSignInAuthorization) {
 				t.Fatalf("expected current Administrator session rejection, got %v", err)
 			}
@@ -355,7 +371,7 @@ func TestPrepareTestSignInSamplesTimeAfterWriterOwnership(t *testing.T) {
 	writer := holdTestSignInWriter(t, fixture)
 	result := make(chan error, 1)
 	go func() {
-		_, err := fixture.service.PrepareTestSignIn(
+		_, err := fixture.service.prepareTestSignIn(
 			fixture.ctx,
 			validTestSignInInput(fixture.adminID, 1),
 		)
@@ -386,7 +402,7 @@ func TestPrepareTestSignInRejectsMalformedStateAndSanitizesFailures(t *testing.T
 		if _, err := fixture.database.Exec(`UPDATE company_oidc_setup_checks SET checked_at = '2026-02-30T10:00:00.000000000Z' WHERE connection_id = 1`); err != nil {
 			t.Fatal(err)
 		}
-		_, err := fixture.service.PrepareTestSignIn(fixture.ctx, validTestSignInInput(fixture.adminID, 1))
+		_, err := fixture.service.prepareTestSignIn(fixture.ctx, validTestSignInInput(fixture.adminID, 1))
 		if !errors.Is(err, ErrTestSignInUnavailable) {
 			t.Fatalf("expected malformed setup-check rejection, got %v", err)
 		}
@@ -399,7 +415,7 @@ func TestPrepareTestSignInRejectsMalformedStateAndSanitizesFailures(t *testing.T
 		if _, err := fixture.database.Exec(`UPDATE company_oidc_connections SET issuer = 'http://invalid.example' WHERE id = 1`); err != nil {
 			t.Fatal(err)
 		}
-		_, err := fixture.service.PrepareTestSignIn(fixture.ctx, validTestSignInInput(fixture.adminID, 1))
+		_, err := fixture.service.prepareTestSignIn(fixture.ctx, validTestSignInInput(fixture.adminID, 1))
 		if !errors.Is(err, ErrTestSignInUnavailable) {
 			t.Fatalf("expected malformed snapshot rejection, got %v", err)
 		}
@@ -411,7 +427,7 @@ func TestPrepareTestSignInRejectsMalformedStateAndSanitizesFailures(t *testing.T
 		prepareTestSignInSession(t, fixture, fixture.adminID)
 		fixture.service.random = bytes.NewReader(testSignInRandomBytes(0x41, 0x42, 0x43))
 		fixture.service.secrets = verifierLeakingErrorStore{}
-		_, err := fixture.service.PrepareTestSignIn(fixture.ctx, validTestSignInInput(fixture.adminID, 1))
+		_, err := fixture.service.prepareTestSignIn(fixture.ctx, validTestSignInInput(fixture.adminID, 1))
 		if err == nil || err.Error() != "encrypt company OIDC Test sign-in verifier" {
 			t.Fatalf("unexpected sanitized encryption error: %v", err)
 		}
@@ -442,7 +458,7 @@ func TestPrepareTestSignInRejectsMalformedStateAndSanitizesFailures(t *testing.T
 			testSignInNow,
 			testSignInNow.Add(testSignInTransactionTTL),
 		)
-		_, err := fixture.service.PrepareTestSignIn(fixture.ctx, validTestSignInInput(fixture.adminID, 1))
+		_, err := fixture.service.prepareTestSignIn(fixture.ctx, validTestSignInInput(fixture.adminID, 1))
 		if err == nil || strings.Contains(err.Error(), state) {
 			t.Fatalf("expected sanitized insert conflict, got %v", err)
 		}
@@ -461,9 +477,9 @@ func TestClaimTestSignInIsStrictlyOneTimeAndSessionBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantNonceDigest := testSignInDigest(testSignInNonceDigestPurpose, initiation.Nonce)
-	if claim.Issuer != initiation.Issuer || claim.ClientID != initiation.ClientID ||
-		claim.PKCEVerifier != verifier || claim.NonceDigest != wantNonceDigest ||
-		claim.ConfigRevision != initiation.ConfigRevision || !claim.CreatedAt.Equal(testSignInNow) {
+	if claim.issuer != initiation.Issuer || claim.clientID != initiation.ClientID ||
+		claimVerifier(t, fixture, claim) != verifier || claim.nonceDigest != wantNonceDigest ||
+		claim.configRevision != 1 || !claim.createdAt.Equal(testSignInNow) {
 		t.Fatalf("unexpected claimed transaction: %#v", claim)
 	}
 	assertTestSignInTransactionCount(t, fixture.database, 0)
@@ -514,7 +530,7 @@ func TestClaimTestSignInSurvivesProcessRestartWithoutCreatingAuthority(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if claim.PKCEVerifier != verifier || claim.ConfigRevision != 1 {
+	if claimVerifier(t, fixture, claim) != verifier || claim.configRevision != 1 {
 		t.Fatalf("restarted service returned wrong protected transaction: %#v", claim)
 	}
 	var sessions int
@@ -577,12 +593,6 @@ func TestClaimTestSignInConsumesExpiredRevokedAndInvalidatedTransactions(t *test
 			},
 		},
 		{
-			name: "missing secret store",
-			mutate: func(_ *testing.T, fixture *serviceFixture) {
-				fixture.service.secrets = nil
-			},
-		},
-		{
 			name: "changed Draft revision",
 			mutate: func(t *testing.T, fixture *serviceFixture) {
 				input := validEditInput(1)
@@ -638,12 +648,12 @@ func TestClaimTestSignInConsumesExpiredRevokedAndInvalidatedTransactions(t *test
 		if _, err := fixture.database.Exec(`UPDATE company_oidc_test_transactions SET pkce_verifier_ciphertext = x'01'`); err != nil {
 			t.Fatal(err)
 		}
-		_, err := fixture.service.claimTestSignIn(fixture.ctx, testSignInClaimInput{
+		claim, err := fixture.service.claimTestSignIn(fixture.ctx, testSignInClaimInput{
 			State:     initiation.State,
 			SessionID: testSignInSessionID,
 		})
-		if !errors.Is(err, ErrTestTransactionUnavailable) {
-			t.Fatalf("expected generic malformed verifier rejection, got %v", err)
+		if err != nil || len(claim.pkceCiphertext) != 1 {
+			t.Fatalf("expected claim to capture malformed ciphertext for post-claim result mapping, claim=%#v err=%v", claim, err)
 		}
 		assertTestSignInTransactionCount(t, fixture.database, 0)
 	})
@@ -680,7 +690,7 @@ func TestClaimTestSignInPreservesTransactionOnOperationalSnapshotFailure(t *test
 	if !errors.Is(err, ErrTestTransactionUnavailable) || err != ErrTestTransactionUnavailable {
 		t.Fatalf("expected generic operational snapshot error, got %v", err)
 	}
-	if claim != (testSignInClaim{}) {
+	if !reflect.DeepEqual(claim, testSignInClaim{}) {
 		t.Fatalf("operational snapshot failure returned protocol material: %#v", claim)
 	}
 	assertTestSignInTransactionCount(t, fixture.database, 1)
@@ -695,7 +705,7 @@ func TestClaimTestSignInPreservesTransactionOnOperationalSnapshotFailure(t *test
 	if err != nil {
 		t.Fatalf("retry after operational snapshot failure: %v", err)
 	}
-	if retry.PKCEVerifier != verifier {
+	if claimVerifier(t, fixture, retry) != verifier {
 		t.Fatal("retry returned the wrong verifier")
 	}
 	assertTestSignInTransactionCount(t, fixture.database, 0)
@@ -735,7 +745,7 @@ func TestClaimTestSignInSamplesTimeAfterWriterOwnership(t *testing.T) {
 		if !errors.Is(result.err, ErrTestTransactionUnavailable) {
 			t.Fatalf("expected post-lock expired-transaction rejection, got %v", result.err)
 		}
-		if result.claim != (testSignInClaim{}) {
+		if !reflect.DeepEqual(result.claim, testSignInClaim{}) {
 			t.Fatalf("expired transaction returned protocol material: %#v", result.claim)
 		}
 	case <-time.After(5 * time.Second):
@@ -772,7 +782,7 @@ func TestClaimTestSignInAllowsExactlyOneConcurrentWinner(t *testing.T) {
 		result := <-results
 		if result.err == nil {
 			winners++
-			if result.claim.PKCEVerifier != verifier {
+			if claimVerifier(t, fixture, result.claim) != verifier {
 				t.Fatal("winning callback received wrong verifier")
 			}
 			continue
@@ -808,7 +818,7 @@ func TestPrepareTestSignInCleansBoundedExpiredRowsAndPreservesLiveRows(t *testin
 	liveSession := sha256.Sum256([]byte("preexisting-live-session"))
 	insertTestTransactionRow(t, fixture, liveState, liveSession, testSignInNow, testSignInNow.Add(time.Minute))
 	fixture.service.random = bytes.NewReader(testSignInRandomBytes(0x61, 0x62, 0x63))
-	if _, err := fixture.service.PrepareTestSignIn(fixture.ctx, validTestSignInInput(fixture.adminID, 1)); err != nil {
+	if _, err := fixture.service.prepareTestSignIn(fixture.ctx, validTestSignInInput(fixture.adminID, 1)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -852,7 +862,7 @@ func TestPrepareTestSignInDoesNotDecryptClientSecret(t *testing.T) {
 		t.Fatal(err)
 	}
 	prepareTestSignInSession(t, fixture, fixture.adminID)
-	if _, err := fixture.service.PrepareTestSignIn(fixture.ctx, validTestSignInInput(fixture.adminID, 1)); err != nil {
+	if _, err := fixture.service.prepareTestSignIn(fixture.ctx, validTestSignInInput(fixture.adminID, 1)); err != nil {
 		t.Fatal(err)
 	}
 	if store.decrypts != 0 {
@@ -926,10 +936,13 @@ func prepareReadyTestSignIn(
 	configureReadyTestSignInDraft(t, fixture)
 	insertTestSignInSession(t, fixture, sessionID, fixture.adminID, testSignInNow.Add(time.Hour))
 	fixture.service.random = bytes.NewReader(testSignInRandomBytes(0x11, 0x22, 0x33))
-	initiation, err := fixture.service.PrepareTestSignIn(fixture.ctx, TestSignInInitiationInput{
+	initiation, err := fixture.service.prepareTestSignIn(fixture.ctx, TestSignInInitiationInput{
 		ActorUserID:      fixture.adminID,
 		SessionID:        sessionID,
 		ExpectedRevision: 1,
+		TokenEndpoint:    testSignInTokenEndpoint,
+		JWKSURI:          testSignInJWKSURI,
+		RedirectURI:      testSignInRedirectURI,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -983,6 +996,9 @@ func validTestSignInInput(actorID, revision int64) TestSignInInitiationInput {
 		ActorUserID:      actorID,
 		SessionID:        testSignInSessionID,
 		ExpectedRevision: revision,
+		TokenEndpoint:    testSignInTokenEndpoint,
+		JWKSURI:          testSignInJWKSURI,
+		RedirectURI:      testSignInRedirectURI,
 	}
 }
 
@@ -1008,13 +1024,16 @@ func insertTestTransactionRow(
 INSERT INTO company_oidc_test_transactions(
   state_digest, connection_id, config_revision, actor_user_id,
   session_binding_digest, nonce_digest, pkce_verifier_ciphertext,
-  created_at, expires_at
+  token_endpoint, jwks_uri, redirect_uri, created_at, expires_at
 )
-VALUES (?, 1, 1, ?, ?, ?, x'01', ?, ?)`,
+VALUES (?, 1, 1, ?, ?, ?, x'01', ?, ?, ?, ?, ?)`,
 		stateDigest[:],
 		fixture.adminID,
 		sessionDigest[:],
 		nonceDigest[:],
+		testSignInTokenEndpoint,
+		testSignInJWKSURI,
+		testSignInRedirectURI,
 		formatCompanyOIDCTime(createdAt),
 		formatCompanyOIDCTime(expiresAt),
 	); err != nil {
@@ -1059,4 +1078,14 @@ func assertTestSignInTransactionCount(t *testing.T, database *sql.DB, want int) 
 	if got != want {
 		t.Fatalf("Test sign-in transaction count = %d, want %d", got, want)
 	}
+}
+
+func claimVerifier(t *testing.T, fixture *serviceFixture, claim testSignInClaim) string {
+	t.Helper()
+	plaintext, err := fixture.secretStore.Decrypt(fixture.ctx, claim.pkceCiphertext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(plaintext)
+	return string(plaintext)
 }

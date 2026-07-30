@@ -12,15 +12,23 @@
       {{ if and .HasConnection (not .ShowForm) }}
       <li class="flex min-w-0 items-center gap-2 rounded-card bg-success-soft px-3 py-2 text-sm font-semibold text-success"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-success-soft text-success"><svg class="h-3.5 w-3.5" aria-hidden="true"><use href="#tg-i-check"></use></svg></span><span>Configure</span></li>
       {{ if .EncryptionAvailable }}
-      <li class="flex min-w-0 items-center gap-2 rounded-card bg-accent-soft px-3 py-2 text-sm font-semibold text-accent-strong" aria-current="step"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-accent text-xs text-on-accent">2</span><span class="min-w-0">Verify metadata <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Saved Draft</span></span></li>
+      {{ if .TestSignInAvailable }}
+      <li class="flex min-w-0 items-center gap-2 rounded-card bg-success-soft px-3 py-2 text-sm font-semibold text-success"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-success-soft text-success"><svg class="h-3.5 w-3.5" aria-hidden="true"><use href="#tg-i-check"></use></svg></span><span class="min-w-0">Verify metadata <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Metadata verified</span></span></li>
       {{ else }}
-      <li class="flex min-w-0 items-center gap-2 rounded-card bg-surface-muted px-3 py-2 text-sm text-text-muted" aria-disabled="true"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-neutral-soft text-xs">2</span><span class="min-w-0">Verify metadata <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Encryption unavailable</span></span></li>
+      <li class="flex min-w-0 items-center gap-2 rounded-card bg-accent-soft px-3 py-2 text-sm font-semibold text-accent-strong" aria-current="step"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-accent text-xs text-on-accent">2</span><span class="min-w-0">Verify metadata <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Saved Draft</span></span></li>
+      {{ end }}
+      {{ else }}
+      <li class="flex min-w-0 items-center gap-2 rounded-card bg-surface-muted px-3 py-2 text-sm text-text-muted" aria-current="step" aria-disabled="true"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-neutral-soft text-xs">2</span><span class="min-w-0">Verify metadata <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Encryption unavailable</span></span></li>
       {{ end }}
       {{ else }}
       <li class="flex min-w-0 items-center gap-2 rounded-card bg-accent-soft px-3 py-2 text-sm font-semibold text-accent-strong" aria-current="step"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-accent text-xs text-on-accent">1</span><span>Configure</span></li>
       <li class="flex min-w-0 items-center gap-2 rounded-card bg-surface-muted px-3 py-2 text-sm text-text-muted" aria-disabled="true"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-neutral-soft text-xs">2</span><span class="min-w-0">Verify metadata <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Available after save</span></span></li>
       {{ end }}
-      <li class="flex min-w-0 items-center gap-2 rounded-card bg-surface-muted px-3 py-2 text-sm text-text-muted" aria-disabled="true"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-neutral-soft text-xs">3</span><span class="min-w-0">Test sign-in <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Not implemented</span></span></li>
+      {{ if .TestSignInAvailable }}
+      <li class="flex min-w-0 items-center gap-2 rounded-card bg-accent-soft px-3 py-2 text-sm font-semibold text-accent-strong" aria-current="step"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-accent text-xs text-on-accent">3</span><span class="min-w-0">Test sign-in <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Available for saved Draft</span></span></li>
+      {{ else }}
+      <li class="flex min-w-0 items-center gap-2 rounded-card bg-surface-muted px-3 py-2 text-sm text-text-muted" aria-disabled="true"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-neutral-soft text-xs">3</span><span class="min-w-0">Test sign-in <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Requires current verification</span></span></li>
+      {{ end }}
       <li class="flex min-w-0 items-center gap-2 rounded-card bg-surface-muted px-3 py-2 text-sm text-text-muted" aria-disabled="true"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-neutral-soft text-xs">4</span><span class="min-w-0">Enable <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Not implemented</span></span></li>
     </ol>
   </nav>
@@ -78,6 +86,7 @@
         <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Revision</dt><dd class="m-0 mt-1 text-sm text-text">{{ .Connection.Revision }}</dd></div>
         <div class="min-w-0 sm:col-span-2"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Issuer</dt><dd class="m-0 mt-1 break-all font-mono text-sm text-text">{{ .Connection.Issuer }}</dd></div>
         <div class="min-w-0 sm:col-span-2"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Client ID</dt><dd class="m-0 mt-1 break-all font-mono text-sm text-text">{{ .Connection.ClientID }}</dd></div>
+        <div class="min-w-0 sm:col-span-2"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Callback URI</dt><dd class="m-0 mt-1 break-all font-mono text-sm text-text"><code>{{ .CallbackURI }}</code></dd><dd class="m-0 mt-1 text-xs text-text-muted">Register this exact URI with the provider. Test sign-in requests only the <code>openid</code> scope.</dd></div>
         <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Client secret</dt><dd class="m-0 mt-1 flex items-center gap-2 text-sm font-semibold text-success"><svg class="h-4 w-4 flex-none" aria-hidden="true"><use href="#tg-i-check"></use></svg>Client secret stored</dd></div>
         <div class="min-w-0 sm:col-span-2"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Allowed domains</dt><dd class="m-0 mt-2 flex min-w-0 flex-wrap gap-2">{{ range .Connection.Domains }}<span class="max-w-full break-all rounded-pill border border-border bg-surface-muted px-2.5 py-1 font-mono text-xs text-text">{{ . }}</span>{{ end }}</dd></div>
       </dl>
@@ -91,6 +100,19 @@
         {{ template "ui/button" dict "Label" "Edit draft" "Variant" "secondary" "Href" "/settings/authentication/edit" "Icon" "tg-i-key" }}
       </div>
       {{ end }}
+      <section class="mt-5 rounded-card border border-border bg-surface-muted p-4" aria-labelledby="oidc-test-sign-in-title">
+        <h3 id="oidc-test-sign-in-title" class="m-0 text-base font-bold text-text">Test sign-in</h3>
+        <p class="m-0 mt-1 text-sm text-text-muted">Verify the configured client credentials, authorization-code redirect, and signed ID token. This creates no identity, user, or Thawguard session and does not enable the connection.</p>
+        {{ if .TestSignInAvailable }}
+        <form method="post" action="/settings/authentication/oidc/test" class="mt-4">
+          <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+          <input type="hidden" name="expected_revision" value="{{ .Connection.Revision }}">
+          {{ template "ui/button" dict "Label" "Test sign-in" "Variant" "primary" "Type" "submit" "Icon" "tg-i-key" }}
+        </form>
+        {{ else }}
+        <p class="m-0 mt-3 text-sm font-semibold text-warning">{{ .TestSignInReason }}</p>
+        {{ end }}
+      </section>
     </section>
     {{ else }}
     <section class="flex min-h-72 flex-col items-center justify-center rounded-panel border border-border bg-surface px-5 py-10 text-center shadow-card" aria-labelledby="no-oidc-connection-title">

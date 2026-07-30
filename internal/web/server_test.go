@@ -23,6 +23,7 @@ import (
 
 	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/auth"
+	"github.com/taua-almeida/thawguard/internal/companyoidc"
 	"github.com/taua-almeida/thawguard/internal/db"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/forge/forgejo"
@@ -2928,6 +2929,16 @@ func TestActivityMappingsCoverEveryKnownAuditAction(t *testing.T) {
 			event.SubjectID = "1"
 			event.DetailsJSON = `{"revision":1,"result_code":"verified"}`
 		}
+		if action == audit.ActionOIDCConnectionTestSignInClaimed {
+			event.SubjectType = audit.SubjectTypeOIDCConnection
+			event.SubjectID = "1"
+			event.DetailsJSON = `{"revision":1,"binding":"exact_session","authority":"current_administrator"}`
+		}
+		if action == audit.ActionOIDCConnectionTestSignInCompleted {
+			event.SubjectType = audit.SubjectTypeOIDCConnection
+			event.SubjectID = "1"
+			event.DetailsJSON = `{"revision":1,"result_code":"verified"}`
+		}
 		view := activityEventViewForEvent(nil, nil, event)
 		if view.ActionLabel == "Unrecognized activity" || view.ActionLabel == "" || view.Outcome == "" || view.Target == "" || view.Detail == "" {
 			t.Fatalf("audit action %q lacks a complete curated activity mapping: %+v", action, view)
@@ -2991,6 +3002,102 @@ func TestActivityOIDCMetadataCheckedDetailsFailClosed(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestActivityOIDCTestSignInClaimedDetailsFailClosed(t *testing.T) {
+	tests := []struct {
+		name        string
+		subjectType string
+		subjectID   string
+		details     string
+	}{
+		{name: "valid", subjectType: audit.SubjectTypeOIDCConnection, subjectID: "1", details: `{"revision":2,"binding":"exact_session","authority":"current_administrator"}`},
+		{name: "wrong subject", subjectType: audit.SubjectTypeRepository, subjectID: "1", details: `{"revision":2,"binding":"exact_session","authority":"current_administrator"}`},
+		{name: "wrong singleton", subjectType: audit.SubjectTypeOIDCConnection, subjectID: "2", details: `{"revision":2,"binding":"exact_session","authority":"current_administrator"}`},
+		{name: "missing binding", subjectType: audit.SubjectTypeOIDCConnection, subjectID: "1", details: `{"revision":2,"authority":"current_administrator"}`},
+		{name: "wrong binding", subjectType: audit.SubjectTypeOIDCConnection, subjectID: "1", details: `{"revision":2,"binding":"cookie-canary","authority":"current_administrator"}`},
+		{name: "wrong authority", subjectType: audit.SubjectTypeOIDCConnection, subjectID: "1", details: `{"revision":2,"binding":"exact_session","authority":"subject-canary"}`},
+		{name: "extra", subjectType: audit.SubjectTypeOIDCConnection, subjectID: "1", details: `{"revision":2,"binding":"exact_session","authority":"current_administrator","subject":"subject-canary"}`},
+		{name: "duplicate", subjectType: audit.SubjectTypeOIDCConnection, subjectID: "1", details: `{"revision":2,"revision":3,"binding":"exact_session","authority":"current_administrator"}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			view := activityEventViewForEvent(nil, nil, audit.Event{
+				Action:      audit.ActionOIDCConnectionTestSignInClaimed,
+				SubjectType: tc.subjectType,
+				SubjectID:   tc.subjectID,
+				DetailsJSON: tc.details,
+			})
+			if tc.name == "valid" {
+				if view.ActionLabel == "Unrecognized activity" || !strings.Contains(view.Detail, "provider verification had not yet completed") {
+					t.Fatalf("valid claimed Activity = %+v", view)
+				}
+				return
+			}
+			if view.ActionLabel != "Unrecognized activity" || view.Outcome != "Unknown" {
+				t.Fatalf("malformed claimed Activity did not fail closed: %+v", view)
+			}
+			visible := view.ActionLabel + " " + view.Target + " " + view.Detail
+			for _, canary := range []string{"cookie-canary", "subject-canary"} {
+				if strings.Contains(visible, canary) {
+					t.Fatalf("malformed claimed Activity exposed %q: %q", canary, visible)
+				}
+			}
+		})
+	}
+}
+
+func TestActivityOIDCTestSignInCompletedPresentsEveryResultAndFailsClosed(t *testing.T) {
+	results := []struct {
+		code    companyoidc.TestSignInResultCode
+		outcome string
+		copy    string
+	}{
+		{code: companyoidc.TestSignInVerified, outcome: "Verified", copy: "signed ID token were verified"},
+		{code: companyoidc.TestSignInProviderDenied, outcome: "Denied", copy: "provider denied"},
+		{code: companyoidc.TestSignInProviderUnavailable, outcome: "Unavailable", copy: "provider was unavailable"},
+		{code: companyoidc.TestSignInProviderInvalid, outcome: "Invalid", copy: "invalid Test sign-in response"},
+		{code: companyoidc.TestSignInConfigurationUnavailable, outcome: "Unavailable", copy: "client configuration was unavailable"},
+	}
+	for _, tc := range results {
+		t.Run(string(tc.code), func(t *testing.T) {
+			view := activityEventViewForEvent(nil, nil, audit.Event{
+				Action:      audit.ActionOIDCConnectionTestSignInCompleted,
+				SubjectType: audit.SubjectTypeOIDCConnection,
+				SubjectID:   "1",
+				DetailsJSON: fmt.Sprintf(`{"revision":3,"result_code":%q}`, tc.code),
+			})
+			if view.Outcome != tc.outcome || !strings.Contains(view.Detail, tc.copy) || !strings.Contains(view.Detail, "remains Draft") {
+				t.Fatalf("completed Activity for %q = %+v", tc.code, view)
+			}
+		})
+	}
+
+	malformed := []string{
+		`{"revision":3}`,
+		`{"revision":0,"result_code":"verified"}`,
+		`{"revision":3,"result_code":"provider-body-canary"}`,
+		`{"revision":3,"result_code":"verified","subject":"subject-canary"}`,
+		`{"revision":3,"revision":4,"result_code":"verified"}`,
+		`{"revision":3,"result_code":"verified","result_code":"provider_invalid"}`,
+	}
+	for _, details := range malformed {
+		view := activityEventViewForEvent(nil, nil, audit.Event{
+			Action:      audit.ActionOIDCConnectionTestSignInCompleted,
+			SubjectType: audit.SubjectTypeOIDCConnection,
+			SubjectID:   "1",
+			DetailsJSON: details,
+		})
+		if view.ActionLabel != "Unrecognized activity" || view.Outcome != "Unknown" {
+			t.Fatalf("malformed completed Activity did not fail closed: %+v", view)
+		}
+		visible := view.ActionLabel + " " + view.Target + " " + view.Detail
+		for _, canary := range []string{"provider-body-canary", "subject-canary"} {
+			if strings.Contains(visible, canary) {
+				t.Fatalf("malformed completed Activity exposed %q: %q", canary, visible)
+			}
+		}
 	}
 }
 

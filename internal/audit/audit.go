@@ -70,6 +70,8 @@ const (
 	ActionInvitationAccepted                 = "invitation.accepted"
 	ActionOIDCConnectionDraftSaved           = "oidc_connection.draft_saved"
 	ActionOIDCConnectionMetadataChecked      = "oidc_connection.metadata_checked"
+	ActionOIDCConnectionTestSignInClaimed    = "oidc_connection.test_sign_in_claimed"
+	ActionOIDCConnectionTestSignInCompleted  = "oidc_connection.test_sign_in_completed"
 
 	ActorKindPasswordRecoveryLink = "recovery_link"
 	ActorKindInvitationLink       = "invitation_link"
@@ -145,6 +147,8 @@ func KnownActions() []string {
 		ActionInvitationAccepted,
 		ActionOIDCConnectionDraftSaved,
 		ActionOIDCConnectionMetadataChecked,
+		ActionOIDCConnectionTestSignInClaimed,
+		ActionOIDCConnectionTestSignInCompleted,
 	}
 }
 

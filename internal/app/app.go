@@ -74,7 +74,7 @@ func (a *App) Run(ctx context.Context) error {
 	}
 	repositorySetup := repositorysetup.NewServiceWithSecrets(database, secretStore)
 	companyOIDCChecker := companyoidc.NewChecker(http.DefaultTransport)
-	companyOIDCService := companyoidc.NewService(database, secretStore, companyOIDCChecker.Check)
+	companyOIDCService := companyoidc.NewServiceWithChecker(database, secretStore, companyOIDCChecker, publicURL)
 	repositoryStore := repository.NewStore(database)
 	setupCheckStore := setupcheck.NewStore(database)
 	webhookDeliveryStore := webhook.NewDeliveryStore(database)

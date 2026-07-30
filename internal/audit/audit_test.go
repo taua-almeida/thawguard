@@ -354,6 +354,8 @@ func TestScopedActionClassificationCoversEveryKnownAction(t *testing.T) {
 		"invitation.accepted":                        adminOnly,
 		"oidc_connection.draft_saved":                adminOnly,
 		"oidc_connection.metadata_checked":           adminOnly,
+		"oidc_connection.test_sign_in_claimed":       adminOnly,
+		"oidc_connection.test_sign_in_completed":     adminOnly,
 	}
 
 	classified := map[string]string{}
@@ -449,6 +451,8 @@ func TestOIDCAuditIsAdministratorOnlyDespiteRepositoryDetail(t *testing.T) {
 	}{
 		{action: ActionOIDCConnectionDraftSaved, details: `{"revision":1,"secret_replaced":false,"domain_count":1,"repository_id":"7"}`},
 		{action: ActionOIDCConnectionMetadataChecked, details: `{"revision":1,"result_code":"verified","repository_id":"7"}`},
+		{action: ActionOIDCConnectionTestSignInClaimed, details: `{"revision":1,"binding":"exact_session","authority":"current_administrator","repository_id":"7"}`},
+		{action: ActionOIDCConnectionTestSignInCompleted, details: `{"revision":1,"result_code":"verified","repository_id":"7"}`},
 	} {
 		insertRawEvent(t, ctx, store, event.action, SubjectTypeOIDCConnection, "1", event.details, base.Add(time.Duration(i)*time.Second))
 	}
@@ -464,7 +468,9 @@ func TestOIDCAuditIsAdministratorOnlyDespiteRepositoryDetail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(all) != 2 || all[0].Action != ActionOIDCConnectionMetadataChecked || all[1].Action != ActionOIDCConnectionDraftSaved {
+	if len(all) != 4 || all[0].Action != ActionOIDCConnectionTestSignInCompleted ||
+		all[1].Action != ActionOIDCConnectionTestSignInClaimed ||
+		all[2].Action != ActionOIDCConnectionMetadataChecked || all[3].Action != ActionOIDCConnectionDraftSaved {
 		t.Fatalf("Administrator scope did not retain company OIDC activity: %+v", all)
 	}
 }

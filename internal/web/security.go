@@ -80,19 +80,6 @@ func newSessionStore() *sessionStore {
 	}
 }
 
-func (s *sessionStore) getOrCreate(w http.ResponseWriter, r *http.Request) (sessionState, error) {
-	if session, ok := s.get(r); ok {
-		setSessionCookie(w, r, session)
-		return session, nil
-	}
-	session, err := s.create()
-	if err != nil {
-		return sessionState{}, err
-	}
-	setSessionCookie(w, r, session)
-	return session, nil
-}
-
 func (s *sessionStore) get(r *http.Request) (sessionState, bool) {
 	for _, cookie := range r.Cookies() {
 		if cookie.Name != sessionCookieName || cookie.Value == "" {
@@ -146,7 +133,7 @@ func (s *sessionStore) create() (sessionState, error) {
 	return sessionState{}, errors.New("create unique session")
 }
 
-func clearSessionCookie(w http.ResponseWriter, r *http.Request) {
+func (s *Server) clearSessionCookie(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    "",
@@ -155,7 +142,7 @@ func clearSessionCookie(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   -1,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   r.TLS != nil,
+		Secure:   s.secureCookie(r),
 	})
 }
 
@@ -216,7 +203,7 @@ func (s *Server) newSetupCSRFToken(w http.ResponseWriter, r *http.Request) (stri
 		Expires:  time.Now().UTC().Add(preAuthCSRFMaxAge),
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   r.TLS != nil,
+		Secure:   s.secureCookie(r),
 	})
 	return token, nil
 }
@@ -225,7 +212,7 @@ func (s *Server) validSetupCSRFToken(r *http.Request) bool {
 	return s.validPreAuthCSRFToken(r, setupCSRFPurpose)
 }
 
-func clearSetupCSRFCookie(w http.ResponseWriter, r *http.Request) {
+func (s *Server) clearSetupCSRFCookie(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     setupCookieName,
 		Value:    "",
@@ -234,7 +221,7 @@ func clearSetupCSRFCookie(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   -1,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   r.TLS != nil,
+		Secure:   s.secureCookie(r),
 	})
 }
 
@@ -250,7 +237,7 @@ func (s *Server) newLoginCSRFToken(w http.ResponseWriter, r *http.Request) (stri
 		Expires:  time.Now().UTC().Add(preAuthCSRFMaxAge),
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   r.TLS != nil,
+		Secure:   s.secureCookie(r),
 	})
 	return token, nil
 }
@@ -316,7 +303,7 @@ func (s *Server) signCSRFPayload(payload string) string {
 	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
-func clearLoginCSRFCookie(w http.ResponseWriter, r *http.Request) {
+func (s *Server) clearLoginCSRFCookie(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     loginCookieName,
 		Value:    "",
@@ -325,11 +312,11 @@ func clearLoginCSRFCookie(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   -1,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   r.TLS != nil,
+		Secure:   s.secureCookie(r),
 	})
 }
 
-func setSessionCookie(w http.ResponseWriter, r *http.Request, session sessionState) {
+func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, session sessionState) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    session.ID,
@@ -337,8 +324,12 @@ func setSessionCookie(w http.ResponseWriter, r *http.Request, session sessionSta
 		Expires:  session.ExpiresAt,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   r.TLS != nil,
+		Secure:   s.secureCookie(r),
 	})
+}
+
+func (s *Server) secureCookie(r *http.Request) bool {
+	return strings.HasPrefix(s.cfg.PublicURL, "https://") || r.TLS != nil
 }
 
 func randomToken(byteLength int) (string, error) {

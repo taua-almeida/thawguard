@@ -14,6 +14,7 @@ import (
 const (
 	companyOIDCDraftMaxBodyBytes int64 = 32 << 10
 	companyOIDCCheckMaxBodyBytes int64 = 8 << 10
+	companyOIDCTestMaxBodyBytes  int64 = 8 << 10
 	companyOIDCCheckPath               = "/settings/authentication/oidc/check"
 
 	companyOIDCCheckStaleNotice       = "oidc-check-stale"
@@ -21,6 +22,14 @@ const (
 	companyOIDCCheckUnavailableNotice = "oidc-check-unavailable"
 	companyOIDCCheckAuthorityNotice   = "oidc-check-authority"
 	companyOIDCCheckSupersededNotice  = "oidc-check-superseded"
+
+	companyOIDCTestVerifiedNotice       = "oidc-test-verified"
+	companyOIDCTestProviderDeniedNotice = "oidc-test-provider-denied"
+	companyOIDCTestProviderUnavailable  = "oidc-test-provider-unavailable"
+	companyOIDCTestProviderInvalid      = "oidc-test-provider-invalid"
+	companyOIDCTestConfigurationNotice  = "oidc-test-configuration-unavailable"
+	companyOIDCTestTransactionNotice    = "oidc-test-transaction-unavailable"
+	companyOIDCTestUnknownNotice        = "oidc-test-unknown"
 )
 
 type companyOIDCFormView struct {
@@ -52,6 +61,9 @@ type authenticationPageData struct {
 	TerminalMessage     string
 	TerminalTone        string
 	SetupHealth         companyOIDCSetupHealthView
+	CallbackURI         string
+	TestSignInAvailable bool
+	TestSignInReason    string
 }
 
 type companyOIDCSetupHealthView struct {
@@ -276,6 +288,117 @@ func (s *Server) handleCompanyOIDCCheck(w http.ResponseWriter, r *http.Request) 
 	s.renderPage(w, "components/company-oidc-setup-health", companyOIDCSetupHealth(connection))
 }
 
+func (s *Server) handleCompanyOIDCTestStart(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, companyOIDCTestMaxBodyBytes)
+	if !s.validExactPublicOrigin(r) {
+		s.logRequestRejected(r, originRejectionReason(r))
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	session, ok := s.requireAdminForm(w, r)
+	if !ok || session.UserID == nil {
+		return
+	}
+	revision, err := parseCompanyOIDCTestForm(r.URL, r.PostForm)
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if !s.cfg.CompanyOIDCSecretEncryptionConfigured {
+		redirectCompanyOIDCTest(w, r, companyOIDCTestConfigurationNotice)
+		return
+	}
+	if s.cfg.CompanyOIDCService == nil {
+		redirectCompanyOIDCTest(w, r, companyOIDCTestUnknownNotice)
+		return
+	}
+	start, err := s.cfg.CompanyOIDCService.StartTestSignIn(r.Context(), companyoidc.TestSignInStartInput{
+		ActorUserID:      *session.UserID,
+		SessionID:        session.ID,
+		ExpectedRevision: revision,
+		CallbackURI:      s.cfg.PublicURL + companyoidc.TestSignInCallbackPath,
+	})
+	if err != nil {
+		notice := companyOIDCTestTransactionNotice
+		switch {
+		case errors.Is(err, companyoidc.ErrConfiguration):
+			notice = companyOIDCTestConfigurationNotice
+		case errors.Is(err, companyoidc.ErrTestProviderUnavailable):
+			notice = companyOIDCTestProviderUnavailable
+		case errors.Is(err, companyoidc.ErrTestProviderInvalid):
+			notice = companyOIDCTestProviderInvalid
+		case errors.Is(err, companyoidc.ErrTestTransactionOutcomeUnknown):
+			notice = companyOIDCTestUnknownNotice
+		}
+		redirectCompanyOIDCTest(w, r, notice)
+		return
+	}
+	http.Redirect(w, r, start.AuthorizationURL, http.StatusSeeOther)
+}
+
+func (s *Server) handleCompanyOIDCTestCallback(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	state, ok := companyoidc.TestSignInStateFromRawQuery(r.URL.RawQuery)
+	if !ok {
+		redirectCompanyOIDCTest(w, r, companyOIDCTestTransactionNotice)
+		return
+	}
+	sessionID := exactTestSignInSessionCookie(r)
+	if s.cfg.CompanyOIDCService == nil {
+		redirectCompanyOIDCTest(w, r, companyOIDCTestTransactionNotice)
+		return
+	}
+	result, err := s.cfg.CompanyOIDCService.CompleteTestSignIn(r.Context(), companyoidc.TestSignInCallbackInput{
+		State:     state,
+		SessionID: sessionID,
+		RawQuery:  r.URL.RawQuery,
+	})
+	if err != nil {
+		notice := companyOIDCTestTransactionNotice
+		if errors.Is(err, companyoidc.ErrTestTransactionOutcomeUnknown) {
+			notice = companyOIDCTestUnknownNotice
+		}
+		redirectCompanyOIDCTest(w, r, notice)
+		return
+	}
+	notice := map[companyoidc.TestSignInResultCode]string{
+		companyoidc.TestSignInVerified:                 companyOIDCTestVerifiedNotice,
+		companyoidc.TestSignInProviderDenied:           companyOIDCTestProviderDeniedNotice,
+		companyoidc.TestSignInProviderUnavailable:      companyOIDCTestProviderUnavailable,
+		companyoidc.TestSignInProviderInvalid:          companyOIDCTestProviderInvalid,
+		companyoidc.TestSignInConfigurationUnavailable: companyOIDCTestConfigurationNotice,
+	}[result]
+	if notice == "" {
+		notice = companyOIDCTestUnknownNotice
+	}
+	redirectCompanyOIDCTest(w, r, notice)
+}
+
+func redirectCompanyOIDCTest(w http.ResponseWriter, r *http.Request, notice string) {
+	http.Redirect(w, r, companyOIDCNoticeLocation(notice), http.StatusSeeOther)
+}
+
+func exactTestSignInSessionCookie(r *http.Request) string {
+	value := ""
+	count := 0
+	for _, cookie := range r.Cookies() {
+		if cookie.Name != sessionCookieName {
+			continue
+		}
+		count++
+		value = cookie.Value
+	}
+	if count != 1 || value == "" {
+		return ""
+	}
+	return value
+}
+
 func (s *Server) renderAuthenticationRead(w http.ResponseWriter, r *http.Request, status int, session sessionState) {
 	connection, found, ok := s.currentCompanyOIDCConnection(w, r, session)
 	if !ok {
@@ -286,6 +409,16 @@ func (s *Server) renderAuthenticationRead(w http.ResponseWriter, r *http.Request
 	data.HasConnection = found
 	if found {
 		data.SetupHealth = companyOIDCSetupHealth(connection)
+		data.CallbackURI = s.cfg.PublicURL + companyoidc.TestSignInCallbackPath
+		data.TestSignInReason = "Complete a current metadata check and resolve its result before testing sign-in."
+		if !s.cfg.CompanyOIDCSecretEncryptionConfigured {
+			data.TestSignInReason = "Configure client-secret encryption before testing sign-in."
+		} else if connection.SetupCheck != nil &&
+			connection.SetupCheck.ConfigRevision == connection.Revision &&
+			connection.SetupCheck.ResultCode == companyoidc.SetupCheckVerified {
+			data.TestSignInAvailable = true
+			data.TestSignInReason = ""
+		}
 	}
 	data.Toasts = companyOIDCNoticeToasts(r.URL.Query())
 	s.renderPageStatus(w, status, "layouts/authentication", data)
@@ -407,6 +540,20 @@ func parseCompanyOIDCCheckForm(requestURL *url.URL, values url.Values) error {
 	return nil
 }
 
+func parseCompanyOIDCTestForm(requestURL *url.URL, values url.Values) (int64, error) {
+	if requestURL.RawQuery != "" || requestURL.ForceQuery {
+		return 0, errors.New("query values are not allowed")
+	}
+	if len(values) != 2 || len(values[csrfFormField]) != 1 || len(values["expected_revision"]) != 1 {
+		return 0, errors.New("Test sign-in form is malformed")
+	}
+	revision, err := canonicalExpectedRevision(values.Get("expected_revision"))
+	if err != nil || revision == 0 {
+		return 0, errors.New("expected revision is invalid")
+	}
+	return revision, nil
+}
+
 func (s *Server) redirectCompanyOIDCCheck(w http.ResponseWriter, r *http.Request, notice string) {
 	s.redirectCompanyOIDCCheckLocation(w, r, companyOIDCNoticeLocation(notice))
 }
@@ -430,7 +577,14 @@ func companyOIDCNoticeLocation(notice string) string {
 		companyOIDCCheckUnknownNotice,
 		companyOIDCCheckUnavailableNotice,
 		companyOIDCCheckAuthorityNotice,
-		companyOIDCCheckSupersededNotice:
+		companyOIDCCheckSupersededNotice,
+		companyOIDCTestVerifiedNotice,
+		companyOIDCTestProviderDeniedNotice,
+		companyOIDCTestProviderUnavailable,
+		companyOIDCTestProviderInvalid,
+		companyOIDCTestConfigurationNotice,
+		companyOIDCTestTransactionNotice,
+		companyOIDCTestUnknownNotice:
 		return "/settings/authentication?notice=" + notice
 	default:
 		return "/settings/authentication?notice=" + companyOIDCCheckUnknownNotice
@@ -456,6 +610,24 @@ func companyOIDCNoticeToasts(values url.Values) []toastView {
 		tone = "danger"
 	case companyOIDCCheckSupersededNotice:
 		message = "The check completed, then the saved OIDC state changed. Review the current Authentication settings before taking another action."
+	case companyOIDCTestVerifiedNotice:
+		message = "Configured client credentials were accepted. Thawguard verified the OIDC authorization/code flow and signed ID token. The connection remains Draft and disabled."
+		tone = "success"
+	case companyOIDCTestProviderDeniedNotice:
+		message = "The provider denied this Test sign-in. The connection remains Draft and disabled."
+	case companyOIDCTestProviderUnavailable:
+		message = "The provider was unavailable during Test sign-in. No identity or session was created."
+	case companyOIDCTestProviderInvalid:
+		message = "The provider returned an invalid Test sign-in response. Review the provider configuration before trying again."
+		tone = "danger"
+	case companyOIDCTestConfigurationNotice:
+		message = "Test sign-in could not use the saved client configuration. Check client-secret encryption and the saved provider credentials."
+		tone = "danger"
+	case companyOIDCTestTransactionNotice:
+		message = "The Test sign-in transaction, session, or Draft revision is no longer available. Start a new Test sign-in from Authentication settings."
+	case companyOIDCTestUnknownNotice:
+		message = "Thawguard could not confirm the Test sign-in outcome. Review Activity before trying again."
+		tone = "danger"
 	default:
 		return nil
 	}

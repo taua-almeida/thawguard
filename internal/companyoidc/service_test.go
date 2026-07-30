@@ -682,6 +682,7 @@ func newServiceFixture(t *testing.T) *serviceFixture {
 		nextUserID:  2,
 	}
 	fixture.service = NewService(database, secretStore, nil)
+	fixture.service.publicURL = "http://localhost:8080"
 	fixture.insertAdminWithID(t, fixture.adminID, "admin@example.test")
 	return fixture
 }

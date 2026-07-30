@@ -144,6 +144,8 @@ type CompanyOIDCService interface {
 	Create(ctx context.Context, actorUserID int64, input companyoidc.CreateInput) error
 	Edit(ctx context.Context, actorUserID int64, input companyoidc.EditInput) error
 	Check(ctx context.Context, actorUserID int64) (companyoidc.SetupCheck, error)
+	StartTestSignIn(ctx context.Context, input companyoidc.TestSignInStartInput) (companyoidc.TestSignInStart, error)
+	CompleteTestSignIn(ctx context.Context, input companyoidc.TestSignInCallbackInput) (companyoidc.TestSignInResultCode, error)
 }
 
 type RepositoryStore interface {
@@ -484,6 +486,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /settings/authentication/edit", s.handleAuthenticationSettingsEdit)
 	s.mux.HandleFunc("POST /settings/authentication/oidc", s.handleCompanyOIDCDraftSave)
 	s.mux.HandleFunc("POST /settings/authentication/oidc/check", s.handleCompanyOIDCCheck)
+	s.mux.HandleFunc("POST /settings/authentication/oidc/test", s.handleCompanyOIDCTestStart)
+	s.mux.HandleFunc("GET /settings/authentication/oidc/callback", s.handleCompanyOIDCTestCallback)
 	s.mux.HandleFunc("POST /users", s.handleCreateUser)
 	s.mux.HandleFunc("POST /users/invitations", s.handleCreateInvitation)
 	s.mux.HandleFunc("POST /users/invitations/{id}/cancel", s.handleCancelInvitation)
@@ -578,8 +582,8 @@ func (s *Server) handleCreateFirstAdmin(w http.ResponseWriter, r *http.Request) 
 		s.renderSetupStatus(w, r, email, displayName, err.Error(), http.StatusBadRequest)
 		return
 	}
-	clearSetupCSRFCookie(w, r)
-	setSessionCookie(w, r, sessionStateFromAuth(session))
+	s.clearSetupCSRFCookie(w, r)
+	s.setSessionCookie(w, r, sessionStateFromAuth(session))
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
@@ -634,8 +638,8 @@ func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 		s.renderLoginStatus(w, r, email, err.Error(), http.StatusUnauthorized)
 		return
 	}
-	clearLoginCSRFCookie(w, r)
-	setSessionCookie(w, r, sessionStateFromAuth(session))
+	s.clearLoginCSRFCookie(w, r)
+	s.setSessionCookie(w, r, sessionStateFromAuth(session))
 	http.Redirect(w, r, postLoginPath(session.User.MustChangePassword), http.StatusSeeOther)
 }
 
@@ -657,7 +661,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	clearSessionCookie(w, r)
+	s.clearSessionCookie(w, r)
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
@@ -1985,7 +1989,7 @@ func (s *Server) handleAccountPasswordPost(w http.ResponseWriter, r *http.Reques
 		s.renderAccountPassword(w, err.Error(), http.StatusBadRequest, session)
 		return
 	}
-	setSessionCookie(w, r, sessionStateFromAuth(newSession))
+	s.setSessionCookie(w, r, sessionStateFromAuth(newSession))
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
@@ -2143,7 +2147,7 @@ func (s *Server) requireViewWithGate(w http.ResponseWriter, r *http.Request, all
 		return sessionState{}, false
 	}
 	if ok {
-		setSessionCookie(w, r, session)
+		s.setSessionCookie(w, r, session)
 		return session, true
 	}
 	if s.cfg.AuthService == nil {
@@ -2289,6 +2293,8 @@ var activityActionDefinitions = map[string]activityActionDefinition{
 	audit.ActionInvitationAccepted:                 {Label: "Invitation", Outcome: "Accepted", OutcomeClass: "ok"},
 	audit.ActionOIDCConnectionDraftSaved:           {Label: "Company sign-in Draft saved", Outcome: "Saved", OutcomeClass: "ok"},
 	audit.ActionOIDCConnectionMetadataChecked:      {Label: "OIDC metadata check", Outcome: "Checked", OutcomeClass: "ok"},
+	audit.ActionOIDCConnectionTestSignInClaimed:    {Label: "OIDC Test sign-in", Outcome: "Claimed", OutcomeClass: "pending"},
+	audit.ActionOIDCConnectionTestSignInCompleted:  {Label: "OIDC Test sign-in", Outcome: "Completed", OutcomeClass: "ok"},
 }
 
 func activityEventViews(repositories []domain.Repository, users []auth.User, events []audit.Event) []activityEventView {
@@ -2474,6 +2480,22 @@ func activityEventViewForEvent(repositories map[int64]domain.Repository, users m
 		}
 		view.Target = "Company OIDC connection"
 		view.Detail = detail
+	case audit.ActionOIDCConnectionTestSignInClaimed:
+		detail, ok := activityOIDCTestSignInClaimedDetail(event, details)
+		if !ok {
+			return fallbackActivityEventView(users, event, details, true, forceUnknownInvitationActor)
+		}
+		view.Target = "Company OIDC connection"
+		view.Detail = detail
+	case audit.ActionOIDCConnectionTestSignInCompleted:
+		detail, outcome, outcomeClass, ok := activityOIDCTestSignInCompletedDetail(event, details)
+		if !ok {
+			return fallbackActivityEventView(users, event, details, true, forceUnknownInvitationActor)
+		}
+		view.Target = "Company OIDC connection"
+		view.Detail = detail
+		view.Outcome = outcome
+		view.OutcomeClass = outcomeClass
 	case audit.ActionRepositoryGrantAdded:
 		view.Target = activityRepositoryTarget(repositories, event, details, "")
 		if provenance, ok := activityExactStringDetail(details, "provenance"); ok && provenance == "invitation_acceptance" {
@@ -2570,7 +2592,9 @@ func activityHasGuardedDetails(action string) bool {
 		audit.ActionUserCreated,
 		audit.ActionUserRolesUpdated,
 		audit.ActionRepositoryGrantAdded,
-		audit.ActionOIDCConnectionMetadataChecked:
+		audit.ActionOIDCConnectionMetadataChecked,
+		audit.ActionOIDCConnectionTestSignInClaimed,
+		audit.ActionOIDCConnectionTestSignInCompleted:
 		return true
 	default:
 		return false
@@ -2588,6 +2612,10 @@ func activityGuardedDetail(action, key string) bool {
 	case audit.ActionRepositoryGrantAdded:
 		return key == "actor_kind" || key == "provenance" || key == "user_id" || key == "role"
 	case audit.ActionOIDCConnectionMetadataChecked:
+		return key == "revision" || key == "result_code"
+	case audit.ActionOIDCConnectionTestSignInClaimed:
+		return key == "revision" || key == "binding" || key == "authority"
+	case audit.ActionOIDCConnectionTestSignInCompleted:
 		return key == "revision" || key == "result_code"
 	default:
 		return false
@@ -3033,6 +3061,80 @@ func activityOIDCMetadataCheckedDetail(event audit.Event, details activityDetail
 		companyoidc.SetupCheckJWKSNoCandidate:      "no supported public-key candidate was published",
 	}[result]
 	return fmt.Sprintf("Revision %d checked; %s.", revision, resultCopy), true
+}
+
+func activityOIDCTestSignInClaimedDetail(event audit.Event, details activityDetails) (string, bool) {
+	if event.SubjectType != audit.SubjectTypeOIDCConnection || event.SubjectID != "1" || len(details) != 3 {
+		return "", false
+	}
+	revision, ok := activityOIDCRevision(details)
+	if !ok || !activityExactStringDetailEquals(details, "binding", "exact_session") ||
+		!activityExactStringDetailEquals(details, "authority", "current_administrator") {
+		return "", false
+	}
+	return fmt.Sprintf("Revision %d callback claimed; provider verification had not yet completed.", revision), true
+}
+
+func activityOIDCTestSignInCompletedDetail(
+	event audit.Event,
+	details activityDetails,
+) (detail string, outcome string, outcomeClass string, ok bool) {
+	if event.SubjectType != audit.SubjectTypeOIDCConnection || event.SubjectID != "1" || len(details) != 2 {
+		return "", "", "", false
+	}
+	revision, ok := activityOIDCRevision(details)
+	if !ok {
+		return "", "", "", false
+	}
+	var resultText string
+	if raw, present := details["result_code"]; !present || json.Unmarshal(raw, &resultText) != nil {
+		return "", "", "", false
+	}
+	result := companyoidc.TestSignInResultCode(resultText)
+	if !result.Valid() {
+		return "", "", "", false
+	}
+	presentation := map[companyoidc.TestSignInResultCode]struct {
+		detail       string
+		outcome      string
+		outcomeClass string
+	}{
+		companyoidc.TestSignInVerified: {
+			detail:       "Configured client credentials, the authorization-code flow, and the signed ID token were verified; the connection remains Draft.",
+			outcome:      "Verified",
+			outcomeClass: "ok",
+		},
+		companyoidc.TestSignInProviderDenied: {
+			detail:       "The provider denied the Test sign-in; the connection remains Draft.",
+			outcome:      "Denied",
+			outcomeClass: "warning",
+		},
+		companyoidc.TestSignInProviderUnavailable: {
+			detail:       "The provider was unavailable during Test sign-in; the connection remains Draft.",
+			outcome:      "Unavailable",
+			outcomeClass: "failed",
+		},
+		companyoidc.TestSignInProviderInvalid: {
+			detail:       "The provider returned an invalid Test sign-in response; the connection remains Draft.",
+			outcome:      "Invalid",
+			outcomeClass: "failed",
+		},
+		companyoidc.TestSignInConfigurationUnavailable: {
+			detail:       "The saved client configuration was unavailable during Test sign-in; the connection remains Draft.",
+			outcome:      "Unavailable",
+			outcomeClass: "failed",
+		},
+	}[result]
+	return fmt.Sprintf("Revision %d: %s", revision, presentation.detail), presentation.outcome, presentation.outcomeClass, true
+}
+
+func activityOIDCRevision(details activityDetails) (int64, bool) {
+	var revision int64
+	raw, ok := details["revision"]
+	if !ok || json.Unmarshal(raw, &revision) != nil || revision <= 0 {
+		return 0, false
+	}
+	return revision, true
 }
 
 func activitySetupCheckDetail(details activityDetails) string {
