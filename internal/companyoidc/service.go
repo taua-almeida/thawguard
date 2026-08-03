@@ -29,12 +29,13 @@ const (
 )
 
 type Connection struct {
-	ProviderLabel string
-	Issuer        string
-	ClientID      string
-	Domains       []string
-	Revision      int64
-	SetupCheck    *SetupCheck
+	ProviderLabel      string
+	Issuer             string
+	ClientID           string
+	Domains            []string
+	Revision           int64
+	SetupCheck         *SetupCheck
+	TestSignInEvidence *TestSignInEvidence
 }
 
 type CreateInput struct {
@@ -510,6 +511,7 @@ type connectionRecord struct {
 	CreatedAt              time.Time
 	UpdatedAt              time.Time
 	SetupCheck             *SetupCheck
+	TestSignInEvidence     *TestSignInEvidence
 }
 
 type connectionQueryer interface {
@@ -521,10 +523,12 @@ func loadConnectionRecord(ctx context.Context, q connectionQueryer) (connectionR
 SELECT c.provider_label, c.issuer, c.client_id, c.client_secret_ciphertext,
   c.revision, c.created_at, c.updated_at, d.domain,
   sc.config_revision, sc.result_code, sc.observed_issuer,
-  sc.public_key_candidate_count, sc.checked_at
+  sc.public_key_candidate_count, sc.checked_at,
+  te.config_revision, te.verified_at
 FROM company_oidc_connections c
 LEFT JOIN company_oidc_allowed_domains d ON d.connection_id = c.id
 LEFT JOIN company_oidc_setup_checks sc ON sc.connection_id = c.id
+LEFT JOIN company_oidc_test_sign_in_evidence te ON te.connection_id = c.id
 WHERE c.id = 1
 ORDER BY d.domain`)
 	if err != nil {
@@ -539,8 +543,8 @@ ORDER BY d.domain`)
 		var ciphertext []byte
 		var revision int64
 		var domain sql.NullString
-		var checkRevision, candidateCount sql.NullInt64
-		var resultCode, observedIssuer, checkedAt sql.NullString
+		var checkRevision, candidateCount, evidenceRevision sql.NullInt64
+		var resultCode, observedIssuer, checkedAt, verifiedAt sql.NullString
 		if err := rows.Scan(
 			&providerLabel,
 			&issuer,
@@ -555,6 +559,8 @@ ORDER BY d.domain`)
 			&observedIssuer,
 			&candidateCount,
 			&checkedAt,
+			&evidenceRevision,
+			&verifiedAt,
 		); err != nil {
 			return connectionRecord{}, false, fmt.Errorf("scan company OIDC Draft: %w", err)
 		}
@@ -595,6 +601,19 @@ ORDER BY d.domain`)
 				}
 				record.SetupCheck = check
 			}
+			if evidenceRevision.Valid || verifiedAt.Valid {
+				if !evidenceRevision.Valid || !verifiedAt.Valid {
+					return connectionRecord{}, false, errors.New("company OIDC test sign-in evidence is malformed")
+				}
+				parsedVerifiedAt, parseErr := parseCompanyOIDCTime(verifiedAt.String)
+				if parseErr != nil {
+					return connectionRecord{}, false, errors.New("company OIDC test sign-in evidence is malformed")
+				}
+				record.TestSignInEvidence = &TestSignInEvidence{
+					ConfigRevision: evidenceRevision.Int64,
+					VerifiedAt:     parsedVerifiedAt,
+				}
+			}
 			found = true
 		}
 		if domain.Valid {
@@ -626,13 +645,19 @@ func publicConnection(record connectionRecord) (Connection, error) {
 			return Connection{}, err
 		}
 	}
+	if record.TestSignInEvidence != nil {
+		if err := validateTestSignInEvidence(*record.TestSignInEvidence, record.Revision); err != nil {
+			return Connection{}, err
+		}
+	}
 	return Connection{
-		ProviderLabel: record.ProviderLabel,
-		Issuer:        record.Issuer,
-		ClientID:      record.ClientID,
-		Domains:       slices.Clone(record.Domains),
-		Revision:      record.Revision,
-		SetupCheck:    cloneSetupCheck(record.SetupCheck),
+		ProviderLabel:      record.ProviderLabel,
+		Issuer:             record.Issuer,
+		ClientID:           record.ClientID,
+		Domains:            slices.Clone(record.Domains),
+		Revision:           record.Revision,
+		SetupCheck:         cloneSetupCheck(record.SetupCheck),
+		TestSignInEvidence: cloneTestSignInEvidence(record.TestSignInEvidence),
 	}, nil
 }
 
@@ -700,6 +725,9 @@ WHERE id = 1`,
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM company_oidc_setup_checks WHERE connection_id = 1`); err != nil {
 		return fmt.Errorf("invalidate company OIDC setup-check evidence: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM company_oidc_test_sign_in_evidence WHERE connection_id = 1`); err != nil {
+		return fmt.Errorf("invalidate company OIDC test sign-in evidence: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM company_oidc_allowed_domains WHERE connection_id = 1`); err != nil {
 		return fmt.Errorf("replace company OIDC allowed domains: %w", err)

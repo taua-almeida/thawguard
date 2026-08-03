@@ -503,11 +503,30 @@ func (s *Service) completeTestSignIn(
 		!bytes.Equal(snapshot.clientSecretCiphertext, claim.clientSecretCiphertext) {
 		return ErrTestTransactionUnavailable
 	}
+	if result == TestSignInVerified {
+		if err := replaceTestSignInEvidence(ctx, tx, claim.configRevision, now); err != nil {
+			return ErrTestTransactionUnavailable
+		}
+	}
 	if err := recordTestSignInCompleted(ctx, tx, claim.actorUserID, claim.configRevision, result); err != nil {
 		return ErrTestTransactionUnavailable
 	}
 	if err := tx.Commit(); err != nil {
 		return ErrTestTransactionOutcomeUnknown
+	}
+	return nil
+}
+
+func replaceTestSignInEvidence(ctx context.Context, tx *sql.Tx, revision int64, verifiedAt time.Time) error {
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO company_oidc_test_sign_in_evidence(connection_id, config_revision, verified_at)
+VALUES (1, ?, ?)
+ON CONFLICT(connection_id) DO UPDATE
+SET config_revision = excluded.config_revision, verified_at = excluded.verified_at`,
+		revision,
+		formatCompanyOIDCTime(verifiedAt),
+	); err != nil {
+		return fmt.Errorf("record company OIDC test sign-in evidence: %w", err)
 	}
 	return nil
 }

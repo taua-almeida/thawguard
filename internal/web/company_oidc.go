@@ -21,7 +21,6 @@ const (
 	companyOIDCCheckUnknownNotice     = "oidc-check-unknown"
 	companyOIDCCheckUnavailableNotice = "oidc-check-unavailable"
 	companyOIDCCheckAuthorityNotice   = "oidc-check-authority"
-	companyOIDCCheckSupersededNotice  = "oidc-check-superseded"
 
 	companyOIDCTestVerifiedNotice       = "oidc-test-verified"
 	companyOIDCTestProviderDeniedNotice = "oidc-test-provider-denied"
@@ -62,8 +61,13 @@ type authenticationPageData struct {
 	TerminalTone        string
 	SetupHealth         companyOIDCSetupHealthView
 	CallbackURI         string
+	MetadataVerified    bool
 	TestSignInAvailable bool
 	TestSignInReason    string
+	TestSignInCompleted bool
+	TestSignInRevision  int64
+	TestSignInTime      string
+	ReadyToEnable       bool
 }
 
 type companyOIDCSetupHealthView struct {
@@ -257,8 +261,7 @@ func (s *Server) handleCompanyOIDCCheck(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	check, err := s.cfg.CompanyOIDCService.Check(r.Context(), *session.UserID)
-	if err != nil {
+	if _, err := s.cfg.CompanyOIDCService.Check(r.Context(), *session.UserID); err != nil {
 		notice := companyOIDCCheckUnknownNotice
 		switch {
 		case errors.Is(err, companyoidc.ErrCheckStale), errors.Is(err, companyoidc.ErrNoDraft):
@@ -271,21 +274,7 @@ func (s *Server) handleCompanyOIDCCheck(w http.ResponseWriter, r *http.Request) 
 		s.redirectCompanyOIDCCheck(w, r, notice)
 		return
 	}
-	if !isHXRequest(r) {
-		http.Redirect(w, r, "/settings/authentication", http.StatusSeeOther)
-		return
-	}
-
-	connection, found, currentErr := s.cfg.CompanyOIDCService.Current(r.Context())
-	if currentErr != nil {
-		s.redirectCompanyOIDCCheck(w, r, companyOIDCCheckUnknownNotice)
-		return
-	}
-	if !found || connection.Revision != check.ConfigRevision || connection.SetupCheck == nil {
-		s.redirectCompanyOIDCCheck(w, r, companyOIDCCheckSupersededNotice)
-		return
-	}
-	s.renderPage(w, "components/company-oidc-setup-health", companyOIDCSetupHealth(connection))
+	s.redirectCompanyOIDCCheckLocation(w, r, "/settings/authentication")
 }
 
 func (s *Server) handleCompanyOIDCTestStart(w http.ResponseWriter, r *http.Request) {
@@ -410,15 +399,22 @@ func (s *Server) renderAuthenticationRead(w http.ResponseWriter, r *http.Request
 	if found {
 		data.SetupHealth = companyOIDCSetupHealth(connection)
 		data.CallbackURI = s.cfg.PublicURL + companyoidc.TestSignInCallbackPath
+		data.MetadataVerified = connection.SetupCheck != nil &&
+			connection.SetupCheck.ConfigRevision == connection.Revision &&
+			connection.SetupCheck.ResultCode == companyoidc.SetupCheckVerified
 		data.TestSignInReason = "Complete a current metadata check and resolve its result before testing sign-in."
 		if !s.cfg.CompanyOIDCSecretEncryptionConfigured {
 			data.TestSignInReason = "Configure client-secret encryption before testing sign-in."
-		} else if connection.SetupCheck != nil &&
-			connection.SetupCheck.ConfigRevision == connection.Revision &&
-			connection.SetupCheck.ResultCode == companyoidc.SetupCheckVerified {
+		} else if data.MetadataVerified {
 			data.TestSignInAvailable = true
 			data.TestSignInReason = ""
 		}
+		if connection.TestSignInEvidence != nil {
+			data.TestSignInCompleted = true
+			data.TestSignInRevision = connection.TestSignInEvidence.ConfigRevision
+			data.TestSignInTime = connection.TestSignInEvidence.VerifiedAt.UTC().Format("2006-01-02 15:04:05 UTC")
+		}
+		data.ReadyToEnable = data.TestSignInAvailable && data.TestSignInCompleted
 	}
 	data.Toasts = companyOIDCNoticeToasts(r.URL.Query())
 	s.renderPageStatus(w, status, "layouts/authentication", data)
@@ -577,7 +573,6 @@ func companyOIDCNoticeLocation(notice string) string {
 		companyOIDCCheckUnknownNotice,
 		companyOIDCCheckUnavailableNotice,
 		companyOIDCCheckAuthorityNotice,
-		companyOIDCCheckSupersededNotice,
 		companyOIDCTestVerifiedNotice,
 		companyOIDCTestProviderDeniedNotice,
 		companyOIDCTestProviderUnavailable,
@@ -608,8 +603,6 @@ func companyOIDCNoticeToasts(values url.Values) []toastView {
 	case companyOIDCCheckAuthorityNotice:
 		message = "Administrator authority changed before this check could be recorded."
 		tone = "danger"
-	case companyOIDCCheckSupersededNotice:
-		message = "The check completed, then the saved OIDC state changed. Review the current Authentication settings before taking another action."
 	case companyOIDCTestVerifiedNotice:
 		message = "Configured client credentials were accepted. Thawguard verified the OIDC authorization/code flow and signed ID token. The connection remains Draft and disabled."
 		tone = "success"

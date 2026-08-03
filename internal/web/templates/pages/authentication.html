@@ -12,7 +12,7 @@
       {{ if and .HasConnection (not .ShowForm) }}
       <li class="flex min-w-0 items-center gap-2 rounded-card bg-success-soft px-3 py-2 text-sm font-semibold text-success"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-success-soft text-success"><svg class="h-3.5 w-3.5" aria-hidden="true"><use href="#tg-i-check"></use></svg></span><span>Configure</span></li>
       {{ if .EncryptionAvailable }}
-      {{ if .TestSignInAvailable }}
+      {{ if .MetadataVerified }}
       <li class="flex min-w-0 items-center gap-2 rounded-card bg-success-soft px-3 py-2 text-sm font-semibold text-success"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-success-soft text-success"><svg class="h-3.5 w-3.5" aria-hidden="true"><use href="#tg-i-check"></use></svg></span><span class="min-w-0">Verify metadata <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Metadata verified</span></span></li>
       {{ else }}
       <li class="flex min-w-0 items-center gap-2 rounded-card bg-accent-soft px-3 py-2 text-sm font-semibold text-accent-strong" aria-current="step"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-accent text-xs text-on-accent">2</span><span class="min-w-0">Verify metadata <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Saved Draft</span></span></li>
@@ -24,12 +24,18 @@
       <li class="flex min-w-0 items-center gap-2 rounded-card bg-accent-soft px-3 py-2 text-sm font-semibold text-accent-strong" aria-current="step"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-accent text-xs text-on-accent">1</span><span>Configure</span></li>
       <li class="flex min-w-0 items-center gap-2 rounded-card bg-surface-muted px-3 py-2 text-sm text-text-muted" aria-disabled="true"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-neutral-soft text-xs">2</span><span class="min-w-0">Verify metadata <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Available after save</span></span></li>
       {{ end }}
-      {{ if .TestSignInAvailable }}
+      {{ if .ReadyToEnable }}
+      <li class="flex min-w-0 items-center gap-2 rounded-card bg-success-soft px-3 py-2 text-sm font-semibold text-success"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-success-soft text-success"><svg class="h-3.5 w-3.5" aria-hidden="true"><use href="#tg-i-check"></use></svg></span><span class="min-w-0">Test sign-in <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Verified for saved Draft</span></span></li>
+      {{ else if .TestSignInAvailable }}
       <li class="flex min-w-0 items-center gap-2 rounded-card bg-accent-soft px-3 py-2 text-sm font-semibold text-accent-strong" aria-current="step"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-accent text-xs text-on-accent">3</span><span class="min-w-0">Test sign-in <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Available for saved Draft</span></span></li>
       {{ else }}
       <li class="flex min-w-0 items-center gap-2 rounded-card bg-surface-muted px-3 py-2 text-sm text-text-muted" aria-disabled="true"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-neutral-soft text-xs">3</span><span class="min-w-0">Test sign-in <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Requires current verification</span></span></li>
       {{ end }}
+      {{ if .ReadyToEnable }}
+      <li class="flex min-w-0 items-center gap-2 rounded-card bg-accent-soft px-3 py-2 text-sm font-semibold text-accent-strong" aria-current="step" aria-disabled="true"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-accent text-xs text-on-accent">4</span><span class="min-w-0">Enable <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Ready to enable · Not implemented</span></span></li>
+      {{ else }}
       <li class="flex min-w-0 items-center gap-2 rounded-card bg-surface-muted px-3 py-2 text-sm text-text-muted" aria-disabled="true"><span class="flex size-7 flex-none items-center justify-center rounded-pill bg-neutral-soft text-xs">4</span><span class="min-w-0">Enable <span class="block text-[0.65rem] font-semibold uppercase tracking-wide">Not implemented</span></span></li>
+      {{ end }}
     </ol>
   </nav>
 
@@ -93,7 +99,7 @@
       <div class="mt-5">{{ template "components/company-oidc-setup-health" .SetupHealth }}</div>
       {{ if .EncryptionAvailable }}
       <div class="mt-5 flex flex-wrap items-center gap-3">
-        <form method="post" action="/settings/authentication/oidc/check" hx-post="/settings/authentication/oidc/check" hx-target="#oidc-setup-health" hx-swap="outerHTML" hx-indicator="#oidc-setup-health" hx-disabled-elt="find button">
+        <form method="post" action="/settings/authentication/oidc/check" hx-post="/settings/authentication/oidc/check" hx-indicator="#oidc-setup-health" hx-disabled-elt="find button">
           <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
           {{ template "ui/button" dict "Label" "Check configuration" "Variant" "primary" "Type" "submit" "Icon" "tg-i-check" }}
         </form>
@@ -103,6 +109,12 @@
       <section class="mt-5 rounded-card border border-border bg-surface-muted p-4" aria-labelledby="oidc-test-sign-in-title">
         <h3 id="oidc-test-sign-in-title" class="m-0 text-base font-bold text-text">Test sign-in</h3>
         <p class="m-0 mt-1 text-sm text-text-muted">Verify the configured client credentials, authorization-code redirect, and signed ID token. This creates no identity, user, or Thawguard session and does not enable the connection.</p>
+        {{ if .TestSignInCompleted }}
+        <p class="m-0 mt-3 flex items-center gap-2 text-sm font-semibold text-success"><svg class="h-4 w-4 flex-none" aria-hidden="true"><use href="#tg-i-check"></use></svg><span>Test sign-in verified for saved revision {{ .TestSignInRevision }} at {{ .TestSignInTime }}.</span></p>
+        {{ end }}
+        {{ if .ReadyToEnable }}
+        <p class="m-0 mt-2 text-sm text-text-muted">Requirements met; enabling is not implemented. The connection remains Draft and disabled.</p>
+        {{ end }}
         {{ if .TestSignInAvailable }}
         <form method="post" action="/settings/authentication/oidc/test" class="mt-4">
           <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">

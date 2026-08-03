@@ -464,8 +464,17 @@ func TestAuthenticationCheckNativeAndHTMXFlowsRenderPersistedTruth(t *testing.T)
 
 	fixture.checker.report = companyoidc.SetupCheckReport{ResultCode: companyoidc.SetupCheckJWKSInvalid}
 	hx := companyOIDCCheckPOST(fixture.server, fixture.adminCookie(), form, []string{companyOIDCWebPublicURL}, true)
-	assertStatusAndBodyContains(t, hx, http.StatusOK,
-		`id="oidc-setup-health"`,
+	if hx.Code != http.StatusOK || hx.Header().Get("HX-Redirect") != "/settings/authentication" {
+		t.Fatalf("HX check status=%d redirect=%q body=%q", hx.Code, hx.Header().Get("HX-Redirect"), hx.Body.String())
+	}
+	if strings.Contains(hx.Body.String(), "oidc-setup-health") {
+		t.Fatalf("HX check answered with a stale fragment: %q", hx.Body.String())
+	}
+	if vary := hx.Header().Values("Vary"); !containsString(vary, "HX-Request") {
+		t.Fatalf("HX result Vary = %v", vary)
+	}
+	failedPage := companyOIDCGET(fixture.server, hx.Header().Get("HX-Redirect"), fixture.adminCookie())
+	assertStatusAndBodyContains(t, failedPage, http.StatusOK,
 		"Check failed",
 		"advertised JWK Set was not a valid bounded JSON key set",
 		"Discovery readable",
@@ -474,18 +483,6 @@ func TestAuthenticationCheckNativeAndHTMXFlowsRenderPersistedTruth(t *testing.T)
 		"Public-key candidates published",
 		"Failed",
 	)
-	if strings.Contains(hx.Body.String(), "<!doctype html>") || hx.Header().Get("HX-Redirect") != "" {
-		t.Fatalf("successful persisted HX result was not one fragment: headers=%v body=%q", hx.Header(), hx.Body.String())
-	}
-	if vary := hx.Header().Values("Vary"); !containsString(vary, "HX-Request") {
-		t.Fatalf("HX result Vary = %v", vary)
-	}
-	failedPage := companyOIDCGET(fixture.server, "/settings/authentication", fixture.adminCookie())
-	for _, phrase := range []string{"Check failed", "advertised JWK Set was not a valid bounded JSON key set", "Public-key candidates published"} {
-		if !strings.Contains(hx.Body.String(), phrase) || !strings.Contains(failedPage.Body.String(), phrase) {
-			t.Fatalf("HTMX and native GET outcomes differ for %q", phrase)
-		}
-	}
 
 	observed := "https://issuer.example.test/"
 	fixture.checker.report = companyoidc.SetupCheckReport{
@@ -715,7 +712,7 @@ func TestAuthenticationCheckHXDemotedAdministratorGetsVisibleAuthorityRedirect(t
 	}
 }
 
-func TestAuthenticationCheckHXFollowupUsesLatestTruthAfterCommittedResult(t *testing.T) {
+func TestAuthenticationCheckHXSuccessRedirectsAndFollowupRendersLatestTruth(t *testing.T) {
 	fixture := newCompanyOIDCWebFixture(t, true)
 	checkedAt := time.Date(2026, 7, 28, 15, 0, 0, 0, time.UTC)
 	one := int64(1)
@@ -747,115 +744,16 @@ func TestAuthenticationCheckHXFollowupUsesLatestTruthAfterCommittedResult(t *tes
 		[]string{companyOIDCWebPublicURL},
 		true,
 	)
-	assertStatusAndBodyContains(t, response, http.StatusOK, "Check failed", "advertised JWK Set was not a valid bounded JSON key set")
-	if strings.Contains(response.Body.String(), "Discovery verified") || response.Header().Get("HX-Redirect") != "" {
-		t.Fatalf("HX response did not render the latest same-revision evidence: headers=%v body=%q", response.Header(), response.Body.String())
+	if response.Code != http.StatusOK || response.Header().Get("HX-Redirect") != "/settings/authentication" {
+		t.Fatalf("HX check status=%d redirect=%q body=%q", response.Code, response.Header().Get("HX-Redirect"), response.Body.String())
 	}
-}
-
-func TestAuthenticationCheckHXFollowupDistinguishesSupersessionAndReadFailure(t *testing.T) {
-	fixture := newCompanyOIDCWebFixture(t, true)
-	checkedAt := time.Date(2026, 7, 28, 15, 0, 0, 0, time.UTC)
-	one := int64(1)
-	completed := companyoidc.SetupCheck{
-		ConfigRevision:          1,
-		ResultCode:              companyoidc.SetupCheckVerified,
-		PublicKeyCandidateCount: &one,
-		CheckedAt:               checkedAt,
+	if strings.Contains(response.Body.String(), "oidc-setup-health") {
+		t.Fatalf("HX check answered with a stale fragment: %q", response.Body.String())
 	}
-	tests := []struct {
-		name       string
-		service    *recordingCompanyOIDCService
-		wantNotice string
-	}{
-		{
-			name: "later edit invalidated committed result",
-			service: &recordingCompanyOIDCService{
-				checkResult:  completed,
-				current:      companyoidc.Connection{Revision: 2},
-				currentFound: true,
-			},
-			wantNotice: companyOIDCCheckSupersededNotice,
-		},
-		{
-			name: "Draft removed after committed result",
-			service: &recordingCompanyOIDCService{
-				checkResult: completed,
-			},
-			wantNotice: companyOIDCCheckSupersededNotice,
-		},
-		{
-			name: "newer revision already has evidence",
-			service: &recordingCompanyOIDCService{
-				checkResult: completed,
-				current: companyoidc.Connection{
-					Revision: 2,
-					SetupCheck: &companyoidc.SetupCheck{
-						ConfigRevision:          2,
-						ResultCode:              companyoidc.SetupCheckVerified,
-						PublicKeyCandidateCount: &one,
-						CheckedAt:               checkedAt.Add(time.Second),
-					},
-				},
-				currentFound: true,
-			},
-			wantNotice: companyOIDCCheckSupersededNotice,
-		},
-		{
-			name: "followup read failed",
-			service: &recordingCompanyOIDCService{
-				checkResult: completed,
-				currentErr:  errors.New("raw followup database canary"),
-			},
-			wantNotice: companyOIDCCheckUnknownNotice,
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			fixture.server.cfg.CompanyOIDCService = tc.service
-			response := companyOIDCCheckPOST(
-				fixture.server,
-				fixture.adminCookie(),
-				url.Values{csrfFormField: {fixture.admin.CSRFToken}},
-				[]string{companyOIDCWebPublicURL},
-				true,
-			)
-			wantLocation := companyOIDCNoticeLocation(tc.wantNotice)
-			if response.Code != http.StatusOK || response.Header().Get("HX-Redirect") != wantLocation {
-				t.Fatalf("status=%d redirect=%q want=%q", response.Code, response.Header().Get("HX-Redirect"), wantLocation)
-			}
-			if strings.Contains(response.Body.String(), "raw followup") {
-				t.Fatal("followup failure exposed a raw error")
-			}
-			if tc.wantNotice == companyOIDCCheckSupersededNotice {
-				toasts := companyOIDCNoticeToasts(url.Values{"notice": {companyOIDCCheckSupersededNotice}})
-				if len(toasts) != 1 || !strings.Contains(toasts[0].Message, "saved OIDC state changed") {
-					t.Fatalf("superseded copy is not neutral: %+v", toasts)
-				}
-				for _, misleading := range []string{"current revision has no result", "run Check configuration again"} {
-					if strings.Contains(toasts[0].Message, misleading) {
-						t.Fatalf("superseded copy made an unsupported claim %q", misleading)
-					}
-				}
-			}
-		})
-	}
-
-	service := tests[0].service
-	fixture.server.cfg.CompanyOIDCService = service
-	redirect := companyOIDCCheckPOST(
-		fixture.server,
-		fixture.adminCookie(),
-		url.Values{csrfFormField: {fixture.admin.CSRFToken}},
-		[]string{companyOIDCWebPublicURL},
-		true,
-	)
-	noticePage := companyOIDCGET(fixture.server, redirect.Header().Get("HX-Redirect"), fixture.adminCookie())
-	assertStatusAndBodyContains(t, noticePage, http.StatusOK, "check completed, then the saved OIDC state changed", "Review the current Authentication settings")
-	for _, misleading := range []string{"current revision has no result", "run Check configuration again"} {
-		if strings.Contains(noticePage.Body.String(), misleading) {
-			t.Fatalf("superseded notice made an unsupported claim %q", misleading)
-		}
+	followup := companyOIDCGET(fixture.server, response.Header().Get("HX-Redirect"), fixture.adminCookie())
+	assertStatusAndBodyContains(t, followup, http.StatusOK, "Check failed", "advertised JWK Set was not a valid bounded JSON key set")
+	if strings.Contains(followup.Body.String(), "Discovery verified") {
+		t.Fatalf("followup page did not render the latest same-revision evidence: %q", followup.Body.String())
 	}
 }
 
@@ -990,7 +888,6 @@ func TestAuthenticationCheckExistsOnlyOnSavedReadStateAndFutureStepsStayInert(t 
 	for _, want := range []string{
 		`action="/settings/authentication/oidc/check"`,
 		`hx-post="/settings/authentication/oidc/check"`,
-		`hx-target="#oidc-setup-health"`,
 		`hx-indicator="#oidc-setup-health"`,
 		`hx-disabled-elt="find button"`,
 		"Check configuration",
@@ -1004,6 +901,9 @@ func TestAuthenticationCheckExistsOnlyOnSavedReadStateAndFutureStepsStayInert(t 
 	}
 	if strings.Count(body, "Check configuration") != 1 {
 		t.Fatalf("saved state rendered duplicate check controls: %q", body)
+	}
+	if strings.Contains(body, "hx-target=") || strings.Contains(body, "hx-swap=") {
+		t.Fatal("check form still targets an in-page fragment instead of redirecting")
 	}
 	for _, label := range []string{"Test sign-in", "Enable"} {
 		position := strings.Index(body, label)
@@ -1375,6 +1275,96 @@ func TestAuthenticationRendersExactCallbackAndOnlyEnablesCurrentVerifiedDraft(t 
 	}
 }
 
+func TestAuthenticationReadyStateShowsInertEnableEvidenceAndRetestForm(t *testing.T) {
+	fixture := newCompanyOIDCWebFixture(t, true)
+	ready := companyoidc.Connection{
+		ProviderLabel: "Ready IdP",
+		Issuer:        "https://id.example.test",
+		ClientID:      "client",
+		Domains:       []string{"example.test"},
+		Revision:      4,
+		SetupCheck: &companyoidc.SetupCheck{
+			ConfigRevision: 4,
+			ResultCode:     companyoidc.SetupCheckVerified,
+			CheckedAt:      time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC),
+		},
+		TestSignInEvidence: &companyoidc.TestSignInEvidence{
+			ConfigRevision: 4,
+			VerifiedAt:     time.Date(2026, 7, 30, 9, 15, 42, 123456789, time.UTC),
+		},
+	}
+	fixture.server.cfg.CompanyOIDCService = &recordingCompanyOIDCService{current: ready, currentFound: true}
+	response := companyOIDCGET(fixture.server, "/settings/authentication", fixture.adminCookie())
+	assertStatusAndBodyContains(t, response, http.StatusOK,
+		"Test sign-in verified for saved revision 4 at 2026-07-30 09:15:42 UTC.",
+		"Requirements met; enabling is not implemented. The connection remains Draft and disabled.",
+		`method="post" action="/settings/authentication/oidc/test"`,
+		`name="expected_revision" value="4"`,
+	)
+	if body := response.Body.String(); strings.Contains(body, "oidc/enable") {
+		t.Fatal("Ready state referenced an Enable route")
+	}
+	assertAuthenticationSecurityHeaders(t, response.Header())
+}
+
+func TestAuthenticationSuspendedReadinessKeepsEvidenceAndRestores(t *testing.T) {
+	fixture := newCompanyOIDCWebFixture(t, true)
+	evidence := &companyoidc.TestSignInEvidence{
+		ConfigRevision: 4,
+		VerifiedAt:     time.Date(2026, 7, 30, 9, 15, 42, 0, time.UTC),
+	}
+	verifiedCheck := &companyoidc.SetupCheck{ConfigRevision: 4, ResultCode: companyoidc.SetupCheckVerified}
+	service := &recordingCompanyOIDCService{currentFound: true}
+	fixture.server.cfg.CompanyOIDCService = service
+	const evidenceLine = "Test sign-in verified for saved revision 4 at 2026-07-30 09:15:42 UTC."
+	const readyCopy = "Requirements met; enabling is not implemented."
+	for _, tc := range []struct {
+		name       string
+		connection companyoidc.Connection
+		encryption bool
+	}{
+		{name: "stale metadata check", connection: companyoidc.Connection{
+			Revision:           4,
+			SetupCheck:         &companyoidc.SetupCheck{ConfigRevision: 3, ResultCode: companyoidc.SetupCheckVerified},
+			TestSignInEvidence: evidence,
+		}, encryption: true},
+		{name: "failed metadata check", connection: companyoidc.Connection{
+			Revision:           4,
+			SetupCheck:         &companyoidc.SetupCheck{ConfigRevision: 4, ResultCode: companyoidc.SetupCheckDiscoveryInvalid},
+			TestSignInEvidence: evidence,
+		}, encryption: true},
+		{name: "encryption unavailable", connection: companyoidc.Connection{
+			Revision:           4,
+			SetupCheck:         verifiedCheck,
+			TestSignInEvidence: evidence,
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			service.current = tc.connection
+			fixture.server.cfg.CompanyOIDCSecretEncryptionConfigured = tc.encryption
+			page := companyOIDCGET(fixture.server, "/settings/authentication", fixture.adminCookie())
+			assertStatusAndBodyContains(t, page, http.StatusOK, evidenceLine)
+			body := page.Body.String()
+			if strings.Contains(body, `action="/settings/authentication/oidc/test"`) || strings.Contains(body, readyCopy) {
+				t.Fatalf("suspended readiness still offered testing or enabling: %q", body)
+			}
+		})
+	}
+
+	service.current = companyoidc.Connection{
+		Revision:           4,
+		SetupCheck:         verifiedCheck,
+		TestSignInEvidence: evidence,
+	}
+	fixture.server.cfg.CompanyOIDCSecretEncryptionConfigured = true
+	restored := companyOIDCGET(fixture.server, "/settings/authentication", fixture.adminCookie())
+	assertStatusAndBodyContains(t, restored, http.StatusOK,
+		evidenceLine,
+		readyCopy,
+		`action="/settings/authentication/oidc/test"`,
+	)
+}
+
 func TestAuthenticationSetupProgressHasExactlyOneCurrentStep(t *testing.T) {
 	fixture := newCompanyOIDCWebFixture(t, true)
 	unverified := companyoidc.Connection{Revision: 4}
@@ -1385,6 +1375,11 @@ func TestAuthenticationSetupProgressHasExactlyOneCurrentStep(t *testing.T) {
 			ResultCode:     companyoidc.SetupCheckVerified,
 		},
 	}
+	ready := verified
+	ready.TestSignInEvidence = &companyoidc.TestSignInEvidence{
+		ConfigRevision: 4,
+		VerifiedAt:     time.Date(2026, 7, 30, 9, 15, 42, 0, time.UTC),
+	}
 	tests := []struct {
 		name             string
 		connection       companyoidc.Connection
@@ -1392,11 +1387,19 @@ func TestAuthenticationSetupProgressHasExactlyOneCurrentStep(t *testing.T) {
 		encryption       bool
 		currentStep      string
 		metadataComplete bool
+		ready            bool
 	}{
 		{name: "configure", encryption: true, currentStep: "Configure"},
 		{name: "saved unverified", connection: unverified, found: true, encryption: true, currentStep: "Verify metadata"},
 		{name: "encryption unavailable", connection: unverified, found: true, currentStep: "Verify metadata"},
 		{name: "verified", connection: verified, found: true, encryption: true, currentStep: "Test sign-in", metadataComplete: true},
+		{name: "ready", connection: ready, found: true, encryption: true, currentStep: "Enable", metadataComplete: true, ready: true},
+		{name: "readiness suspended by stale metadata", connection: companyoidc.Connection{
+			Revision:           4,
+			SetupCheck:         &companyoidc.SetupCheck{ConfigRevision: 3, ResultCode: companyoidc.SetupCheckVerified},
+			TestSignInEvidence: ready.TestSignInEvidence,
+		}, found: true, encryption: true, currentStep: "Verify metadata"},
+		{name: "readiness suspended by encryption loss", connection: ready, found: true, currentStep: "Verify metadata"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1449,6 +1452,32 @@ func TestAuthenticationSetupProgressHasExactlyOneCurrentStep(t *testing.T) {
 					!strings.Contains(metadataItem, "Metadata verified") ||
 					strings.Contains(metadataItem, current) {
 					t.Fatalf("verified metadata item is not completed: %s", metadataItem)
+				}
+			}
+			if tc.ready {
+				testPosition := strings.Index(progress, "Verified for saved Draft")
+				if testPosition < 0 {
+					t.Fatalf("Test sign-in step is not completed: %s", progress)
+				}
+				testStart := strings.LastIndex(progress[:testPosition], "<li")
+				testEnd := strings.Index(progress[testPosition:], "</li>")
+				if testStart < 0 || testEnd < 0 {
+					t.Fatal("completed Test sign-in item could not be isolated")
+				}
+				testItem := progress[testStart : testPosition+testEnd]
+				if !strings.Contains(testItem, "bg-success-soft") ||
+					!strings.Contains(testItem, `href="#tg-i-check"`) ||
+					strings.Contains(testItem, current) {
+					t.Fatalf("completed Test sign-in item is not completed: %s", testItem)
+				}
+				if !strings.Contains(currentItem, `aria-disabled="true"`) ||
+					!strings.Contains(currentItem, "Not implemented") {
+					t.Fatalf("Enable step is not inert: %s", currentItem)
+				}
+				for _, control := range []string{"<a", "<button", "<form", "href="} {
+					if strings.Contains(currentItem, control) {
+						t.Fatalf("Enable step rendered an actionable control %q: %s", control, currentItem)
+					}
 				}
 			}
 		})
