@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -21,7 +22,7 @@ import (
 
 func TestTestSignInDiscoveryCompatibilityIsNarrowAndDefaultsToBasic(t *testing.T) {
 	document := validDiscoveryDocument("https://id.example.test", "https://id.example.test/jwks")
-	document["scopes_supported"] = []string{"openid"}
+	document["scopes_supported"] = []string{"openid", "email"}
 	if !testSignInCompatibleDiscoveryObject(t, document) {
 		t.Fatal("absent token auth methods should default to client_secret_basic")
 	}
@@ -30,7 +31,8 @@ func TestTestSignInDiscoveryCompatibilityIsNarrowAndDefaultsToBasic(t *testing.T
 		name   string
 		mutate func(map[string]any)
 	}{
-		{name: "openid scope missing", mutate: func(value map[string]any) { value["scopes_supported"] = []string{"profile"} }},
+		{name: "openid scope missing", mutate: func(value map[string]any) { value["scopes_supported"] = []string{"profile", "email"} }},
+		{name: "email scope missing", mutate: func(value map[string]any) { value["scopes_supported"] = []string{"openid"} }},
 		{name: "basic auth missing", mutate: func(value map[string]any) {
 			value["token_endpoint_auth_methods_supported"] = []string{"client_secret_post"}
 		}},
@@ -39,7 +41,7 @@ func TestTestSignInDiscoveryCompatibilityIsNarrowAndDefaultsToBasic(t *testing.T
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			candidate := validDiscoveryDocument("https://id.example.test", "https://id.example.test/jwks")
-			candidate["scopes_supported"] = []string{"openid"}
+			candidate["scopes_supported"] = []string{"openid", "email"}
 			candidate["token_endpoint_auth_methods_supported"] = []string{"client_secret_basic"}
 			candidate["response_modes_supported"] = []string{"query"}
 			candidate["code_challenge_methods_supported"] = []string{"S256"}
@@ -66,7 +68,7 @@ func TestStartAndCompleteTestSignInPinsProtocolAndVerifiesFreshKey(t *testing.T)
 	}
 	query := authorizationURL.Query()
 	for key, want := range map[string]string{
-		"scope":                 "openid",
+		"scope":                 "openid email",
 		"response_type":         "code",
 		"response_mode":         "query",
 		"client_id":             protocolTestClientID,
@@ -111,6 +113,7 @@ func TestStartAndCompleteTestSignInPinsProtocolAndVerifiesFreshKey(t *testing.T)
 		provider.accessToken,
 		provider.refreshToken,
 		provider.lastIDToken(),
+		provider.email,
 		state,
 		nonce,
 		protocolTestClientSecret,
@@ -242,6 +245,27 @@ func TestTestSignInFinalFenceLeavesClaimedWithoutCompleted(t *testing.T) {
 				return err
 			},
 		},
+		{
+			name: "same-revision allowed domain replaced",
+			mutate: func(fixture *serviceFixture) error {
+				_, err := fixture.database.Exec(`UPDATE company_oidc_allowed_domains SET domain = 'changed.test' WHERE connection_id = 1`)
+				return err
+			},
+		},
+		{
+			name: "same-revision allowed domain malformed",
+			mutate: func(fixture *serviceFixture) error {
+				_, err := fixture.database.Exec(`UPDATE company_oidc_allowed_domains SET domain = 'bad_domain' WHERE connection_id = 1`)
+				return err
+			},
+		},
+		{
+			name: "same-revision allowed domains removed",
+			mutate: func(fixture *serviceFixture) error {
+				_, err := fixture.database.Exec(`DELETE FROM company_oidc_allowed_domains WHERE connection_id = 1`)
+				return err
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			provider := newTestSignInTLSProvider(t)
@@ -353,6 +377,147 @@ func TestTestSignInCrashTruthAllowsClaimedWithoutCompleted(t *testing.T) {
 	assertAuditActionCount(t, fixture, audit.ActionOIDCConnectionTestSignInClaimed, 1)
 	assertAuditActionCount(t, fixture, audit.ActionOIDCConnectionTestSignInCompleted, 0)
 	assertTestSignInTransactionCount(t, fixture.database, 0)
+}
+
+func TestStartTestSignInRequiresAdvertisedEmailScopeWhileSetupCheckPasses(t *testing.T) {
+	provider := newTestSignInTLSProvider(t)
+	provider.advertisedScopes = []string{"openid"}
+	fixture := newProtocolServiceFixture(t, provider)
+
+	_, err := fixture.service.StartTestSignIn(fixture.ctx, validProtocolStartInput(fixture.adminID))
+	if !errors.Is(err, ErrTestProviderInvalid) {
+		t.Fatalf("start without advertised email scope = %v", err)
+	}
+	assertTestSignInTransactionCount(t, fixture.database, 0)
+	assertAuditActionCount(t, fixture, audit.ActionOIDCConnectionTestSignInClaimed, 0)
+}
+
+func TestTestSignInEmailOutsideAllowedDomainsMapsToProviderInvalidAndPreservesEvidence(t *testing.T) {
+	provider := newTestSignInTLSProvider(t)
+	fixture := newProtocolServiceFixture(t, provider)
+	start := startProtocolTestSignIn(t, fixture)
+	authorizationURL := mustParseURL(t, start.AuthorizationURL)
+	state, nonce := authorizationURL.Query().Get("state"), authorizationURL.Query().Get("nonce")
+	provider.setNonceAndRotate(nonce)
+	result, err := fixture.service.CompleteTestSignIn(fixture.ctx, TestSignInCallbackInput{
+		State:     state,
+		SessionID: testSignInSessionID,
+		RawQuery:  url.Values{"state": {state}, "code": {"authorization-code"}}.Encode(),
+	})
+	if err != nil || result != TestSignInVerified {
+		t.Fatalf("verified Test sign-in: result=%q err=%v", result, err)
+	}
+
+	provider.setEmail("email-canary-7f3a9@unlisted.test")
+	fixture.service.random = bytes.NewReader(testSignInRandomBytes(0x44, 0x55, 0x66))
+	retry := startProtocolTestSignIn(t, fixture)
+	retryURL := mustParseURL(t, retry.AuthorizationURL)
+	retryState, retryNonce := retryURL.Query().Get("state"), retryURL.Query().Get("nonce")
+	provider.setNonceAndRotate(retryNonce)
+	result, err = fixture.service.CompleteTestSignIn(fixture.ctx, TestSignInCallbackInput{
+		State:     retryState,
+		SessionID: testSignInSessionID,
+		RawQuery:  url.Values{"state": {retryState}, "code": {"authorization-code"}}.Encode(),
+	})
+	if err != nil || result != TestSignInProviderInvalid {
+		t.Fatalf("wrong-domain Test sign-in: result=%q err=%v", result, err)
+	}
+	if provider.tokenRequests() != 2 {
+		t.Fatalf("token requests = %d, want both runs to exchange the code", provider.tokenRequests())
+	}
+
+	connection, found, err := fixture.service.Current(fixture.ctx)
+	if err != nil || !found {
+		t.Fatalf("current connection: found=%v err=%v", found, err)
+	}
+	if connection.TestSignInEvidence == nil ||
+		connection.TestSignInEvidence.ConfigRevision != 1 ||
+		!connection.TestSignInEvidence.VerifiedAt.Equal(testSignInNow) {
+		t.Fatalf("wrong-domain retest changed evidence: %+v", connection.TestSignInEvidence)
+	}
+}
+
+func TestTestSignInAcceptsMixedCaseEmailAcrossMultipleAllowedDomains(t *testing.T) {
+	provider := newTestSignInTLSProvider(t)
+	provider.domains = []string{"corp.example.test", "example.test"}
+	provider.email = "Person@EXAMPLE.Test"
+	fixture := newProtocolServiceFixture(t, provider)
+	start := startProtocolTestSignIn(t, fixture)
+	authorizationURL := mustParseURL(t, start.AuthorizationURL)
+	state, nonce := authorizationURL.Query().Get("state"), authorizationURL.Query().Get("nonce")
+	provider.setNonceAndRotate(nonce)
+
+	result, err := fixture.service.CompleteTestSignIn(fixture.ctx, TestSignInCallbackInput{
+		State:     state,
+		SessionID: testSignInSessionID,
+		RawQuery:  url.Values{"state": {state}, "code": {"authorization-code"}}.Encode(),
+	})
+	if err != nil || result != TestSignInVerified {
+		t.Fatalf("multi-domain mixed-case Test sign-in: result=%q err=%v", result, err)
+	}
+	assertTestSignInAudit(t, fixture, audit.ActionOIDCConnectionTestSignInCompleted, `{"revision":1,"result_code":"verified"}`)
+}
+
+func TestTestSignInClaimConsumesTransactionWhenStoredDomainsMalformed(t *testing.T) {
+	provider := newTestSignInTLSProvider(t)
+	fixture := newProtocolServiceFixture(t, provider)
+	start := startProtocolTestSignIn(t, fixture)
+	state := mustParseURL(t, start.AuthorizationURL).Query().Get("state")
+	if _, err := fixture.database.Exec(`UPDATE company_oidc_allowed_domains SET domain = 'bad_domain' WHERE connection_id = 1`); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := fixture.service.CompleteTestSignIn(fixture.ctx, TestSignInCallbackInput{
+		State:     state,
+		SessionID: testSignInSessionID,
+		RawQuery:  url.Values{"state": {state}, "code": {"authorization-code"}}.Encode(),
+	})
+	if result != "" || !errors.Is(err, ErrTestTransactionUnavailable) {
+		t.Fatalf("claim with malformed stored domains: result=%q err=%v", result, err)
+	}
+	if provider.tokenRequests() != 0 {
+		t.Fatal("malformed stored domains still triggered token exchange")
+	}
+	assertAuditActionCount(t, fixture, audit.ActionOIDCConnectionTestSignInClaimed, 0)
+	assertAuditActionCount(t, fixture, audit.ActionOIDCConnectionTestSignInCompleted, 0)
+	assertTestSignInTransactionCount(t, fixture.database, 0)
+}
+
+func TestVerifiedTestSignInPersistsNoEmailIdentityOrSession(t *testing.T) {
+	provider := newTestSignInTLSProvider(t)
+	fixture := newProtocolServiceFixture(t, provider)
+	usersBefore := countTableRows(t, fixture, "users")
+	sessionsBefore := countTableRows(t, fixture, "sessions")
+	start := startProtocolTestSignIn(t, fixture)
+	authorizationURL := mustParseURL(t, start.AuthorizationURL)
+	state, nonce := authorizationURL.Query().Get("state"), authorizationURL.Query().Get("nonce")
+	provider.setNonceAndRotate(nonce)
+
+	result, err := fixture.service.CompleteTestSignIn(fixture.ctx, TestSignInCallbackInput{
+		State:     state,
+		SessionID: testSignInSessionID,
+		RawQuery:  url.Values{"state": {state}, "code": {"authorization-code"}}.Encode(),
+	})
+	if err != nil || result != TestSignInVerified {
+		t.Fatalf("verified Test sign-in: result=%q err=%v", result, err)
+	}
+
+	if got := countTableRows(t, fixture, "users"); got != usersBefore {
+		t.Fatalf("users = %d, want unchanged %d", got, usersBefore)
+	}
+	if got := countTableRows(t, fixture, "sessions"); got != sessionsBefore {
+		t.Fatalf("sessions = %d, want unchanged %d", got, sessionsBefore)
+	}
+	var connectionID, revision int64
+	var verifiedAt string
+	if err := fixture.database.QueryRow(`
+SELECT connection_id, config_revision, verified_at FROM company_oidc_test_sign_in_evidence`).Scan(&connectionID, &revision, &verifiedAt); err != nil {
+		t.Fatal(err)
+	}
+	if connectionID != 1 || revision != 1 || verifiedAt != formatCompanyOIDCTime(testSignInNow) {
+		t.Fatalf("evidence = (%d, %d, %q), want only the revision and writer-owned timestamp", connectionID, revision, verifiedAt)
+	}
+	assertNoDatabaseText(t, fixture, "email-canary-7f3a9")
 }
 
 func TestAuthorizationResponseShapeAndProviderErrorMapping(t *testing.T) {
@@ -520,6 +685,10 @@ type testSignInTLSProvider struct {
 	accessToken        string
 	refreshToken       string
 	authorizationQuery string
+	advertisedScopes   []string
+	email              string
+	emailVerified      any
+	domains            []string
 	networkHook        func() error
 
 	mu                      sync.Mutex
@@ -543,6 +712,10 @@ func newTestSignInTLSProvider(t *testing.T) *testSignInTLSProvider {
 		accessToken:        "access-token-canary",
 		refreshToken:       "refresh-token-canary",
 		authorizationQuery: "tenant=blue&tenant=green",
+		advertisedScopes:   []string{"openid", "email"},
+		email:              "email-canary-7f3a9@example.test",
+		emailVerified:      true,
+		domains:            []string{"example.test"},
 		kid:                "setup-key",
 	}
 	provider.server = httptest.NewTLSServer(http.HandlerFunc(provider.serveHTTP))
@@ -565,7 +738,7 @@ func (provider *testSignInTLSProvider) serveHTTP(w http.ResponseWriter, r *http.
 		}
 		document["authorization_endpoint"] = authorizationEndpoint
 		document["token_endpoint"] = provider.advertisedTokenEndpoint
-		document["scopes_supported"] = []string{"openid"}
+		document["scopes_supported"] = provider.advertisedScopes
 		document["token_endpoint_auth_methods_supported"] = []string{"client_secret_basic"}
 		document["response_modes_supported"] = []string{"query"}
 		document["code_challenge_methods_supported"] = []string{"S256"}
@@ -610,6 +783,9 @@ func (provider *testSignInTLSProvider) serveHTTP(w http.ResponseWriter, r *http.
 			"exp":   testSignInNow.Add(5 * time.Minute).Unix(),
 			"iat":   testSignInNow.Unix(),
 			"nonce": provider.nonce,
+
+			"email":          provider.email,
+			"email_verified": provider.emailVerified,
 		}
 		provider.idToken = signTestCompact(
 			provider.t,
@@ -648,6 +824,12 @@ func (provider *testSignInTLSProvider) setNonceAndRotate(nonce string) {
 	defer provider.mu.Unlock()
 	provider.nonce = nonce
 	provider.kid = "callback-key"
+}
+
+func (provider *testSignInTLSProvider) setEmail(email string) {
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	provider.email = email
 }
 
 func (provider *testSignInTLSProvider) setAdvertisedTokenEndpoint(endpoint string) {
@@ -697,7 +879,7 @@ func newProtocolServiceFixture(t *testing.T, provider *testSignInTLSProvider) *s
 		Issuer:        provider.server.URL + "/tenant",
 		ClientID:      protocolTestClientID,
 		ClientSecret:  protocolTestClientSecret,
-		Domains:       []string{"example.test"},
+		Domains:       provider.domains,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -772,6 +954,73 @@ func assertAuditActionCount(t *testing.T, fixture *serviceFixture, action string
 	}
 	if got != want {
 		t.Fatalf("%s audit count = %d, want %d", action, got, want)
+	}
+}
+
+func countTableRows(t *testing.T, fixture *serviceFixture, table string) int {
+	t.Helper()
+	var got int
+	if err := fixture.database.QueryRow(`SELECT count(*) FROM "` + table + `"`).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+func assertNoDatabaseText(t *testing.T, fixture *serviceFixture, needle string) {
+	t.Helper()
+	tableRows, err := fixture.database.Query(`SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tableRows.Close()
+	var tables []string
+	for tableRows.Next() {
+		var name string
+		if err := tableRows.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		tables = append(tables, name)
+	}
+	if err := tableRows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range tables {
+		assertNoTableText(t, fixture, table, needle)
+	}
+}
+
+func assertNoTableText(t *testing.T, fixture *serviceFixture, table, needle string) {
+	t.Helper()
+	rows, err := fixture.database.Query(`SELECT * FROM "` + table + `"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	columns, err := rows.Columns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		values := make([]any, len(columns))
+		pointers := make([]any, len(columns))
+		for i := range values {
+			pointers[i] = &values[i]
+		}
+		if err := rows.Scan(pointers...); err != nil {
+			t.Fatal(err)
+		}
+		for _, value := range values {
+			text := fmt.Sprint(value)
+			if raw, ok := value.([]byte); ok {
+				text = string(raw)
+			}
+			if strings.Contains(text, needle) {
+				t.Fatalf("table %s contains the provider email canary", table)
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
 	}
 }
 

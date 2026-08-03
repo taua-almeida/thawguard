@@ -1235,9 +1235,10 @@ func TestAuthenticationRendersExactCallbackAndOnlyEnablesCurrentVerifiedDraft(t 
 	assertStatusAndBodyContains(t, response, http.StatusOK,
 		companyOIDCWebPublicURL+companyoidc.TestSignInCallbackPath,
 		"Register this exact URI with the provider",
-		"requests only the <code>openid</code> scope",
+		"requests only the <code>openid email</code> scopes",
 		`method="post" action="/settings/authentication/oidc/test"`,
 		`name="expected_revision" value="4"`,
+		"a signed, verified email in a saved allowed domain",
 		"This creates no identity, user, or Thawguard session and does not enable the connection",
 	)
 	body := response.Body.String()
@@ -1492,7 +1493,7 @@ func TestCompanyOIDCTestNoticeCopyIsTruthfulAndSanitized(t *testing.T) {
 		{notice: companyOIDCTestVerifiedNotice, copy: "Configured client credentials were accepted"},
 		{notice: companyOIDCTestProviderDeniedNotice, copy: "provider denied this Test sign-in"},
 		{notice: companyOIDCTestProviderUnavailable, copy: "provider was unavailable"},
-		{notice: companyOIDCTestProviderInvalid, copy: "invalid Test sign-in response"},
+		{notice: companyOIDCTestProviderInvalid, copy: "invalid sign-in response or did not supply a signed, verified email in a saved allowed domain"},
 		{notice: companyOIDCTestConfigurationNotice, copy: "could not use the saved client configuration"},
 		{notice: companyOIDCTestTransactionNotice, copy: "transaction, session, or Draft revision is no longer available"},
 		{notice: companyOIDCTestUnknownNotice, copy: "could not confirm the Test sign-in outcome"},

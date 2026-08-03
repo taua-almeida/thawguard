@@ -210,7 +210,7 @@ func compatibleDiscoveryMetadata(discovery map[string]jsonRawMessage) (discovery
 
 func testSignInCompatibleDiscovery(discovery map[string]jsonRawMessage) bool {
 	scopes, ok := requiredStringSlice(discovery, "scopes_supported")
-	if !ok || !slices.Contains(scopes, "openid") {
+	if !ok || !slices.Contains(scopes, "openid") || !slices.Contains(scopes, "email") {
 		return false
 	}
 	if _, present := discovery["token_endpoint_auth_methods_supported"]; present {

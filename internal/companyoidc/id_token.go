@@ -23,6 +23,7 @@ const (
 	maxSignificandDigits   = 32
 	maxDecimalExponent     = 18
 	maxNumericDateSeconds  = int64(253402300799)
+	maxEmailClaimBytes     = 254
 )
 
 var errIDTokenValidation = errors.New("company OIDC ID token validation failed")
@@ -37,7 +38,8 @@ type idTokenVerifier struct {
 }
 
 type verifiedIDToken struct {
-	subject string
+	subject     string
+	emailDomain string
 }
 
 type protectedIDTokenHeader struct {
@@ -65,7 +67,11 @@ func (v idTokenVerifier) verify(token string) (verifiedIDToken, error) {
 	if err != nil {
 		return verifiedIDToken{}, errIDTokenValidation
 	}
-	claims, err := decodeVerifiedIDTokenClaims(payload)
+	object, ok := decodeJSONObject(payload)
+	if !ok {
+		return verifiedIDToken{}, errIDTokenValidation
+	}
+	claims, err := decodeVerifiedIDTokenClaims(object)
 	if err != nil {
 		return verifiedIDToken{}, errIDTokenValidation
 	}
@@ -73,7 +79,11 @@ func (v idTokenVerifier) verify(token string) (verifiedIDToken, error) {
 	if !claims.valid(v, now) {
 		return verifiedIDToken{}, errIDTokenValidation
 	}
-	return verifiedIDToken{subject: claims.subject}, nil
+	emailDomain, ok := verifiedEmailDomain(object)
+	if !ok {
+		return verifiedIDToken{}, errIDTokenValidation
+	}
+	return verifiedIDToken{subject: claims.subject, emailDomain: emailDomain}, nil
 }
 
 func preflightCompactIDToken(token string) (protectedIDTokenHeader, *jose.JSONWebSignature, error) {
@@ -144,11 +154,7 @@ type verifiedIDTokenClaims struct {
 	nonce              string
 }
 
-func decodeVerifiedIDTokenClaims(payload []byte) (verifiedIDTokenClaims, error) {
-	object, ok := decodeJSONObject(payload)
-	if !ok {
-		return verifiedIDTokenClaims{}, errIDTokenValidation
-	}
+func decodeVerifiedIDTokenClaims(object map[string]jsonRawMessage) (verifiedIDTokenClaims, error) {
 	issuer, ok := requiredJSONString(object, "iss")
 	if !ok {
 		return verifiedIDTokenClaims{}, errIDTokenValidation
@@ -194,6 +200,47 @@ func decodeVerifiedIDTokenClaims(payload []byte) (verifiedIDTokenClaims, error) 
 		return verifiedIDTokenClaims{}, errIDTokenValidation
 	}
 	return claims, nil
+}
+
+// verifiedEmailDomain extracts the transient admission claims from an already
+// signature-verified and base-validated claims object. It requires
+// email_verified to be the exact JSON boolean true and returns the
+// ASCII-lowercased DNS domain of a strictly validated email. The local part is
+// transient and never used for identity.
+func verifiedEmailDomain(object map[string]jsonRawMessage) (string, bool) {
+	raw, present := object["email_verified"]
+	if !present {
+		return "", false
+	}
+	var emailVerified bool
+	if strictJSONUnmarshal(raw, &emailVerified) != nil || !emailVerified {
+		return "", false
+	}
+
+	email, ok := requiredJSONString(object, "email")
+	if !ok || email == "" || len(email) > maxEmailClaimBytes || !utf8.ValidString(email) {
+		return "", false
+	}
+	if email != strings.TrimSpace(email) || containsControlOrLineSeparator(email) {
+		return "", false
+	}
+	if strings.Count(email, "@") != 1 {
+		return "", false
+	}
+	local, domain, _ := strings.Cut(email, "@")
+	if local == "" || domain == "" {
+		return "", false
+	}
+	for i := range len(domain) {
+		if domain[i] > 0x7f {
+			return "", false
+		}
+	}
+	domain = strings.ToLower(domain)
+	if validateDomain(domain) != nil {
+		return "", false
+	}
+	return domain, true
 }
 
 func parseAudience(raw jsonRawMessage) ([]string, bool) {

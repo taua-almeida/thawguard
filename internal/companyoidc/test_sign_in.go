@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -128,7 +129,7 @@ func (s *Service) StartTestSignIn(
 	}
 
 	values := authorizationEndpoint.Query()
-	values.Set("scope", "openid")
+	values.Set("scope", "openid email")
 	values.Set("response_type", "code")
 	values.Set("response_mode", "query")
 	values.Set("client_id", initiation.ClientID)
@@ -359,7 +360,7 @@ func (s *Service) verifyAuthorizationCode(
 	if status == fetchInvalid {
 		return TestSignInProviderInvalid
 	}
-	_, err = (idTokenVerifier{
+	verified, err := (idTokenVerifier{
 		issuer:               claim.issuer,
 		clientID:             claim.clientID,
 		keys:                 keys,
@@ -368,6 +369,9 @@ func (s *Service) verifyAuthorizationCode(
 		now:                  s.now,
 	}).verify(idToken)
 	if err != nil {
+		return TestSignInProviderInvalid
+	}
+	if !slices.Contains(claim.domains, verified.emailDomain) {
 		return TestSignInProviderInvalid
 	}
 	return TestSignInVerified
@@ -501,6 +505,10 @@ func (s *Service) completeTestSignIn(
 	if err != nil || !found || !snapshot.ready || snapshot.revision != claim.configRevision ||
 		snapshot.issuer != claim.issuer || snapshot.clientID != claim.clientID ||
 		!bytes.Equal(snapshot.clientSecretCiphertext, claim.clientSecretCiphertext) {
+		return ErrTestTransactionUnavailable
+	}
+	domains, err := loadTestSignInDomains(ctx, tx)
+	if err != nil || !slices.Equal(domains, claim.domains) {
 		return ErrTestTransactionUnavailable
 	}
 	if result == TestSignInVerified {

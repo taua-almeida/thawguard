@@ -1,0 +1,3 @@
+DELETE FROM company_oidc_test_transactions;
+
+DELETE FROM company_oidc_test_sign_in_evidence;

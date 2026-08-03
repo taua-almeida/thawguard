@@ -72,6 +72,7 @@ type testSignInClaim struct {
 	nonceDigest            [sha256.Size]byte
 	configRevision         int64
 	createdAt              time.Time
+	domains                []string
 }
 
 type testSignInMaterial struct {
@@ -285,6 +286,13 @@ func (s *Service) claimTestSignIn(
 	if !found || !snapshot.ready || snapshot.revision != record.configRevision {
 		return testSignInClaim{}, consumeTestTransaction(ctx, tx, stateDigest)
 	}
+	domains, err := loadTestSignInDomains(ctx, tx)
+	if err != nil {
+		if errors.Is(err, errMalformedTestSignInSnapshot) {
+			return testSignInClaim{}, consumeTestTransaction(ctx, tx, stateDigest)
+		}
+		return testSignInClaim{}, ErrTestTransactionUnavailable
+	}
 	if err := deleteTestTransaction(ctx, tx, stateDigest); err != nil {
 		return testSignInClaim{}, ErrTestTransactionUnavailable
 	}
@@ -307,6 +315,7 @@ func (s *Service) claimTestSignIn(
 		nonceDigest:            record.nonceDigest,
 		configRevision:         snapshot.revision,
 		createdAt:              record.createdAt,
+		domains:                domains,
 	}, nil
 }
 
@@ -481,6 +490,42 @@ WHERE c.id = 1`).Scan(
 	}
 	snapshot.ready = check.ResultCode == SetupCheckVerified
 	return snapshot, true, nil
+}
+
+// loadTestSignInDomains reads the complete allowed-domain policy inside the
+// caller's transaction, in deterministic order. The claim keeps this in-memory
+// snapshot only; completion reloads and compares it so a same-revision domain
+// edit fails the final fence.
+func loadTestSignInDomains(ctx context.Context, tx *sql.Tx) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `
+SELECT domain
+FROM company_oidc_allowed_domains
+WHERE connection_id = 1
+ORDER BY domain`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var domains []string
+	for rows.Next() {
+		var domain string
+		if err := rows.Scan(&domain); err != nil {
+			return nil, err
+		}
+		domains = append(domains, domain)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(domains) < 1 || len(domains) > 20 {
+		return nil, errMalformedTestSignInSnapshot
+	}
+	for i, domain := range domains {
+		if validateDomain(domain) != nil || (i > 0 && domains[i-1] >= domain) {
+			return nil, errMalformedTestSignInSnapshot
+		}
+	}
+	return domains, nil
 }
 
 func loadTestTransaction(

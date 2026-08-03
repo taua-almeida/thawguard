@@ -3041,6 +3041,111 @@ FROM company_oidc_test_transactions`).Scan(
 	assertForeignKeyCheckClean(t, database)
 }
 
+func TestCompanyOIDCEmailPolicyRefreshMigrationClearsTestStateAndAppliesOnce(t *testing.T) {
+	ctx := context.Background()
+	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-company-oidc-email-policy-refresh.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	migrations, err := LoadMigrations(projectMigrationsDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshIndex := migrationIndex(t, migrations, "0043_company_oidc_email_policy_refresh.sql")
+	if err := ApplyMigrations(ctx, database, migrations[:refreshIndex]); err != nil {
+		t.Fatal(err)
+	}
+
+	const timestamp = "2026-07-29T10:00:00.000000000Z"
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO users(id, email, display_name, created_at, updated_at)
+VALUES (1, 'admin@example.test', 'Admin', ?, ?);
+INSERT INTO user_roles(user_id, role, created_at)
+VALUES (1, 'admin', ?);
+INSERT INTO sessions(id, user_id, csrf_token, expires_at, created_at)
+VALUES ('preserved-session', 1, 'preserved-csrf', '2026-07-30T10:00:00Z', ?);
+INSERT INTO company_oidc_connections(
+  id, provider_label, issuer, client_id, client_secret_ciphertext, revision, created_at, updated_at
+)
+VALUES (1, 'Preserved IdP', 'https://id.example.test', 'preserved-client', x'0102', 4, ?, ?);
+INSERT INTO company_oidc_allowed_domains(connection_id, domain)
+VALUES (1, 'example.test');
+INSERT INTO company_oidc_setup_checks(
+  connection_id, config_revision, result_code, observed_issuer,
+  public_key_candidate_count, checked_at
+)
+VALUES (1, 4, 'verified', NULL, 2, ?);
+INSERT INTO audit_events(id, actor_user_id, action, subject_type, subject_id, details_json, created_at)
+VALUES (42, 1, 'oidc_connection.test_sign_in_completed', 'oidc_connection', '1',
+  '{"revision":4,"result_code":"verified"}', ?);
+INSERT INTO company_oidc_test_transactions(
+  state_digest, connection_id, config_revision, actor_user_id,
+  session_binding_digest, nonce_digest, pkce_verifier_ciphertext,
+  token_endpoint, jwks_uri, redirect_uri, created_at, expires_at
+)
+VALUES (x'A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1', 1, 4, 1,
+  x'B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2',
+  x'C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3', x'0D0E0F',
+  'https://id.example.test/token', 'https://id.example.test/jwks',
+  'http://localhost:8080/settings/authentication/oidc/callback',
+  '2026-07-29T10:01:00.000000000Z', '2026-07-29T10:11:00.000000000Z');
+INSERT INTO company_oidc_test_sign_in_evidence(connection_id, config_revision, verified_at)
+VALUES (1, 4, '2026-07-29T10:02:00.000000000Z');`,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+		timestamp,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ApplyMigrations(ctx, database, migrations[:refreshIndex+1]); err != nil {
+		t.Fatal(err)
+	}
+	for _, check := range []struct {
+		name  string
+		query string
+		want  int
+	}{
+		{name: "user", query: `SELECT count(*) FROM users WHERE id = 1`, want: 1},
+		{name: "role", query: `SELECT count(*) FROM user_roles WHERE user_id = 1 AND role = 'admin'`, want: 1},
+		{name: "session", query: `SELECT count(*) FROM sessions WHERE id = 'preserved-session'`, want: 1},
+		{name: "Draft and encrypted secret", query: `SELECT count(*) FROM company_oidc_connections WHERE revision = 4 AND client_secret_ciphertext = x'0102'`, want: 1},
+		{name: "domain", query: `SELECT count(*) FROM company_oidc_allowed_domains WHERE domain = 'example.test'`, want: 1},
+		{name: "setup evidence", query: `SELECT count(*) FROM company_oidc_setup_checks WHERE result_code = 'verified'`, want: 1},
+		{name: "historical completion audit", query: `SELECT count(*) FROM audit_events WHERE id = 42`, want: 1},
+		{name: "cleared pre-email-policy test transaction", query: `SELECT count(*) FROM company_oidc_test_transactions`, want: 0},
+		{name: "cleared pre-email-policy test sign-in evidence", query: `SELECT count(*) FROM company_oidc_test_sign_in_evidence`, want: 0},
+		{name: "retained transaction table", query: `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'company_oidc_test_transactions'`, want: 1},
+		{name: "retained evidence table", query: `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'company_oidc_test_sign_in_evidence'`, want: 1},
+	} {
+		var got int
+		if err := database.QueryRowContext(ctx, check.query).Scan(&got); err != nil {
+			t.Fatalf("count %s: %v", check.name, err)
+		}
+		if got != check.want {
+			t.Fatalf("expected %d %s rows, got %d", check.want, check.name, got)
+		}
+	}
+
+	if err := ApplyMigrations(ctx, database, migrations[:refreshIndex+1]); err != nil {
+		t.Fatal(err)
+	}
+	var applied int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations WHERE version = '0043_company_oidc_email_policy_refresh'`).Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("expected email-policy refresh migration applied once, got %d", applied)
+	}
+	assertForeignKeyCheckClean(t, database)
+}
+
 func TestCompanyOIDCTestSignInEvidenceSchemaConstrainsSingletonProof(t *testing.T) {
 	ctx := context.Background()
 	database, err := Open(ctx, DefaultConfig(filepath.Join(t.TempDir(), "thawguard-company-oidc-test-evidence-constraints.db")))

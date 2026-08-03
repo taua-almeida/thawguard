@@ -604,14 +604,14 @@ func companyOIDCNoticeToasts(values url.Values) []toastView {
 		message = "Administrator authority changed before this check could be recorded."
 		tone = "danger"
 	case companyOIDCTestVerifiedNotice:
-		message = "Configured client credentials were accepted. Thawguard verified the OIDC authorization/code flow and signed ID token. The connection remains Draft and disabled."
+		message = "Configured client credentials were accepted. Thawguard verified the OIDC authorization/code flow, signed ID token, and a signed, verified email in a saved allowed domain. The connection remains Draft and disabled."
 		tone = "success"
 	case companyOIDCTestProviderDeniedNotice:
 		message = "The provider denied this Test sign-in. The connection remains Draft and disabled."
 	case companyOIDCTestProviderUnavailable:
 		message = "The provider was unavailable during Test sign-in. No identity or session was created."
 	case companyOIDCTestProviderInvalid:
-		message = "The provider returned an invalid Test sign-in response. Review the provider configuration before trying again."
+		message = "The provider returned an invalid sign-in response or did not supply a signed, verified email in a saved allowed domain. Review the provider configuration before trying again."
 		tone = "danger"
 	case companyOIDCTestConfigurationNotice:
 		message = "Test sign-in could not use the saved client configuration. Check client-secret encryption and the saved provider credentials."

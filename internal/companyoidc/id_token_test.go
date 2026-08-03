@@ -48,6 +48,9 @@ func TestIDTokenVerifierAcceptsStrictRS256TokenAndCapturesNowOnce(t *testing.T) 
 	if verified.subject != "provider-subject-123" {
 		t.Fatalf("verified subject = %q", verified.subject)
 	}
+	if verified.emailDomain != "example.test" {
+		t.Fatalf("verified email domain = %q", verified.emailDomain)
+	}
 	if calls.Load() != 1 {
 		t.Fatalf("clock calls = %d, want one", calls.Load())
 	}
@@ -364,6 +367,121 @@ func TestIDTokenVerifierAcceptsIgnoredLargeGroupsClaim(t *testing.T) {
 	}
 }
 
+func TestIDTokenVerifierEmailVerifiedRequiresExactJSONTrue(t *testing.T) {
+	fixture := newIDTokenFixture(t)
+	tests := []struct {
+		name   string
+		value  any
+		remove bool
+	}{
+		{name: "missing", remove: true},
+		{name: "false", value: false},
+		{name: "string true", value: "true"},
+		{name: "number one", value: 1},
+		{name: "null", value: nil},
+		{name: "array", value: []bool{true}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			claims := maps.Clone(fixture.claims)
+			if tc.remove {
+				delete(claims, "email_verified")
+			} else {
+				claims["email_verified"] = tc.value
+			}
+			assertIDTokenRejected(t, fixture.verifier, fixture.sign(t, fixture.header, claims))
+		})
+	}
+
+	for _, tc := range []struct {
+		name   string
+		member string
+	}{
+		{name: "duplicate email_verified", member: `"email_verified":true`},
+		{name: "duplicate email", member: `"email":"person@example.test"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := appendRawJSONObjectMember(t, mustMarshalJSON(t, fixture.claims), tc.member)
+			assertIDTokenRejected(t, fixture.verifier, signTestCompact(t, fixture.key, mustMarshalJSON(t, fixture.header), payload))
+		})
+	}
+}
+
+func TestIDTokenVerifierEmailAdmissionPolicyMatrix(t *testing.T) {
+	fixture := newIDTokenFixture(t)
+	boundaryLocal := strings.Repeat("a", maxEmailClaimBytes-len("@example.test"))
+	tests := []struct {
+		name       string
+		email      any
+		remove     bool
+		wantDomain string
+	}{
+		{name: "plain ASCII", email: "person@example.test", wantDomain: "example.test"},
+		{name: "mixed-case ASCII domain folds", email: "Person@EXAMPLE.Test", wantDomain: "example.test"},
+		{name: "subdomain is its own domain", email: "person@mail.example.test", wantDomain: "mail.example.test"},
+		{name: "non-ASCII local part with ASCII domain", email: "pérson@example.test", wantDomain: "example.test"},
+		{name: "boundary 254 bytes", email: boundaryLocal + "@example.test", wantDomain: "example.test"},
+
+		{name: "missing email", remove: true},
+		{name: "null email", email: nil},
+		{name: "numeric email", email: 7},
+		{name: "empty email", email: ""},
+		{name: "oversized 255 bytes", email: boundaryLocal + "a@example.test"},
+		{name: "leading ASCII space", email: " person@example.test"},
+		{name: "trailing ASCII space", email: "person@example.test "},
+		{name: "leading tab", email: "\tperson@example.test"},
+		{name: "trailing Unicode whitespace", email: "person@example.test\u00a0"},
+		{name: "embedded NUL", email: "per\x00son@example.test"},
+		{name: "embedded newline", email: "person@exam\nple.test"},
+		{name: "line separator Zl", email: "person\u2028@example.test"},
+		{name: "paragraph separator Zp", email: "person\u2029@example.test"},
+		{name: "no at sign", email: "person.example.test"},
+		{name: "two at signs", email: "person@extra@example.test"},
+		{name: "empty local part", email: "@example.test"},
+		{name: "empty domain part", email: "person@"},
+		{name: "non-ASCII domain byte", email: "person@exämple.test"},
+		{name: "Cyrillic lookalike domain", email: "person@еxample.test"},
+		{name: "uppercase non-ASCII domain", email: "person@EXÄMPLE.TEST"},
+		{name: "kelvin sign folding into ASCII domain", email: "person@EXAMPLE.TES\u212a"},
+		{name: "trailing dot domain", email: "person@example.test."},
+		{name: "IPv4 literal domain", email: "person@192.0.2.1"},
+		{name: "bracketed IPv6 domain", email: "person@[2001:db8::1]"},
+		{name: "leading hyphen label", email: "person@-example.test"},
+		{name: "empty domain label", email: "person@example..test"},
+		{name: "underscore label", email: "person@ex_ample.test"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			claims := maps.Clone(fixture.claims)
+			if tc.remove {
+				delete(claims, "email")
+			} else {
+				claims["email"] = tc.email
+			}
+			verified, err := fixture.verifier.verify(fixture.sign(t, fixture.header, claims))
+			if tc.wantDomain == "" {
+				if err != errIDTokenValidation {
+					t.Fatalf("verification error = %v, want generic validation error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if verified.emailDomain != tc.wantDomain {
+				t.Fatalf("email domain = %q, want %q", verified.emailDomain, tc.wantDomain)
+			}
+		})
+	}
+}
+
+func TestIDTokenVerifierBaseClaimValidationPrecedesEmailPolicy(t *testing.T) {
+	fixture := newIDTokenFixture(t)
+	claims := maps.Clone(fixture.claims)
+	claims["exp"] = fixture.now.Add(-5 * time.Minute).Unix()
+	assertIDTokenRejected(t, fixture.verifier, fixture.sign(t, fixture.header, claims))
+}
+
 func newIDTokenFixture(t *testing.T) idTokenFixture {
 	t.Helper()
 	key := sharedTestRSAKey(t)
@@ -401,6 +519,9 @@ func newIDTokenFixture(t *testing.T) idTokenFixture {
 			"exp":   now.Add(5 * time.Minute).Unix(),
 			"iat":   created.Unix(),
 			"nonce": nonce,
+
+			"email":          "person@example.test",
+			"email_verified": true,
 		},
 		nonce:   nonce,
 		now:     now,
