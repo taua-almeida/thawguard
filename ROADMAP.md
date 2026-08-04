@@ -15,12 +15,13 @@ Documented in [docs/scheduled-freezes.md](docs/scheduled-freezes.md).
 - Truthful schedule, reason, and actor context in forge-facing status descriptions within provider limits.
 - Named dated freeze windows entered manually on a dated schedule; there is no bundled holiday calendar, and month/year recurrence is not implemented.
 
-## Next: Organization readiness
+## In progress: Organization readiness
 
 - **Shipped:** repository-scoped authorization and Users & Access management under the [organization identity and onboarding](https://github.com/taua-almeida/thawguard/issues/5) milestone.
-- **Shipped:** [manual invitation and password-recovery links](https://github.com/taua-almeida/thawguard/issues/11), including atomic invitation acceptance and replay-safe replacement. SMTP delivery and public recovery requests remain separate decisions.
-- **Next:** [one configurable company OIDC connection](https://github.com/taua-almeida/thawguard/issues/13) alongside the required local recovery path.
-- Then define repository-scoped Viewer access for verified repository members who do not yet have a Thawguard account.
+- **Shipped:** [manual invitation and password-recovery links](https://github.com/taua-almeida/thawguard/issues/11), including atomic invitation acceptance and replay-safe replacement. [Optional email delivery and public recovery](https://github.com/taua-almeida/thawguard/issues/15) and [sole-Administrator recovery policy](https://github.com/taua-almeida/thawguard/issues/16) remain focused follow-ups.
+- **Shipped:** the Administrator-only first release of [one configurable company OIDC connection](https://github.com/taua-almeida/thawguard/issues/13), including encrypted client-secret storage, discovery/JWKS health, Test sign-in, verified email/domain admission, explicit Administrator linking, operational login sessions, revocation, and local-password recovery.
+- **Next OIDC evidence:** complete a supervised [real-provider and browser smoke test](https://github.com/taua-almeida/thawguard/issues/17), then expand to [explicit linking for existing local users](https://github.com/taua-almeida/thawguard/issues/18) and [zero-access account creation on first verified sign-in](https://github.com/taua-almeida/thawguard/issues/19).
+- After identity and account-creation boundaries are stable, define [repository-scoped Viewer access from verified forge membership](https://github.com/taua-almeida/thawguard/issues/12).
 - Preserve explicit Freezer, Thaw approver, and Administrator grants; elevated roles will not be assigned automatically.
 
 ## Next: GitHub connectivity
