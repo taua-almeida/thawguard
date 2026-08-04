@@ -91,34 +91,35 @@ type authenticationPageData struct {
 	CSRFField   string
 	Toasts      []toastView
 
-	Connection          companyoidc.Connection
-	HasConnection       bool
-	EncryptionAvailable bool
-	ShowForm            bool
-	Editing             bool
-	Form                companyOIDCFormView
-	FormError           string
-	TerminalHeading     string
-	TerminalMessage     string
-	TerminalTone        string
-	SetupHealth         companyOIDCSetupHealthView
-	CallbackURI         string
-	MetadataVerified    bool
-	TestSignInAvailable bool
-	TestSignInReason    string
-	TestSignInCompleted bool
-	TestSignInRevision  int64
-	TestSignInTime      string
-	ReadyToEnable       bool
-	Enabled             bool
-	Linked              bool
-	LinkedEmail         string
-	LinkedAt            string
-	LinkedMatches       bool
-	LinkedIsSelf        bool
-	CanLink             bool
-	CanEnable           bool
-	CanUnlink           bool
+	Connection              companyoidc.Connection
+	HasConnection           bool
+	EncryptionAvailable     bool
+	ShowForm                bool
+	Editing                 bool
+	Form                    companyOIDCFormView
+	FormError               string
+	TerminalHeading         string
+	TerminalMessage         string
+	TerminalTone            string
+	SetupHealth             companyOIDCSetupHealthView
+	CallbackURI             string
+	MetadataVerified        bool
+	TestSignInAvailable     bool
+	TestSignInReason        string
+	TestSignInCompleted     bool
+	TestSignInRevision      int64
+	TestSignInTime          string
+	ReadyToEnable           bool
+	Enabled                 bool
+	CompanyLoginOperational bool
+	Linked                  bool
+	LinkedEmail             string
+	LinkedAt                string
+	LinkedMatches           bool
+	LinkedIsSelf            bool
+	CanLink                 bool
+	CanEnable               bool
+	CanUnlink               bool
 }
 
 type companyOIDCSetupHealthView struct {
@@ -157,12 +158,16 @@ func (s *Server) handleAuthenticationSettingsEdit(w http.ResponseWriter, r *http
 	if !ok {
 		return
 	}
-	if !s.cfg.CompanyOIDCSecretEncryptionConfigured {
-		s.renderAuthenticationRead(w, r, http.StatusOK, session)
-		return
-	}
 	connection, found, ok := s.currentCompanyOIDCConnection(w, r, session)
 	if !ok {
+		return
+	}
+	if found && connection.Enabled {
+		http.Redirect(w, r, companyOIDCNoticeLocation(companyOIDCEnabledGuardNotice), http.StatusSeeOther)
+		return
+	}
+	if !s.cfg.CompanyOIDCSecretEncryptionConfigured {
+		s.renderAuthenticationRead(w, r, http.StatusOK, session)
 		return
 	}
 	data := s.authenticationPageBase(session)
@@ -882,6 +887,9 @@ func (s *Server) renderAuthenticationRead(w http.ResponseWriter, r *http.Request
 			data.TestSignInTime = connection.TestSignInEvidence.VerifiedAt.UTC().Format("2006-01-02 15:04:05 UTC")
 		}
 		data.Enabled = connection.Enabled
+		if connection.Enabled && s.cfg.CompanyOIDCSecretEncryptionConfigured {
+			data.CompanyLoginOperational = s.cfg.CompanyOIDCService.LoginAvailable(r.Context())
+		}
 		if identity := connection.Identity; identity != nil {
 			data.Linked = true
 			data.LinkedEmail = identity.Email

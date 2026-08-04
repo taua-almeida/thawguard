@@ -182,6 +182,177 @@ func TestAuthenticationDraftEmptyCreateSavedAndEditStatesKeepSecretWriteOnly(t *
 	assertNoCompanyOIDCCheckSurface(t, edit.Body.String())
 }
 
+func TestAuthenticationEnabledConnectionShowsOperationalTruth(t *testing.T) {
+	fixture := newCompanyOIDCWebFixture(t, true)
+	connection := companyoidc.Connection{
+		ProviderLabel: "Example IdP",
+		Issuer:        "https://id.example.test",
+		ClientID:      "client-id",
+		Domains:       []string{"example.test"},
+		Revision:      7,
+		Enabled:       true,
+		SetupCheck: &companyoidc.SetupCheck{
+			ConfigRevision: 7,
+			ResultCode:     companyoidc.SetupCheckVerified,
+			CheckedAt:      time.Date(2026, 7, 30, 9, 0, 0, 0, time.UTC),
+		},
+		TestSignInEvidence: &companyoidc.TestSignInEvidence{
+			ConfigRevision: 7,
+			VerifiedAt:     time.Date(2026, 7, 30, 9, 15, 0, 0, time.UTC),
+		},
+		Identity: &companyoidc.LinkedIdentity{
+			UserID:            fixture.admin.User.ID,
+			Email:             "admin@example.test",
+			ConfigRevision:    7,
+			LinkedAt:          time.Date(2026, 7, 30, 9, 30, 0, 0, time.UTC),
+			MatchesConnection: true,
+		},
+	}
+
+	t.Run("operational", func(t *testing.T) {
+		service := &recordingCompanyOIDCService{
+			current:        connection,
+			currentFound:   true,
+			loginAvailable: true,
+		}
+		fixture.server.cfg.CompanyOIDCService = service
+		fixture.server.cfg.CompanyOIDCSecretEncryptionConfigured = true
+
+		response := companyOIDCGET(fixture.server, "/settings/authentication", fixture.adminCookie())
+		assertStatusAndBodyContains(t, response, http.StatusOK,
+			"Company login is active for the linked Administrator.",
+			"Company login enabled.",
+			">Enabled</span>",
+			`action="/settings/authentication/oidc/disable"`,
+			"Disable company login",
+		)
+		if body := response.Body.String(); strings.Contains(body, "Company login enabled but unavailable.") || strings.Contains(body, "Enabled · unavailable") {
+			t.Fatalf("operational state rendered unavailable warning: %q", body)
+		}
+		if service.loginAvailableCalls != 1 {
+			t.Fatalf("LoginAvailable calls = %d, want 1", service.loginAvailableCalls)
+		}
+	})
+
+	t.Run("service unavailable", func(t *testing.T) {
+		service := &recordingCompanyOIDCService{current: connection, currentFound: true}
+		fixture.server.cfg.CompanyOIDCService = service
+		fixture.server.cfg.CompanyOIDCSecretEncryptionConfigured = true
+
+		response := companyOIDCGET(fixture.server, "/settings/authentication", fixture.adminCookie())
+		assertStatusAndBodyContains(t, response, http.StatusOK,
+			"Company login enabled but unavailable.",
+			"Enabled · unavailable",
+			"Company sign-in is currently unavailable.",
+			"Local password sign-in remains available for every account.",
+			"Disable company login before changing the connection.",
+			`action="/settings/authentication/oidc/disable"`,
+			"Disable company login",
+		)
+		body := response.Body.String()
+		if strings.Contains(body, "The linked Administrator can sign in with the company account.") {
+			t.Fatal("unavailable state claimed that the linked Administrator can sign in")
+		}
+		for _, control := range []string{
+			`href="/settings/authentication/edit"`,
+			`action="/settings/authentication/oidc/check"`,
+			`action="/settings/authentication/oidc/test"`,
+			`action="/settings/authentication/oidc/enable"`,
+			`action="/settings/authentication/oidc/link"`,
+			`action="/settings/authentication/oidc/unlink"`,
+		} {
+			if strings.Contains(body, control) {
+				t.Fatalf("unavailable state rendered control %q", control)
+			}
+		}
+		if service.loginAvailableCalls != 1 {
+			t.Fatalf("LoginAvailable calls = %d, want 1", service.loginAvailableCalls)
+		}
+	})
+
+	t.Run("encryption unavailable", func(t *testing.T) {
+		service := &recordingCompanyOIDCService{
+			current:        connection,
+			currentFound:   true,
+			loginAvailable: true,
+		}
+		fixture.server.cfg.CompanyOIDCService = service
+		fixture.server.cfg.CompanyOIDCSecretEncryptionConfigured = false
+
+		response := companyOIDCGET(fixture.server, "/settings/authentication", fixture.adminCookie())
+		assertStatusAndBodyContains(t, response, http.StatusOK,
+			"Company login enabled but unavailable.",
+			"Enabled · unavailable",
+			`action="/settings/authentication/oidc/disable"`,
+			"Disable company login",
+		)
+		if strings.Contains(response.Body.String(), "Client-secret encryption unavailable") {
+			t.Fatal("enabled unavailable state exposed a specific operational cause")
+		}
+		if service.loginAvailableCalls != 0 {
+			t.Fatalf("LoginAvailable calls = %d, want 0", service.loginAvailableCalls)
+		}
+	})
+}
+
+func TestAuthenticationEditRouteGuardsEnabledConnection(t *testing.T) {
+	fixture := newCompanyOIDCWebFixture(t, true)
+	enabled := companyoidc.Connection{
+		ProviderLabel: "Example IdP",
+		Issuer:        "https://id.example.test",
+		ClientID:      "client-id",
+		Domains:       []string{"example.test"},
+		Revision:      7,
+		Enabled:       true,
+	}
+
+	for _, encryptionAvailable := range []bool{true, false} {
+		name := "encryption available"
+		if !encryptionAvailable {
+			name = "encryption unavailable"
+		}
+		t.Run(name, func(t *testing.T) {
+			fixture.server.cfg.CompanyOIDCService = &recordingCompanyOIDCService{
+				current:      enabled,
+				currentFound: true,
+			}
+			fixture.server.cfg.CompanyOIDCSecretEncryptionConfigured = encryptionAvailable
+
+			response := companyOIDCGET(fixture.server, "/settings/authentication/edit", fixture.adminCookie())
+			wantLocation := companyOIDCNoticeLocation(companyOIDCEnabledGuardNotice)
+			if response.Code != http.StatusSeeOther || response.Header().Get("Location") != wantLocation {
+				t.Fatalf("status=%d location=%q, want status=%d location=%q", response.Code, response.Header().Get("Location"), http.StatusSeeOther, wantLocation)
+			}
+			for _, marker := range []string{"Edit company OIDC Draft", "Save draft", `id="oidc-client-secret"`} {
+				if strings.Contains(response.Body.String(), marker) {
+					t.Fatalf("enabled edit route rendered %q", marker)
+				}
+			}
+		})
+	}
+
+	disabled := enabled
+	disabled.Enabled = false
+	fixture.server.cfg.CompanyOIDCSecretEncryptionConfigured = true
+	fixture.server.cfg.CompanyOIDCService = &recordingCompanyOIDCService{current: disabled, currentFound: true}
+	disabledEdit := companyOIDCGET(fixture.server, "/settings/authentication/edit", fixture.adminCookie())
+	assertStatusAndBodyContains(t, disabledEdit, http.StatusOK,
+		"Edit company OIDC Draft",
+		`name="expected_revision" value="7"`,
+		`id="oidc-client-secret"`,
+		"Save draft",
+	)
+
+	fixture.server.cfg.CompanyOIDCService = &recordingCompanyOIDCService{}
+	emptyEdit := companyOIDCGET(fixture.server, "/settings/authentication/edit", fixture.adminCookie())
+	assertStatusAndBodyContains(t, emptyEdit, http.StatusOK,
+		"Configure company OIDC Draft",
+		`name="expected_revision" value="0"`,
+		`id="oidc-client-secret"`,
+		"Save draft",
+	)
+}
+
 func TestAuthenticationValidationConflictAndInternalErrorsNeverEchoSecret(t *testing.T) {
 	fixture := newCompanyOIDCWebFixture(t, true)
 	validationSecret := "validation secret canary"
