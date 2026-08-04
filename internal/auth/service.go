@@ -40,9 +40,12 @@ type Session struct {
 	// Grants is the repository-aware capability set current as of when this
 	// Session value was produced. For live requests only the fresh SessionByID
 	// result is authoritative.
-	Grants    Grants
-	ExpiresAt time.Time
-	CreatedAt time.Time
+	Grants Grants
+	// CompanyOIDC reports whether this session was created through company
+	// OIDC login rather than a local password.
+	CompanyOIDC bool
+	ExpiresAt   time.Time
+	CreatedAt   time.Time
 }
 
 type CreateFirstAdminParams struct {
@@ -230,7 +233,8 @@ func (s *Service) SessionByID(ctx context.Context, id string) (Session, bool, er
 SELECT s.id, s.csrf_token, s.expires_at, s.created_at,
   u.id, u.email, u.display_name,
   EXISTS (SELECT 1 FROM user_roles admin_role WHERE admin_role.user_id = u.id AND admin_role.role = 'admin'),
-  u.disabled_at, lc.user_id IS NOT NULL, lc.must_change_password, u.created_at, u.updated_at
+  u.disabled_at, lc.user_id IS NOT NULL, lc.must_change_password, u.created_at, u.updated_at,
+  EXISTS (SELECT 1 FROM company_oidc_sessions cs WHERE cs.session_id = s.id)
 FROM sessions s
 JOIN users u ON u.id = s.user_id
 LEFT JOIN local_credentials lc ON lc.user_id = u.id
@@ -259,6 +263,18 @@ WHERE s.id = ?`, id)
 			return Session{}, false, err
 		}
 		return Session{}, false, nil
+	}
+	if session.CompanyOIDC {
+		authorized, err := s.companyOIDCSessionStillAuthorized(ctx, session.User.ID)
+		if err != nil {
+			return Session{}, false, err
+		}
+		if !authorized {
+			if err := s.Logout(ctx, id); err != nil {
+				return Session{}, false, err
+			}
+			return Session{}, false, nil
+		}
 	}
 	grants, err := loadGrants(ctx, s.db, session.User)
 	if err != nil {
@@ -555,7 +571,8 @@ func scanSession(row scanner) (Session, error) {
 	var mustChangePassword sql.NullInt64
 	var userCreatedAt string
 	var userUpdatedAt string
-	if err := row.Scan(&session.ID, &session.CSRFToken, &expiresAt, &sessionCreatedAt, &session.User.ID, &session.User.Email, &session.User.DisplayName, &isAdmin, &disabledAt, &hasLocalPassword, &mustChangePassword, &userCreatedAt, &userUpdatedAt); err != nil {
+	var companyOIDC int
+	if err := row.Scan(&session.ID, &session.CSRFToken, &expiresAt, &sessionCreatedAt, &session.User.ID, &session.User.Email, &session.User.DisplayName, &isAdmin, &disabledAt, &hasLocalPassword, &mustChangePassword, &userCreatedAt, &userUpdatedAt, &companyOIDC); err != nil {
 		return Session{}, err
 	}
 	parsedExpiresAt, err := parseTime(expiresAt)
@@ -586,6 +603,7 @@ func scanSession(row scanner) (Session, error) {
 	session.User.MustChangePassword = mustChangePassword.Valid && mustChangePassword.Int64 != 0
 	session.User.CreatedAt = parsedUserCreatedAt
 	session.User.UpdatedAt = parsedUserUpdatedAt
+	session.CompanyOIDC = companyOIDC != 0
 	return session, nil
 }
 

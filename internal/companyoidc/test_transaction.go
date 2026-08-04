@@ -426,17 +426,51 @@ WHERE s.id = ?`, sessionID).Scan(&userID, &hasCSRF, &expiresAt, &mustChangePassw
 	return userID == actorUserID && hasCSRF == 1 && now.Before(parsedExpiry.UTC()) && !forced, nil
 }
 
+// currentCredentialedSession is currentTestSession restricted to users who
+// hold a local credential: the INNER JOIN requires the credential row to
+// exist, so a user without a local password never passes.
+func currentCredentialedSession(
+	ctx context.Context,
+	tx *sql.Tx,
+	actorUserID int64,
+	sessionID string,
+	now time.Time,
+) (bool, error) {
+	var userID int64
+	var hasCSRF int
+	var expiresAt string
+	var mustChangePassword int64
+	err := tx.QueryRowContext(ctx, `
+SELECT s.user_id, s.csrf_token != '', s.expires_at, lc.must_change_password
+FROM sessions s
+JOIN local_credentials lc ON lc.user_id = s.user_id
+WHERE s.id = ?`, sessionID).Scan(&userID, &hasCSRF, &expiresAt, &mustChangePassword)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	parsedExpiry, err := time.Parse(time.RFC3339Nano, expiresAt)
+	if err != nil {
+		return false, nil
+	}
+	return userID == actorUserID && hasCSRF == 1 && now.Before(parsedExpiry.UTC()) &&
+		mustChangePassword == 0, nil
+}
+
 func loadTestSignInSnapshot(
 	ctx context.Context,
 	tx *sql.Tx,
 ) (testSignInSnapshot, bool, error) {
 	var snapshot testSignInSnapshot
+	var enabled int64
 	var checkRevision sql.NullInt64
 	var resultCode sql.NullString
 	var observedIssuer, checkedAt sql.NullString
 	var candidateCount sql.NullInt64
 	err := tx.QueryRowContext(ctx, `
-SELECT c.issuer, c.client_id, c.client_secret_ciphertext, c.revision,
+SELECT c.issuer, c.client_id, c.client_secret_ciphertext, c.revision, c.enabled,
   sc.config_revision, sc.result_code, sc.observed_issuer,
   sc.public_key_candidate_count, sc.checked_at
 FROM company_oidc_connections c
@@ -446,6 +480,7 @@ WHERE c.id = 1`).Scan(
 		&snapshot.clientID,
 		&snapshot.clientSecretCiphertext,
 		&snapshot.revision,
+		&enabled,
 		&checkRevision,
 		&resultCode,
 		&observedIssuer,
@@ -461,7 +496,8 @@ WHERE c.id = 1`).Scan(
 	issuer, issuerErr := normalizeIssuer(snapshot.issuer)
 	clientID, clientIDErr := normalizeClientID(snapshot.clientID)
 	if issuerErr != nil || issuer != snapshot.issuer || clientIDErr != nil || clientID != snapshot.clientID ||
-		len(snapshot.clientSecretCiphertext) == 0 || len(snapshot.clientSecretCiphertext) > 8192 || snapshot.revision <= 0 {
+		len(snapshot.clientSecretCiphertext) == 0 || len(snapshot.clientSecretCiphertext) > 8192 ||
+		snapshot.revision <= 0 || enabled < 0 || enabled > 1 {
 		return testSignInSnapshot{}, true, errMalformedTestSignInSnapshot
 	}
 	if !checkRevision.Valid && !resultCode.Valid && !observedIssuer.Valid && !candidateCount.Valid && !checkedAt.Valid {
@@ -488,7 +524,7 @@ WHERE c.id = 1`).Scan(
 	if err := validateSetupCheck(check, snapshot.issuer, snapshot.revision); err != nil {
 		return testSignInSnapshot{}, true, errMalformedTestSignInSnapshot
 	}
-	snapshot.ready = check.ResultCode == SetupCheckVerified
+	snapshot.ready = check.ResultCode == SetupCheckVerified && enabled == 0
 	return snapshot, true, nil
 }
 

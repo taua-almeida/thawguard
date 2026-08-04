@@ -33,6 +33,7 @@ const (
 	loginCSRFPurpose            = "login"
 	passwordRecoveryCSRFPurpose = "password-recovery"
 	invitationCSRFPurpose       = "invitation"
+	companyLoginCSRFPurpose     = "company-login"
 )
 
 type sessionState struct {
@@ -44,6 +45,7 @@ type sessionState struct {
 	Grants             auth.Grants
 	HasLocalPassword   bool
 	MustChangePassword bool
+	CompanyOIDC        bool
 	ExpiresAt          time.Time
 }
 
@@ -263,6 +265,17 @@ func (s *Server) newInvitationCSRFToken() (string, error) {
 
 func (s *Server) validInvitationCSRFToken(r *http.Request) bool {
 	return s.validPreAuthCSRFToken(r, invitationCSRFPurpose)
+}
+
+// Company login initiation is anonymous like password recovery, so its CSRF
+// token is cookie-free and purpose-bound: a token minted for any other
+// anonymous form never validates here.
+func (s *Server) newCompanyLoginCSRFToken() (string, error) {
+	return s.newSignedCSRFToken(companyLoginCSRFPurpose)
+}
+
+func (s *Server) validCompanyLoginCSRFToken(r *http.Request) bool {
+	return s.validPreAuthCSRFToken(r, companyLoginCSRFPurpose)
 }
 
 func (s *Server) newSignedCSRFToken(purpose string) (string, error) {

@@ -81,6 +81,9 @@ VALUES (?, ?, ?)`, record.ID, RoleAdmin, nowText); err != nil {
 			); err != nil {
 				return User{}, err
 			}
+			if err := secureCompanyOIDCOnAuthorityLoss(ctx, tx, params.ActorUserID, record.ID); err != nil {
+				return User{}, err
+			}
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE users SET updated_at = ? WHERE id = ?`, nowText, record.ID); err != nil {
@@ -159,6 +162,9 @@ func (s *Service) DisableUser(ctx context.Context, actorUserID int64, userID int
 		return User{}, err
 	}
 	if err := deleteUserPasswordRecoveryToken(ctx, tx, record.ID); err != nil {
+		return User{}, err
+	}
+	if err := secureCompanyOIDCOnAuthorityLoss(ctx, tx, actorUserID, record.ID); err != nil {
 		return User{}, err
 	}
 	event := userAuditEvent(audit.ActionUserDisabled, actorUserID, record.ID, map[string]string{"enabled": "false"})
@@ -380,6 +386,9 @@ WHERE user_id = ?`, passwordHash, nowText, record.ID); err != nil {
 		return err
 	}
 	if err := deleteUserPasswordRecoveryToken(ctx, tx, record.ID); err != nil {
+		return err
+	}
+	if err := secureCompanyOIDCOnAuthorityLoss(ctx, tx, params.ActorUserID, record.ID); err != nil {
 		return err
 	}
 	event := userAuditEvent(audit.ActionUserPasswordReset, params.ActorUserID, record.ID, nil)

@@ -483,9 +483,9 @@ func beginAdminDemotion(t *testing.T, fixture *serviceFixture) *sql.Tx {
 	return tx
 }
 
-func TestCheckSnapshotQuerySelectsOnlyIssuerAndRevision(t *testing.T) {
+func TestCheckSnapshotQuerySelectsOnlyIssuerRevisionAndEnabled(t *testing.T) {
 	query := strings.Join(strings.Fields(checkSnapshotQuery), " ")
-	if want := "SELECT issuer, revision FROM company_oidc_connections WHERE id = 1"; query != want {
+	if want := "SELECT issuer, revision, enabled FROM company_oidc_connections WHERE id = 1"; query != want {
 		t.Fatalf("check snapshot query = %q, want %q", query, want)
 	}
 	if strings.Contains(strings.ToLower(query), "client_secret_ciphertext") {

@@ -222,6 +222,13 @@ WHERE user_id = ?
 	if err := deleteUserSessions(ctx, tx, userID); err != nil {
 		return err
 	}
+	// Recovery proves the provider identity can no longer be trusted for this
+	// account: a linked company identity is removed and company login shut off
+	// in the same transaction, so an attacker-linked identity never survives a
+	// recovery. Recovery itself proceeds regardless of prior OIDC state.
+	if err := removeCompanyOIDCIdentityForRecovery(ctx, tx, userID); err != nil {
+		return err
+	}
 	event := audit.Event{
 		Action:      audit.ActionUserPasswordRecoveryCompleted,
 		SubjectType: audit.SubjectTypeUser,

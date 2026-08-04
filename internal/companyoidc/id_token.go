@@ -33,12 +33,14 @@ type idTokenVerifier struct {
 	clientID             string
 	keys                 trustedJWKS
 	nonceDigest          [sha256.Size]byte
+	nonceDigestPurpose   string
 	transactionCreatedAt time.Time
 	now                  func() time.Time
 }
 
 type verifiedIDToken struct {
 	subject     string
+	email       string
 	emailDomain string
 }
 
@@ -52,7 +54,7 @@ type numericDate struct {
 
 func (v idTokenVerifier) verify(token string) (verifiedIDToken, error) {
 	if v.issuer == "" || v.clientID == "" || v.keys.keys == nil ||
-		v.transactionCreatedAt.IsZero() || v.now == nil {
+		v.nonceDigestPurpose == "" || v.transactionCreatedAt.IsZero() || v.now == nil {
 		return verifiedIDToken{}, errIDTokenValidation
 	}
 	header, signed, err := preflightCompactIDToken(token)
@@ -79,11 +81,11 @@ func (v idTokenVerifier) verify(token string) (verifiedIDToken, error) {
 	if !claims.valid(v, now) {
 		return verifiedIDToken{}, errIDTokenValidation
 	}
-	emailDomain, ok := verifiedEmailDomain(object)
+	email, emailDomain, ok := verifiedEmailClaim(object)
 	if !ok {
 		return verifiedIDToken{}, errIDTokenValidation
 	}
-	return verifiedIDToken{subject: claims.subject, emailDomain: emailDomain}, nil
+	return verifiedIDToken{subject: claims.subject, email: email, emailDomain: emailDomain}, nil
 }
 
 func preflightCompactIDToken(token string) (protectedIDTokenHeader, *jose.JSONWebSignature, error) {
@@ -160,7 +162,7 @@ func decodeVerifiedIDTokenClaims(object map[string]jsonRawMessage) (verifiedIDTo
 		return verifiedIDTokenClaims{}, errIDTokenValidation
 	}
 	subject, ok := requiredJSONString(object, "sub")
-	if !ok || subject == "" {
+	if !ok || !validOIDCSubject(subject) {
 		return verifiedIDTokenClaims{}, errIDTokenValidation
 	}
 	audience, ok := parseAudience(object["aud"])
@@ -202,45 +204,52 @@ func decodeVerifiedIDTokenClaims(object map[string]jsonRawMessage) (verifiedIDTo
 	return claims, nil
 }
 
-// verifiedEmailDomain extracts the transient admission claims from an already
+// verifiedEmailClaim extracts the admission claims from an already
 // signature-verified and base-validated claims object. It requires
-// email_verified to be the exact JSON boolean true and returns the
-// ASCII-lowercased DNS domain of a strictly validated email. The local part is
-// transient and never used for identity.
-func verifiedEmailDomain(object map[string]jsonRawMessage) (string, bool) {
+// email_verified to be the exact JSON boolean true and returns the canonical
+// email (local part unchanged, domain ASCII-lowercased) together with the
+// lowercased DNS domain of a strictly validated email.
+func verifiedEmailClaim(object map[string]jsonRawMessage) (string, string, bool) {
 	raw, present := object["email_verified"]
 	if !present {
-		return "", false
+		return "", "", false
 	}
 	var emailVerified bool
 	if strictJSONUnmarshal(raw, &emailVerified) != nil || !emailVerified {
-		return "", false
+		return "", "", false
 	}
 
 	email, ok := requiredJSONString(object, "email")
 	if !ok || email == "" || len(email) > maxEmailClaimBytes || !utf8.ValidString(email) {
-		return "", false
+		return "", "", false
 	}
 	if email != strings.TrimSpace(email) || containsControlOrLineSeparator(email) {
-		return "", false
+		return "", "", false
 	}
 	if strings.Count(email, "@") != 1 {
-		return "", false
+		return "", "", false
 	}
 	local, domain, _ := strings.Cut(email, "@")
 	if local == "" || domain == "" {
-		return "", false
+		return "", "", false
 	}
 	for i := range len(domain) {
 		if domain[i] > 0x7f {
-			return "", false
+			return "", "", false
 		}
 	}
 	domain = strings.ToLower(domain)
 	if validateDomain(domain) != nil {
-		return "", false
+		return "", "", false
 	}
-	return domain, true
+	return local + "@" + domain, domain, true
+}
+
+// validOIDCSubject bounds the raw provider subject before it is compared or
+// stored: 1..255 bytes, valid UTF-8, no control or line-separator characters.
+func validOIDCSubject(value string) bool {
+	return len(value) >= 1 && len(value) <= 255 &&
+		utf8.ValidString(value) && !containsControlOrLineSeparator(value)
 }
 
 func parseAudience(raw jsonRawMessage) ([]string, bool) {
@@ -380,7 +389,7 @@ func (claims verifiedIDTokenClaims) valid(verifier idTokenVerifier, now time.Tim
 	if len(claims.audience) > 1 && !claims.hasAuthorizedParty {
 		return false
 	}
-	nonceDigest := testSignInDigest(testSignInNonceDigestPurpose, claims.nonce)
+	nonceDigest := testSignInDigest(verifier.nonceDigestPurpose, claims.nonce)
 	if subtle.ConstantTimeCompare(nonceDigest[:], verifier.nonceDigest[:]) != 1 {
 		return false
 	}

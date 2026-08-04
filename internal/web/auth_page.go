@@ -10,15 +10,20 @@ import (
 // prefers-color-scheme; the dev preview forces it via ?theme=.
 
 // authLoginData feeds pages/login.html. Email is preserved on error
-// re-renders; the password never is.
+// re-renders; the password never is. CompanyLoginAvailable is true only while
+// the company OIDC connection is enabled; Notice carries the generic company
+// sign-in failure copy and never discloses account existence.
 type authLoginData struct {
-	AppName   string
-	PageTitle string
-	Theme     string
-	CSRFField string
-	CSRFToken string
-	FormError string
-	Email     string
+	AppName               string
+	PageTitle             string
+	Theme                 string
+	CSRFField             string
+	CSRFToken             string
+	FormError             string
+	Email                 string
+	Notice                string
+	CompanyLoginAvailable bool
+	CompanyCSRFToken      string
 }
 
 // authSetupData feeds pages/setup.html. Email and DisplayName are preserved

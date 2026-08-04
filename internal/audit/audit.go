@@ -72,6 +72,10 @@ const (
 	ActionOIDCConnectionMetadataChecked      = "oidc_connection.metadata_checked"
 	ActionOIDCConnectionTestSignInClaimed    = "oidc_connection.test_sign_in_claimed"
 	ActionOIDCConnectionTestSignInCompleted  = "oidc_connection.test_sign_in_completed"
+	ActionOIDCConnectionEnabled              = "oidc_connection.enabled"
+	ActionOIDCConnectionDisabled             = "oidc_connection.disabled"
+	ActionOIDCIdentityLinked                 = "oidc_identity.linked"
+	ActionOIDCIdentityUnlinked               = "oidc_identity.unlinked"
 
 	ActorKindPasswordRecoveryLink = "recovery_link"
 	ActorKindInvitationLink       = "invitation_link"
@@ -149,6 +153,10 @@ func KnownActions() []string {
 		ActionOIDCConnectionMetadataChecked,
 		ActionOIDCConnectionTestSignInClaimed,
 		ActionOIDCConnectionTestSignInCompleted,
+		ActionOIDCConnectionEnabled,
+		ActionOIDCConnectionDisabled,
+		ActionOIDCIdentityLinked,
+		ActionOIDCIdentityUnlinked,
 	}
 }
 

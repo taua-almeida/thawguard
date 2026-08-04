@@ -356,6 +356,10 @@ func TestScopedActionClassificationCoversEveryKnownAction(t *testing.T) {
 		"oidc_connection.metadata_checked":           adminOnly,
 		"oidc_connection.test_sign_in_claimed":       adminOnly,
 		"oidc_connection.test_sign_in_completed":     adminOnly,
+		"oidc_connection.enabled":                    adminOnly,
+		"oidc_connection.disabled":                   adminOnly,
+		"oidc_identity.linked":                       adminOnly,
+		"oidc_identity.unlinked":                     adminOnly,
 	}
 
 	classified := map[string]string{}

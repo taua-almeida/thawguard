@@ -508,6 +508,7 @@ func newIDTokenFixture(t *testing.T) idTokenFixture {
 			clientID:             "client-id",
 			keys:                 keys,
 			nonceDigest:          testSignInDigest(testSignInNonceDigestPurpose, nonce),
+			nonceDigestPurpose:   testSignInNonceDigestPurpose,
 			transactionCreatedAt: created,
 			now:                  func() time.Time { return now },
 		},

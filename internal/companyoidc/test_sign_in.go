@@ -3,6 +3,7 @@ package companyoidc
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -100,6 +101,9 @@ func (s *Service) StartTestSignIn(
 	if err != nil || !found || connection.Revision != input.ExpectedRevision ||
 		connection.SetupCheck == nil || connection.SetupCheck.ResultCode != SetupCheckVerified {
 		return TestSignInStart{}, ErrTestSignInUnavailable
+	}
+	if connection.Enabled {
+		return TestSignInStart{}, ErrEnabled
 	}
 
 	providerCtx, cancel := context.WithTimeout(ctx, testSignInProviderTimeout)
@@ -319,22 +323,60 @@ func (s *Service) verifyAuthorizationCode(
 	claim testSignInClaim,
 	code string,
 ) TestSignInResultCode {
+	_, result := s.verifyAuthorizationCodeGrant(ctx, authorizationCodeVerification{
+		issuer:                 claim.issuer,
+		clientID:               claim.clientID,
+		clientSecretCiphertext: claim.clientSecretCiphertext,
+		pkceCiphertext:         claim.pkceCiphertext,
+		tokenEndpoint:          claim.tokenEndpoint,
+		jwksURI:                claim.jwksURI,
+		redirectURI:            claim.redirectURI,
+		nonceDigest:            claim.nonceDigest,
+		nonceDigestPurpose:     testSignInNonceDigestPurpose,
+		createdAt:              claim.createdAt,
+		domains:                claim.domains,
+	}, code)
+	return result
+}
+
+// authorizationCodeVerification carries everything needed to redeem an
+// authorization code and validate the resulting ID token, independent of
+// which transaction flow (Test sign-in, link, login) produced it.
+type authorizationCodeVerification struct {
+	issuer                 string
+	clientID               string
+	clientSecretCiphertext []byte
+	pkceCiphertext         []byte
+	tokenEndpoint          string
+	jwksURI                string
+	redirectURI            string
+	nonceDigest            [sha256.Size]byte
+	nonceDigestPurpose     string
+	createdAt              time.Time
+	domains                []string
+}
+
+func (s *Service) verifyAuthorizationCodeGrant(
+	ctx context.Context,
+	verification authorizationCodeVerification,
+	code string,
+) (verifiedIDToken, TestSignInResultCode) {
 	if s.secrets == nil {
-		return TestSignInConfigurationUnavailable
+		return verifiedIDToken{}, TestSignInConfigurationUnavailable
 	}
 	if s.checker == nil {
-		return TestSignInConfigurationUnavailable
+		return verifiedIDToken{}, TestSignInConfigurationUnavailable
 	}
-	clientSecret, err := s.secrets.Decrypt(ctx, claim.clientSecretCiphertext)
+	clientSecret, err := s.secrets.Decrypt(ctx, verification.clientSecretCiphertext)
 	if err != nil || !validDecryptedClientSecret(clientSecret) {
 		clear(clientSecret)
-		return TestSignInConfigurationUnavailable
+		return verifiedIDToken{}, TestSignInConfigurationUnavailable
 	}
 	defer clear(clientSecret)
-	verifierBytes, err := s.secrets.Decrypt(ctx, claim.pkceCiphertext)
+	verifierBytes, err := s.secrets.Decrypt(ctx, verification.pkceCiphertext)
 	if err != nil || !canonicalTestToken(string(verifierBytes)) {
 		clear(verifierBytes)
-		return TestSignInConfigurationUnavailable
+		return verifiedIDToken{}, TestSignInConfigurationUnavailable
 	}
 	defer clear(verifierBytes)
 
@@ -342,39 +384,40 @@ func (s *Service) verifyAuthorizationCode(
 	defer cancel()
 	idToken, result := s.checker.exchangeAuthorizationCode(
 		providerCtx,
-		claim.tokenEndpoint,
-		claim.clientID,
+		verification.tokenEndpoint,
+		verification.clientID,
 		clientSecret,
 		code,
-		claim.redirectURI,
+		verification.redirectURI,
 		string(verifierBytes),
 	)
 	if result != TestSignInVerified {
-		return result
+		return verifiedIDToken{}, result
 	}
 
-	keys, status := s.checker.fetchJWKS(providerCtx, claim.jwksURI)
+	keys, status := s.checker.fetchJWKS(providerCtx, verification.jwksURI)
 	if status == fetchUnavailable {
-		return TestSignInProviderUnavailable
+		return verifiedIDToken{}, TestSignInProviderUnavailable
 	}
 	if status == fetchInvalid {
-		return TestSignInProviderInvalid
+		return verifiedIDToken{}, TestSignInProviderInvalid
 	}
 	verified, err := (idTokenVerifier{
-		issuer:               claim.issuer,
-		clientID:             claim.clientID,
+		issuer:               verification.issuer,
+		clientID:             verification.clientID,
 		keys:                 keys,
-		nonceDigest:          claim.nonceDigest,
-		transactionCreatedAt: claim.createdAt,
+		nonceDigest:          verification.nonceDigest,
+		nonceDigestPurpose:   verification.nonceDigestPurpose,
+		transactionCreatedAt: verification.createdAt,
 		now:                  s.now,
 	}).verify(idToken)
 	if err != nil {
-		return TestSignInProviderInvalid
+		return verifiedIDToken{}, TestSignInProviderInvalid
 	}
-	if !slices.Contains(claim.domains, verified.emailDomain) {
-		return TestSignInProviderInvalid
+	if !slices.Contains(verification.domains, verified.emailDomain) {
+		return verifiedIDToken{}, TestSignInProviderInvalid
 	}
-	return TestSignInVerified
+	return verified, TestSignInVerified
 }
 
 func validDecryptedClientSecret(secret []byte) bool {

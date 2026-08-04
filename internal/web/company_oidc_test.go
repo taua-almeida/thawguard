@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -107,7 +108,7 @@ func TestAuthenticationDraftEmptyCreateSavedAndEditStatesKeepSecretWriteOnly(t *
 		"No company connection configured",
 		"Configure OIDC",
 		"Local-password sign-in remains unchanged",
-		"Company OIDC can later establish identity. Repository access is managed separately.",
+		"Company OIDC establishes identity for the linked Administrator. Repository access is managed separately.",
 	)
 	if strings.Contains(empty.Body.String(), `name="client_secret"`) {
 		t.Fatal("empty read state rendered a secret control")
@@ -123,7 +124,7 @@ func TestAuthenticationDraftEmptyCreateSavedAndEditStatesKeepSecretWriteOnly(t *
 		"Verify metadata",
 		"Available after save",
 		"Test sign-in",
-		"Not implemented",
+		"Requires verified Test sign-in",
 	)
 	assertNoCompanyOIDCCheckSurface(t, create.Body.String())
 
@@ -893,7 +894,7 @@ func TestAuthenticationCheckExistsOnlyOnSavedReadStateAndFutureStepsStayInert(t 
 		"Check configuration",
 		"Test sign-in",
 		"Enable",
-		"Not implemented",
+		"Requires verified Test sign-in",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("saved state is missing %q", want)
@@ -1298,14 +1299,67 @@ func TestAuthenticationReadyStateShowsInertEnableEvidenceAndRetestForm(t *testin
 	response := companyOIDCGET(fixture.server, "/settings/authentication", fixture.adminCookie())
 	assertStatusAndBodyContains(t, response, http.StatusOK,
 		"Test sign-in verified for saved revision 4 at 2026-07-30 09:15:42 UTC.",
-		"Requirements met; enabling is not implemented. The connection remains Draft and disabled.",
+		`action="/settings/authentication/oidc/link"`,
+		"Link company identity",
 		`method="post" action="/settings/authentication/oidc/test"`,
 		`name="expected_revision" value="4"`,
 	)
 	if body := response.Body.String(); strings.Contains(body, "oidc/enable") {
-		t.Fatal("Ready state referenced an Enable route")
+		t.Fatal("Ready-but-unlinked state referenced an Enable route")
 	}
 	assertAuthenticationSecurityHeaders(t, response.Header())
+}
+
+func TestAuthenticationWithholdsEnableUntilServiceReportsReady(t *testing.T) {
+	fixture := newCompanyOIDCWebFixture(t, true)
+	linked := companyoidc.Connection{
+		ProviderLabel: "Ready IdP",
+		Issuer:        "https://id.example.test",
+		ClientID:      "client",
+		Domains:       []string{"example.test"},
+		Revision:      4,
+		SetupCheck: &companyoidc.SetupCheck{
+			ConfigRevision: 4,
+			ResultCode:     companyoidc.SetupCheckVerified,
+			CheckedAt:      time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC),
+		},
+		TestSignInEvidence: &companyoidc.TestSignInEvidence{
+			ConfigRevision: 4,
+			VerifiedAt:     time.Date(2026, 7, 30, 9, 15, 42, 0, time.UTC),
+		},
+		Identity: &companyoidc.LinkedIdentity{
+			UserID:            fixture.admin.User.ID,
+			Email:             "person@example.test",
+			ConfigRevision:    4,
+			LinkedAt:          time.Date(2026, 7, 30, 10, 0, 0, 0, time.UTC),
+			MatchesConnection: true,
+		},
+	}
+	service := &recordingCompanyOIDCService{current: linked, currentFound: true}
+	fixture.server.cfg.CompanyOIDCService = service
+
+	withheld := companyOIDCGET(fixture.server, "/settings/authentication", fixture.adminCookie())
+	assertStatusAndBodyContains(t, withheld, http.StatusOK,
+		"Prerequisites incomplete",
+		"Company login cannot be enabled yet.",
+	)
+	if body := withheld.Body.String(); strings.Contains(body, "oidc/enable") || strings.Contains(body, "Ready to enable") {
+		t.Fatalf("service-not-ready state still offered Enable: %q", body)
+	}
+	if service.enableReadyCalls != 1 {
+		t.Fatalf("EnableReady calls = %d, want 1", service.enableReadyCalls)
+	}
+
+	service.enableReady = true
+	ready := companyOIDCGET(fixture.server, "/settings/authentication", fixture.adminCookie())
+	assertStatusAndBodyContains(t, ready, http.StatusOK,
+		"Ready to enable",
+		`action="/settings/authentication/oidc/enable"`,
+		"Enable company login",
+	)
+	if service.enableReadyCalls != 2 {
+		t.Fatalf("EnableReady calls = %d, want 2", service.enableReadyCalls)
+	}
 }
 
 func TestAuthenticationSuspendedReadinessKeepsEvidenceAndRestores(t *testing.T) {
@@ -1318,7 +1372,7 @@ func TestAuthenticationSuspendedReadinessKeepsEvidenceAndRestores(t *testing.T) 
 	service := &recordingCompanyOIDCService{currentFound: true}
 	fixture.server.cfg.CompanyOIDCService = service
 	const evidenceLine = "Test sign-in verified for saved revision 4 at 2026-07-30 09:15:42 UTC."
-	const readyCopy = "Requirements met; enabling is not implemented."
+	const readyCopy = `action="/settings/authentication/oidc/link"`
 	for _, tc := range []struct {
 		name       string
 		connection companyoidc.Connection
@@ -1471,9 +1525,9 @@ func TestAuthenticationSetupProgressHasExactlyOneCurrentStep(t *testing.T) {
 					strings.Contains(testItem, current) {
 					t.Fatalf("completed Test sign-in item is not completed: %s", testItem)
 				}
-				if !strings.Contains(currentItem, `aria-disabled="true"`) ||
-					!strings.Contains(currentItem, "Not implemented") {
-					t.Fatalf("Enable step is not inert: %s", currentItem)
+				if strings.Contains(currentItem, `aria-disabled="true"`) ||
+					!strings.Contains(currentItem, "Link a company identity") {
+					t.Fatalf("Enable step does not ask for identity linking: %s", currentItem)
 				}
 				for _, control := range []string{"<a", "<button", "<form", "href="} {
 					if strings.Contains(currentItem, control) {
@@ -1631,6 +1685,43 @@ type recordingCompanyOIDCService struct {
 	callbackCalls  int
 	callbackResult companyoidc.TestSignInResultCode
 	callbackErr    error
+
+	linkStartCalls  int
+	linkStartInput  companyoidc.LinkStartInput
+	linkStartResult companyoidc.LinkStart
+	linkStartErr    error
+
+	linkCallbackCalls  int
+	linkCallbackInput  companyoidc.LinkCallbackInput
+	linkCallbackResult companyoidc.TestSignInResultCode
+	linkCallbackErr    error
+
+	enableCalls  int
+	enableInput  companyoidc.EnableInput
+	enableErr    error
+	disableCalls int
+	disableInput companyoidc.DisableInput
+	disableErr   error
+	unlinkCalls  int
+	unlinkInput  companyoidc.UnlinkInput
+	unlinkErr    error
+
+	loginStartCalls  int
+	loginStartInput  companyoidc.LoginStartInput
+	loginStartResult companyoidc.LoginStart
+	loginStartErr    error
+
+	loginCallbackCalls      int
+	loginCallbackInput      companyoidc.LoginCallbackInput
+	loginCallbackCompletion companyoidc.LoginCompletion
+	loginCallbackResult     companyoidc.TestSignInResultCode
+	loginCallbackErr        error
+
+	loginAvailable      bool
+	loginAvailableCalls int
+
+	enableReady      bool
+	enableReadyCalls int
 }
 
 func (s *recordingCompanyOIDCService) Current(context.Context) (companyoidc.Connection, bool, error) {
@@ -1670,11 +1761,88 @@ func (s *recordingCompanyOIDCService) CompleteTestSignIn(
 	return s.callbackResult, s.callbackErr
 }
 
+func (s *recordingCompanyOIDCService) StartLink(
+	_ context.Context,
+	input companyoidc.LinkStartInput,
+) (companyoidc.LinkStart, error) {
+	s.linkStartCalls++
+	s.linkStartInput = input
+	return s.linkStartResult, s.linkStartErr
+}
+
+func (s *recordingCompanyOIDCService) CompleteLink(
+	_ context.Context,
+	input companyoidc.LinkCallbackInput,
+) (companyoidc.TestSignInResultCode, error) {
+	s.linkCallbackCalls++
+	s.linkCallbackInput = input
+	return s.linkCallbackResult, s.linkCallbackErr
+}
+
+func (s *recordingCompanyOIDCService) Enable(_ context.Context, input companyoidc.EnableInput) error {
+	s.enableCalls++
+	s.enableInput = input
+	return s.enableErr
+}
+
+func (s *recordingCompanyOIDCService) Disable(_ context.Context, input companyoidc.DisableInput) error {
+	s.disableCalls++
+	s.disableInput = input
+	return s.disableErr
+}
+
+func (s *recordingCompanyOIDCService) Unlink(_ context.Context, input companyoidc.UnlinkInput) error {
+	s.unlinkCalls++
+	s.unlinkInput = input
+	return s.unlinkErr
+}
+
+func (s *recordingCompanyOIDCService) StartLogin(
+	_ context.Context,
+	input companyoidc.LoginStartInput,
+) (companyoidc.LoginStart, error) {
+	s.loginStartCalls++
+	s.loginStartInput = input
+	return s.loginStartResult, s.loginStartErr
+}
+
+func (s *recordingCompanyOIDCService) CompleteLogin(
+	_ context.Context,
+	input companyoidc.LoginCallbackInput,
+) (companyoidc.LoginCompletion, companyoidc.TestSignInResultCode, error) {
+	s.loginCallbackCalls++
+	s.loginCallbackInput = input
+	return s.loginCallbackCompletion, s.loginCallbackResult, s.loginCallbackErr
+}
+
+func (s *recordingCompanyOIDCService) LoginAvailable(context.Context) bool {
+	s.loginAvailableCalls++
+	return s.loginAvailable
+}
+
+func (s *recordingCompanyOIDCService) EnableReady(context.Context) bool {
+	s.enableReadyCalls++
+	return s.enableReady
+}
+
 func (s *recordingCompanyOIDCService) reset() {
 	s.calls = 0
 	s.checkCalls = 0
 	s.startCalls = 0
 	s.callbackCalls = 0
+	s.linkStartCalls = 0
+	s.linkCallbackCalls = 0
+	s.enableCalls = 0
+	s.disableCalls = 0
+	s.unlinkCalls = 0
+	s.loginStartCalls = 0
+	s.loginCallbackCalls = 0
+}
+
+// administratorActionCalls counts every administrator-facing mutation the
+// recorder received, so gate tests can assert no route leaked past a fence.
+func (s *recordingCompanyOIDCService) administratorActionCalls() int {
+	return s.startCalls + s.linkStartCalls + s.enableCalls + s.disableCalls + s.unlinkCalls
 }
 
 func validCompanyOIDCWebForm(csrfToken, revision, secret string) url.Values {
@@ -1843,5 +2011,934 @@ func assertAuthenticationSecurityHeaders(t *testing.T, header http.Header) {
 	}
 	if !strings.Contains(header.Get("Content-Security-Policy"), "connect-src 'self'") {
 		t.Fatal("Authentication CSP must allow only same-origin htmx connections")
+	}
+}
+
+func companyOIDCPasswordForm(csrfToken, revision, password string) url.Values {
+	return url.Values{
+		csrfFormField:       {csrfToken},
+		"expected_revision": {revision},
+		"current_password":  {password},
+	}
+}
+
+func optionalResponseCookie(t *testing.T, recorder *httptest.ResponseRecorder, name string) *http.Cookie {
+	t.Helper()
+	var found *http.Cookie
+	for _, cookie := range recorder.Result().Cookies() {
+		if cookie.Name != name {
+			continue
+		}
+		if found != nil {
+			t.Fatalf("response set cookie %q twice", name)
+		}
+		found = cookie
+	}
+	return found
+}
+
+func assertCompanyLoginCookieCleared(t *testing.T, recorder *httptest.ResponseRecorder) {
+	t.Helper()
+	cookie := optionalResponseCookie(t, recorder, companyLoginCookieName)
+	if cookie == nil || cookie.MaxAge >= 0 || cookie.Value != "" || cookie.Path != companyLoginCookiePath {
+		t.Fatalf("browser-binding cookie was not cleared: %#v", cookie)
+	}
+}
+
+// insertEnabledCompanyOIDCConnectionForWeb persists an enabled connection and
+// a linked identity directly. The two inserts run as separate statements
+// because multi-statement execs with bound arguments bind unreliably across
+// foreign-key references.
+func insertEnabledCompanyOIDCConnectionForWeb(
+	t *testing.T,
+	ctx context.Context,
+	database *sql.DB,
+	linkedUserID, revision, generation int64,
+) {
+	t.Helper()
+	const timestamp = "2026-07-30T10:00:00.000000000Z"
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO company_oidc_connections(
+  id, provider_label, issuer, client_id, client_secret_ciphertext,
+  revision, enabled, activation_generation, created_at, updated_at
+)
+VALUES (1, 'Example IdP', 'https://id.example.test', 'client-id', x'01', ?, 1, ?, ?, ?)`,
+		revision, generation, timestamp, timestamp,
+	); err != nil {
+		t.Fatalf("insert enabled company OIDC connection: %v", err)
+	}
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO company_oidc_identities(
+  connection_id, user_id, issuer, client_id, subject, email, config_revision, linked_at
+)
+VALUES (1, ?, 'https://id.example.test', 'client-id', 'linked-subject', 'linked@example.test', ?, ?)`,
+		linkedUserID, revision, timestamp,
+	); err != nil {
+		t.Fatalf("insert linked company OIDC identity: %v", err)
+	}
+}
+
+func TestCompanyOIDCLinkStartVerifiesPasswordBeforeStartingLink(t *testing.T) {
+	fixture := newCompanyOIDCWebFixture(t, true)
+	service := &recordingCompanyOIDCService{linkStartResult: companyoidc.LinkStart{
+		AuthorizationURL: "https://id.example.test/authorize?request=link",
+	}}
+	fixture.server.cfg.CompanyOIDCService = service
+
+	wrong := companyOIDCPasswordForm(fixture.admin.CSRFToken, "7", "wrong-password-canary")
+	response := companyOIDCPOST(fixture.server, "/settings/authentication/oidc/link", fixture.adminCookie(), wrong, []string{companyOIDCWebPublicURL})
+	if response.Code != http.StatusSeeOther ||
+		response.Header().Get("Location") != companyOIDCNoticeLocation(companyOIDCLinkPasswordNotice) ||
+		service.linkStartCalls != 0 {
+		t.Fatalf("wrong password: status=%d location=%q calls=%d", response.Code, response.Header().Get("Location"), service.linkStartCalls)
+	}
+	assertSecretAbsent(t, response.Body.String()+response.Header().Get("Location"), "wrong-password-canary")
+	assertAuthenticationSecurityHeaders(t, response.Header())
+
+	valid := companyOIDCPasswordForm(fixture.admin.CSRFToken, "7", accountWebTestPassword)
+	response = companyOIDCPOST(fixture.server, "/settings/authentication/oidc/link", fixture.adminCookie(), valid, []string{companyOIDCWebPublicURL})
+	if response.Code != http.StatusSeeOther ||
+		response.Header().Get("Location") != service.linkStartResult.AuthorizationURL ||
+		service.linkStartCalls != 1 {
+		t.Fatalf("link start: status=%d location=%q calls=%d", response.Code, response.Header().Get("Location"), service.linkStartCalls)
+	}
+	want := companyoidc.LinkStartInput{
+		ActorUserID:      fixture.admin.User.ID,
+		SessionID:        fixture.admin.ID,
+		ExpectedRevision: 7,
+		CallbackURI:      companyOIDCWebPublicURL + companyoidc.TestSignInCallbackPath,
+	}
+	if service.linkStartInput != want {
+		t.Fatalf("link start input = %#v, want %#v", service.linkStartInput, want)
+	}
+	assertSecretAbsent(t, response.Body.String(), accountWebTestPassword)
+	assertAuthenticationSecurityHeaders(t, response.Header())
+}
+
+func TestCompanyOIDCLinkStartUnavailableGateRunsBeforePasswordVerification(t *testing.T) {
+	fixture := newCompanyOIDCWebFixture(t, false)
+	service := &recordingCompanyOIDCService{}
+	fixture.server.cfg.CompanyOIDCService = service
+	form := companyOIDCPasswordForm(fixture.admin.CSRFToken, "7", "wrong-password-canary")
+	response := companyOIDCPOST(fixture.server, "/settings/authentication/oidc/link", fixture.adminCookie(), form, []string{companyOIDCWebPublicURL})
+	if response.Code != http.StatusSeeOther ||
+		response.Header().Get("Location") != companyOIDCNoticeLocation(companyOIDCLinkUnavailableNotice) ||
+		service.linkStartCalls != 0 {
+		t.Fatalf("status=%d location=%q calls=%d", response.Code, response.Header().Get("Location"), service.linkStartCalls)
+	}
+}
+
+func TestCompanyOIDCLinkStartMapsServiceErrorsToStableNotices(t *testing.T) {
+	fixture := newCompanyOIDCWebFixture(t, true)
+	form := companyOIDCPasswordForm(fixture.admin.CSRFToken, "7", accountWebTestPassword)
+	tests := []struct {
+		name   string
+		err    error
+		notice string
+	}{
+		{name: "authority", err: companyoidc.ErrLinkAuthorization, notice: companyOIDCLinkAuthorityNotice},
+		{name: "conflict", err: companyoidc.ErrConflict, notice: companyOIDCLinkUnavailableNotice},
+		{name: "no draft", err: companyoidc.ErrNoDraft, notice: companyOIDCLinkUnavailableNotice},
+		{name: "not ready", err: companyoidc.ErrNotReady, notice: companyOIDCLinkUnavailableNotice},
+		{name: "enabled", err: companyoidc.ErrEnabled, notice: companyOIDCLinkUnavailableNotice},
+		{name: "link unavailable", err: companyoidc.ErrLinkUnavailable, notice: companyOIDCLinkUnavailableNotice},
+		{name: "configuration", err: companyoidc.ErrConfiguration, notice: companyOIDCLinkUnavailableNotice},
+		{name: "provider unavailable", err: companyoidc.ErrTestProviderUnavailable, notice: companyOIDCLinkProviderNotice},
+		{name: "provider invalid", err: companyoidc.ErrTestProviderInvalid, notice: companyOIDCLinkProviderNotice},
+		{name: "unknown", err: errors.New("boom"), notice: companyOIDCLinkUnknownNotice},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			service := &recordingCompanyOIDCService{linkStartErr: tc.err}
+			fixture.server.cfg.CompanyOIDCService = service
+			response := companyOIDCPOST(fixture.server, "/settings/authentication/oidc/link", fixture.adminCookie(), form, []string{companyOIDCWebPublicURL})
+			if response.Code != http.StatusSeeOther ||
+				response.Header().Get("Location") != companyOIDCNoticeLocation(tc.notice) ||
+				service.linkStartCalls != 1 {
+				t.Fatalf("status=%d location=%q calls=%d", response.Code, response.Header().Get("Location"), service.linkStartCalls)
+			}
+		})
+	}
+}
+
+func TestCompanyOIDCEnableDisableUnlinkUseExactInputsAndStableNotices(t *testing.T) {
+	fixture := newCompanyOIDCWebFixture(t, true)
+	service := &recordingCompanyOIDCService{}
+	fixture.server.cfg.CompanyOIDCService = service
+	revisionForm := url.Values{csrfFormField: {fixture.admin.CSRFToken}, "expected_revision": {"7"}}
+	passwordForm := companyOIDCPasswordForm(fixture.admin.CSRFToken, "7", accountWebTestPassword)
+
+	response := companyOIDCPOST(fixture.server, "/settings/authentication/oidc/enable", fixture.adminCookie(), revisionForm, []string{companyOIDCWebPublicURL})
+	if response.Code != http.StatusSeeOther ||
+		response.Header().Get("Location") != companyOIDCNoticeLocation(companyOIDCEnabledNotice) ||
+		service.enableCalls != 1 ||
+		service.enableInput != (companyoidc.EnableInput{ActorUserID: fixture.admin.User.ID, ExpectedRevision: 7}) {
+		t.Fatalf("enable: status=%d location=%q calls=%d input=%#v", response.Code, response.Header().Get("Location"), service.enableCalls, service.enableInput)
+	}
+
+	response = companyOIDCPOST(fixture.server, "/settings/authentication/oidc/disable", fixture.adminCookie(), revisionForm, []string{companyOIDCWebPublicURL})
+	if response.Code != http.StatusSeeOther ||
+		response.Header().Get("Location") != companyOIDCNoticeLocation(companyOIDCDisabledNotice) ||
+		service.disableCalls != 1 ||
+		service.disableInput != (companyoidc.DisableInput{ActorUserID: fixture.admin.User.ID, ExpectedRevision: 7}) {
+		t.Fatalf("disable: status=%d location=%q calls=%d input=%#v", response.Code, response.Header().Get("Location"), service.disableCalls, service.disableInput)
+	}
+
+	response = companyOIDCPOST(fixture.server, "/settings/authentication/oidc/unlink", fixture.adminCookie(), passwordForm, []string{companyOIDCWebPublicURL})
+	if response.Code != http.StatusSeeOther ||
+		response.Header().Get("Location") != companyOIDCNoticeLocation(companyOIDCUnlinkedNotice) ||
+		service.unlinkCalls != 1 ||
+		service.unlinkInput != (companyoidc.UnlinkInput{ActorUserID: fixture.admin.User.ID, SessionID: fixture.admin.ID, ExpectedRevision: 7}) {
+		t.Fatalf("unlink: status=%d location=%q calls=%d input=%#v", response.Code, response.Header().Get("Location"), service.unlinkCalls, service.unlinkInput)
+	}
+
+	service.reset()
+	wrongPassword := companyOIDCPasswordForm(fixture.admin.CSRFToken, "7", "wrong-password-canary")
+	response = companyOIDCPOST(fixture.server, "/settings/authentication/oidc/unlink", fixture.adminCookie(), wrongPassword, []string{companyOIDCWebPublicURL})
+	if response.Code != http.StatusSeeOther ||
+		response.Header().Get("Location") != companyOIDCNoticeLocation(companyOIDCUnlinkPasswordNotice) ||
+		service.unlinkCalls != 0 {
+		t.Fatalf("unlink wrong password: status=%d location=%q calls=%d", response.Code, response.Header().Get("Location"), service.unlinkCalls)
+	}
+	assertSecretAbsent(t, response.Body.String()+response.Header().Get("Location"), "wrong-password-canary")
+
+	mappings := []struct {
+		path   string
+		form   url.Values
+		err    error
+		notice string
+		calls  func() int
+		setErr func(*recordingCompanyOIDCService, error)
+	}{
+		{path: "/settings/authentication/oidc/enable", form: revisionForm, err: companyoidc.ErrConfiguration, notice: companyOIDCEnableUnavailableNotice, calls: func() int { return service.enableCalls }, setErr: func(s *recordingCompanyOIDCService, err error) { s.enableErr = err }},
+		{path: "/settings/authentication/oidc/enable", form: revisionForm, err: companyoidc.ErrAuthorization, notice: companyOIDCEnableAuthorityNotice, calls: func() int { return service.enableCalls }, setErr: func(s *recordingCompanyOIDCService, err error) { s.enableErr = err }},
+		{path: "/settings/authentication/oidc/enable", form: revisionForm, err: companyoidc.ErrConflict, notice: companyOIDCEnableStaleNotice, calls: func() int { return service.enableCalls }, setErr: func(s *recordingCompanyOIDCService, err error) { s.enableErr = err }},
+		{path: "/settings/authentication/oidc/enable", form: revisionForm, err: companyoidc.ErrNotReady, notice: companyOIDCEnableNotReadyNotice, calls: func() int { return service.enableCalls }, setErr: func(s *recordingCompanyOIDCService, err error) { s.enableErr = err }},
+		{path: "/settings/authentication/oidc/enable", form: revisionForm, err: errors.New("boom"), notice: companyOIDCEnableUnknownNotice, calls: func() int { return service.enableCalls }, setErr: func(s *recordingCompanyOIDCService, err error) { s.enableErr = err }},
+		{path: "/settings/authentication/oidc/disable", form: revisionForm, err: companyoidc.ErrAuthorization, notice: companyOIDCDisableAuthorityNotice, calls: func() int { return service.disableCalls }, setErr: func(s *recordingCompanyOIDCService, err error) { s.disableErr = err }},
+		{path: "/settings/authentication/oidc/disable", form: revisionForm, err: companyoidc.ErrConflict, notice: companyOIDCDisableStaleNotice, calls: func() int { return service.disableCalls }, setErr: func(s *recordingCompanyOIDCService, err error) { s.disableErr = err }},
+		{path: "/settings/authentication/oidc/disable", form: revisionForm, err: errors.New("boom"), notice: companyOIDCDisableUnknownNotice, calls: func() int { return service.disableCalls }, setErr: func(s *recordingCompanyOIDCService, err error) { s.disableErr = err }},
+		{path: "/settings/authentication/oidc/unlink", form: passwordForm, err: companyoidc.ErrEnabled, notice: companyOIDCUnlinkEnabledNotice, calls: func() int { return service.unlinkCalls }, setErr: func(s *recordingCompanyOIDCService, err error) { s.unlinkErr = err }},
+		{path: "/settings/authentication/oidc/unlink", form: passwordForm, err: companyoidc.ErrConflict, notice: companyOIDCUnlinkStaleNotice, calls: func() int { return service.unlinkCalls }, setErr: func(s *recordingCompanyOIDCService, err error) { s.unlinkErr = err }},
+		{path: "/settings/authentication/oidc/unlink", form: passwordForm, err: companyoidc.ErrLinkAuthorization, notice: companyOIDCUnlinkAuthorityNotice, calls: func() int { return service.unlinkCalls }, setErr: func(s *recordingCompanyOIDCService, err error) { s.unlinkErr = err }},
+		{path: "/settings/authentication/oidc/unlink", form: passwordForm, err: errors.New("boom"), notice: companyOIDCUnlinkUnknownNotice, calls: func() int { return service.unlinkCalls }, setErr: func(s *recordingCompanyOIDCService, err error) { s.unlinkErr = err }},
+	}
+	for _, tc := range mappings {
+		t.Run(tc.path+"/"+tc.notice, func(t *testing.T) {
+			service.reset()
+			tc.setErr(service, tc.err)
+			defer tc.setErr(service, nil)
+			response := companyOIDCPOST(fixture.server, tc.path, fixture.adminCookie(), tc.form, []string{companyOIDCWebPublicURL})
+			if response.Code != http.StatusSeeOther ||
+				response.Header().Get("Location") != companyOIDCNoticeLocation(tc.notice) ||
+				tc.calls() != 1 {
+				t.Fatalf("status=%d location=%q calls=%d", response.Code, response.Header().Get("Location"), tc.calls())
+			}
+		})
+	}
+}
+
+func TestCompanyOIDCDisableAndUnlinkWorkWithoutSecretEncryption(t *testing.T) {
+	fixture := newCompanyOIDCWebFixture(t, false)
+	service := &recordingCompanyOIDCService{}
+	fixture.server.cfg.CompanyOIDCService = service
+	revisionForm := url.Values{csrfFormField: {fixture.admin.CSRFToken}, "expected_revision": {"7"}}
+
+	response := companyOIDCPOST(fixture.server, "/settings/authentication/oidc/enable", fixture.adminCookie(), revisionForm, []string{companyOIDCWebPublicURL})
+	if response.Header().Get("Location") != companyOIDCNoticeLocation(companyOIDCEnableUnavailableNotice) || service.enableCalls != 0 {
+		t.Fatalf("enable without encryption: location=%q calls=%d", response.Header().Get("Location"), service.enableCalls)
+	}
+
+	response = companyOIDCPOST(fixture.server, "/settings/authentication/oidc/disable", fixture.adminCookie(), revisionForm, []string{companyOIDCWebPublicURL})
+	if response.Header().Get("Location") != companyOIDCNoticeLocation(companyOIDCDisabledNotice) || service.disableCalls != 1 {
+		t.Fatalf("disable without encryption: location=%q calls=%d", response.Header().Get("Location"), service.disableCalls)
+	}
+
+	unlinkForm := companyOIDCPasswordForm(fixture.admin.CSRFToken, "7", accountWebTestPassword)
+	response = companyOIDCPOST(fixture.server, "/settings/authentication/oidc/unlink", fixture.adminCookie(), unlinkForm, []string{companyOIDCWebPublicURL})
+	if response.Header().Get("Location") != companyOIDCNoticeLocation(companyOIDCUnlinkedNotice) || service.unlinkCalls != 1 {
+		t.Fatalf("unlink without encryption: location=%q calls=%d", response.Header().Get("Location"), service.unlinkCalls)
+	}
+}
+
+func TestCompanyOIDCAdministratorActionRoutesEnforceGatesAndFormBoundary(t *testing.T) {
+	fixture := newCompanyOIDCWebFixture(t, true)
+	service := &recordingCompanyOIDCService{}
+	fixture.server.cfg.CompanyOIDCService = service
+
+	viewer := mustCreateWebUser(t, fixture.ctx, fixture.authService, "action-viewer@example.test", false)
+	viewerSession, err := fixture.authService.Login(fixture.ctx, auth.LoginParams{Email: viewer.Email, Password: accountWebTestPassword})
+	if err != nil {
+		t.Fatal(err)
+	}
+	forced := mustCreateWebUser(t, fixture.ctx, fixture.authService, "action-forced@example.test", true)
+	forcedSession, err := fixture.authService.Login(fixture.ctx, auth.LoginParams{Email: forced.Email, Password: accountWebTestPassword})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.database.ExecContext(fixture.ctx, `UPDATE local_credentials SET must_change_password = 1 WHERE user_id = ?`, forced.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	routes := []struct {
+		name string
+		path string
+		form func(csrfToken string) url.Values
+	}{
+		{name: "link", path: "/settings/authentication/oidc/link", form: func(csrfToken string) url.Values {
+			return companyOIDCPasswordForm(csrfToken, "1", accountWebTestPassword)
+		}},
+		{name: "enable", path: "/settings/authentication/oidc/enable", form: func(csrfToken string) url.Values {
+			return url.Values{csrfFormField: {csrfToken}, "expected_revision": {"1"}}
+		}},
+		{name: "disable", path: "/settings/authentication/oidc/disable", form: func(csrfToken string) url.Values {
+			return url.Values{csrfFormField: {csrfToken}, "expected_revision": {"1"}}
+		}},
+		{name: "unlink", path: "/settings/authentication/oidc/unlink", form: func(csrfToken string) url.Values {
+			return companyOIDCPasswordForm(csrfToken, "1", accountWebTestPassword)
+		}},
+	}
+	for _, route := range routes {
+		valid := route.form(fixture.admin.CSRFToken)
+		cases := []struct {
+			name    string
+			path    string
+			form    url.Values
+			origins []string
+			status  int
+		}{
+			{name: "missing origin", path: route.path, form: valid, status: http.StatusForbidden},
+			{name: "wrong origin", path: route.path, form: valid, origins: []string{"https://other.example.test"}, status: http.StatusForbidden},
+			{name: "query forbidden", path: route.path + "?extension=1", form: valid, origins: []string{companyOIDCWebPublicURL}, status: http.StatusBadRequest},
+			{name: "bad csrf", path: route.path, form: route.form("wrong"), origins: []string{companyOIDCWebPublicURL}, status: http.StatusForbidden},
+			{name: "duplicate csrf", path: route.path, form: withDuplicateFormValue(valid, csrfFormField, fixture.admin.CSRFToken), origins: []string{companyOIDCWebPublicURL}, status: http.StatusBadRequest},
+			{name: "unknown field", path: route.path, form: withFormValue(valid, "code", "canary"), origins: []string{companyOIDCWebPublicURL}, status: http.StatusBadRequest},
+			{name: "missing revision", path: route.path, form: withoutFormValue(valid, "expected_revision"), origins: []string{companyOIDCWebPublicURL}, status: http.StatusBadRequest},
+			{name: "zero revision", path: route.path, form: withFormValue(valid, "expected_revision", "0"), origins: []string{companyOIDCWebPublicURL}, status: http.StatusBadRequest},
+			{name: "noncanonical revision", path: route.path, form: withFormValue(valid, "expected_revision", "01"), origins: []string{companyOIDCWebPublicURL}, status: http.StatusBadRequest},
+		}
+		if len(valid["current_password"]) == 1 {
+			cases = append(cases, struct {
+				name    string
+				path    string
+				form    url.Values
+				origins []string
+				status  int
+			}{name: "missing password", path: route.path, form: withoutFormValue(valid, "current_password"), origins: []string{companyOIDCWebPublicURL}, status: http.StatusBadRequest})
+		}
+		for _, tc := range cases {
+			t.Run(route.name+"/"+tc.name, func(t *testing.T) {
+				service.reset()
+				response := companyOIDCPOST(fixture.server, tc.path, fixture.adminCookie(), tc.form, tc.origins)
+				if response.Code != tc.status || service.administratorActionCalls() != 0 {
+					t.Fatalf("status=%d calls=%d, want status=%d calls=0", response.Code, service.administratorActionCalls(), tc.status)
+				}
+				assertAuthenticationSecurityHeaders(t, response.Header())
+			})
+		}
+
+		t.Run(route.name+"/signed out", func(t *testing.T) {
+			service.reset()
+			response := companyOIDCPOST(fixture.server, route.path, nil, valid, []string{companyOIDCWebPublicURL})
+			if response.Code != http.StatusForbidden || service.administratorActionCalls() != 0 {
+				t.Fatalf("status=%d calls=%d", response.Code, service.administratorActionCalls())
+			}
+		})
+		t.Run(route.name+"/viewer", func(t *testing.T) {
+			service.reset()
+			response := companyOIDCPOST(fixture.server, route.path, &http.Cookie{Name: sessionCookieName, Value: viewerSession.ID}, route.form(viewerSession.CSRFToken), []string{companyOIDCWebPublicURL})
+			if response.Code != http.StatusForbidden || service.administratorActionCalls() != 0 {
+				t.Fatalf("status=%d calls=%d", response.Code, service.administratorActionCalls())
+			}
+		})
+		t.Run(route.name+"/forced password change", func(t *testing.T) {
+			service.reset()
+			response := companyOIDCPOST(fixture.server, route.path, &http.Cookie{Name: sessionCookieName, Value: forcedSession.ID}, route.form(forcedSession.CSRFToken), []string{companyOIDCWebPublicURL})
+			if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/account/password" || service.administratorActionCalls() != 0 {
+				t.Fatalf("status=%d location=%q calls=%d", response.Code, response.Header().Get("Location"), service.administratorActionCalls())
+			}
+		})
+	}
+}
+
+func TestCompanyOIDCLoginStartRedirectsAuthenticatedBrowserWithoutServiceCalls(t *testing.T) {
+	fixture := newCompanyOIDCWebFixture(t, true)
+	service := &recordingCompanyOIDCService{}
+	fixture.server.cfg.CompanyOIDCService = service
+
+	response := companyOIDCPOST(fixture.server, "/settings/authentication/oidc/login", fixture.adminCookie(), url.Values{}, []string{companyOIDCWebPublicURL})
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/" || service.loginStartCalls != 0 {
+		t.Fatalf("authenticated login start: status=%d location=%q calls=%d", response.Code, response.Header().Get("Location"), service.loginStartCalls)
+	}
+
+	forced := mustCreateWebUser(t, fixture.ctx, fixture.authService, "login-start-forced@example.test", true)
+	forcedSession, err := fixture.authService.Login(fixture.ctx, auth.LoginParams{Email: forced.Email, Password: accountWebTestPassword})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.database.ExecContext(fixture.ctx, `UPDATE local_credentials SET must_change_password = 1 WHERE user_id = ?`, forced.ID); err != nil {
+		t.Fatal(err)
+	}
+	response = companyOIDCPOST(fixture.server, "/settings/authentication/oidc/login", &http.Cookie{Name: sessionCookieName, Value: forcedSession.ID}, url.Values{}, []string{companyOIDCWebPublicURL})
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/account/password" || service.loginStartCalls != 0 {
+		t.Fatalf("forced-change login start: status=%d location=%q calls=%d", response.Code, response.Header().Get("Location"), service.loginStartCalls)
+	}
+}
+
+func TestCompanyOIDCLoginStartRequiresValidCompanyCSRFAndSetsBindingCookie(t *testing.T) {
+	fixture := newCompanyOIDCWebFixture(t, true)
+	service := &recordingCompanyOIDCService{loginStartResult: companyoidc.LoginStart{
+		AuthorizationURL: "https://id.example.test/authorize?request=login",
+		BrowserToken:     "browser-token-canary",
+	}}
+	fixture.server.cfg.CompanyOIDCService = service
+
+	validToken, err := fixture.server.newCompanyLoginCSRFToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	crossPurpose, err := fixture.server.newSignedCSRFToken(loginCSRFPurpose)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveryPurpose, err := fixture.server.newSignedCSRFToken(passwordRecoveryCSRFPurpose)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	expiredPayload := companyLoginCSRFPurpose + "." + strconv.FormatInt(now.Add(-31*time.Minute).Unix(), 10) + ".nonce"
+	futurePayload := companyLoginCSRFPurpose + "." + strconv.FormatInt(now.Add(2*time.Minute).Unix(), 10) + ".nonce"
+
+	rejected := []struct {
+		name  string
+		token string
+	}{
+		{name: "garbage", token: "not-a-token"},
+		{name: "empty", token: ""},
+		{name: "login purpose", token: crossPurpose},
+		{name: "recovery purpose", token: recoveryPurpose},
+		{name: "expired", token: expiredPayload + "." + fixture.server.signCSRFPayload(expiredPayload)},
+		{name: "future", token: futurePayload + "." + fixture.server.signCSRFPayload(futurePayload)},
+		{name: "tampered", token: validToken + "x"},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			service.reset()
+			form := url.Values{csrfFormField: {tc.token}}
+			response := companyOIDCPOST(fixture.server, "/settings/authentication/oidc/login", nil, form, []string{companyOIDCWebPublicURL})
+			if response.Code != http.StatusSeeOther ||
+				response.Header().Get("Location") != "/login?notice="+companyLoginUnavailableNotice ||
+				service.loginStartCalls != 0 {
+				t.Fatalf("status=%d location=%q calls=%d", response.Code, response.Header().Get("Location"), service.loginStartCalls)
+			}
+			if cookie := optionalResponseCookie(t, response, companyLoginCookieName); cookie != nil {
+				t.Fatalf("rejected login start set a binding cookie: %#v", cookie)
+			}
+		})
+	}
+
+	malformed := []struct {
+		name string
+		path string
+		form url.Values
+	}{
+		{name: "missing csrf", path: "/settings/authentication/oidc/login", form: url.Values{}},
+		{name: "duplicate csrf", path: "/settings/authentication/oidc/login", form: url.Values{csrfFormField: {validToken, validToken}}},
+		{name: "extra field", path: "/settings/authentication/oidc/login", form: url.Values{csrfFormField: {validToken}, "email": {"probe@example.test"}}},
+		{name: "query forbidden", path: "/settings/authentication/oidc/login?probe=1", form: url.Values{csrfFormField: {validToken}}},
+	}
+	for _, tc := range malformed {
+		t.Run(tc.name, func(t *testing.T) {
+			service.reset()
+			response := companyOIDCPOST(fixture.server, tc.path, nil, tc.form, []string{companyOIDCWebPublicURL})
+			if response.Code != http.StatusBadRequest || service.loginStartCalls != 0 {
+				t.Fatalf("status=%d calls=%d", response.Code, service.loginStartCalls)
+			}
+		})
+	}
+
+	t.Run("missing origin", func(t *testing.T) {
+		service.reset()
+		response := companyOIDCPOST(fixture.server, "/settings/authentication/oidc/login", nil, url.Values{csrfFormField: {validToken}}, nil)
+		if response.Code != http.StatusForbidden || service.loginStartCalls != 0 {
+			t.Fatalf("status=%d calls=%d", response.Code, service.loginStartCalls)
+		}
+	})
+
+	t.Run("start error", func(t *testing.T) {
+		service.reset()
+		service.loginStartErr = errors.New("discovery failed")
+		defer func() { service.loginStartErr = nil }()
+		response := companyOIDCPOST(fixture.server, "/settings/authentication/oidc/login", nil, url.Values{csrfFormField: {validToken}}, []string{companyOIDCWebPublicURL})
+		if response.Code != http.StatusSeeOther ||
+			response.Header().Get("Location") != "/login?notice="+companyLoginUnavailableNotice ||
+			service.loginStartCalls != 1 {
+			t.Fatalf("status=%d location=%q calls=%d", response.Code, response.Header().Get("Location"), service.loginStartCalls)
+		}
+		if cookie := optionalResponseCookie(t, response, companyLoginCookieName); cookie != nil {
+			t.Fatalf("failed login start set a binding cookie: %#v", cookie)
+		}
+	})
+
+	t.Run("success", func(t *testing.T) {
+		service.reset()
+		response := companyOIDCPOST(fixture.server, "/settings/authentication/oidc/login", nil, url.Values{csrfFormField: {validToken}}, []string{companyOIDCWebPublicURL})
+		if response.Code != http.StatusSeeOther ||
+			response.Header().Get("Location") != service.loginStartResult.AuthorizationURL ||
+			service.loginStartCalls != 1 {
+			t.Fatalf("status=%d location=%q calls=%d", response.Code, response.Header().Get("Location"), service.loginStartCalls)
+		}
+		want := companyoidc.LoginStartInput{CallbackURI: companyOIDCWebPublicURL + companyoidc.TestSignInCallbackPath}
+		if service.loginStartInput != want {
+			t.Fatalf("login start input = %#v, want %#v", service.loginStartInput, want)
+		}
+		cookie := optionalResponseCookie(t, response, companyLoginCookieName)
+		if cookie == nil ||
+			cookie.Value != "browser-token-canary" ||
+			cookie.Path != companyLoginCookiePath ||
+			cookie.MaxAge != companyLoginCookieMaxAge ||
+			!cookie.HttpOnly ||
+			cookie.SameSite != http.SameSiteLaxMode {
+			t.Fatalf("binding cookie = %#v", cookie)
+		}
+		assertSecretAbsent(t, response.Body.String(), "browser-token-canary")
+	})
+}
+
+func TestCompanyOIDCLoginStartUnavailableWithoutEncryptionOrService(t *testing.T) {
+	withoutEncryption := newCompanyOIDCWebFixture(t, false)
+	service := &recordingCompanyOIDCService{}
+	withoutEncryption.server.cfg.CompanyOIDCService = service
+	token, err := withoutEncryption.server.newCompanyLoginCSRFToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := companyOIDCPOST(withoutEncryption.server, "/settings/authentication/oidc/login", nil, url.Values{csrfFormField: {token}}, []string{companyOIDCWebPublicURL})
+	if response.Code != http.StatusSeeOther ||
+		response.Header().Get("Location") != "/login?notice="+companyLoginUnavailableNotice ||
+		service.loginStartCalls != 0 {
+		t.Fatalf("no encryption: status=%d location=%q calls=%d", response.Code, response.Header().Get("Location"), service.loginStartCalls)
+	}
+
+	withoutService := newCompanyOIDCWebFixture(t, true)
+	withoutService.server.cfg.CompanyOIDCService = nil
+	token, err = withoutService.server.newCompanyLoginCSRFToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	response = companyOIDCPOST(withoutService.server, "/settings/authentication/oidc/login", nil, url.Values{csrfFormField: {token}}, []string{companyOIDCWebPublicURL})
+	if response.Code != http.StatusSeeOther ||
+		response.Header().Get("Location") != "/login?notice="+companyLoginUnavailableNotice {
+		t.Fatalf("no service: status=%d location=%q", response.Code, response.Header().Get("Location"))
+	}
+}
+
+func TestCompanyOIDCCallbackDispatchesByStateShapeOnly(t *testing.T) {
+	const token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	fixture := newCompanyOIDCWebFixture(t, true)
+
+	tests := []struct {
+		name       string
+		state      string
+		wantTest   int
+		wantLink   int
+		wantLogin  int
+		wantNotice string
+	}{
+		{name: "bare state claims Test sign-in", state: token, wantTest: 1},
+		{name: "link state claims link", state: "link." + token, wantLink: 1},
+		{name: "login state claims login", state: "login." + token, wantLogin: 1},
+		{name: "unknown prefix claims nothing", state: "evil." + token, wantNotice: companyOIDCNoticeLocation(companyOIDCTestTransactionNotice)},
+		{name: "missing state claims nothing", state: "", wantNotice: companyOIDCNoticeLocation(companyOIDCTestTransactionNotice)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			service := &recordingCompanyOIDCService{
+				callbackResult:     companyoidc.TestSignInProviderInvalid,
+				linkCallbackResult: companyoidc.TestSignInProviderInvalid,
+				loginCallbackErr:   errors.New("rejected"),
+			}
+			fixture.server.cfg.CompanyOIDCService = service
+			query := "code=code-canary"
+			if tc.state != "" {
+				query = "state=" + tc.state + "&code=code-canary"
+			}
+			request := httptest.NewRequest(http.MethodGet, companyoidc.TestSignInCallbackPath, nil)
+			request.URL.RawQuery = query
+			request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "session-binding-canary"})
+			request.AddCookie(&http.Cookie{Name: companyLoginCookieName, Value: "browser-binding-canary"})
+			response := httptest.NewRecorder()
+			fixture.server.Routes().ServeHTTP(response, request)
+
+			if service.callbackCalls != tc.wantTest || service.linkCallbackCalls != tc.wantLink || service.loginCallbackCalls != tc.wantLogin {
+				t.Fatalf("dispatch: test=%d link=%d login=%d, want %d/%d/%d",
+					service.callbackCalls, service.linkCallbackCalls, service.loginCallbackCalls,
+					tc.wantTest, tc.wantLink, tc.wantLogin)
+			}
+			if tc.wantLink == 1 {
+				want := companyoidc.LinkCallbackInput{State: "link." + token, SessionID: "session-binding-canary", RawQuery: query}
+				if service.linkCallbackInput != want {
+					t.Fatalf("link callback input = %#v, want %#v", service.linkCallbackInput, want)
+				}
+			}
+			if tc.wantLogin == 1 {
+				want := companyoidc.LoginCallbackInput{State: "login." + token, BrowserToken: "browser-binding-canary", RawQuery: query}
+				if service.loginCallbackInput != want {
+					t.Fatalf("login callback input = %#v, want %#v", service.loginCallbackInput, want)
+				}
+			}
+			if tc.wantNotice != "" && (response.Code != http.StatusSeeOther || response.Header().Get("Location") != tc.wantNotice) {
+				t.Fatalf("unclaimed callback: status=%d location=%q", response.Code, response.Header().Get("Location"))
+			}
+			visible := response.Body.String() + response.Header().Get("Location")
+			for _, canary := range []string{token, "code-canary", "session-binding-canary", "browser-binding-canary"} {
+				if strings.Contains(visible, canary) {
+					t.Fatalf("callback exposed %q: %q", canary, visible)
+				}
+			}
+		})
+	}
+
+	service := &recordingCompanyOIDCService{}
+	fixture.server.cfg.CompanyOIDCService = service
+	request := httptest.NewRequest(http.MethodPost, companyoidc.TestSignInCallbackPath+"?state=login."+token+"&code=one", strings.NewReader(""))
+	response := httptest.NewRecorder()
+	fixture.server.Routes().ServeHTTP(response, request)
+	if response.Code != http.StatusMethodNotAllowed || !strings.Contains(response.Header().Get("Allow"), http.MethodGet) ||
+		service.callbackCalls+service.linkCallbackCalls+service.loginCallbackCalls != 0 {
+		t.Fatalf("POST callback: status=%d allow=%q", response.Code, response.Header().Get("Allow"))
+	}
+}
+
+func TestCompanyOIDCLinkCallbackMapsResultsAndErrorsToNotices(t *testing.T) {
+	const state = "link.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	fixture := newCompanyOIDCWebFixture(t, true)
+	tests := []struct {
+		name   string
+		result companyoidc.TestSignInResultCode
+		err    error
+		notice string
+	}{
+		{name: "verified", result: companyoidc.TestSignInVerified, notice: companyOIDCLinkedNotice},
+		{name: "denied", result: companyoidc.TestSignInProviderDenied, notice: companyOIDCLinkProviderNotice},
+		{name: "unavailable", result: companyoidc.TestSignInProviderUnavailable, notice: companyOIDCLinkProviderNotice},
+		{name: "invalid", result: companyoidc.TestSignInProviderInvalid, notice: companyOIDCLinkProviderNotice},
+		{name: "configuration", result: companyoidc.TestSignInConfigurationUnavailable, notice: companyOIDCLinkUnavailableNotice},
+		{name: "transaction error", err: companyoidc.ErrLinkUnavailable, notice: companyOIDCLinkTransactionNotice},
+		{name: "unknown outcome", err: companyoidc.ErrLinkOutcomeUnknown, notice: companyOIDCLinkUnknownNotice},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			service := &recordingCompanyOIDCService{linkCallbackResult: tc.result, linkCallbackErr: tc.err}
+			fixture.server.cfg.CompanyOIDCService = service
+			request := httptest.NewRequest(http.MethodGet, companyoidc.TestSignInCallbackPath, nil)
+			request.URL.RawQuery = "state=" + state + "&code=code-canary"
+			response := httptest.NewRecorder()
+			fixture.server.Routes().ServeHTTP(response, request)
+			if response.Code != http.StatusSeeOther ||
+				response.Header().Get("Location") != companyOIDCNoticeLocation(tc.notice) ||
+				service.linkCallbackCalls != 1 {
+				t.Fatalf("status=%d location=%q calls=%d", response.Code, response.Header().Get("Location"), service.linkCallbackCalls)
+			}
+		})
+	}
+}
+
+func TestCompanyOIDCLoginCallbackClearsBindingCookieOnEveryTerminalOutcome(t *testing.T) {
+	const state = "login.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	query := "state=" + state + "&code=code-canary"
+	fixture := newCompanyOIDCWebFixture(t, true)
+
+	tests := []struct {
+		name      string
+		cookies   []*http.Cookie
+		result    companyoidc.TestSignInResultCode
+		err       error
+		wantToken string
+	}{
+		{name: "service error", cookies: []*http.Cookie{{Name: companyLoginCookieName, Value: "browser-token-canary"}}, err: errors.New("boom"), wantToken: "browser-token-canary"},
+		{name: "provider denied", cookies: []*http.Cookie{{Name: companyLoginCookieName, Value: "browser-token-canary"}}, result: companyoidc.TestSignInProviderDenied, wantToken: "browser-token-canary"},
+		{name: "missing cookie", err: errors.New("boom")},
+		{name: "empty cookie", cookies: []*http.Cookie{{Name: companyLoginCookieName, Value: ""}}, err: errors.New("boom")},
+		{name: "duplicate cookies", cookies: []*http.Cookie{{Name: companyLoginCookieName, Value: "one"}, {Name: companyLoginCookieName, Value: "two"}}, err: errors.New("boom")},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			service := &recordingCompanyOIDCService{loginCallbackResult: tc.result, loginCallbackErr: tc.err}
+			fixture.server.cfg.CompanyOIDCService = service
+			request := httptest.NewRequest(http.MethodGet, companyoidc.TestSignInCallbackPath, nil)
+			request.URL.RawQuery = query
+			for _, cookie := range tc.cookies {
+				request.AddCookie(cookie)
+			}
+			response := httptest.NewRecorder()
+			fixture.server.Routes().ServeHTTP(response, request)
+			if response.Code != http.StatusSeeOther ||
+				response.Header().Get("Location") != "/login?notice="+companyLoginFailedNotice ||
+				service.loginCallbackCalls != 1 {
+				t.Fatalf("status=%d location=%q calls=%d", response.Code, response.Header().Get("Location"), service.loginCallbackCalls)
+			}
+			want := companyoidc.LoginCallbackInput{State: state, BrowserToken: tc.wantToken, RawQuery: query}
+			if service.loginCallbackInput != want {
+				t.Fatalf("login callback input = %#v, want %#v", service.loginCallbackInput, want)
+			}
+			assertCompanyLoginCookieCleared(t, response)
+			if cookie := optionalResponseCookie(t, response, sessionCookieName); cookie != nil {
+				t.Fatalf("failed login set a session cookie: %#v", cookie)
+			}
+			visible := response.Body.String() + response.Header().Get("Location")
+			for _, canary := range []string{"browser-token-canary", state, "code-canary"} {
+				if strings.Contains(visible, canary) {
+					t.Fatalf("login callback exposed %q: %q", canary, visible)
+				}
+			}
+		})
+	}
+
+	t.Run("authenticated browser", func(t *testing.T) {
+		service := &recordingCompanyOIDCService{}
+		fixture.server.cfg.CompanyOIDCService = service
+		request := httptest.NewRequest(http.MethodGet, companyoidc.TestSignInCallbackPath, nil)
+		request.URL.RawQuery = query
+		request.AddCookie(fixture.adminCookie())
+		request.AddCookie(&http.Cookie{Name: companyLoginCookieName, Value: "browser-token-canary"})
+		response := httptest.NewRecorder()
+		fixture.server.Routes().ServeHTTP(response, request)
+		if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/" || service.loginCallbackCalls != 0 {
+			t.Fatalf("authenticated callback: status=%d location=%q calls=%d", response.Code, response.Header().Get("Location"), service.loginCallbackCalls)
+		}
+		assertCompanyLoginCookieCleared(t, response)
+	})
+}
+
+func TestCompanyOIDCLoginCallbackCreatesProvenancedSessionOnVerifiedCompletion(t *testing.T) {
+	const state = "login.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	query := "state=" + state + "&code=code-canary"
+	fixture := newCompanyOIDCWebFixture(t, true)
+	insertEnabledCompanyOIDCConnectionForWeb(t, fixture.ctx, fixture.database, fixture.admin.User.ID, 3, 5)
+
+	t.Run("verified completion signs in the linked administrator", func(t *testing.T) {
+		service := &recordingCompanyOIDCService{
+			loginCallbackResult: companyoidc.TestSignInVerified,
+			loginCallbackCompletion: companyoidc.LoginCompletion{
+				UserID:               fixture.admin.User.ID,
+				ConnectionRevision:   3,
+				ActivationGeneration: 5,
+			},
+		}
+		fixture.server.cfg.CompanyOIDCService = service
+		request := httptest.NewRequest(http.MethodGet, companyoidc.TestSignInCallbackPath, nil)
+		request.URL.RawQuery = query
+		request.AddCookie(&http.Cookie{Name: companyLoginCookieName, Value: "browser-token-canary"})
+		response := httptest.NewRecorder()
+		fixture.server.Routes().ServeHTTP(response, request)
+
+		if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/" {
+			t.Fatalf("verified login: status=%d location=%q", response.Code, response.Header().Get("Location"))
+		}
+		assertCompanyLoginCookieCleared(t, response)
+		sessionCookie := optionalResponseCookie(t, response, sessionCookieName)
+		if sessionCookie == nil || sessionCookie.Value == "" || sessionCookie.Value == fixture.admin.ID {
+			t.Fatalf("verified login did not set a fresh session cookie: %#v", sessionCookie)
+		}
+		session, found, err := fixture.authService.SessionByID(fixture.ctx, sessionCookie.Value)
+		if err != nil || !found {
+			t.Fatalf("created session lookup: found=%v err=%v", found, err)
+		}
+		if !session.CompanyOIDC || session.User.ID != fixture.admin.User.ID {
+			t.Fatalf("created session lacks provenance: %#v", session)
+		}
+		assertSecretAbsent(t, response.Body.String(), sessionCookie.Value)
+		assertSecretAbsent(t, response.Body.String(), "browser-token-canary")
+	})
+
+	t.Run("stale activation generation is rejected", func(t *testing.T) {
+		service := &recordingCompanyOIDCService{
+			loginCallbackResult: companyoidc.TestSignInVerified,
+			loginCallbackCompletion: companyoidc.LoginCompletion{
+				UserID:               fixture.admin.User.ID,
+				ConnectionRevision:   3,
+				ActivationGeneration: 4,
+			},
+		}
+		fixture.server.cfg.CompanyOIDCService = service
+		request := httptest.NewRequest(http.MethodGet, companyoidc.TestSignInCallbackPath, nil)
+		request.URL.RawQuery = query
+		request.AddCookie(&http.Cookie{Name: companyLoginCookieName, Value: "browser-token-canary"})
+		response := httptest.NewRecorder()
+		fixture.server.Routes().ServeHTTP(response, request)
+
+		if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/login?notice="+companyLoginFailedNotice {
+			t.Fatalf("stale login: status=%d location=%q", response.Code, response.Header().Get("Location"))
+		}
+		assertCompanyLoginCookieCleared(t, response)
+		if cookie := optionalResponseCookie(t, response, sessionCookieName); cookie != nil {
+			t.Fatalf("stale login set a session cookie: %#v", cookie)
+		}
+	})
+}
+
+func TestCompanyOIDCDisableByCompanySessionSignsOutToLogin(t *testing.T) {
+	fixture := newCompanyOIDCWebFixture(t, true)
+	insertEnabledCompanyOIDCConnectionForWeb(t, fixture.ctx, fixture.database, fixture.admin.User.ID, 3, 5)
+	oidcSession, err := fixture.authService.CreateCompanyOIDCSession(fixture.ctx, auth.CreateCompanyOIDCSessionParams{
+		UserID:               fixture.admin.User.ID,
+		ConnectionRevision:   3,
+		ActivationGeneration: 5,
+	})
+	if err != nil {
+		t.Fatalf("create company OIDC session: %v", err)
+	}
+	service := &recordingCompanyOIDCService{}
+	fixture.server.cfg.CompanyOIDCService = service
+
+	form := url.Values{csrfFormField: {oidcSession.CSRFToken}, "expected_revision": {"3"}}
+	cookie := &http.Cookie{Name: sessionCookieName, Value: oidcSession.ID}
+	response := companyOIDCPOST(fixture.server, "/settings/authentication/oidc/disable", cookie, form, []string{companyOIDCWebPublicURL})
+
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/login?notice="+companyLoginDisabledNotice {
+		t.Fatalf("company-session disable: status=%d location=%q", response.Code, response.Header().Get("Location"))
+	}
+	if service.disableInput != (companyoidc.DisableInput{ActorUserID: fixture.admin.User.ID, ExpectedRevision: 3}) {
+		t.Fatalf("disable input = %#v", service.disableInput)
+	}
+	cleared := optionalResponseCookie(t, response, sessionCookieName)
+	if cleared == nil || cleared.Value != "" || cleared.MaxAge >= 0 {
+		t.Fatalf("company-session disable did not clear the session cookie: %#v", cleared)
+	}
+}
+
+func TestCompanyOIDCDisableByLocalSessionKeepsSettingsRedirect(t *testing.T) {
+	fixture := newCompanyOIDCWebFixture(t, true)
+	service := &recordingCompanyOIDCService{}
+	fixture.server.cfg.CompanyOIDCService = service
+
+	form := url.Values{csrfFormField: {fixture.admin.CSRFToken}, "expected_revision": {"3"}}
+	response := companyOIDCPOST(fixture.server, "/settings/authentication/oidc/disable", fixture.adminCookie(), form, []string{companyOIDCWebPublicURL})
+
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != companyOIDCNoticeLocation(companyOIDCDisabledNotice) {
+		t.Fatalf("local-session disable: status=%d location=%q", response.Code, response.Header().Get("Location"))
+	}
+	if cookie := optionalResponseCookie(t, response, sessionCookieName); cookie != nil {
+		t.Fatalf("local-session disable touched the session cookie: %#v", cookie)
+	}
+}
+
+func TestSelfDemotionByCompanySessionSignsOutToLogin(t *testing.T) {
+	fixture := newCompanyOIDCWebFixture(t, true)
+	mustCreateWebUser(t, fixture.ctx, fixture.authService, "second-admin@example.test", true)
+	insertEnabledCompanyOIDCConnectionForWeb(t, fixture.ctx, fixture.database, fixture.admin.User.ID, 3, 5)
+	oidcSession, err := fixture.authService.CreateCompanyOIDCSession(fixture.ctx, auth.CreateCompanyOIDCSessionParams{
+		UserID:               fixture.admin.User.ID,
+		ConnectionRevision:   3,
+		ActivationGeneration: 5,
+	})
+	if err != nil {
+		t.Fatalf("create company OIDC session: %v", err)
+	}
+
+	form := url.Values{csrfFormField: {oidcSession.CSRFToken}, "admin": {"0"}}
+	cookie := &http.Cookie{Name: sessionCookieName, Value: oidcSession.ID}
+	path := "/users/" + strconv.FormatInt(fixture.admin.User.ID, 10) + "/admin"
+	response := companyOIDCPOST(fixture.server, path, cookie, form, []string{companyOIDCWebPublicURL})
+
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/login?notice="+companyLoginDisabledNotice {
+		t.Fatalf("company-session self-demotion: status=%d location=%q", response.Code, response.Header().Get("Location"))
+	}
+	cleared := optionalResponseCookie(t, response, sessionCookieName)
+	if cleared == nil || cleared.Value != "" || cleared.MaxAge >= 0 {
+		t.Fatalf("company-session self-demotion did not clear the session cookie: %#v", cleared)
+	}
+
+	users, err := fixture.authService.ListUsers(fixture.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, user := range users {
+		if user.ID == fixture.admin.User.ID && user.IsAdmin {
+			t.Fatal("self-demotion did not remove the admin role")
+		}
+	}
+}
+
+func TestSelfDemotionByLocalSessionKeepsLocalSession(t *testing.T) {
+	fixture := newCompanyOIDCWebFixture(t, true)
+	mustCreateWebUser(t, fixture.ctx, fixture.authService, "second-admin@example.test", true)
+
+	form := url.Values{csrfFormField: {fixture.admin.CSRFToken}, "admin": {"0"}}
+	path := "/users/" + strconv.FormatInt(fixture.admin.User.ID, 10) + "/admin"
+	response := companyOIDCPOST(fixture.server, path, fixture.adminCookie(), form, []string{companyOIDCWebPublicURL})
+
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/" {
+		t.Fatalf("local-session self-demotion: status=%d location=%q", response.Code, response.Header().Get("Location"))
+	}
+	if cookie := optionalResponseCookie(t, response, sessionCookieName); cookie != nil {
+		t.Fatalf("local-session self-demotion touched the session cookie: %#v", cookie)
+	}
+}
+
+func TestLoginPageOffersCompanySignInOnlyWhileAvailable(t *testing.T) {
+	fixture := newCompanyOIDCWebFixture(t, true)
+	const buttonLabel = "Sign in with company account"
+	const formAction = `action="/settings/authentication/oidc/login"`
+	const companyCSRFPrefix = `value="company-login.`
+
+	tests := []struct {
+		name       string
+		service    CompanyOIDCService
+		encryption bool
+		available  bool
+	}{
+		{name: "service reports available", service: &recordingCompanyOIDCService{loginAvailable: true}, encryption: true, available: true},
+		{name: "service reports unavailable", service: &recordingCompanyOIDCService{}, encryption: true},
+		{name: "encryption unavailable", service: &recordingCompanyOIDCService{loginAvailable: true}},
+		{name: "no service", service: nil, encryption: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture.server.cfg.CompanyOIDCService = tc.service
+			fixture.server.cfg.CompanyOIDCSecretEncryptionConfigured = tc.encryption
+			response := companyOIDCGET(fixture.server, "/login", nil)
+			if response.Code != http.StatusOK {
+				t.Fatalf("login page returned %d", response.Code)
+			}
+			body := response.Body.String()
+			for _, marker := range []string{buttonLabel, formAction, companyCSRFPrefix} {
+				if strings.Contains(body, marker) != tc.available {
+					t.Fatalf("marker %q presence = %v, want %v", marker, !tc.available, tc.available)
+				}
+			}
+			if recording, ok := tc.service.(*recordingCompanyOIDCService); ok {
+				wantCalls := 0
+				if tc.encryption {
+					wantCalls = 1
+				}
+				if recording.loginAvailableCalls != wantCalls {
+					t.Fatalf("LoginAvailable calls = %d, want %d", recording.loginAvailableCalls, wantCalls)
+				}
+			}
+		})
+	}
+
+	notices := []struct {
+		notice string
+		copy   string
+	}{
+		{notice: companyLoginFailedNotice, copy: "Company sign-in was not completed. Try again, or sign in with your password."},
+		{notice: companyLoginUnavailableNotice, copy: "Company sign-in is not available right now. Sign in with your password."},
+		{notice: companyLoginDisabledNotice, copy: "Company login is disabled. Sign in with your password."},
+	}
+	fixture.server.cfg.CompanyOIDCService = &recordingCompanyOIDCService{}
+	fixture.server.cfg.CompanyOIDCSecretEncryptionConfigured = true
+	for _, tc := range notices {
+		response := companyOIDCGET(fixture.server, "/login?notice="+tc.notice, nil)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), tc.copy) {
+			t.Fatalf("notice %q: status=%d body missing %q", tc.notice, response.Code, tc.copy)
+		}
+	}
+	response := companyOIDCGET(fixture.server, "/login?notice=unknown-canary", nil)
+	body := response.Body.String()
+	if strings.Contains(body, "Company sign-in was not completed") || strings.Contains(body, "not available right now") {
+		t.Fatal("unknown notice rendered company sign-in copy")
 	}
 }

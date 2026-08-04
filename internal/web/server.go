@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -137,6 +138,8 @@ type AuthService interface {
 	CancelInvitation(ctx context.Context, params auth.CancelInvitationParams) error
 	ReplaceInvitationLink(ctx context.Context, params auth.ReplaceInvitationLinkParams) (auth.InvitationLinkReplacement, error)
 	AcceptInvitation(ctx context.Context, token, password string) (auth.User, error)
+	VerifyCurrentPassword(ctx context.Context, userID int64, password string) error
+	CreateCompanyOIDCSession(ctx context.Context, params auth.CreateCompanyOIDCSessionParams) (auth.Session, error)
 }
 
 type CompanyOIDCService interface {
@@ -146,6 +149,15 @@ type CompanyOIDCService interface {
 	Check(ctx context.Context, actorUserID int64) (companyoidc.SetupCheck, error)
 	StartTestSignIn(ctx context.Context, input companyoidc.TestSignInStartInput) (companyoidc.TestSignInStart, error)
 	CompleteTestSignIn(ctx context.Context, input companyoidc.TestSignInCallbackInput) (companyoidc.TestSignInResultCode, error)
+	StartLink(ctx context.Context, input companyoidc.LinkStartInput) (companyoidc.LinkStart, error)
+	CompleteLink(ctx context.Context, input companyoidc.LinkCallbackInput) (companyoidc.TestSignInResultCode, error)
+	Enable(ctx context.Context, input companyoidc.EnableInput) error
+	Disable(ctx context.Context, input companyoidc.DisableInput) error
+	Unlink(ctx context.Context, input companyoidc.UnlinkInput) error
+	StartLogin(ctx context.Context, input companyoidc.LoginStartInput) (companyoidc.LoginStart, error)
+	CompleteLogin(ctx context.Context, input companyoidc.LoginCallbackInput) (companyoidc.LoginCompletion, companyoidc.TestSignInResultCode, error)
+	LoginAvailable(ctx context.Context) bool
+	EnableReady(ctx context.Context) bool
 }
 
 type RepositoryStore interface {
@@ -487,7 +499,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /settings/authentication/oidc", s.handleCompanyOIDCDraftSave)
 	s.mux.HandleFunc("POST /settings/authentication/oidc/check", s.handleCompanyOIDCCheck)
 	s.mux.HandleFunc("POST /settings/authentication/oidc/test", s.handleCompanyOIDCTestStart)
-	s.mux.HandleFunc("GET /settings/authentication/oidc/callback", s.handleCompanyOIDCTestCallback)
+	s.mux.HandleFunc("POST /settings/authentication/oidc/link", s.handleCompanyOIDCLinkStart)
+	s.mux.HandleFunc("POST /settings/authentication/oidc/enable", s.handleCompanyOIDCEnable)
+	s.mux.HandleFunc("POST /settings/authentication/oidc/disable", s.handleCompanyOIDCDisable)
+	s.mux.HandleFunc("POST /settings/authentication/oidc/unlink", s.handleCompanyOIDCUnlink)
+	s.mux.HandleFunc("POST /settings/authentication/oidc/login", s.handleCompanyOIDCLoginStart)
+	s.mux.HandleFunc("GET /settings/authentication/oidc/callback", s.handleCompanyOIDCCallback)
 	s.mux.HandleFunc("POST /users", s.handleCreateUser)
 	s.mux.HandleFunc("POST /users/invitations", s.handleCreateInvitation)
 	s.mux.HandleFunc("POST /users/invitations/{id}/cancel", s.handleCancelInvitation)
@@ -2198,6 +2215,7 @@ func sessionStateFromAuth(session auth.Session) sessionState {
 		Grants:             session.Grants,
 		HasLocalPassword:   session.User.HasLocalPassword,
 		MustChangePassword: session.User.MustChangePassword,
+		CompanyOIDC:        session.CompanyOIDC,
 		ExpiresAt:          session.ExpiresAt,
 	}
 }
@@ -2295,6 +2313,10 @@ var activityActionDefinitions = map[string]activityActionDefinition{
 	audit.ActionOIDCConnectionMetadataChecked:      {Label: "OIDC metadata check", Outcome: "Checked", OutcomeClass: "ok"},
 	audit.ActionOIDCConnectionTestSignInClaimed:    {Label: "OIDC Test sign-in", Outcome: "Claimed", OutcomeClass: "pending"},
 	audit.ActionOIDCConnectionTestSignInCompleted:  {Label: "OIDC Test sign-in", Outcome: "Completed", OutcomeClass: "ok"},
+	audit.ActionOIDCIdentityLinked:                 {Label: "Company identity", Outcome: "Linked", OutcomeClass: "ok"},
+	audit.ActionOIDCIdentityUnlinked:               {Label: "Company identity", Outcome: "Unlinked", OutcomeClass: "warning"},
+	audit.ActionOIDCConnectionEnabled:              {Label: "Company login", Outcome: "Enabled", OutcomeClass: "ok"},
+	audit.ActionOIDCConnectionDisabled:             {Label: "Company login", Outcome: "Disabled", OutcomeClass: "warning"},
 }
 
 func activityEventViews(repositories []domain.Repository, users []auth.User, events []audit.Event) []activityEventView {
@@ -2496,6 +2518,34 @@ func activityEventViewForEvent(repositories map[int64]domain.Repository, users m
 		view.Detail = detail
 		view.Outcome = outcome
 		view.OutcomeClass = outcomeClass
+	case audit.ActionOIDCIdentityLinked:
+		detail, ok := activityOIDCIdentityLinkedDetail(event, details)
+		if !ok {
+			return fallbackActivityEventView(users, event, details, true, forceUnknownInvitationActor)
+		}
+		view.Target = "Company OIDC connection"
+		view.Detail = detail
+	case audit.ActionOIDCIdentityUnlinked:
+		detail, ok := activityOIDCIdentityUnlinkedDetail(event, details)
+		if !ok {
+			return fallbackActivityEventView(users, event, details, true, forceUnknownInvitationActor)
+		}
+		view.Target = "Company OIDC connection"
+		view.Detail = detail
+	case audit.ActionOIDCConnectionEnabled:
+		detail, ok := activityOIDCConnectionEnabledDetail(event, details)
+		if !ok {
+			return fallbackActivityEventView(users, event, details, true, forceUnknownInvitationActor)
+		}
+		view.Target = "Company OIDC connection"
+		view.Detail = detail
+	case audit.ActionOIDCConnectionDisabled:
+		detail, ok := activityOIDCConnectionDisabledDetail(event, details)
+		if !ok {
+			return fallbackActivityEventView(users, event, details, true, forceUnknownInvitationActor)
+		}
+		view.Target = "Company OIDC connection"
+		view.Detail = detail
 	case audit.ActionRepositoryGrantAdded:
 		view.Target = activityRepositoryTarget(repositories, event, details, "")
 		if provenance, ok := activityExactStringDetail(details, "provenance"); ok && provenance == "invitation_acceptance" {
@@ -2594,7 +2644,11 @@ func activityHasGuardedDetails(action string) bool {
 		audit.ActionRepositoryGrantAdded,
 		audit.ActionOIDCConnectionMetadataChecked,
 		audit.ActionOIDCConnectionTestSignInClaimed,
-		audit.ActionOIDCConnectionTestSignInCompleted:
+		audit.ActionOIDCConnectionTestSignInCompleted,
+		audit.ActionOIDCIdentityLinked,
+		audit.ActionOIDCIdentityUnlinked,
+		audit.ActionOIDCConnectionEnabled,
+		audit.ActionOIDCConnectionDisabled:
 		return true
 	default:
 		return false
@@ -2617,6 +2671,10 @@ func activityGuardedDetail(action, key string) bool {
 		return key == "revision" || key == "binding" || key == "authority"
 	case audit.ActionOIDCConnectionTestSignInCompleted:
 		return key == "revision" || key == "result_code"
+	case audit.ActionOIDCIdentityLinked, audit.ActionOIDCConnectionEnabled:
+		return key == "revision"
+	case audit.ActionOIDCIdentityUnlinked, audit.ActionOIDCConnectionDisabled:
+		return key == "revision" || key == "cause"
 	default:
 		return false
 	}
@@ -3128,6 +3186,68 @@ func activityOIDCTestSignInCompletedDetail(
 	return fmt.Sprintf("Revision %d: %s", revision, presentation.detail), presentation.outcome, presentation.outcomeClass, true
 }
 
+func activityOIDCIdentityLinkedDetail(event audit.Event, details activityDetails) (string, bool) {
+	if event.SubjectType != audit.SubjectTypeOIDCConnection || event.SubjectID != "1" || len(details) != 1 {
+		return "", false
+	}
+	revision, ok := activityOIDCRevision(details)
+	if !ok {
+		return "", false
+	}
+	return fmt.Sprintf("Revision %d: the acting Administrator linked their company identity.", revision), true
+}
+
+func activityOIDCIdentityUnlinkedDetail(event audit.Event, details activityDetails) (string, bool) {
+	revision, cause, ok := activityOIDCRevisionAndCause(event, details, "administrator", "recovery")
+	if !ok {
+		return "", false
+	}
+	if cause == "recovery" {
+		return fmt.Sprintf("Revision %d: password recovery removed the linked company identity.", revision), true
+	}
+	return fmt.Sprintf("Revision %d: the acting Administrator unlinked their company identity.", revision), true
+}
+
+func activityOIDCConnectionEnabledDetail(event audit.Event, details activityDetails) (string, bool) {
+	if event.SubjectType != audit.SubjectTypeOIDCConnection || event.SubjectID != "1" || len(details) != 1 {
+		return "", false
+	}
+	revision, ok := activityOIDCRevision(details)
+	if !ok {
+		return "", false
+	}
+	return fmt.Sprintf("Revision %d: company login was enabled for the linked Administrator.", revision), true
+}
+
+func activityOIDCConnectionDisabledDetail(event audit.Event, details activityDetails) (string, bool) {
+	revision, cause, ok := activityOIDCRevisionAndCause(event, details, "administrator", "recovery", "authority-loss")
+	if !ok {
+		return "", false
+	}
+	switch cause {
+	case "recovery":
+		return fmt.Sprintf("Revision %d: password recovery disabled company login and revoked company sessions.", revision), true
+	case "authority-loss":
+		return fmt.Sprintf("Revision %d: an account authority change disabled company login and revoked company sessions.", revision), true
+	}
+	return fmt.Sprintf("Revision %d: company login was disabled and company sessions were revoked.", revision), true
+}
+
+func activityOIDCRevisionAndCause(event audit.Event, details activityDetails, allowedCauses ...string) (int64, string, bool) {
+	if event.SubjectType != audit.SubjectTypeOIDCConnection || event.SubjectID != "1" || len(details) != 2 {
+		return 0, "", false
+	}
+	revision, ok := activityOIDCRevision(details)
+	if !ok {
+		return 0, "", false
+	}
+	cause, ok := activityExactStringDetail(details, "cause")
+	if !ok || !slices.Contains(allowedCauses, cause) {
+		return 0, "", false
+	}
+	return revision, cause, true
+}
+
 func activityOIDCRevision(details activityDetails) (int64, bool) {
 	var revision int64
 	raw, ok := details["revision"]
@@ -3495,14 +3615,23 @@ func (s *Server) renderLoginStatus(w http.ResponseWriter, r *http.Request, email
 		s.renderErrorPage(w, http.StatusInternalServerError, true)
 		return
 	}
-	s.renderPageStatus(w, status, "layouts/login", authLoginData{
+	data := authLoginData{
 		AppName:   s.cfg.AppName,
 		PageTitle: "Sign in",
 		CSRFField: csrfFormField,
 		CSRFToken: csrfToken,
 		FormError: formError,
 		Email:     email,
-	})
+		Notice:    companyLoginNoticeMessage(r.URL.Query()),
+	}
+	if s.companyLoginAvailable(r) {
+		companyCSRF, err := s.newCompanyLoginCSRFToken()
+		if err == nil {
+			data.CompanyLoginAvailable = true
+			data.CompanyCSRFToken = companyCSRF
+		}
+	}
+	s.renderPageStatus(w, status, "layouts/login", data)
 }
 
 func internalServerError(w http.ResponseWriter) {

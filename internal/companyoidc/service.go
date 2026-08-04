@@ -29,13 +29,27 @@ const (
 )
 
 type Connection struct {
-	ProviderLabel      string
-	Issuer             string
-	ClientID           string
-	Domains            []string
-	Revision           int64
-	SetupCheck         *SetupCheck
-	TestSignInEvidence *TestSignInEvidence
+	ProviderLabel        string
+	Issuer               string
+	ClientID             string
+	Domains              []string
+	Revision             int64
+	Enabled              bool
+	ActivationGeneration int64
+	SetupCheck           *SetupCheck
+	TestSignInEvidence   *TestSignInEvidence
+	Identity             *LinkedIdentity
+}
+
+// LinkedIdentity is the public view of the linked Administrator identity.
+// It never carries the provider issuer, client ID, or subject; whether they
+// still match the current connection is reported only as MatchesConnection.
+type LinkedIdentity struct {
+	UserID            int64
+	Email             string
+	ConfigRevision    int64
+	LinkedAt          time.Time
+	MatchesConnection bool
 }
 
 type CreateInput struct {
@@ -67,20 +81,26 @@ func IsValidationError(err error) bool {
 }
 
 var (
-	ErrConflict       = errors.New("the company OIDC Draft changed; reload it before saving again")
-	ErrConfiguration  = errors.New("company OIDC client-secret encryption is not configured")
-	ErrAuthorization  = errors.New("only an enabled Administrator can save the company OIDC Draft")
-	ErrOutcomeUnknown = errors.New("the company OIDC Draft save outcome could not be confirmed")
+	ErrConflict          = errors.New("the company OIDC Draft changed; reload it before saving again")
+	ErrConfiguration     = errors.New("company OIDC client-secret encryption is not configured")
+	ErrAuthorization     = errors.New("only an enabled Administrator can save the company OIDC Draft")
+	ErrOutcomeUnknown    = errors.New("the company OIDC Draft save outcome could not be confirmed")
+	ErrEnabled           = errors.New("disable company login before making this change")
+	ErrNotReady          = errors.New("company login prerequisites are not satisfied")
+	ErrLinkUnavailable   = errors.New("company OIDC identity linking is not available")
+	ErrLinkAuthorization = errors.New("company OIDC identity linking requires a current enabled Administrator session")
+	ErrLoginUnavailable  = errors.New("company OIDC login is not available")
 )
 
 type Service struct {
-	db        *sql.DB
-	secrets   secrets.Store
-	check     func(context.Context, string) SetupCheckReport
-	checker   *Checker
-	publicURL string
-	random    io.Reader
-	now       func() time.Time
+	db         *sql.DB
+	secrets    secrets.Store
+	check      func(context.Context, string) SetupCheckReport
+	checker    *Checker
+	publicURL  string
+	random     io.Reader
+	now        func() time.Time
+	loginGuard chan struct{}
 }
 
 func NewServiceWithChecker(
@@ -105,11 +125,12 @@ func NewService(
 	check func(context.Context, string) SetupCheckReport,
 ) *Service {
 	return &Service{
-		db:      db,
-		secrets: secretStore,
-		check:   check,
-		random:  rand.Reader,
-		now:     func() time.Time { return time.Now().UTC() },
+		db:         db,
+		secrets:    secretStore,
+		check:      check,
+		random:     rand.Reader,
+		now:        func() time.Time { return time.Now().UTC() },
+		loginGuard: make(chan struct{}, loginDiscoveryConcurrencyLimit),
 	}
 }
 
@@ -214,6 +235,9 @@ func (s *Service) Edit(ctx context.Context, actorUserID int64, input EditInput) 
 	}
 	if !found || existing.Revision != normalized.ExpectedRevision {
 		return ErrConflict
+	}
+	if existing.Enabled {
+		return ErrEnabled
 	}
 	secretReplaced := len(replacementCiphertext) > 0
 	if !secretReplaced &&
@@ -508,20 +532,34 @@ type connectionRecord struct {
 	ClientSecretCiphertext []byte
 	Domains                []string
 	Revision               int64
+	Enabled                bool
+	ActivationGeneration   int64
 	CreatedAt              time.Time
 	UpdatedAt              time.Time
 	SetupCheck             *SetupCheck
 	TestSignInEvidence     *TestSignInEvidence
+	Identity               *identityRecord
 }
 
-type connectionQueryer interface {
+type identityRecord struct {
+	userID   int64
+	issuer   string
+	clientID string
+	subject  string
+	email    string
+	revision int64
+	linkedAt time.Time
+}
+
+type queryer interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-func loadConnectionRecord(ctx context.Context, q connectionQueryer) (connectionRecord, bool, error) {
+func loadConnectionRecord(ctx context.Context, q queryer) (connectionRecord, bool, error) {
 	rows, err := q.QueryContext(ctx, `
 SELECT c.provider_label, c.issuer, c.client_id, c.client_secret_ciphertext,
-  c.revision, c.created_at, c.updated_at, d.domain,
+  c.revision, c.enabled, c.activation_generation, c.created_at, c.updated_at, d.domain,
   sc.config_revision, sc.result_code, sc.observed_issuer,
   sc.public_key_candidate_count, sc.checked_at,
   te.config_revision, te.verified_at
@@ -541,7 +579,7 @@ ORDER BY d.domain`)
 	for rows.Next() {
 		var providerLabel, issuer, clientID, createdAt, updatedAt string
 		var ciphertext []byte
-		var revision int64
+		var revision, enabled, activationGeneration int64
 		var domain sql.NullString
 		var checkRevision, candidateCount, evidenceRevision sql.NullInt64
 		var resultCode, observedIssuer, checkedAt, verifiedAt sql.NullString
@@ -551,6 +589,8 @@ ORDER BY d.domain`)
 			&clientID,
 			&ciphertext,
 			&revision,
+			&enabled,
+			&activationGeneration,
 			&createdAt,
 			&updatedAt,
 			&domain,
@@ -570,6 +610,11 @@ ORDER BY d.domain`)
 			record.ClientID = clientID
 			record.ClientSecretCiphertext = ciphertext
 			record.Revision = revision
+			if enabled < 0 || enabled > 1 {
+				return connectionRecord{}, false, errors.New("company OIDC Draft data is malformed")
+			}
+			record.Enabled = enabled == 1
+			record.ActivationGeneration = activationGeneration
 			record.CreatedAt, err = parseCompanyOIDCTime(createdAt)
 			if err != nil {
 				return connectionRecord{}, false, errors.New("company OIDC Draft data is malformed")
@@ -623,7 +668,80 @@ ORDER BY d.domain`)
 	if err := rows.Err(); err != nil {
 		return connectionRecord{}, false, fmt.Errorf("read company OIDC Draft rows: %w", err)
 	}
+	if found {
+		record.Identity, err = loadLinkedIdentity(ctx, q)
+		if err != nil {
+			return connectionRecord{}, false, err
+		}
+	}
 	return record, found, nil
+}
+
+func loadLinkedIdentity(ctx context.Context, q queryer) (*identityRecord, error) {
+	rows, err := q.QueryContext(ctx, `
+SELECT user_id, issuer, client_id, subject, email, config_revision, linked_at
+FROM company_oidc_identities
+WHERE connection_id = 1`)
+	if err != nil {
+		return nil, fmt.Errorf("read company OIDC linked identity: %w", err)
+	}
+	defer rows.Close()
+	var identity *identityRecord
+	for rows.Next() {
+		if identity != nil {
+			return nil, errors.New("company OIDC linked identity is malformed")
+		}
+		var record identityRecord
+		var linkedAt string
+		if err := rows.Scan(
+			&record.userID,
+			&record.issuer,
+			&record.clientID,
+			&record.subject,
+			&record.email,
+			&record.revision,
+			&linkedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan company OIDC linked identity: %w", err)
+		}
+		record.linkedAt, err = parseCompanyOIDCTime(linkedAt)
+		if err != nil {
+			return nil, errors.New("company OIDC linked identity is malformed")
+		}
+		identity = &record
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read company OIDC linked identity rows: %w", err)
+	}
+	return identity, nil
+}
+
+func validIdentityRecord(record identityRecord) bool {
+	issuer, issuerErr := normalizeIssuer(record.issuer)
+	clientID, clientIDErr := normalizeClientID(record.clientID)
+	return record.userID > 0 &&
+		issuerErr == nil && issuer == record.issuer &&
+		clientIDErr == nil && clientID == record.clientID &&
+		validOIDCSubject(record.subject) &&
+		validLinkedIdentityEmail(record.email) &&
+		record.revision > 0 && !record.linkedAt.IsZero()
+}
+
+// validLinkedIdentityEmail rechecks the stored display email against the
+// same shape verifiedEmailClaim guarantees at link time.
+func validLinkedIdentityEmail(value string) bool {
+	if value == "" || len(value) > maxEmailClaimBytes || !utf8.ValidString(value) {
+		return false
+	}
+	if value != strings.TrimSpace(value) || containsControlOrLineSeparator(value) {
+		return false
+	}
+	if strings.Count(value, "@") != 1 {
+		return false
+	}
+	local, domain, _ := strings.Cut(value, "@")
+	return local != "" && domain != "" &&
+		strings.ToLower(domain) == domain && validateDomain(domain) == nil
 }
 
 func publicConnection(record connectionRecord) (Connection, error) {
@@ -634,6 +752,7 @@ func publicConnection(record connectionRecord) (Connection, error) {
 		normalized.ClientID != record.ClientID ||
 		!slices.Equal(normalized.Domains, record.Domains) ||
 		record.Revision <= 0 ||
+		record.ActivationGeneration <= 0 ||
 		len(record.ClientSecretCiphertext) == 0 ||
 		record.CreatedAt.IsZero() ||
 		record.UpdatedAt.IsZero() ||
@@ -650,14 +769,32 @@ func publicConnection(record connectionRecord) (Connection, error) {
 			return Connection{}, err
 		}
 	}
+	var identity *LinkedIdentity
+	if record.Identity != nil {
+		if !validIdentityRecord(*record.Identity) {
+			return Connection{}, errors.New("company OIDC linked identity is malformed")
+		}
+		identity = &LinkedIdentity{
+			UserID:         record.Identity.userID,
+			Email:          record.Identity.email,
+			ConfigRevision: record.Identity.revision,
+			LinkedAt:       record.Identity.linkedAt,
+			MatchesConnection: record.Identity.issuer == record.Issuer &&
+				record.Identity.clientID == record.ClientID &&
+				record.Identity.revision == record.Revision,
+		}
+	}
 	return Connection{
-		ProviderLabel:      record.ProviderLabel,
-		Issuer:             record.Issuer,
-		ClientID:           record.ClientID,
-		Domains:            slices.Clone(record.Domains),
-		Revision:           record.Revision,
-		SetupCheck:         cloneSetupCheck(record.SetupCheck),
-		TestSignInEvidence: cloneTestSignInEvidence(record.TestSignInEvidence),
+		ProviderLabel:        record.ProviderLabel,
+		Issuer:               record.Issuer,
+		ClientID:             record.ClientID,
+		Domains:              slices.Clone(record.Domains),
+		Revision:             record.Revision,
+		Enabled:              record.Enabled,
+		ActivationGeneration: record.ActivationGeneration,
+		SetupCheck:           cloneSetupCheck(record.SetupCheck),
+		TestSignInEvidence:   cloneTestSignInEvidence(record.TestSignInEvidence),
+		Identity:             identity,
 	}, nil
 }
 
@@ -704,7 +841,8 @@ VALUES (1, ?, ?, ?, ?, ?, ?, ?)`,
 func updateConnection(ctx context.Context, tx *sql.Tx, record connectionRecord) error {
 	result, err := tx.ExecContext(ctx, `
 UPDATE company_oidc_connections
-SET provider_label = ?, issuer = ?, client_id = ?, client_secret_ciphertext = ?, revision = ?, updated_at = ?
+SET provider_label = ?, issuer = ?, client_id = ?, client_secret_ciphertext = ?, revision = ?,
+  activation_generation = activation_generation + 1, updated_at = ?
 WHERE id = 1`,
 		record.ProviderLabel,
 		record.Issuer,

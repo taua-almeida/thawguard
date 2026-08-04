@@ -493,6 +493,13 @@ func (s *Server) handleSetUserAdmin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if *session.UserID == target.ID && !adminValue {
+		if session.CompanyOIDC {
+			// Self-demotion from a company sign-in session revoked that
+			// session inside the demotion transaction; the cookie is stale.
+			s.clearSessionCookie(w, r)
+			redirectCompanyLogin(w, r, companyLoginDisabledNotice)
+			return
+		}
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}

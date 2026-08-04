@@ -2939,6 +2939,16 @@ func TestActivityMappingsCoverEveryKnownAuditAction(t *testing.T) {
 			event.SubjectID = "1"
 			event.DetailsJSON = `{"revision":1,"result_code":"verified"}`
 		}
+		if action == audit.ActionOIDCIdentityLinked || action == audit.ActionOIDCConnectionEnabled {
+			event.SubjectType = audit.SubjectTypeOIDCConnection
+			event.SubjectID = "1"
+			event.DetailsJSON = `{"revision":1}`
+		}
+		if action == audit.ActionOIDCIdentityUnlinked || action == audit.ActionOIDCConnectionDisabled {
+			event.SubjectType = audit.SubjectTypeOIDCConnection
+			event.SubjectID = "1"
+			event.DetailsJSON = `{"revision":1,"cause":"administrator"}`
+		}
 		view := activityEventViewForEvent(nil, nil, event)
 		if view.ActionLabel == "Unrecognized activity" || view.ActionLabel == "" || view.Outcome == "" || view.Target == "" || view.Detail == "" {
 			t.Fatalf("audit action %q lacks a complete curated activity mapping: %+v", action, view)
@@ -2964,6 +2974,40 @@ func TestActivityOIDCDraftPresentationIgnoresSensitiveUnexpectedDetails(t *testi
 		if strings.Contains(visible, canary) {
 			t.Fatalf("OIDC Activity presentation exposed %q: %q", canary, visible)
 		}
+	}
+}
+
+func TestActivityOIDCDisabledRecognizesAuthorityLossOnlyForDisable(t *testing.T) {
+	actorID := int64(7)
+	disabled := audit.Event{
+		ActorUserID: &actorID,
+		Action:      audit.ActionOIDCConnectionDisabled,
+		SubjectType: audit.SubjectTypeOIDCConnection,
+		SubjectID:   "1",
+		DetailsJSON: `{"revision":4,"cause":"authority-loss"}`,
+	}
+	view := activityEventViewForEvent(nil, nil, disabled)
+	if view.ActionLabel != "Company login" || view.Outcome != "Disabled" {
+		t.Fatalf("authority-loss disable was not recognized: %+v", view)
+	}
+	if view.Detail != "Revision 4: an account authority change disabled company login and revoked company sessions." {
+		t.Fatalf("authority-loss disable detail = %q", view.Detail)
+	}
+
+	unlinked := disabled
+	unlinked.Action = audit.ActionOIDCIdentityUnlinked
+	if view := activityEventViewForEvent(nil, nil, unlinked); view.ActionLabel != "Unrecognized activity" || view.Outcome != "Unknown" {
+		t.Fatalf("identity unlink accepted the authority-loss cause: %+v", view)
+	}
+
+	unknown := disabled
+	unknown.DetailsJSON = `{"revision":4,"cause":"cause-canary"}`
+	view = activityEventViewForEvent(nil, nil, unknown)
+	if view.ActionLabel != "Unrecognized activity" || view.Outcome != "Unknown" {
+		t.Fatalf("unknown disable cause did not fail closed: %+v", view)
+	}
+	if visible := view.ActionLabel + " " + view.Target + " " + view.Detail; strings.Contains(visible, "cause-canary") {
+		t.Fatalf("unknown disable cause exposed raw details: %q", visible)
 	}
 }
 

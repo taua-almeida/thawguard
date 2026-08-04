@@ -18,13 +18,14 @@ var (
 )
 
 const checkSnapshotQuery = `
-SELECT issuer, revision
+SELECT issuer, revision, enabled
 FROM company_oidc_connections
 WHERE id = 1`
 
 type checkSnapshot struct {
 	issuer   string
 	revision int64
+	enabled  bool
 }
 
 func (s *Service) Check(ctx context.Context, actorUserID int64) (SetupCheck, error) {
@@ -69,6 +70,9 @@ func (s *Service) Check(ctx context.Context, actorUserID int64) (SetupCheck, err
 	if !found || current.revision != snapshot.revision || current.issuer != snapshot.issuer {
 		return SetupCheck{}, ErrCheckStale
 	}
+	if current.enabled {
+		return SetupCheck{}, ErrEnabled
+	}
 	if err := replaceSetupCheck(ctx, tx, check); err != nil {
 		return SetupCheck{}, err
 	}
@@ -97,6 +101,9 @@ func (s *Service) checkSnapshot(ctx context.Context, actorUserID int64) (checkSn
 	if !found {
 		return checkSnapshot{}, ErrNoDraft
 	}
+	if snapshot.enabled {
+		return checkSnapshot{}, ErrEnabled
+	}
 	if err := tx.Commit(); err != nil {
 		return checkSnapshot{}, fmt.Errorf("commit company OIDC setup-check snapshot: %w", err)
 	}
@@ -105,16 +112,18 @@ func (s *Service) checkSnapshot(ctx context.Context, actorUserID int64) (checkSn
 
 func loadCheckSnapshot(ctx context.Context, tx *sql.Tx) (checkSnapshot, bool, error) {
 	var snapshot checkSnapshot
-	err := tx.QueryRowContext(ctx, checkSnapshotQuery).Scan(&snapshot.issuer, &snapshot.revision)
+	var enabled int64
+	err := tx.QueryRowContext(ctx, checkSnapshotQuery).Scan(&snapshot.issuer, &snapshot.revision, &enabled)
 	if errors.Is(err, sql.ErrNoRows) {
 		return checkSnapshot{}, false, nil
 	}
 	if err != nil {
 		return checkSnapshot{}, false, fmt.Errorf("read company OIDC setup-check snapshot: %w", err)
 	}
-	if !validExactIssuer(snapshot.issuer) || snapshot.revision <= 0 {
+	if !validExactIssuer(snapshot.issuer) || snapshot.revision <= 0 || enabled < 0 || enabled > 1 {
 		return checkSnapshot{}, false, errors.New("company OIDC setup-check snapshot is malformed")
 	}
+	snapshot.enabled = enabled == 1
 	return snapshot, true, nil
 }
 
