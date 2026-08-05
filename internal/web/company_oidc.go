@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net/http"
@@ -120,6 +121,15 @@ type authenticationPageData struct {
 	CanLink                 bool
 	CanEnable               bool
 	CanUnlink               bool
+}
+
+type companyOIDCProviderNavigationData struct {
+	AppName          string
+	PageTitle        string
+	Theme            string
+	AuthorizationURL string
+	ReturnHref       string
+	ReturnLabel      string
 }
 
 type companyOIDCSetupHealthView struct {
@@ -391,7 +401,7 @@ func (s *Server) handleCompanyOIDCTestStart(w http.ResponseWriter, r *http.Reque
 		redirectCompanyOIDCNotice(w, r, notice)
 		return
 	}
-	http.Redirect(w, r, start.AuthorizationURL, http.StatusSeeOther)
+	s.renderCompanyOIDCProviderNavigation(w, r, start.AuthorizationURL, "")
 }
 
 // handleCompanyOIDCCallback serves the single registered callback URI for
@@ -573,7 +583,7 @@ func (s *Server) handleCompanyOIDCLinkStart(w http.ResponseWriter, r *http.Reque
 		redirectCompanyOIDCNotice(w, r, notice)
 		return
 	}
-	http.Redirect(w, r, start.AuthorizationURL, http.StatusSeeOther)
+	s.renderCompanyOIDCProviderNavigation(w, r, start.AuthorizationURL, "")
 }
 
 func (s *Server) handleCompanyOIDCEnable(w http.ResponseWriter, r *http.Request) {
@@ -755,8 +765,60 @@ func (s *Server) handleCompanyOIDCLoginStart(w http.ResponseWriter, r *http.Requ
 		redirectCompanyLogin(w, r, companyLoginUnavailableNotice)
 		return
 	}
-	s.setCompanyLoginCookie(w, r, start.BrowserToken)
-	http.Redirect(w, r, start.AuthorizationURL, http.StatusSeeOther)
+	s.renderCompanyOIDCProviderNavigation(w, r, start.AuthorizationURL, start.BrowserToken)
+}
+
+func (s *Server) renderCompanyOIDCProviderNavigation(
+	w http.ResponseWriter,
+	r *http.Request,
+	authorizationURL string,
+	browserToken string,
+) {
+	signedOut := browserToken != ""
+	returnHref := "/settings/authentication"
+	returnLabel := "Back to Authentication settings"
+	if signedOut {
+		returnHref = "/login"
+		returnLabel = "Back to sign in"
+	}
+	data := companyOIDCProviderNavigationData{
+		AppName:          s.cfg.AppName,
+		PageTitle:        "Continue to company sign-in",
+		AuthorizationURL: authorizationURL,
+		ReturnHref:       returnHref,
+		ReturnLabel:      returnLabel,
+	}
+	var page bytes.Buffer
+	if err := pageTemplates.ExecuteTemplate(&page, "layouts/company-oidc-provider-navigation", data); err != nil {
+		s.renderCompanyOIDCProviderNavigationFailure(w, signedOut)
+		return
+	}
+
+	w.Header().Set("Content-Security-Policy", providerNavigationCSP)
+	if signedOut {
+		s.setCompanyLoginCookie(w, r, browserToken)
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(page.Bytes())
+}
+
+func (s *Server) renderCompanyOIDCProviderNavigationFailure(w http.ResponseWriter, signedOut bool) {
+	actionHref := "/settings/authentication"
+	actionLabel := "Back to Authentication settings"
+	if signedOut {
+		actionHref = "/login"
+		actionLabel = "Back to sign in"
+	}
+	s.renderPageStatus(w, http.StatusInternalServerError, "layouts/error", authErrorData{
+		AppName:     s.cfg.AppName,
+		PageTitle:   "Company sign-in could not continue",
+		Status:      http.StatusInternalServerError,
+		Heading:     "Company sign-in could not continue",
+		Message:     "Thawguard could not display the page that continues to the company provider. A one-time sign-in request may already exist and will expire on its own. Return and start a new attempt.",
+		ActionHref:  actionHref,
+		ActionLabel: actionLabel,
+	})
 }
 
 func redirectCompanyOIDCNotice(w http.ResponseWriter, r *http.Request, notice string) {

@@ -40,6 +40,7 @@ const (
 	passwordRecoveryMaxBodyBytes int64 = 8 << 10
 	sensitiveFormCSP                   = "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self'"
 	authenticationCSP                  = sensitiveFormCSP + "; connect-src 'self'"
+	providerNavigationCSP              = "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'; script-src 'self'; style-src 'self'"
 )
 
 const (
@@ -375,12 +376,12 @@ func NewServer(cfg Config) *Server {
 
 func (s *Server) Routes() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if isAuthenticationSettingsPath(r.URL.Path) || isPasswordRecoveryPath(r.URL.Path) ||
+		if isAuthenticationSettingsPath(r.URL.Path) || r.URL.Path == "/login" || isPasswordRecoveryPath(r.URL.Path) ||
 			isInvitationSensitivePath(r.URL.Path) {
 			w.Header().Set("Cache-Control", "no-store")
 			// no-referrer makes browsers serialize Origin as "null" for form
 			// posts initiated by sensitive documents, so exact-Origin validation
-			// rejects same-origin saves, acceptance, recovery, and validation retries.
+			// rejects same-origin sign-in, saves, acceptance, recovery, and validation retries.
 			// same-origin still sends no referrer off this origin, and referrers
 			// never carry the URL fragment that holds the bearer.
 			w.Header().Set("Referrer-Policy", "same-origin")
