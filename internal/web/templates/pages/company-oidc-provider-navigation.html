@@ -1,0 +1,10 @@
+{{ define "pages/company-oidc-provider-navigation" }}
+<h1 class="m-0 mb-3 text-base font-bold text-text">Continue to company sign-in</h1>
+<p class="m-0 text-sm text-text-muted">Thawguard prepared a one-time sign-in request. Continue to your company provider to complete it.</p>
+<div id="oidc-provider-navigation" class="mt-4">
+  {{ template "ui/button" dict "Label" "Continue to company provider" "Variant" "primary" "Href" .AuthorizationURL }}
+</div>
+<noscript><p class="m-0 mt-3 text-xs text-text-muted">Automatic navigation needs JavaScript. Use the button above to continue.</p></noscript>
+<p class="m-0 mt-4 text-sm"><a class="font-semibold text-accent-strong" href="{{ .ReturnHref }}">{{ .ReturnLabel }}</a></p>
+<script src="/static/js/oidc-provider-navigation.js" defer></script>
+{{ end }}

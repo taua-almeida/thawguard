@@ -5,6 +5,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"html"
+	"html/template"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -1105,10 +1107,11 @@ func TestAuthenticationCheckExistsOnlyOnSavedReadStateAndFutureStepsStayInert(t 
 	}
 }
 
-func TestCompanyOIDCTestStartUsesPlainExternalRedirectAndExactInput(t *testing.T) {
+func TestCompanyOIDCTestStartUsesProviderNavigationPageAndExactInput(t *testing.T) {
 	fixture := newCompanyOIDCWebFixture(t, true)
+	const authorizationURL = "https://id.example.test/authorize?provider_hint=%22%3E%3Cimg%20src%3Dx%20onerror%3Dalert%281%29%3E%26owned&request=exact&state=one-time-canary"
 	service := &recordingCompanyOIDCService{startResult: companyoidc.TestSignInStart{
-		AuthorizationURL: "https://id.example.test/authorize?request=exact",
+		AuthorizationURL: authorizationURL,
 	}}
 	fixture.server.cfg.CompanyOIDCService = service
 	form := url.Values{csrfFormField: {fixture.admin.CSRFToken}, "expected_revision": {"7"}}
@@ -1116,11 +1119,16 @@ func TestCompanyOIDCTestStartUsesPlainExternalRedirectAndExactInput(t *testing.T
 	for _, hx := range []bool{false, true} {
 		service.reset()
 		response := companyOIDCTestPOST(fixture.server, fixture.adminCookie(), form, []string{companyOIDCWebPublicURL}, hx)
-		if response.Code != http.StatusSeeOther || response.Header().Get("Location") != service.startResult.AuthorizationURL {
-			t.Fatalf("start redirect: status=%d location=%q", response.Code, response.Header().Get("Location"))
-		}
-		if response.Header().Get("HX-Redirect") != "" || service.startCalls != 1 {
-			t.Fatalf("Test sign-in unexpectedly used an HTMX redirect: headers=%v calls=%d", response.Header(), service.startCalls)
+		assertCompanyOIDCProviderNavigation(
+			t,
+			response,
+			service.startResult.AuthorizationURL,
+			"/settings/authentication",
+			"Back to Authentication settings",
+		)
+		assertAdversarialCompanyOIDCProviderNavigation(t, response, authorizationURL)
+		if service.startCalls != 1 {
+			t.Fatalf("Test sign-in start calls = %d, want 1", service.startCalls)
 		}
 		want := companyoidc.TestSignInStartInput{
 			ActorUserID:      fixture.admin.User.ID,
@@ -1129,10 +1137,133 @@ func TestCompanyOIDCTestStartUsesPlainExternalRedirectAndExactInput(t *testing.T
 			CallbackURI:      companyOIDCWebPublicURL + companyoidc.TestSignInCallbackPath,
 		}
 		if service.startInput != want {
-			t.Fatalf("start input = %#v, want %#v", service.startInput, want)
+			t.Fatal("Test sign-in start did not receive the exact expected input")
 		}
-		assertAuthenticationSecurityHeaders(t, response.Header())
 	}
+}
+
+func TestCompanyOIDCProviderNavigationScriptUsesTheRenderedLinkAndReplacesHistory(t *testing.T) {
+	server := NewServer(Config{AppName: "Thawguard", PublicURL: companyOIDCWebPublicURL})
+	response := companyOIDCGET(server, "/static/js/oidc-provider-navigation.js", nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("provider navigation script status = %d, want %d", response.Code, http.StatusOK)
+	}
+	script := response.Body.String()
+	for _, marker := range []string{
+		`document.querySelector("#oidc-provider-navigation a")`,
+		"navigationLink instanceof HTMLAnchorElement",
+		"window.location.replace(navigationLink.href)",
+	} {
+		if !strings.Contains(script, marker) {
+			t.Fatalf("provider navigation script is missing %q", marker)
+		}
+	}
+	if strings.Contains(script, "https://") || strings.Contains(script, "http://") {
+		t.Fatal("provider navigation script contains a fixed provider or application origin")
+	}
+}
+
+func TestCompanyOIDCProviderNavigationRenderFailureDoesNotCommitSensitiveResponse(t *testing.T) {
+	const authorizationURL = "https://id.example.test/authorize?state=render-state-canary&nonce=render-nonce-canary"
+
+	t.Run("Test sign-in", func(t *testing.T) {
+		fixture := newCompanyOIDCWebFixture(t, true)
+		service := &recordingCompanyOIDCService{startResult: companyoidc.TestSignInStart{
+			AuthorizationURL: authorizationURL,
+		}}
+		fixture.server.cfg.CompanyOIDCService = service
+		breakCompanyOIDCProviderNavigationTemplate(t)
+
+		form := url.Values{csrfFormField: {fixture.admin.CSRFToken}, "expected_revision": {"7"}}
+		response := companyOIDCTestPOST(
+			fixture.server,
+			fixture.adminCookie(),
+			form,
+			[]string{companyOIDCWebPublicURL},
+			false,
+		)
+		assertCompanyOIDCProviderNavigationFailure(
+			t,
+			response,
+			service.startCalls,
+			authorizationURL,
+			"render-state-canary",
+			"render-nonce-canary",
+			fixture.admin.ID,
+			fixture.admin.CSRFToken,
+		)
+	})
+
+	t.Run("Link", func(t *testing.T) {
+		fixture := newCompanyOIDCWebFixture(t, true)
+		service := &recordingCompanyOIDCService{linkStartResult: companyoidc.LinkStart{
+			AuthorizationURL: authorizationURL,
+		}}
+		fixture.server.cfg.CompanyOIDCService = service
+		breakCompanyOIDCProviderNavigationTemplate(t)
+
+		form := companyOIDCPasswordForm(fixture.admin.CSRFToken, "7", accountWebTestPassword)
+		response := companyOIDCPOST(
+			fixture.server,
+			"/settings/authentication/oidc/link",
+			fixture.adminCookie(),
+			form,
+			[]string{companyOIDCWebPublicURL},
+		)
+		assertCompanyOIDCProviderNavigationFailure(
+			t,
+			response,
+			service.linkStartCalls,
+			authorizationURL,
+			"render-state-canary",
+			"render-nonce-canary",
+			fixture.admin.ID,
+			fixture.admin.CSRFToken,
+			accountWebTestPassword,
+		)
+	})
+
+	t.Run("Login", func(t *testing.T) {
+		fixture := newCompanyOIDCWebFixture(t, true)
+		const browserToken = "new-browser-binding-canary"
+		const existingBrowserToken = "existing-browser-binding-canary"
+		service := &recordingCompanyOIDCService{loginStartResult: companyoidc.LoginStart{
+			AuthorizationURL: authorizationURL,
+			BrowserToken:     browserToken,
+		}}
+		fixture.server.cfg.CompanyOIDCService = service
+		csrfToken, err := fixture.server.newCompanyLoginCSRFToken()
+		if err != nil {
+			t.Fatal(err)
+		}
+		breakCompanyOIDCProviderNavigationTemplate(t)
+
+		existingCookie := &http.Cookie{Name: companyLoginCookieName, Value: existingBrowserToken}
+		response := companyOIDCPOST(
+			fixture.server,
+			"/settings/authentication/oidc/login",
+			existingCookie,
+			url.Values{csrfFormField: {csrfToken}},
+			[]string{companyOIDCWebPublicURL},
+		)
+		assertCompanyOIDCProviderNavigationFailure(
+			t,
+			response,
+			service.loginStartCalls,
+			authorizationURL,
+			"render-state-canary",
+			"render-nonce-canary",
+			browserToken,
+			existingBrowserToken,
+			csrfToken,
+		)
+		if len(response.Header().Values("Set-Cookie")) != 0 {
+			t.Fatal("failed Login continuation changed the browser-binding cookie")
+		}
+		if existingCookie.Value != existingBrowserToken {
+			t.Fatal("failed Login continuation mutated the existing request cookie")
+		}
+	})
 }
 
 func TestCompanyOIDCTestStartEnforcesFormAndAdministratorGates(t *testing.T) {
@@ -2166,22 +2297,209 @@ func assertNoCompanyOIDCCheckSurface(t *testing.T, body string) {
 	}
 }
 
+func breakCompanyOIDCProviderNavigationTemplate(t *testing.T) {
+	t.Helper()
+	brokenTemplates, err := template.New("").Funcs(templateFuncs).ParseFS(templateFS,
+		"templates/layouts/*.html",
+		"templates/pages/*.html",
+		"templates/components/*.html",
+		"templates/components/primitives/*.html",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := brokenTemplates.Parse(
+		`{{ define "layouts/company-oidc-provider-navigation" }}{{ .MissingField }}{{ end }}`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	originalTemplates := pageTemplates
+	pageTemplates = brokenTemplates
+	t.Cleanup(func() { pageTemplates = originalTemplates })
+}
+
+func assertCompanyOIDCProviderNavigationFailure(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+	startCalls int,
+	sensitiveValues ...string,
+) {
+	t.Helper()
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("provider navigation failure status = %d, want %d", response.Code, http.StatusInternalServerError)
+	}
+	if startCalls != 1 {
+		t.Fatalf("provider navigation Start calls = %d, want 1", startCalls)
+	}
+	if response.Header().Get("Location") != "" || response.Header().Get("HX-Redirect") != "" {
+		t.Fatal("provider navigation render failure used a redirect header")
+	}
+	body := html.UnescapeString(response.Body.String())
+	for _, marker := range []string{
+		"Company sign-in could not continue",
+		"A one-time sign-in request may already exist and will expire on its own.",
+		"Return and start a new attempt.",
+	} {
+		if !strings.Contains(body, marker) {
+			t.Fatalf("provider navigation failure is missing safe copy %q", marker)
+		}
+	}
+	if strings.Contains(body, "Nothing was changed") ||
+		strings.Contains(body, "/static/js/oidc-provider-navigation.js") {
+		t.Fatal("provider navigation failure made an unsafe claim or rendered the continuation script")
+	}
+	for i, value := range sensitiveValues {
+		if value != "" && strings.Contains(body, value) {
+			t.Fatalf("provider navigation failure exposed sensitive value %d", i+1)
+		}
+	}
+	assertAuthenticationSecurityHeaders(t, response.Header())
+}
+
+func assertCompanyOIDCProviderNavigation(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+	authorizationURL string,
+	returnHref string,
+	returnLabel string,
+) {
+	t.Helper()
+	if response.Code != http.StatusOK {
+		t.Fatalf("provider navigation status = %d, want %d", response.Code, http.StatusOK)
+	}
+	if response.Header().Get("Location") != "" || response.Header().Get("HX-Redirect") != "" {
+		t.Fatal("provider navigation response used a redirect header")
+	}
+	if got := response.Header().Get("Content-Type"); got != "text/html; charset=utf-8" {
+		t.Fatalf("provider navigation Content-Type = %q", got)
+	}
+
+	rawBody := response.Body.String()
+	rawHref, decodedHref := companyOIDCProviderNavigationAnchorHref(t, rawBody)
+	if decodedHref != authorizationURL || rawHref != html.EscapeString(authorizationURL) {
+		t.Fatal("provider navigation anchor did not preserve and safely escape the exact authorization URL")
+	}
+	if strings.Count(rawBody, rawHref) != 1 {
+		t.Fatal("provider navigation page rendered the authorization URL outside the intended anchor")
+	}
+	body := html.UnescapeString(rawBody)
+	if strings.Count(body, authorizationURL) != 1 {
+		t.Fatal("provider navigation page did not contain the exact one-time authorization URL once")
+	}
+	for _, marker := range []string{
+		`id="oidc-provider-navigation"`,
+		"Continue to company provider",
+		`<noscript>`,
+		`<script src="/static/js/oidc-provider-navigation.js" defer></script>`,
+		`href="` + returnHref + `"`,
+		returnLabel,
+	} {
+		if !strings.Contains(body, marker) {
+			t.Fatalf("provider navigation page is missing %q", marker)
+		}
+	}
+	if strings.Contains(body, "<form") || strings.Count(body, "<script") != 1 ||
+		strings.Contains(strings.ToLower(body), `http-equiv="refresh"`) {
+		t.Fatal("provider navigation page did not keep the script-plus-native-link contract")
+	}
+	assertCompanyOIDCSecurityHeaders(t, response.Header(), providerNavigationCSP)
+	if strings.Contains(response.Header().Get("Content-Security-Policy"), "connect-src") ||
+		strings.Contains(response.Header().Get("Content-Security-Policy"), "https:") {
+		t.Fatal("provider navigation CSP grants an unnecessary network or broad external source")
+	}
+}
+
+func companyOIDCProviderNavigationAnchorHref(t *testing.T, rawBody string) (string, string) {
+	t.Helper()
+	containerStart := strings.Index(rawBody, `id="oidc-provider-navigation"`)
+	if containerStart < 0 {
+		t.Fatal("provider navigation container is missing")
+	}
+	containerEndOffset := strings.Index(rawBody[containerStart:], "</div>")
+	if containerEndOffset < 0 {
+		t.Fatal("provider navigation container is incomplete")
+	}
+	container := rawBody[containerStart : containerStart+containerEndOffset]
+	if strings.Count(container, "<a ") != 1 {
+		t.Fatal("provider navigation container does not contain exactly one anchor")
+	}
+	anchorStart := strings.Index(container, "<a ")
+	anchorEndOffset := strings.Index(container[anchorStart:], ">")
+	if anchorEndOffset < 0 {
+		t.Fatal("provider navigation anchor is incomplete")
+	}
+	anchor := container[anchorStart : anchorStart+anchorEndOffset]
+	hrefStart := strings.Index(anchor, `href="`)
+	if hrefStart < 0 || strings.Count(anchor, `href="`) != 1 {
+		t.Fatal("provider navigation anchor does not contain exactly one href")
+	}
+	hrefValue := anchor[hrefStart+len(`href="`):]
+	hrefEnd := strings.Index(hrefValue, `"`)
+	if hrefEnd < 0 {
+		t.Fatal("provider navigation href is incomplete")
+	}
+	rawHref := hrefValue[:hrefEnd]
+	return rawHref, html.UnescapeString(rawHref)
+}
+
+func assertAdversarialCompanyOIDCProviderNavigation(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+	authorizationURL string,
+) {
+	t.Helper()
+	rawBody := response.Body.String()
+	rawHref, decodedHref := companyOIDCProviderNavigationAnchorHref(t, rawBody)
+	if decodedHref != authorizationURL {
+		t.Fatal("adversarial authorization anchor destination changed")
+	}
+	for _, encoded := range []string{"%22", "%3E", "%3C", "%20", "%3D", "%28", "%29", "%26"} {
+		if !strings.Contains(rawHref, encoded) {
+			t.Fatalf("adversarial authorization href lost encoded marker %q", encoded)
+		}
+	}
+	for _, escapedSeparator := range []string{"&amp;request=", "&amp;state="} {
+		if !strings.Contains(rawHref, escapedSeparator) {
+			t.Fatalf("adversarial authorization href is missing escaped separator %q", escapedSeparator)
+		}
+	}
+	for _, injected := range []string{"<img", "onerror=", `src="x"`, `href="#ZgotmplZ"`} {
+		if strings.Contains(rawBody, injected) {
+			t.Fatalf("adversarial authorization URL injected forbidden markup %q", injected)
+		}
+	}
+	if !strings.Contains(rawBody, "<noscript>") ||
+		!strings.Contains(rawBody, `id="oidc-provider-navigation"`) {
+		t.Fatal("adversarial authorization page lost its native anchor contract")
+	}
+}
+
 func assertAuthenticationSecurityHeaders(t *testing.T, header http.Header) {
+	t.Helper()
+	assertCompanyOIDCSecurityHeaders(t, header, authenticationCSP)
+	if !strings.Contains(header.Get("Content-Security-Policy"), "connect-src 'self'") {
+		t.Fatal("Authentication CSP must allow only same-origin htmx connections")
+	}
+}
+
+func assertSensitiveFormSecurityHeaders(t *testing.T, header http.Header) {
+	t.Helper()
+	assertCompanyOIDCSecurityHeaders(t, header, sensitiveFormCSP)
+}
+
+func assertCompanyOIDCSecurityHeaders(t *testing.T, header http.Header, csp string) {
 	t.Helper()
 	want := map[string]string{
 		"Cache-Control":           "no-store",
 		"Referrer-Policy":         "same-origin",
 		"X-Frame-Options":         "DENY",
 		"X-Content-Type-Options":  "nosniff",
-		"Content-Security-Policy": authenticationCSP,
+		"Content-Security-Policy": csp,
 	}
 	for name, value := range want {
 		if got := header.Get(name); got != value {
 			t.Fatalf("%s = %q, want %q", name, got, value)
 		}
-	}
-	if !strings.Contains(header.Get("Content-Security-Policy"), "connect-src 'self'") {
-		t.Fatal("Authentication CSP must allow only same-origin htmx connections")
 	}
 }
 
@@ -2268,10 +2586,15 @@ func TestCompanyOIDCLinkStartVerifiesPasswordBeforeStartingLink(t *testing.T) {
 
 	valid := companyOIDCPasswordForm(fixture.admin.CSRFToken, "7", accountWebTestPassword)
 	response = companyOIDCPOST(fixture.server, "/settings/authentication/oidc/link", fixture.adminCookie(), valid, []string{companyOIDCWebPublicURL})
-	if response.Code != http.StatusSeeOther ||
-		response.Header().Get("Location") != service.linkStartResult.AuthorizationURL ||
-		service.linkStartCalls != 1 {
-		t.Fatalf("link start: status=%d location=%q calls=%d", response.Code, response.Header().Get("Location"), service.linkStartCalls)
+	assertCompanyOIDCProviderNavigation(
+		t,
+		response,
+		service.linkStartResult.AuthorizationURL,
+		"/settings/authentication",
+		"Back to Authentication settings",
+	)
+	if service.linkStartCalls != 1 {
+		t.Fatalf("link start calls = %d, want 1", service.linkStartCalls)
 	}
 	want := companyoidc.LinkStartInput{
 		ActorUserID:      fixture.admin.User.ID,
@@ -2280,10 +2603,11 @@ func TestCompanyOIDCLinkStartVerifiesPasswordBeforeStartingLink(t *testing.T) {
 		CallbackURI:      companyOIDCWebPublicURL + companyoidc.TestSignInCallbackPath,
 	}
 	if service.linkStartInput != want {
-		t.Fatalf("link start input = %#v, want %#v", service.linkStartInput, want)
+		t.Fatal("link start did not receive the exact expected input")
 	}
-	assertSecretAbsent(t, response.Body.String(), accountWebTestPassword)
-	assertAuthenticationSecurityHeaders(t, response.Header())
+	if strings.Contains(response.Body.String(), accountWebTestPassword) {
+		t.Fatal("successful link continuation exposed the current password")
+	}
 }
 
 func TestCompanyOIDCLinkStartUnavailableGateRunsBeforePasswordVerification(t *testing.T) {
@@ -2654,14 +2978,19 @@ func TestCompanyOIDCLoginStartRequiresValidCompanyCSRFAndSetsBindingCookie(t *te
 	t.Run("success", func(t *testing.T) {
 		service.reset()
 		response := companyOIDCPOST(fixture.server, "/settings/authentication/oidc/login", nil, url.Values{csrfFormField: {validToken}}, []string{companyOIDCWebPublicURL})
-		if response.Code != http.StatusSeeOther ||
-			response.Header().Get("Location") != service.loginStartResult.AuthorizationURL ||
-			service.loginStartCalls != 1 {
-			t.Fatalf("status=%d location=%q calls=%d", response.Code, response.Header().Get("Location"), service.loginStartCalls)
+		assertCompanyOIDCProviderNavigation(
+			t,
+			response,
+			service.loginStartResult.AuthorizationURL,
+			"/login",
+			"Back to sign in",
+		)
+		if service.loginStartCalls != 1 {
+			t.Fatalf("login start calls = %d, want 1", service.loginStartCalls)
 		}
 		want := companyoidc.LoginStartInput{CallbackURI: companyOIDCWebPublicURL + companyoidc.TestSignInCallbackPath}
 		if service.loginStartInput != want {
-			t.Fatalf("login start input = %#v, want %#v", service.loginStartInput, want)
+			t.Fatal("login start did not receive the exact expected callback input")
 		}
 		cookie := optionalResponseCookie(t, response, companyLoginCookieName)
 		if cookie == nil ||
@@ -2670,9 +2999,11 @@ func TestCompanyOIDCLoginStartRequiresValidCompanyCSRFAndSetsBindingCookie(t *te
 			cookie.MaxAge != companyLoginCookieMaxAge ||
 			!cookie.HttpOnly ||
 			cookie.SameSite != http.SameSiteLaxMode {
-			t.Fatalf("binding cookie = %#v", cookie)
+			t.Fatal("binding cookie did not match the expected value and attributes")
 		}
-		assertSecretAbsent(t, response.Body.String(), "browser-token-canary")
+		if strings.Contains(response.Body.String(), "browser-token-canary") {
+			t.Fatal("successful Login continuation exposed the browser-binding token")
+		}
 	})
 }
 
@@ -3073,6 +3404,7 @@ func TestLoginPageOffersCompanySignInOnlyWhileAvailable(t *testing.T) {
 			if response.Code != http.StatusOK {
 				t.Fatalf("login page returned %d", response.Code)
 			}
+			assertSensitiveFormSecurityHeaders(t, response.Header())
 			body := response.Body.String()
 			for _, marker := range []string{buttonLabel, formAction, companyCSRFPrefix} {
 				if strings.Contains(body, marker) != tc.available {
@@ -3106,6 +3438,7 @@ func TestLoginPageOffersCompanySignInOnlyWhileAvailable(t *testing.T) {
 		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), tc.copy) {
 			t.Fatalf("notice %q: status=%d body missing %q", tc.notice, response.Code, tc.copy)
 		}
+		assertSensitiveFormSecurityHeaders(t, response.Header())
 	}
 	response := companyOIDCGET(fixture.server, "/login?notice=unknown-canary", nil)
 	body := response.Body.String()
