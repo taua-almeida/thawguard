@@ -20,6 +20,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/auth"
 	"github.com/taua-almeida/thawguard/internal/companyoidc"
 	"github.com/taua-almeida/thawguard/internal/domain"
+	"github.com/taua-almeida/thawguard/internal/forgeconnection"
 	"github.com/taua-almeida/thawguard/internal/freeze"
 	"github.com/taua-almeida/thawguard/internal/jobs"
 	"github.com/taua-almeida/thawguard/internal/repository"
@@ -84,6 +85,11 @@ type Config struct {
 	AuthService                           AuthService
 	CompanyOIDCService                    CompanyOIDCService
 	CompanyOIDCSecretEncryptionConfigured bool
+	// ForgeConnectionService backs the Administrator-only Forgejo connection
+	// preview at /settings/forge-access; optional (the page degrades to an
+	// unavailable notice when absent).
+	ForgeConnectionService                    ForgeConnectionService
+	ForgeConnectionSecretEncryptionConfigured bool
 	// PullRequestStore feeds the freeze-impact preview from the
 	// webhook-synced local cache; optional (the preview degrades to the
 	// zero state when absent).
@@ -376,8 +382,8 @@ func NewServer(cfg Config) *Server {
 
 func (s *Server) Routes() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if isAuthenticationSettingsPath(r.URL.Path) || r.URL.Path == "/login" || isPasswordRecoveryPath(r.URL.Path) ||
-			isInvitationSensitivePath(r.URL.Path) {
+		if isAuthenticationSettingsPath(r.URL.Path) || isForgeAccessPath(r.URL.Path) || r.URL.Path == "/login" ||
+			isPasswordRecoveryPath(r.URL.Path) || isInvitationSensitivePath(r.URL.Path) {
 			w.Header().Set("Cache-Control", "no-store")
 			// no-referrer makes browsers serialize Origin as "null" for form
 			// posts initiated by sensitive documents, so exact-Origin validation
@@ -406,6 +412,13 @@ func (s *Server) Routes() http.Handler {
 
 func isAuthenticationSettingsPath(path string) bool {
 	return path == "/settings/authentication" || strings.HasPrefix(path, "/settings/authentication/")
+}
+
+// isForgeAccessPath matches the Forge access routes. Every response there,
+// including errors, carries the sensitive no-store header set: the page
+// handles a write-only service credential and credential-visible inventory.
+func isForgeAccessPath(path string) bool {
+	return path == "/settings/forge-access" || strings.HasPrefix(path, "/settings/forge-access/")
 }
 
 func isPasswordRecoveryPath(path string) bool {
@@ -506,6 +519,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /settings/authentication/oidc/unlink", s.handleCompanyOIDCUnlink)
 	s.mux.HandleFunc("POST /settings/authentication/oidc/login", s.handleCompanyOIDCLoginStart)
 	s.mux.HandleFunc("GET /settings/authentication/oidc/callback", s.handleCompanyOIDCCallback)
+	s.mux.HandleFunc("GET /settings/forge-access", s.handleForgeAccess)
+	s.mux.HandleFunc("POST /settings/forge-access", s.handleForgeAccessSave)
+	s.mux.HandleFunc("POST /settings/forge-access/check", s.handleForgeAccessCheck)
+	s.mux.HandleFunc("POST /settings/forge-access/reset", s.handleForgeAccessReset)
 	s.mux.HandleFunc("POST /users", s.handleCreateUser)
 	s.mux.HandleFunc("POST /users/invitations", s.handleCreateInvitation)
 	s.mux.HandleFunc("POST /users/invitations/{id}/cancel", s.handleCancelInvitation)
@@ -2318,6 +2335,11 @@ var activityActionDefinitions = map[string]activityActionDefinition{
 	audit.ActionOIDCIdentityUnlinked:               {Label: "Company identity", Outcome: "Unlinked", OutcomeClass: "warning"},
 	audit.ActionOIDCConnectionEnabled:              {Label: "Company login", Outcome: "Enabled", OutcomeClass: "ok"},
 	audit.ActionOIDCConnectionDisabled:             {Label: "Company login", Outcome: "Disabled", OutcomeClass: "warning"},
+	audit.ActionForgeConnectionCreated:             {Label: "Forge connection", Outcome: "Saved", OutcomeClass: "ok"},
+	audit.ActionForgeConnectionUpdated:             {Label: "Forge connection", Outcome: "Changed", OutcomeClass: "frozen"},
+	audit.ActionForgeConnectionCheckStarted:        {Label: "Forge connection check", Outcome: "Started", OutcomeClass: "pending"},
+	audit.ActionForgeConnectionChecked:             {Label: "Forge connection check", Outcome: "Checked", OutcomeClass: "ok"},
+	audit.ActionForgeConnectionReset:               {Label: "Forge connection", Outcome: "Reset", OutcomeClass: "warning"},
 }
 
 func activityEventViews(repositories []domain.Repository, users []auth.User, events []audit.Event) []activityEventView {
@@ -2547,6 +2569,36 @@ func activityEventViewForEvent(repositories map[int64]domain.Repository, users m
 		}
 		view.Target = "Company OIDC connection"
 		view.Detail = detail
+	case audit.ActionForgeConnectionCreated, audit.ActionForgeConnectionUpdated:
+		detail, ok := activityForgeConnectionSavedDetail(event, details)
+		if !ok {
+			return fallbackActivityEventView(users, event, details, true, forceUnknownInvitationActor)
+		}
+		view.Target = activityForgeConnectionTarget(event)
+		view.Detail = detail
+	case audit.ActionForgeConnectionCheckStarted:
+		detail, ok := activityForgeConnectionCheckStartedDetail(event, details)
+		if !ok {
+			return fallbackActivityEventView(users, event, details, true, forceUnknownInvitationActor)
+		}
+		view.Target = activityForgeConnectionTarget(event)
+		view.Detail = detail
+	case audit.ActionForgeConnectionChecked:
+		detail, outcome, outcomeClass, ok := activityForgeConnectionCheckedDetail(event, details)
+		if !ok {
+			return fallbackActivityEventView(users, event, details, true, forceUnknownInvitationActor)
+		}
+		view.Target = activityForgeConnectionTarget(event)
+		view.Detail = detail
+		view.Outcome = outcome
+		view.OutcomeClass = outcomeClass
+	case audit.ActionForgeConnectionReset:
+		detail, ok := activityForgeConnectionResetDetail(event, details)
+		if !ok {
+			return fallbackActivityEventView(users, event, details, true, forceUnknownInvitationActor)
+		}
+		view.Target = activityForgeConnectionTarget(event)
+		view.Detail = detail
 	case audit.ActionRepositoryGrantAdded:
 		view.Target = activityRepositoryTarget(repositories, event, details, "")
 		if provenance, ok := activityExactStringDetail(details, "provenance"); ok && provenance == "invitation_acceptance" {
@@ -2649,7 +2701,12 @@ func activityHasGuardedDetails(action string) bool {
 		audit.ActionOIDCIdentityLinked,
 		audit.ActionOIDCIdentityUnlinked,
 		audit.ActionOIDCConnectionEnabled,
-		audit.ActionOIDCConnectionDisabled:
+		audit.ActionOIDCConnectionDisabled,
+		audit.ActionForgeConnectionCreated,
+		audit.ActionForgeConnectionUpdated,
+		audit.ActionForgeConnectionCheckStarted,
+		audit.ActionForgeConnectionChecked,
+		audit.ActionForgeConnectionReset:
 		return true
 	default:
 		return false
@@ -2676,6 +2733,15 @@ func activityGuardedDetail(action, key string) bool {
 		return key == "revision"
 	case audit.ActionOIDCIdentityUnlinked, audit.ActionOIDCConnectionDisabled:
 		return key == "revision" || key == "cause"
+	case audit.ActionForgeConnectionCreated, audit.ActionForgeConnectionUpdated:
+		return key == "revision" || key == "pat_replaced"
+	case audit.ActionForgeConnectionCheckStarted:
+		return key == "revision" || key == "generation"
+	case audit.ActionForgeConnectionChecked:
+		return key == "revision" || key == "generation" || key == "result_code" ||
+			key == "visible_count" || key == "private_count"
+	case audit.ActionForgeConnectionReset:
+		return key == "revision"
 	default:
 		return false
 	}
@@ -3256,6 +3322,144 @@ func activityOIDCRevision(details activityDetails) (int64, bool) {
 		return 0, false
 	}
 	return revision, true
+}
+
+// validForgeConnectionSubject accepts only a forge_connection subject with a
+// canonical positive decimal id, so the target can echo the internal id and
+// nothing else.
+func validForgeConnectionSubject(event audit.Event) bool {
+	if event.SubjectType != audit.SubjectTypeForgeConnection || event.SubjectID == "" || len(event.SubjectID) > 19 {
+		return false
+	}
+	if event.SubjectID[0] < '1' || event.SubjectID[0] > '9' {
+		return false
+	}
+	for i := range len(event.SubjectID) {
+		if event.SubjectID[i] < '0' || event.SubjectID[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func activityForgeConnectionTarget(event audit.Event) string {
+	return "Forge connection " + event.SubjectID
+}
+
+func activityForgeConnectionSavedDetail(event audit.Event, details activityDetails) (string, bool) {
+	if !validForgeConnectionSubject(event) || len(details) != 2 {
+		return "", false
+	}
+	revision, ok := activityOIDCRevision(details)
+	if !ok {
+		return "", false
+	}
+	var patReplaced bool
+	if raw, present := details["pat_replaced"]; !present || json.Unmarshal(raw, &patReplaced) != nil {
+		return "", false
+	}
+	patDetail := "existing Administrator-attested service PAT retained"
+	if revision == 1 {
+		patDetail = "Administrator-attested service PAT stored"
+	} else if patReplaced {
+		patDetail = "service PAT replaced with a fresh Administrator attestation"
+	}
+	return fmt.Sprintf("Revision %d saved; %s. No roles changed and no repositories were added.", revision, patDetail), true
+}
+
+func activityForgeConnectionCheckStartedDetail(event audit.Event, details activityDetails) (string, bool) {
+	if !validForgeConnectionSubject(event) || len(details) != 2 {
+		return "", false
+	}
+	revision, ok := activityOIDCRevision(details)
+	if !ok {
+		return "", false
+	}
+	var generation int64
+	if raw, present := details["generation"]; !present || json.Unmarshal(raw, &generation) != nil || generation <= 0 {
+		return "", false
+	}
+	return fmt.Sprintf(
+		"Revision %d, check %d reserved. If no result follows, the check was interrupted; run it again. No roles changed and no repositories were added.",
+		revision,
+		generation,
+	), true
+}
+
+func activityForgeConnectionCheckedDetail(
+	event audit.Event,
+	details activityDetails,
+) (detail string, outcome string, outcomeClass string, ok bool) {
+	if !validForgeConnectionSubject(event) {
+		return "", "", "", false
+	}
+	revision, ok := activityOIDCRevision(details)
+	if !ok {
+		return "", "", "", false
+	}
+	var generation int64
+	if raw, present := details["generation"]; !present || json.Unmarshal(raw, &generation) != nil || generation <= 0 {
+		return "", "", "", false
+	}
+	var resultText string
+	if raw, present := details["result_code"]; !present || json.Unmarshal(raw, &resultText) != nil {
+		return "", "", "", false
+	}
+	result := forgeconnection.CheckResultCode(resultText)
+	if !result.Valid() {
+		return "", "", "", false
+	}
+	prefix := fmt.Sprintf("Revision %d, check %d: ", revision, generation)
+	if result.Observed() {
+		if len(details) != 5 {
+			return "", "", "", false
+		}
+		var visible, private int64
+		if raw, present := details["visible_count"]; !present || json.Unmarshal(raw, &visible) != nil || visible < 0 {
+			return "", "", "", false
+		}
+		if raw, present := details["private_count"]; !present || json.Unmarshal(raw, &private) != nil || private < 0 || private > visible {
+			return "", "", "", false
+		}
+		if result == forgeconnection.CheckVisibleInventoryObserved {
+			return prefix + fmt.Sprintf(
+				"%d repositories visible to the attested credential (%d private); private-read capability observed. No roles changed and no repositories were added.",
+				visible,
+				private,
+			), "Observed", "ok", true
+		}
+		return prefix + fmt.Sprintf(
+			"%d repositories visible to the attested credential; no private repository was visible, so private-read capability is unproven. No roles changed and no repositories were added.",
+			visible,
+		), "Observed", "warning", true
+	}
+	if len(details) != 3 {
+		return "", "", "", false
+	}
+	failureCopy := map[forgeconnection.CheckResultCode]string{
+		forgeconnection.CheckUnavailable:             "the installation was unavailable.",
+		forgeconnection.CheckInvalidResponse:         "the installation returned an invalid response.",
+		forgeconnection.CheckAuthenticationFailed:    "the service credential was not accepted.",
+		forgeconnection.CheckAuthorizationFailed:     "the service credential was denied read access.",
+		forgeconnection.CheckServiceUserIsAdmin:      "the service account reports site-administrator rights; use a dedicated non-administrator organization owner.",
+		forgeconnection.CheckServiceUserChanged:      "the credential no longer belongs to the bound service account.",
+		forgeconnection.CheckOrganizationUnavailable: "the configured organization was not visible to the credential.",
+		forgeconnection.CheckOrganizationChanged:     "the bound organization identity was no longer visible to the credential.",
+		forgeconnection.CheckPaginationIncomplete:    "the repository listing did not paginate consistently.",
+		forgeconnection.CheckInventoryLimitExceeded:  "the visible inventory exceeded the preview limits.",
+	}[result]
+	return prefix + failureCopy + " The last observed preview was retained.", "Failed", "failed", true
+}
+
+func activityForgeConnectionResetDetail(event audit.Event, details activityDetails) (string, bool) {
+	if !validForgeConnectionSubject(event) || len(details) != 1 {
+		return "", false
+	}
+	revision, ok := activityOIDCRevision(details)
+	if !ok {
+		return "", false
+	}
+	return fmt.Sprintf("Revision %d: the connection, its preview, and its evidence were deleted. The internal id is never reused.", revision), true
 }
 
 func activitySetupCheckDetail(details activityDetails) string {

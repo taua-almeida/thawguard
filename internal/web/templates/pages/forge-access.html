@@ -1,0 +1,176 @@
+{{ define "pages/forge-access" }}
+<div class="flex min-w-0 flex-col gap-6">
+  <header>
+    <h1 class="m-0 text-page-title font-bold text-text">Forge access</h1>
+    <p class="m-0 mt-1 text-sm text-text-muted">Preview the repositories visible to one Administrator-attested Forgejo service credential. Preview only: no Thawguard roles change and no repositories are added.</p>
+  </header>
+
+  {{ if .LoadError }}
+  <div role="alert">{{ template "ui/callout" dict "Tone" "danger" "Title" "Forge access unavailable" "Body" .LoadError }}</div>
+  {{ else }}
+
+  <div role="note">{{ template "ui/callout" dict "Tone" "info" "Title" "Preview only." "Body" "This page observes what the attested credential can see. It never adds or binds repositories, never changes roles or grants, and cannot verify PAT scopes with the provider." }}</div>
+
+  {{ if not .EncryptionAvailable }}
+  <div role="alert">{{ template "ui/callout" dict "Tone" "warning" "Title" "Service PAT encryption unavailable" "Body" "Configure THAWGUARD_SECRET_KEY and restart Thawguard before saving a PAT or running a check. Saved non-secret configuration remains readable, and reset remains available." }}</div>
+  {{ end }}
+
+  {{ if .ShowForm }}
+  <section class="min-w-0 rounded-panel border border-border bg-surface p-4 shadow-card sm:p-6" aria-labelledby="forge-access-form-title">
+    <div class="flex flex-wrap items-start justify-between gap-3">
+      <div>
+        <h2 id="forge-access-form-title" class="m-0 text-lg font-bold text-text">{{ if .Editing }}Edit Forgejo connection{{ else }}Configure Forgejo connection{{ end }}</h2>
+        <p class="m-0 mt-1 text-sm text-text-muted">Saving prepares a read-only preview connection. Nothing is checked until you run the connection check.</p>
+      </div>
+      <span class="inline-flex rounded-pill bg-neutral-soft px-2.5 py-1 text-xs font-semibold text-text">Preview</span>
+    </div>
+    {{ if .FormError }}<div class="mt-4" role="alert">{{ template "ui/callout" dict "Tone" "danger" "Body" .FormError }}</div>{{ end }}
+    <form method="post" action="/settings/forge-access" class="mt-5 flex min-w-0 flex-col gap-4">
+      <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+      <input type="hidden" name="expected_connection_id" value="{{ .Form.ExpectedConnectionID }}">
+      <input type="hidden" name="expected_revision" value="{{ .Form.ExpectedRevision }}">
+      {{ template "ui/input" dict "ID" "forge-display-name" "Name" "display_name" "Label" "Display name" "Value" .Form.DisplayName "Maxlength" 80 "Required" true "Autocomplete" "off" }}
+      {{ if .Bound }}
+      <input type="hidden" name="base_url" value="{{ .Connection.BaseURL }}">
+      <input type="hidden" name="organization_slug" value="{{ .Connection.OrganizationSlug }}">
+      <dl class="grid min-w-0 grid-cols-1 gap-x-6 gap-y-4 sm:grid-cols-2">
+        <div class="min-w-0 sm:col-span-2"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Installation URL</dt><dd class="m-0 mt-1 break-all font-mono text-sm text-text">{{ .Connection.BaseURL }}</dd><dd class="m-0 mt-1 text-xs text-text-muted">Fixed once identities are bound. Reset the connection to change it.</dd></div>
+        <div class="min-w-0 sm:col-span-2"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Organization</dt><dd class="m-0 mt-1 break-all font-mono text-sm text-text">{{ .Connection.OrganizationSlug }}</dd></div>
+      </dl>
+      {{ else }}
+      {{ template "ui/input" dict "ID" "forge-base-url" "Name" "base_url" "Label" "Installation URL" "Value" .Form.BaseURL "Maxlength" 2048 "Required" true "Autocomplete" "off" "Mono" true "Hint" "Forgejo installation root, for example https://forge.example.test or https://example.test/forge. HTTPS is required; HTTP is allowed only for localhost or loopback addresses. Stored without a trailing slash. Changing the URL of a saved connection always requires a replacement PAT attested for the new destination." }}
+      {{ template "ui/input" dict "ID" "forge-organization" "Name" "organization_slug" "Label" "Organization" "Value" .Form.OrganizationSlug "Maxlength" 255 "Required" true "Autocomplete" "off" "Mono" true "Hint" "Exact Forgejo organization name. The URL and organization can be corrected until the first successful check binds their identities." }}
+      {{ end }}
+      <div class="flex flex-col gap-1.5">
+        <label for="forge-service-pat" class="text-sm font-semibold text-text">{{ if .Editing }}Replace service PAT{{ else }}Service PAT<span class="text-danger" aria-hidden="true"> *</span>{{ end }}</label>
+        <p id="forge-service-pat-hint" class="m-0 text-xs text-text-muted">{{ if .Editing }}Leave blank to keep the stored PAT for the saved installation URL. A non-empty value always replaces it and requires a fresh attestation, and changing the installation URL always requires a replacement PAT.{{ else }}Stored encrypted, write-only, and never shown again after saving.{{ end }}</p>
+        <input id="forge-service-pat" name="service_pat" type="password" class="h-(--control-height) w-full rounded-control border border-border-input bg-surface px-3 text-sm text-text placeholder:text-text-muted" maxlength="1024" autocomplete="new-password" aria-describedby="forge-service-pat-hint"{{ if not .Editing }} required{{ end }}>
+      </div>
+      {{ template "ui/checkbox" dict "ID" "forge-pat-attested" "Name" "pat_attested" "Value" "attested" "Label" "Administrator attestation" "Hint" "I attest this PAT belongs to a dedicated organization owner that is not a site Administrator, and was created with only read:user, read:organization, and read:repository in All-resources mode, with no write scopes. Forgejo cannot prove a PAT's scopes to Thawguard; this remains an Administrator attestation, never a provider-verified fact." }}
+      <div>{{ template "ui/button" dict "Label" "Save connection" "Variant" "primary" "Type" "submit" }}</div>
+    </form>
+    {{ if .Editing }}<div class="mt-4">{{ template "ui/button" dict "Label" "Cancel" "Variant" "secondary" "Href" "/settings/forge-access" }}</div>{{ end }}
+  </section>
+  {{ else if .HasConnection }}
+  <section class="min-w-0 rounded-panel border border-border bg-surface p-4 shadow-card sm:p-6" aria-labelledby="forge-connection-title">
+    <div class="flex flex-wrap items-start justify-between gap-3">
+      <div>
+        <h2 id="forge-connection-title" class="m-0 text-lg font-bold text-text">{{ .Connection.DisplayName }}</h2>
+        <p class="m-0 mt-1 text-sm text-text-muted">Forgejo connection preview. Check evidence reflects only the explicitly saved revision.</p>
+      </div>
+      {{ if .Bound }}
+      <span class="inline-flex rounded-pill bg-accent-soft px-2.5 py-1 text-xs font-semibold text-accent-strong">Identities bound</span>
+      {{ else }}
+      <span class="inline-flex rounded-pill bg-neutral-soft px-2.5 py-1 text-xs font-semibold text-text">Preview</span>
+      {{ end }}
+    </div>
+    <dl class="mt-5 grid min-w-0 grid-cols-1 gap-x-6 gap-y-4 sm:grid-cols-2">
+      <div class="min-w-0 sm:col-span-2"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Installation URL</dt><dd class="m-0 mt-1 break-all font-mono text-sm text-text">{{ .Connection.BaseURL }}</dd></div>
+      <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Organization</dt><dd class="m-0 mt-1 break-all font-mono text-sm text-text">{{ .OrganizationLabel }}</dd>{{ if .Bound }}<dd class="m-0 mt-1 text-xs text-text-muted">Bound to the organization identity observed at the first successful check; renames refresh automatically.</dd>{{ end }}</div>
+      <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Revision</dt><dd class="m-0 mt-1 text-sm text-text">{{ .Connection.Revision }}</dd></div>
+      <div class="min-w-0 sm:col-span-2"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Service PAT</dt><dd class="m-0 mt-1 flex items-center gap-2 text-sm font-semibold text-success"><svg class="h-4 w-4 flex-none" aria-hidden="true"><use href="#tg-i-check"></use></svg>Administrator-attested PAT stored</dd><dd class="m-0 mt-1 text-xs text-text-muted">Attested {{ .PATAttestedAt }} as read-only for a dedicated non-Administrator organization owner. The value is write-only and never redisplayed; Thawguard has not verified its scopes with the provider.</dd></div>
+    </dl>
+
+    <div class="mt-5" role="status">{{ template "ui/callout" dict "Tone" .CheckState.Tone "Title" .CheckState.Heading "Body" .CheckState.Summary }}</div>
+    {{ if eq .CheckState.State "stale" }}
+    <p class="m-0 mt-2 text-sm text-text-muted">Last recorded result: {{ .CheckState.ResultText }}</p>
+    {{ end }}
+    {{ if .CheckState.CheckedAt }}
+    <p class="m-0 mt-2 text-xs text-text-muted">Recorded {{ .CheckState.CheckedAt }}{{ with .CheckState.Version }} · Forgejo version {{ . }} as reported by the installation{{ end }}.</p>
+    {{ end }}
+
+    <div class="mt-5 flex flex-wrap items-center gap-3">
+      {{ if .EncryptionAvailable }}
+      <form method="post" action="/settings/forge-access/check">
+        <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+        <input type="hidden" name="expected_connection_id" value="{{ .Connection.ID }}">
+        <input type="hidden" name="expected_revision" value="{{ .Connection.Revision }}">
+        {{ template "ui/button" dict "Label" "Run connection check" "Variant" "primary" "Type" "submit" "Icon" "tg-i-check" }}
+      </form>
+      {{ template "ui/button" dict "Label" "Edit connection" "Variant" "secondary" "Href" "/settings/forge-access?edit=1" }}
+      {{ else }}
+      <p class="m-0 text-sm font-semibold text-warning">Checking and PAT replacement are disabled until service PAT encryption is configured.</p>
+      {{ end }}
+      {{ template "ui/button" dict "Label" "Reset connection" "Variant" "danger" "Href" "/settings/forge-access?reset=confirm" "DialogTarget" "forge-reset-confirm" }}
+    </div>
+    <p class="m-0 mt-2 text-xs text-text-muted">The check is non-mutating: it reads the installation version, the service account, its organizations, and every repository page visible to the credential. It never probes a write endpoint and never claims write scopes are absent.</p>
+
+    <section class="mt-5" aria-labelledby="forge-preview-title">
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h3 id="forge-preview-title" class="m-0 text-base font-bold text-text">{{ if .PreviewLabel }}{{ .PreviewLabel }}{{ else }}Repositories visible to this attested credential{{ end }}</h3>
+          <p class="m-0 mt-1 text-sm text-text-muted">A stable listing proves only the inventory visible to this credential, never a complete organization inventory. Disappearance from this preview is not evidence of remote absence or access change.</p>
+        </div>
+        {{ if .PreviewStale }}{{ template "ui/badge" dict "Label" "Last observed preview" "Tone" "warning" }}{{ end }}
+      </div>
+      {{ if .PreviewAvailable }}
+      <form method="get" action="/settings/forge-access" class="mt-4 flex flex-wrap items-center gap-3">
+        <label for="forge-preview-search" class="sr-only">Search repositories</label>
+        <input id="forge-preview-search" name="q" type="search" value="{{ .PreviewSearch }}" maxlength="100" placeholder="Search owner/name" class="h-(--control-height) w-full max-w-md rounded-control border border-border-input bg-surface px-3 text-sm text-text placeholder:text-text-muted">
+        {{ template "ui/button" dict "Label" "Search" "Variant" "secondary" "Type" "submit" "Icon" "tg-i-search" }}
+      </form>
+      <div class="mt-3 flex flex-wrap gap-2">
+        {{ range .PreviewChips }}{{ template "ui/chip" dict "Label" .Label "Href" .URL "Active" .Active }}{{ end }}
+      </div>
+      {{ if .PreviewNoMatch }}
+      <div class="mt-4">{{ template "ui/empty-state" dict "Title" "No repositories match" "Hint" "No repositories in the retained preview match this search and filter." "Icon" "tg-i-search" }}</div>
+      {{ else }}
+      <div class="mt-4 overflow-x-auto rounded-panel border border-border bg-surface shadow-card">
+        <table class="w-full border-collapse text-sm">
+          <caption class="sr-only">Repositories visible to the attested credential</caption>
+          <thead>
+            <tr class="bg-surface-muted text-left">
+              <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Repository</th>
+              <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Default branch</th>
+              <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Visibility</th>
+              <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Observed</th>
+            </tr>
+          </thead>
+          <tbody>
+            {{ range .PreviewRows }}
+            <tr class="border-t border-border">
+              <td class="px-4 py-3 break-all font-mono text-text">{{ .FullName }}</td>
+              <td class="px-4 py-3 break-all font-mono text-text">{{ .DefaultBranch }}</td>
+              <td class="px-4 py-3">{{ template "ui/badge" dict "Label" .VisibilityLabel "Tone" .VisibilityTone }}</td>
+              <td class="px-4 py-3 text-text-muted">{{ .ObservedAt }}</td>
+            </tr>
+            {{ end }}
+          </tbody>
+        </table>
+        {{ with .PreviewPager }}{{ template "ui/pager" dict "Pager" . "Noun" "repositories" }}{{ end }}
+      </div>
+      {{ end }}
+      {{ else if and .PreviewEmpty .PreviewStale }}
+      <div class="mt-4">{{ template "ui/empty-state" dict "Title" "Empty visible inventory (last observed)" "Hint" "The last successful check observed no repositories visible to this attested credential, and the connection has since been edited or a newer check did not complete. Run a fresh check to record current evidence." }}</div>
+      {{ else if .PreviewEmpty }}
+      <div class="mt-4">{{ template "ui/empty-state" dict "Title" "Empty visible inventory" "Hint" "The recorded check observed no repositories visible to this attested credential. This proves only what the credential could see, not what the organization contains." }}</div>
+      {{ else }}
+      <div class="mt-4">{{ template "ui/empty-state" dict "Title" "No preview recorded yet" "Hint" "Run a connection check to record the repositories visible to the attested credential. Nothing is added to Thawguard." }}</div>
+      {{ end }}
+    </section>
+  </section>
+
+  {{ template "ui/modal" dict
+    "ID" "forge-reset-confirm"
+    "Open" .ResetConfirmOpen
+    "Title" "Reset Forge connection?"
+    "Body" "This deletes the saved connection, its attested service PAT, its check evidence, and the entire preview. No local repositories, roles, or grants are affected. The internal connection id is never reused."
+    "ConfirmLabel" "Reset connection"
+    "ConfirmVariant" "danger"
+    "Action" "/settings/forge-access/reset"
+    "CSRFField" .CSRFField
+    "CSRFToken" .CSRFToken
+    "Fields" (dict "expected_connection_id" (printf "%d" .Connection.ID) "expected_revision" (printf "%d" .Connection.Revision) "confirm_reset" "delete")
+  }}
+  {{ else }}
+  <section class="flex min-h-72 flex-col items-center justify-center rounded-panel border border-border bg-surface px-5 py-10 text-center shadow-card" aria-labelledby="no-forge-connection-title">
+    <span class="flex size-14 items-center justify-center rounded-pill bg-accent-soft text-accent-strong" aria-hidden="true"><svg class="h-7 w-7"><use href="#tg-i-lock"></use></svg></span>
+    <h2 id="no-forge-connection-title" class="m-0 mt-4 text-lg font-bold text-text">No Forge connection configured</h2>
+    <p class="m-0 mt-2 max-w-2xl text-sm text-text-muted">Saving a connection prepares a read-only preview of the repositories visible to an Administrator-attested service credential. No repositories are added and no roles change.</p>
+  </section>
+  {{ end }}
+
+  <p class="m-0 text-sm text-text-muted">Forge access previews credential visibility only. Repository management and Thawguard roles stay unchanged.</p>
+  {{ end }}
+</div>
+{{ end }}

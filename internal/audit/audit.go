@@ -76,17 +76,23 @@ const (
 	ActionOIDCConnectionDisabled             = "oidc_connection.disabled"
 	ActionOIDCIdentityLinked                 = "oidc_identity.linked"
 	ActionOIDCIdentityUnlinked               = "oidc_identity.unlinked"
+	ActionForgeConnectionCreated             = "forge.connection_created"
+	ActionForgeConnectionUpdated             = "forge.connection_updated"
+	ActionForgeConnectionCheckStarted        = "forge.connection_check_started"
+	ActionForgeConnectionChecked             = "forge.connection_checked"
+	ActionForgeConnectionReset               = "forge.connection_reset"
 
 	ActorKindPasswordRecoveryLink = "recovery_link"
 	ActorKindInvitationLink       = "invitation_link"
 
-	SubjectTypeRepository     = "repository"
-	SubjectTypeSchedule       = "schedule"
-	SubjectTypeBranchFreeze   = "branch_freeze"
-	SubjectTypeThawException  = "thaw_exception"
-	SubjectTypeUser           = "user"
-	SubjectTypeInvitation     = "invitation"
-	SubjectTypeOIDCConnection = "oidc_connection"
+	SubjectTypeRepository      = "repository"
+	SubjectTypeSchedule        = "schedule"
+	SubjectTypeBranchFreeze    = "branch_freeze"
+	SubjectTypeThawException   = "thaw_exception"
+	SubjectTypeUser            = "user"
+	SubjectTypeInvitation      = "invitation"
+	SubjectTypeOIDCConnection  = "oidc_connection"
+	SubjectTypeForgeConnection = "forge_connection"
 )
 
 // KnownActions returns every audit action the application currently writes.
@@ -157,6 +163,11 @@ func KnownActions() []string {
 		ActionOIDCConnectionDisabled,
 		ActionOIDCIdentityLinked,
 		ActionOIDCIdentityUnlinked,
+		ActionForgeConnectionCreated,
+		ActionForgeConnectionUpdated,
+		ActionForgeConnectionCheckStarted,
+		ActionForgeConnectionChecked,
+		ActionForgeConnectionReset,
 	}
 }
 
@@ -236,9 +247,9 @@ var thawExceptionSubjectActions = []string{
 	ActionThawExceptionSharedHeadApproved,
 }
 
-// User, invitation, and company OIDC actions are deliberately absent from
-// every family: identity administration stays admin-only even when details
-// carry a repository_id.
+// User, invitation, company OIDC, and forge connection actions are
+// deliberately absent from every family: identity and installation
+// administration stays admin-only even when details carry a repository_id.
 
 // scopedAuditEventsSQL derives a nullable associated_repository_id for
 // every audit event entirely inside SQL, so read scopes filter before

@@ -2949,6 +2949,26 @@ func TestActivityMappingsCoverEveryKnownAuditAction(t *testing.T) {
 			event.SubjectID = "1"
 			event.DetailsJSON = `{"revision":1,"cause":"administrator"}`
 		}
+		if action == audit.ActionForgeConnectionCreated || action == audit.ActionForgeConnectionUpdated {
+			event.SubjectType = audit.SubjectTypeForgeConnection
+			event.SubjectID = "1"
+			event.DetailsJSON = `{"revision":1,"pat_replaced":true}`
+		}
+		if action == audit.ActionForgeConnectionCheckStarted {
+			event.SubjectType = audit.SubjectTypeForgeConnection
+			event.SubjectID = "1"
+			event.DetailsJSON = `{"revision":1,"generation":1}`
+		}
+		if action == audit.ActionForgeConnectionChecked {
+			event.SubjectType = audit.SubjectTypeForgeConnection
+			event.SubjectID = "1"
+			event.DetailsJSON = `{"revision":1,"generation":1,"result_code":"visible_inventory_observed","visible_count":2,"private_count":1}`
+		}
+		if action == audit.ActionForgeConnectionReset {
+			event.SubjectType = audit.SubjectTypeForgeConnection
+			event.SubjectID = "1"
+			event.DetailsJSON = `{"revision":1}`
+		}
 		view := activityEventViewForEvent(nil, nil, event)
 		if view.ActionLabel == "Unrecognized activity" || view.ActionLabel == "" || view.Outcome == "" || view.Target == "" || view.Detail == "" {
 			t.Fatalf("audit action %q lacks a complete curated activity mapping: %+v", action, view)
