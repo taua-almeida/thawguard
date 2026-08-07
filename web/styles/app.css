@@ -67,6 +67,8 @@
 @source "../../internal/web/templates/pages/account-password.html";
 @source "../../internal/web/templates/pages/error.html";
 @source "../../internal/web/templates/pages/authentication.html";
+@source "../../internal/web/templates/layouts/forge-access.html";
+@source "../../internal/web/templates/pages/forge-access.html";
 
 /*
  * Semantic tokens - LIGHT values (the default theme).

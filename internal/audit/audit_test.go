@@ -360,6 +360,11 @@ func TestScopedActionClassificationCoversEveryKnownAction(t *testing.T) {
 		"oidc_connection.disabled":                   adminOnly,
 		"oidc_identity.linked":                       adminOnly,
 		"oidc_identity.unlinked":                     adminOnly,
+		"forge.connection_created":                   adminOnly,
+		"forge.connection_updated":                   adminOnly,
+		"forge.connection_check_started":             adminOnly,
+		"forge.connection_checked":                   adminOnly,
+		"forge.connection_reset":                     adminOnly,
 	}
 
 	classified := map[string]string{}
