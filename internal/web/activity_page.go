@@ -70,7 +70,9 @@ func activityFilterActions(filter string) []string {
 		// double-count the "freeze_schedule." one-time window actions.
 		return activityActionsWithPrefix("branch_freeze.", "freeze_schedule.", "schedule.", "thaw_exception.")
 	case "repositories":
-		return activityActionsWithPrefix("repository.", "repository_grant.")
+		// "forge.repository_" adds the repository-targeted binding events
+		// without pulling in the connection-level "forge.connection_" family.
+		return activityActionsWithPrefix("repository.", "repository_grant.", "forge.repository_")
 	case "users":
 		return activityActionsWithPrefix("user.", "invitation.", "oidc_connection.", "repository_grant.")
 	default:

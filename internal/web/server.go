@@ -523,6 +523,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /settings/forge-access", s.handleForgeAccessSave)
 	s.mux.HandleFunc("POST /settings/forge-access/check", s.handleForgeAccessCheck)
 	s.mux.HandleFunc("POST /settings/forge-access/reset", s.handleForgeAccessReset)
+	s.mux.HandleFunc("POST /settings/forge-access/repositories/bind", s.handleForgeRepositoryBind)
+	s.mux.HandleFunc("POST /settings/forge-access/repositories/unbind", s.handleForgeRepositoryUnbind)
 	s.mux.HandleFunc("POST /users", s.handleCreateUser)
 	s.mux.HandleFunc("POST /users/invitations", s.handleCreateInvitation)
 	s.mux.HandleFunc("POST /users/invitations/{id}/cancel", s.handleCancelInvitation)
@@ -2340,6 +2342,8 @@ var activityActionDefinitions = map[string]activityActionDefinition{
 	audit.ActionForgeConnectionCheckStarted:        {Label: "Forge connection check", Outcome: "Started", OutcomeClass: "pending"},
 	audit.ActionForgeConnectionChecked:             {Label: "Forge connection check", Outcome: "Checked", OutcomeClass: "ok"},
 	audit.ActionForgeConnectionReset:               {Label: "Forge connection", Outcome: "Reset", OutcomeClass: "warning"},
+	audit.ActionForgeRepositoryBound:               {Label: "Forge repository binding", Outcome: "Bound", OutcomeClass: "ok"},
+	audit.ActionForgeRepositoryUnbound:             {Label: "Forge repository binding", Outcome: "Unbound", OutcomeClass: "warning"},
 }
 
 func activityEventViews(repositories []domain.Repository, users []auth.User, events []audit.Event) []activityEventView {
@@ -2599,6 +2603,13 @@ func activityEventViewForEvent(repositories map[int64]domain.Repository, users m
 		}
 		view.Target = activityForgeConnectionTarget(event)
 		view.Detail = detail
+	case audit.ActionForgeRepositoryBound, audit.ActionForgeRepositoryUnbound:
+		target, detail, ok := activityForgeRepositoryBindingDetail(repositories, event, details)
+		if !ok {
+			return fallbackActivityEventView(users, event, details, true, forceUnknownInvitationActor)
+		}
+		view.Target = target
+		view.Detail = detail
 	case audit.ActionRepositoryGrantAdded:
 		view.Target = activityRepositoryTarget(repositories, event, details, "")
 		if provenance, ok := activityExactStringDetail(details, "provenance"); ok && provenance == "invitation_acceptance" {
@@ -2706,7 +2717,9 @@ func activityHasGuardedDetails(action string) bool {
 		audit.ActionForgeConnectionUpdated,
 		audit.ActionForgeConnectionCheckStarted,
 		audit.ActionForgeConnectionChecked,
-		audit.ActionForgeConnectionReset:
+		audit.ActionForgeConnectionReset,
+		audit.ActionForgeRepositoryBound,
+		audit.ActionForgeRepositoryUnbound:
 		return true
 	default:
 		return false
@@ -2741,7 +2754,13 @@ func activityGuardedDetail(action, key string) bool {
 		return key == "revision" || key == "generation" || key == "result_code" ||
 			key == "visible_count" || key == "private_count"
 	case audit.ActionForgeConnectionReset:
-		return key == "revision"
+		return key == "revision" || key == "binding_revision"
+	case audit.ActionForgeRepositoryBound:
+		return key == "repository_id" || key == "repository_created_at" ||
+			key == "config_revision" || key == "check_generation" || key == "binding_revision"
+	case audit.ActionForgeRepositoryUnbound:
+		return key == "repository_id" || key == "repository_created_at" ||
+			key == "config_revision" || key == "binding_revision"
 	default:
 		return false
 	}
@@ -2952,6 +2971,9 @@ func activityInvitationAuthorizationRevokedDetail(details activityDetails) strin
 }
 
 func activityFallbackTarget(event audit.Event) string {
+	if event.Action == audit.ActionForgeRepositoryBound || event.Action == audit.ActionForgeRepositoryUnbound {
+		return "Former repository"
+	}
 	if event.SubjectType == audit.SubjectTypeInvitation {
 		return activityInvitationTarget(event)
 	}
@@ -3452,14 +3474,87 @@ func activityForgeConnectionCheckedDetail(
 }
 
 func activityForgeConnectionResetDetail(event audit.Event, details activityDetails) (string, bool) {
-	if !validForgeConnectionSubject(event) || len(details) != 1 {
+	if !validForgeConnectionSubject(event) || (len(details) != 1 && len(details) != 2) {
 		return "", false
 	}
 	revision, ok := activityOIDCRevision(details)
 	if !ok {
 		return "", false
 	}
-	return fmt.Sprintf("Revision %d: the connection, its preview, and its evidence were deleted. The internal id is never reused.", revision), true
+	rawBindingRevision, present := details["binding_revision"]
+	if !present {
+		if len(details) != 1 {
+			return "", false
+		}
+		return fmt.Sprintf(
+			"Revision %d: the connection, its preview, and its evidence were deleted. The internal id is never reused.",
+			revision,
+		), true
+	}
+	var bindingRevision int64
+	if json.Unmarshal(rawBindingRevision, &bindingRevision) != nil || bindingRevision < 0 {
+		return "", false
+	}
+	return fmt.Sprintf(
+		"Revision %d, binding revision %d: the connection, its preview, and its evidence were deleted. The internal id is never reused.",
+		revision,
+		bindingRevision,
+	), true
+}
+
+func activityForgeRepositoryBindingDetail(
+	repositories map[int64]domain.Repository,
+	event audit.Event,
+	details activityDetails,
+) (string, string, bool) {
+	if !validForgeConnectionSubject(event) ||
+		(event.Action != audit.ActionForgeRepositoryBound && event.Action != audit.ActionForgeRepositoryUnbound) {
+		return "", "", false
+	}
+	for key := range details {
+		if !activityGuardedDetail(event.Action, key) {
+			return "", "", false
+		}
+	}
+	configRevision, ok := activityPositiveInt64Detail(details, "config_revision")
+	if !ok {
+		return "", "", false
+	}
+	var bindingRevision int64
+	if raw, present := details["binding_revision"]; !present ||
+		json.Unmarshal(raw, &bindingRevision) != nil || bindingRevision <= 0 {
+		return "", "", false
+	}
+
+	target := "Former repository"
+	repositoryID, repositoryIDOK := activityPositiveInt64Detail(details, "repository_id")
+	createdAtText, createdAtOK := activityTextDetail(details, "repository_created_at", 64)
+	if repositoryIDOK && createdAtOK {
+		if _, err := forgeconnection.ParseRepositoryCreatedAt(createdAtText); err == nil {
+			if repository, found := repositories[repositoryID]; found &&
+				repository.CreatedAt.UTC().Format(time.RFC3339Nano) == createdAtText {
+				target = repository.FullName()
+			}
+		}
+	}
+
+	if event.Action == audit.ActionForgeRepositoryBound {
+		checkGeneration, ok := activityPositiveInt64Detail(details, "check_generation")
+		if !ok {
+			return "", "", false
+		}
+		return target, fmt.Sprintf(
+			"Configuration revision %d, check %d, binding revision %d: immutable repository identity metadata recorded. Repository-owned and operational state did not change.",
+			configRevision,
+			checkGeneration,
+			bindingRevision,
+		), true
+	}
+	return target, fmt.Sprintf(
+		"Configuration revision %d, binding revision %d: immutable repository identity metadata removed. Repository-owned and operational state did not change.",
+		configRevision,
+		bindingRevision,
+	), true
 }
 
 func activitySetupCheckDetail(details activityDetails) string {

@@ -2967,7 +2967,17 @@ func TestActivityMappingsCoverEveryKnownAuditAction(t *testing.T) {
 		if action == audit.ActionForgeConnectionReset {
 			event.SubjectType = audit.SubjectTypeForgeConnection
 			event.SubjectID = "1"
-			event.DetailsJSON = `{"revision":1}`
+			event.DetailsJSON = `{"revision":1,"binding_revision":0}`
+		}
+		if action == audit.ActionForgeRepositoryBound {
+			event.SubjectType = audit.SubjectTypeForgeConnection
+			event.SubjectID = "1"
+			event.DetailsJSON = `{"repository_id":1,"repository_created_at":"2026-08-01T10:00:00Z","config_revision":1,"check_generation":1,"binding_revision":1}`
+		}
+		if action == audit.ActionForgeRepositoryUnbound {
+			event.SubjectType = audit.SubjectTypeForgeConnection
+			event.SubjectID = "1"
+			event.DetailsJSON = `{"repository_id":1,"repository_created_at":"2026-08-01T10:00:00Z","config_revision":1,"binding_revision":1}`
 		}
 		view := activityEventViewForEvent(nil, nil, event)
 		if view.ActionLabel == "Unrecognized activity" || view.ActionLabel == "" || view.Outcome == "" || view.Target == "" || view.Detail == "" {
@@ -3671,7 +3681,7 @@ func TestActivityFilterActionsGroupKnownActions(t *testing.T) {
 	}
 	prefixes := map[string][]string{
 		"freeze":       {"branch_freeze.", "freeze_schedule.", "schedule.", "thaw_exception."},
-		"repositories": {"repository.", "repository_grant."},
+		"repositories": {"repository.", "repository_grant.", "forge.repository_"},
 		"users":        {"user.", "invitation.", "oidc_connection.", "repository_grant."},
 	}
 	for filter, allowed := range prefixes {
@@ -3703,6 +3713,12 @@ func TestActivityFilterActionsGroupKnownActions(t *testing.T) {
 	} {
 		if !slices.Contains(users, action) {
 			t.Fatalf("users chip is missing invitation action %q", action)
+		}
+	}
+	repositoriesChip := activityFilterActions("repositories")
+	for _, action := range []string{audit.ActionForgeRepositoryBound, audit.ActionForgeRepositoryUnbound} {
+		if !slices.Contains(repositoriesChip, action) {
+			t.Fatalf("repositories chip is missing forge binding action %q", action)
 		}
 	}
 }

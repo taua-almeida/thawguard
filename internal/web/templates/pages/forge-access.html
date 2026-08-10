@@ -2,17 +2,17 @@
 <div class="flex min-w-0 flex-col gap-6">
   <header>
     <h1 class="m-0 text-page-title font-bold text-text">Forge access</h1>
-    <p class="m-0 mt-1 text-sm text-text-muted">Preview the repositories visible to one Administrator-attested Forgejo service credential. Preview only: no Thawguard roles change and no repositories are added.</p>
+    <p class="m-0 mt-1 text-sm text-text-muted">Observe repositories visible to one Administrator-attested Forgejo credential and bind exact existing local repositories to immutable remote identities.</p>
   </header>
 
   {{ if .LoadError }}
   <div role="alert">{{ template "ui/callout" dict "Tone" "danger" "Title" "Forge access unavailable" "Body" .LoadError }}</div>
   {{ else }}
 
-  <div role="note">{{ template "ui/callout" dict "Tone" "info" "Title" "Preview only." "Body" "This page observes what the attested credential can see. It never adds or binds repositories, never changes roles or grants, and cannot verify PAT scopes with the provider." }}</div>
+  <div role="note">{{ template "ui/callout" dict "Tone" "info" "Title" "Identity metadata only." "Body" "A binding records which exact existing local repository corresponds to an observed immutable Forge repository identity. It does not prove current visibility, scopes, access, authority, enforcement readiness, or operational routing, and it changes no repository-owned state." }}</div>
 
   {{ if not .EncryptionAvailable }}
-  <div role="alert">{{ template "ui/callout" dict "Tone" "warning" "Title" "Service PAT encryption unavailable" "Body" "Configure THAWGUARD_SECRET_KEY and restart Thawguard before saving a PAT or running a check. Saved non-secret configuration remains readable, and reset remains available." }}</div>
+  <div role="alert">{{ template "ui/callout" dict "Tone" "warning" "Title" "Service PAT encryption unavailable" "Body" "Configure THAWGUARD_SECRET_KEY and restart Thawguard before saving a PAT or running a check. Saved metadata remains readable; existing bindings can still be removed." }}</div>
   {{ end }}
 
   {{ if .ShowForm }}
@@ -59,7 +59,7 @@
         <p class="m-0 mt-1 text-sm text-text-muted">Forgejo connection preview. Check evidence reflects only the explicitly saved revision.</p>
       </div>
       {{ if .Bound }}
-      <span class="inline-flex rounded-pill bg-accent-soft px-2.5 py-1 text-xs font-semibold text-accent-strong">Identities bound</span>
+      <span class="inline-flex rounded-pill bg-accent-soft px-2.5 py-1 text-xs font-semibold text-accent-strong">Forge identities bound</span>
       {{ else }}
       <span class="inline-flex rounded-pill bg-neutral-soft px-2.5 py-1 text-xs font-semibold text-text">Preview</span>
       {{ end }}
@@ -67,7 +67,8 @@
     <dl class="mt-5 grid min-w-0 grid-cols-1 gap-x-6 gap-y-4 sm:grid-cols-2">
       <div class="min-w-0 sm:col-span-2"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Installation URL</dt><dd class="m-0 mt-1 break-all font-mono text-sm text-text">{{ .Connection.BaseURL }}</dd></div>
       <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Organization</dt><dd class="m-0 mt-1 break-all font-mono text-sm text-text">{{ .OrganizationLabel }}</dd>{{ if .Bound }}<dd class="m-0 mt-1 text-xs text-text-muted">Bound to the organization identity observed at the first successful check; renames refresh automatically.</dd>{{ end }}</div>
-      <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Revision</dt><dd class="m-0 mt-1 text-sm text-text">{{ .Connection.Revision }}</dd></div>
+      <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Configuration revision</dt><dd class="m-0 mt-1 text-sm text-text">{{ .Connection.Revision }}</dd></div>
+      <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Binding revision</dt><dd class="m-0 mt-1 text-sm text-text">{{ .Connection.BindingRevision }}</dd></div>
       <div class="min-w-0 sm:col-span-2"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Service PAT</dt><dd class="m-0 mt-1 flex items-center gap-2 text-sm font-semibold text-success"><svg class="h-4 w-4 flex-none" aria-hidden="true"><use href="#tg-i-check"></use></svg>Administrator-attested PAT stored</dd><dd class="m-0 mt-1 text-xs text-text-muted">Attested {{ .PATAttestedAt }} as read-only for a dedicated non-Administrator organization owner. The value is write-only and never redisplayed; Thawguard has not verified its scopes with the provider.</dd></div>
     </dl>
 
@@ -93,23 +94,31 @@
       {{ end }}
       {{ template "ui/button" dict "Label" "Reset connection" "Variant" "danger" "Href" "/settings/forge-access?reset=confirm" "DialogTarget" "forge-reset-confirm" }}
     </div>
+    {{ if .HasBindings }}<p class="m-0 mt-2 text-sm font-semibold text-warning">Reset is blocked until every repository binding below is removed.</p>{{ end }}
     <p class="m-0 mt-2 text-xs text-text-muted">The check is non-mutating: it reads the installation version, the service account, its organizations, and every repository page visible to the credential. It never probes a write endpoint and never claims write scopes are absent.</p>
 
     <section class="mt-5" aria-labelledby="forge-preview-title">
       <div class="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h3 id="forge-preview-title" class="m-0 text-base font-bold text-text">{{ if .PreviewLabel }}{{ .PreviewLabel }}{{ else }}Repositories visible to this attested credential{{ end }}</h3>
-          <p class="m-0 mt-1 text-sm text-text-muted">A stable listing proves only the inventory visible to this credential, never a complete organization inventory. Disappearance from this preview is not evidence of remote absence or access change.</p>
+          <h3 id="forge-preview-title" class="m-0 text-base font-bold text-text">{{ if .PreviewLabel }}{{ .PreviewLabel }}{{ else }}Repository bindings{{ end }}</h3>
+          <p class="m-0 mt-1 text-sm text-text-muted">Matching uses the canonical installation URL and exact case-sensitive owner/name; local repositories recorded for another forge type are never matched. Default branches may differ. Active and inactive local repositories are both considered. Remote numeric IDs are never displayed or submitted by the browser.</p>
         </div>
-        {{ if .PreviewStale }}{{ template "ui/badge" dict "Label" "Last observed preview" "Tone" "warning" }}{{ end }}
+        {{ if .PreviewStale }}{{ template "ui/badge" dict "Label" "Preview not current" "Tone" "warning" }}{{ end }}
       </div>
       {{ if .PreviewAvailable }}
       <form method="get" action="/settings/forge-access" class="mt-4 flex flex-wrap items-center gap-3">
         <label for="forge-preview-search" class="sr-only">Search repositories</label>
         <input id="forge-preview-search" name="q" type="search" value="{{ .PreviewSearch }}" maxlength="100" placeholder="Search owner/name" class="h-(--control-height) w-full max-w-md rounded-control border border-border-input bg-surface px-3 text-sm text-text placeholder:text-text-muted">
+        {{ if .PreviewStatus }}<input type="hidden" name="status" value="{{ .PreviewStatus }}">{{ end }}
+        {{ if .BindingFilter }}<input type="hidden" name="binding" value="{{ .BindingFilter }}">{{ end }}
         {{ template "ui/button" dict "Label" "Search" "Variant" "secondary" "Type" "submit" "Icon" "tg-i-search" }}
       </form>
-      <div class="mt-3 flex flex-wrap gap-2">
+      <p class="m-0 mt-3 text-xs font-semibold uppercase tracking-wide text-text-muted">Binding</p>
+      <div class="mt-2 flex flex-wrap gap-2">
+        {{ range .BindingChips }}{{ template "ui/chip" dict "Label" .Label "Href" .URL "Active" .Active }}{{ end }}
+      </div>
+      <p class="m-0 mt-3 text-xs font-semibold uppercase tracking-wide text-text-muted">Visibility</p>
+      <div class="mt-2 flex flex-wrap gap-2">
         {{ range .PreviewChips }}{{ template "ui/chip" dict "Label" .Label "Href" .URL "Active" .Active }}{{ end }}
       </div>
       {{ if .PreviewNoMatch }}
@@ -117,22 +126,39 @@
       {{ else }}
       <div class="mt-4 overflow-x-auto rounded-panel border border-border bg-surface shadow-card">
         <table class="w-full border-collapse text-sm">
-          <caption class="sr-only">Repositories visible to the attested credential</caption>
+          <caption class="sr-only">Forge repository binding states</caption>
           <thead>
             <tr class="bg-surface-muted text-left">
-              <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Repository</th>
-              <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Default branch</th>
+              <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Observed repository</th>
               <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Visibility</th>
-              <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Observed</th>
+              <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Local repository</th>
+              <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Binding state</th>
             </tr>
           </thead>
           <tbody>
             {{ range .PreviewRows }}
             <tr class="border-t border-border">
-              <td class="px-4 py-3 break-all font-mono text-text">{{ .FullName }}</td>
-              <td class="px-4 py-3 break-all font-mono text-text">{{ .DefaultBranch }}</td>
-              <td class="px-4 py-3">{{ template "ui/badge" dict "Label" .VisibilityLabel "Tone" .VisibilityTone }}</td>
-              <td class="px-4 py-3 text-text-muted">{{ .ObservedAt }}</td>
+              <td class="px-4 py-3 align-top">
+                {{ if .RemoteFullName }}<p class="m-0 break-all font-mono text-text">{{ .RemoteFullName }}</p>{{ else }}<p class="m-0 text-text-muted">{{ .RemoteMissingLabel }}</p>{{ end }}
+                <p class="m-0 mt-1 text-xs text-text-muted">Default branch: {{ if .RemoteDefaultBranch }}<span class="break-all font-mono">{{ .RemoteDefaultBranch }}</span>{{ else }}unknown{{ end }}</p>
+                {{ if .ObservedAt }}<p class="m-0 mt-1 text-xs text-text-muted">Observed {{ .ObservedAt }}</p>{{ end }}
+              </td>
+              <td class="px-4 py-3 align-top">{{ template "ui/badge" dict "Label" .VisibilityLabel "Tone" .VisibilityTone }}</td>
+              <td class="px-4 py-3 align-top">
+                {{ if .LocalFullName }}
+                <p class="m-0 break-all font-mono text-text">{{ .LocalFullName }}</p>
+                <p class="m-0 mt-1 text-xs text-text-muted">Default branch: <span class="break-all font-mono">{{ .LocalDefaultBranch }}</span></p>
+                <div class="mt-1">{{ template "ui/badge" dict "Label" .LocalStateLabel "Tone" .LocalStateTone }}</div>
+                {{ else }}
+                <p class="m-0 text-text-muted">No single exact local match</p>
+                {{ end }}
+              </td>
+              <td class="px-4 py-3 align-top">
+                {{ template "ui/badge" dict "Label" .BindingLabel "Tone" .BindingTone }}
+                <p class="m-0 mt-2 min-w-64 text-xs text-text-muted">{{ .BindingSummary }}</p>
+                {{ if .CanBind }}<div class="mt-3">{{ template "ui/button" dict "Label" "Review bind" "Variant" "primary" "Size" "sm" "Href" (printf "/settings/forge-access?bind=%d" .RepositoryID) }}</div>{{ end }}
+                {{ if .CanUnbind }}<div class="mt-3">{{ template "ui/button" dict "Label" "Review unbind" "Variant" "danger" "Size" "sm" "Href" (printf "/settings/forge-access?unbind=%d" .RepositoryID) }}</div>{{ end }}
+              </td>
             </tr>
             {{ end }}
           </tbody>
@@ -141,15 +167,23 @@
       </div>
       {{ end }}
       {{ else if and .PreviewEmpty .PreviewStale }}
-      <div class="mt-4">{{ template "ui/empty-state" dict "Title" "Empty visible inventory (last observed)" "Hint" "The last successful check observed no repositories visible to this attested credential, and the connection has since been edited or a newer check did not complete. Run a fresh check to record current evidence." }}</div>
+      <div class="mt-4">{{ template "ui/empty-state" dict "Title" "Empty visible inventory (last observed)" "Hint" "No retained repository rows or bindings are available, and the latest successful preview is not current. Run a fresh check to record current evidence." }}</div>
       {{ else if .PreviewEmpty }}
-      <div class="mt-4">{{ template "ui/empty-state" dict "Title" "Empty visible inventory" "Hint" "The recorded check observed no repositories visible to this attested credential. This proves only what the credential could see, not what the organization contains." }}</div>
+      <div class="mt-4">{{ template "ui/empty-state" dict "Title" "Empty visible inventory" "Hint" "The current successful check observed no repositories visible to this credential. This proves only what the credential could see, not what the organization contains." }}</div>
       {{ else }}
-      <div class="mt-4">{{ template "ui/empty-state" dict "Title" "No preview recorded yet" "Hint" "Run a connection check to record the repositories visible to the attested credential. Nothing is added to Thawguard." }}</div>
+      <div class="mt-4">{{ template "ui/empty-state" dict "Title" "No preview recorded yet" "Hint" "Run a connection check to derive exact local matches. No repositories are created or changed." }}</div>
       {{ end }}
     </section>
   </section>
 
+  {{ if .HasBindings }}
+  {{ template "ui/modal" dict
+    "ID" "forge-reset-confirm"
+    "Open" .ResetConfirmOpen
+    "Title" "Reset blocked by repository bindings"
+    "Body" "Every repository binding must first be removed. Unbinding leaves repository credentials, grants, freezes, schedules, setup, and enforcement state unchanged."
+  }}
+  {{ else }}
   {{ template "ui/modal" dict
     "ID" "forge-reset-confirm"
     "Open" .ResetConfirmOpen
@@ -160,17 +194,48 @@
     "Action" "/settings/forge-access/reset"
     "CSRFField" .CSRFField
     "CSRFToken" .CSRFToken
-    "Fields" (dict "expected_connection_id" (printf "%d" .Connection.ID) "expected_revision" (printf "%d" .Connection.Revision) "confirm_reset" "delete")
+    "Fields" (dict "expected_connection_id" (printf "%d" .Connection.ID) "expected_revision" (printf "%d" .Connection.Revision) "expected_binding_revision" (printf "%d" .Connection.BindingRevision) "confirm_reset" "delete")
   }}
+  {{ end }}
+
+  {{ with .BindConfirm }}
+  {{ template "ui/modal" dict
+    "ID" "forge-bind-confirm"
+    "Open" true
+    "Title" "Bind repository identity?"
+    "Body" (printf "Bind local repository %s to the one exact current Forge identity at %s? This records reversible identity metadata only and changes no repository-owned or operational state." .LocalFullName .RemoteFullName)
+    "ConfirmLabel" "Bind identity"
+    "ConfirmVariant" "primary"
+    "Action" "/settings/forge-access/repositories/bind"
+    "CSRFField" $.CSRFField
+    "CSRFToken" $.CSRFToken
+    "Fields" (dict "expected_connection_id" (printf "%d" $.Connection.ID) "expected_config_revision" (printf "%d" $.Connection.Revision) "expected_check_generation" (printf "%d" $.Connection.CheckGeneration) "expected_binding_revision" (printf "%d" $.Connection.BindingRevision) "repository_id" (printf "%d" .RepositoryID) "repository_created_at" .RepositoryCreatedAt "confirm_bind" "bind")
+  }}
+  {{ end }}
+
+  {{ with .UnbindConfirm }}
+  {{ template "ui/modal" dict
+    "ID" "forge-unbind-confirm"
+    "Open" true
+    "Title" "Unbind repository identity?"
+    "Body" (printf "Remove the immutable Forge identity binding from local repository %s? Credentials, grants, freezes, schedules, setup, cached state, and enforcement remain unchanged." .LocalFullName)
+    "ConfirmLabel" "Unbind identity"
+    "ConfirmVariant" "danger"
+    "Action" "/settings/forge-access/repositories/unbind"
+    "CSRFField" $.CSRFField
+    "CSRFToken" $.CSRFToken
+    "Fields" (dict "expected_connection_id" (printf "%d" $.Connection.ID) "expected_config_revision" (printf "%d" $.Connection.Revision) "expected_binding_revision" (printf "%d" $.Connection.BindingRevision) "repository_id" (printf "%d" .RepositoryID) "confirm_unbind" "unbind")
+  }}
+  {{ end }}
   {{ else }}
   <section class="flex min-h-72 flex-col items-center justify-center rounded-panel border border-border bg-surface px-5 py-10 text-center shadow-card" aria-labelledby="no-forge-connection-title">
     <span class="flex size-14 items-center justify-center rounded-pill bg-accent-soft text-accent-strong" aria-hidden="true"><svg class="h-7 w-7"><use href="#tg-i-lock"></use></svg></span>
     <h2 id="no-forge-connection-title" class="m-0 mt-4 text-lg font-bold text-text">No Forge connection configured</h2>
-    <p class="m-0 mt-2 max-w-2xl text-sm text-text-muted">Saving a connection prepares a read-only preview of the repositories visible to an Administrator-attested service credential. No repositories are added and no roles change.</p>
+    <p class="m-0 mt-2 max-w-2xl text-sm text-text-muted">Saving a connection prepares a read-only preview. Exact existing local repositories can later be bound to observed immutable identities without changing repository state.</p>
   </section>
   {{ end }}
 
-  <p class="m-0 text-sm text-text-muted">Forge access previews credential visibility only. Repository management and Thawguard roles stay unchanged.</p>
+  <p class="m-0 text-sm text-text-muted">Forge visibility and identity bindings do not establish Thawguard authority. Repository management, operational routing, and roles stay unchanged.</p>
   {{ end }}
 </div>
 {{ end }}

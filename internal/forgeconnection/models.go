@@ -1,12 +1,11 @@
-// Package forgeconnection owns the Administrator-only Forgejo Connection
-// Preview: one saved Forgejo installation and organization, a write-only
-// Administrator-attested service PAT, a non-mutating connection check, and
-// the read-only preview of repositories visible to that credential.
+// Package forgeconnection owns the Administrator-only Forgejo connection:
+// one saved installation and organization, a write-only Administrator-
+// attested service PAT, a non-mutating connection check, the repository
+// preview visible to that credential, and inert local repository bindings.
 //
-// The preview is evidence of credential visibility only. It never binds
-// local repositories, never reads or writes repository grants, and never
-// proves provider-side scopes: Forgejo cannot documentably report an
-// existing PAT's exact scopes, so every claim stays "Administrator
+// Preview evidence and bindings never grant authority, route operations, or
+// change repository-owned state. Forgejo cannot documentably report an
+// existing PAT's exact scopes, so every scope claim stays "Administrator
 // attested", never "provider verified".
 package forgeconnection
 
@@ -82,6 +81,7 @@ type Connection struct {
 	OrganizationSlug    string
 	Revision            int64
 	CheckGeneration     int64
+	BindingRevision     int64
 	PATAttestedAt       time.Time
 	ServiceUserRemoteID string // immutable once bound; empty before binding
 	Organization        *Organization
@@ -117,19 +117,6 @@ type SetupCheck struct {
 	CheckedAt                     time.Time
 }
 
-// VisibleRepository is one repository visible to the attested credential at
-// its observed check generation. Presence or disappearance is preview
-// evidence only, never authority, eligibility, absence, or identity.
-type VisibleRepository struct {
-	RemoteID                string
-	Owner                   string
-	Name                    string
-	DefaultBranch           string
-	Private                 bool
-	ObservedCheckGeneration int64
-	ObservedAt              time.Time
-}
-
 type CreateInput struct {
 	DisplayName      string
 	BaseURL          string
@@ -158,11 +145,109 @@ type EditInput struct {
 
 type ResetInput struct {
 	// ExpectedConnectionID pins the reset to one never-reused internal id.
-	ExpectedConnectionID int64
-	ExpectedRevision     int64
+	ExpectedConnectionID    int64
+	ExpectedRevision        int64
+	ExpectedBindingRevision int64
 	// ConfirmReset must be explicitly true; reset deletes the connection and
 	// every cascaded preview and evidence row.
 	ConfirmReset bool
+}
+
+type BindRepositoryInput struct {
+	ExpectedConnectionID    int64
+	ExpectedConfigRevision  int64
+	ExpectedCheckGeneration int64
+	ExpectedBindingRevision int64
+	RepositoryID            int64
+	RepositoryCreatedAt     string
+	ConfirmBind             bool
+}
+
+type UnbindRepositoryInput struct {
+	ExpectedConnectionID    int64
+	ExpectedConfigRevision  int64
+	ExpectedBindingRevision int64
+	RepositoryID            int64
+	ConfirmUnbind           bool
+}
+
+type RepositoryBindingState string
+
+const (
+	RepositoryBindingLastObservedOnly       RepositoryBindingState = "last_observed_only"
+	RepositoryBindingPreviewNotCurrent      RepositoryBindingState = "preview_not_current"
+	RepositoryBindingIdentityConflict       RepositoryBindingState = "identity_conflict"
+	RepositoryBindingLocatorDrift           RepositoryBindingState = "locator_drift"
+	RepositoryBindingCurrent                RepositoryBindingState = "bound_current"
+	RepositoryBindingNotVisible             RepositoryBindingState = "not_visible"
+	RepositoryBindingReady                  RepositoryBindingState = "ready"
+	RepositoryBindingUnmatched              RepositoryBindingState = "unmatched"
+	RepositoryBindingMultipleLocalMatches   RepositoryBindingState = "multiple_local_matches"
+	RepositoryBindingDuplicateRemoteLocator RepositoryBindingState = "duplicate_remote_locator"
+)
+
+// Bound reports whether the state derives from an existing immutable
+// binding row; exactly these states allow an unbind.
+func (state RepositoryBindingState) Bound() bool {
+	switch state {
+	case RepositoryBindingLastObservedOnly,
+		RepositoryBindingIdentityConflict,
+		RepositoryBindingLocatorDrift,
+		RepositoryBindingCurrent,
+		RepositoryBindingNotVisible:
+		return true
+	default:
+		return false
+	}
+}
+
+// CanBind reports whether a bind command may target this row: exactly one
+// current remote identity matches exactly one existing local repository.
+func (state RepositoryBindingState) CanBind() bool {
+	return state == RepositoryBindingReady
+}
+
+// CanUnbind reports whether an unbind command may target this row.
+func (state RepositoryBindingState) CanUnbind() bool {
+	return state.Bound()
+}
+
+// Attention reports whether an Administrator should review this state
+// before trusting or changing the binding. Unknown states demand attention.
+func (state RepositoryBindingState) Attention() bool {
+	switch state {
+	case RepositoryBindingCurrent, RepositoryBindingReady, RepositoryBindingUnmatched:
+		return false
+	default:
+		return true
+	}
+}
+
+// RepositoryBindingRow is one derived binding or preview-locator state. It
+// deliberately omits remote repository identifiers; mutation commands carry
+// only local ids and revisions and recompute the remote identity in SQLite.
+type RepositoryBindingRow struct {
+	State               RepositoryBindingState
+	RepositoryID        int64
+	RepositoryCreatedAt string
+	LocalFullName       string
+	LocalDefaultBranch  string
+	LocalActive         bool
+	// RemoteFullName is the group's single agreed owner/name locator; it is
+	// empty when the retained group mixes conflicting locators.
+	RemoteFullName string
+	// RemoteFullNames lists every distinct locator retained in the row's
+	// remote group, so conflict rows stay searchable after the ambiguous
+	// display fields are cleared.
+	RemoteFullNames     []string
+	RemoteDefaultBranch string
+	RemotePrivate       *bool
+	ObservedAt          time.Time
+}
+
+type RepositoryBindingReadModel struct {
+	Current bool
+	Rows    []RepositoryBindingRow
 }
 
 type ValidationError struct {
@@ -177,14 +262,17 @@ func IsValidationError(err error) bool {
 }
 
 var (
-	ErrConflict            = errors.New("the Forge connection changed; reload it before saving again")
-	ErrConfiguration       = errors.New("service PAT encryption is not configured")
-	ErrAuthorization       = errors.New("only an enabled Administrator can change the Forge connection")
-	ErrOutcomeUnknown      = errors.New("the Forge connection save outcome could not be confirmed")
-	ErrNoConnection        = errors.New("no saved Forge connection is available")
-	ErrCheckStale          = errors.New("the Forge connection changed during the check; run it again")
-	ErrCheckIncomplete     = errors.New("the Forge connection check could not be completed")
-	ErrCheckOutcomeUnknown = errors.New("the Forge connection check outcome could not be confirmed")
+	ErrConflict              = errors.New("the Forge connection changed; reload it before saving again")
+	ErrConfiguration         = errors.New("service PAT encryption is not configured")
+	ErrAuthorization         = errors.New("only an enabled Administrator can change the Forge connection")
+	ErrOutcomeUnknown        = errors.New("the Forge connection save outcome could not be confirmed")
+	ErrNoConnection          = errors.New("no saved Forge connection is available")
+	ErrCheckStale            = errors.New("the Forge connection changed during the check; run it again")
+	ErrCheckIncomplete       = errors.New("the Forge connection check could not be completed")
+	ErrCheckOutcomeUnknown   = errors.New("the Forge connection check outcome could not be confirmed")
+	ErrBindingUnavailable    = errors.New("the repository is not ready for this binding change")
+	ErrBindingOutcomeUnknown = errors.New("the repository binding outcome could not be confirmed")
+	ErrBindingsExist         = errors.New("remove every repository binding before resetting the Forge connection")
 )
 
 const (
@@ -278,6 +366,19 @@ func validRemoteName(value string) bool {
 		}
 	}
 	return true
+}
+
+// ParseRepositoryCreatedAt accepts only the canonical UTC RFC3339Nano text
+// Thawguard stores for local repository creation timestamps. The exact text
+// fences one repository incarnation, so every other encoding of the same
+// instant is rejected wherever the timestamp travels: bind forms, bind
+// validation, and audit evidence.
+func ParseRepositoryCreatedAt(value string) (time.Time, error) {
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil || parsed.UTC().Format(time.RFC3339Nano) != value {
+		return time.Time{}, errors.New("repository creation timestamp is not canonical")
+	}
+	return parsed, nil
 }
 
 func formatForgeConnectionTime(value time.Time) string {

@@ -88,59 +88,6 @@ func (s *Service) Current(ctx context.Context) (Connection, bool, error) {
 	return connection, true, nil
 }
 
-// VisibleRepositories returns the retained preview rows for a connection,
-// ordered by owner then name. The check-generation replacement protocol
-// keeps every retained row at one observed generation.
-func (s *Service) VisibleRepositories(ctx context.Context, connectionID int64) ([]VisibleRepository, error) {
-	if s == nil || s.db == nil {
-		return nil, errors.New("forge connection service has no database")
-	}
-	rows, err := s.db.QueryContext(ctx, `
-SELECT remote_repository_id, owner, name, default_branch, private, observed_check_generation, observed_at
-FROM forge_visible_repositories
-WHERE connection_id = ?
-ORDER BY owner, name, remote_repository_id`, connectionID)
-	if err != nil {
-		return nil, fmt.Errorf("read forge visible repositories: %w", err)
-	}
-	defer rows.Close()
-	repositories := make([]VisibleRepository, 0)
-	for rows.Next() {
-		var repository VisibleRepository
-		var private int64
-		var observedAt string
-		if err := rows.Scan(
-			&repository.RemoteID,
-			&repository.Owner,
-			&repository.Name,
-			&repository.DefaultBranch,
-			&private,
-			&repository.ObservedCheckGeneration,
-			&observedAt,
-		); err != nil {
-			return nil, fmt.Errorf("scan forge visible repository: %w", err)
-		}
-		if private < 0 || private > 1 ||
-			!validRemoteID(repository.RemoteID) ||
-			!validRemoteName(repository.Owner) ||
-			!validRemoteName(repository.Name) ||
-			!validRemoteName(repository.DefaultBranch) ||
-			repository.ObservedCheckGeneration <= 0 {
-			return nil, errors.New("forge visible repository data is malformed")
-		}
-		repository.Private = private == 1
-		repository.ObservedAt, err = parseForgeConnectionTime(observedAt)
-		if err != nil {
-			return nil, errors.New("forge visible repository data is malformed")
-		}
-		repositories = append(repositories, repository)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("read forge visible repository rows: %w", err)
-	}
-	return repositories, nil
-}
-
 func (s *Service) Create(ctx context.Context, actorUserID int64, input CreateInput) error {
 	if s == nil || s.db == nil {
 		return errors.New("forge connection service has no database")
@@ -345,7 +292,7 @@ func (s *Service) Reset(ctx context.Context, actorUserID int64, input ResetInput
 	if s == nil || s.db == nil {
 		return errors.New("forge connection service has no database")
 	}
-	if input.ExpectedConnectionID <= 0 || input.ExpectedRevision <= 0 {
+	if input.ExpectedConnectionID <= 0 || input.ExpectedRevision <= 0 || input.ExpectedBindingRevision < 0 {
 		return ValidationError{Message: "the expected connection id and revision must identify the connection being reset"}
 	}
 	if !input.ConfirmReset {
@@ -364,10 +311,26 @@ func (s *Service) Reset(ctx context.Context, actorUserID int64, input ResetInput
 	if err != nil {
 		return err
 	}
-	if !found || existing.ID != input.ExpectedConnectionID || existing.Revision != input.ExpectedRevision {
+	if !found || existing.ID != input.ExpectedConnectionID ||
+		existing.Revision != input.ExpectedRevision ||
+		existing.BindingRevision != input.ExpectedBindingRevision {
 		return ErrConflict
 	}
-	deleted, err := execExpectingOneRow(ctx, tx, `DELETE FROM forge_connections WHERE id = ? AND config_revision = ?`, existing.ID, existing.Revision)
+	var bindingExists int
+	if err := tx.QueryRowContext(ctx, `
+SELECT EXISTS(SELECT 1 FROM forge_repository_bindings WHERE connection_id = ?)`, existing.ID).Scan(&bindingExists); err != nil {
+		return fmt.Errorf("check forge repository bindings before reset: %w", err)
+	}
+	if bindingExists == 1 {
+		return ErrBindingsExist
+	}
+	deleted, err := execExpectingOneRow(ctx, tx, `
+DELETE FROM forge_connections
+WHERE id = ? AND config_revision = ? AND binding_revision = ?`,
+		existing.ID,
+		existing.Revision,
+		existing.BindingRevision,
+	)
 	if err != nil {
 		return fmt.Errorf("delete forge connection: %w", err)
 	}
@@ -375,8 +338,9 @@ func (s *Service) Reset(ctx context.Context, actorUserID int64, input ResetInput
 		return ErrConflict
 	}
 	details, err := json.Marshal(struct {
-		Revision int64 `json:"revision"`
-	}{Revision: existing.Revision})
+		Revision        int64 `json:"revision"`
+		BindingRevision int64 `json:"binding_revision"`
+	}{Revision: existing.Revision, BindingRevision: existing.BindingRevision})
 	if err != nil {
 		return errors.New("encode forge connection reset audit evidence")
 	}
@@ -437,7 +401,9 @@ type connectionRecord struct {
 	ServiceUserRemoteID  string
 	Revision             int64
 	CheckGeneration      int64
+	BindingRevision      int64
 	PATAttestedAt        time.Time
+	OrganizationID       int64
 	Organization         *Organization
 	SetupCheck           *SetupCheck
 	CreatedAt            time.Time
@@ -456,9 +422,10 @@ type queryer interface {
 func loadConnectionRecord(ctx context.Context, q queryer) (connectionRecord, bool, error) {
 	row := q.QueryRowContext(ctx, `
 SELECT c.id, c.provider, c.display_name, c.base_url, c.config_revision, c.check_generation,
+	  c.binding_revision,
   c.created_at, c.updated_at,
   fc.organization_slug, fc.service_pat_ciphertext, fc.service_user_remote_id, fc.pat_attested_at,
-  o.remote_organization_id, o.slug, o.display_name, o.observed_at,
+  o.id, o.remote_organization_id, o.slug, o.display_name, o.observed_at,
   sc.config_revision, sc.check_generation, sc.result_code, sc.observed_version,
   sc.visible_repository_count, sc.visible_private_repository_count, sc.checked_at
 FROM forge_connections c
@@ -470,6 +437,7 @@ WHERE c.provider = ?`, ProviderForgejo)
 	var record connectionRecord
 	var createdAt, updatedAt, patAttestedAt string
 	var serviceUserRemoteID sql.NullString
+	var organizationID sql.NullInt64
 	var orgRemoteID, orgSlug, orgDisplayName, orgObservedAt sql.NullString
 	var checkRevision, checkGeneration, visibleCount, privateCount sql.NullInt64
 	var resultCode, observedVersion, checkedAt sql.NullString
@@ -480,12 +448,14 @@ WHERE c.provider = ?`, ProviderForgejo)
 		&record.BaseURL,
 		&record.Revision,
 		&record.CheckGeneration,
+		&record.BindingRevision,
 		&createdAt,
 		&updatedAt,
 		&record.OrganizationSlug,
 		&record.ServicePATCiphertext,
 		&serviceUserRemoteID,
 		&patAttestedAt,
+		&organizationID,
 		&orgRemoteID,
 		&orgSlug,
 		&orgDisplayName,
@@ -525,8 +495,9 @@ WHERE c.provider = ?`, ProviderForgejo)
 		}
 		record.ServiceUserRemoteID = serviceUserRemoteID.String
 	}
-	if orgRemoteID.Valid || orgSlug.Valid || orgDisplayName.Valid || orgObservedAt.Valid {
-		if !orgRemoteID.Valid || !orgSlug.Valid || !orgDisplayName.Valid || !orgObservedAt.Valid {
+	if organizationID.Valid || orgRemoteID.Valid || orgSlug.Valid || orgDisplayName.Valid || orgObservedAt.Valid {
+		if !organizationID.Valid || !orgRemoteID.Valid || !orgSlug.Valid || !orgDisplayName.Valid || !orgObservedAt.Valid ||
+			organizationID.Int64 <= 0 {
 			return malformed()
 		}
 		observedAt, parseErr := parseForgeConnectionTime(orgObservedAt.String)
@@ -540,6 +511,7 @@ WHERE c.provider = ?`, ProviderForgejo)
 			DisplayName: orgDisplayName.String,
 			ObservedAt:  observedAt,
 		}
+		record.OrganizationID = organizationID.Int64
 	}
 	if checkRevision.Valid || checkGeneration.Valid || resultCode.Valid || checkedAt.Valid {
 		if !checkRevision.Valid || !checkGeneration.Valid || !resultCode.Valid || !checkedAt.Valid {
@@ -610,7 +582,7 @@ func publicConnection(record connectionRecord) (Connection, error) {
 		urlErr != nil || baseURL != record.BaseURL ||
 		slugErr != nil || organizationSlug != record.OrganizationSlug ||
 		len(record.ServicePATCiphertext) == 0 ||
-		record.Revision <= 0 || record.CheckGeneration < 0 ||
+		record.Revision <= 0 || record.CheckGeneration < 0 || record.BindingRevision < 0 ||
 		record.CreatedAt.IsZero() || record.UpdatedAt.IsZero() ||
 		record.UpdatedAt.Before(record.CreatedAt) ||
 		(record.ServiceUserRemoteID != "") != (record.Organization != nil) {
@@ -624,6 +596,7 @@ func publicConnection(record connectionRecord) (Connection, error) {
 		OrganizationSlug:    record.OrganizationSlug,
 		Revision:            record.Revision,
 		CheckGeneration:     record.CheckGeneration,
+		BindingRevision:     record.BindingRevision,
 		PATAttestedAt:       record.PATAttestedAt,
 		ServiceUserRemoteID: record.ServiceUserRemoteID,
 		CreatedAt:           record.CreatedAt,

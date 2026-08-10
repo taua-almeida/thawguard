@@ -12,11 +12,9 @@ import (
 	"github.com/taua-almeida/thawguard/internal/forgeconnection"
 )
 
-// Forge access is the Administrator-only Forgejo connection preview: one
-// saved installation and organization, a write-only Administrator-attested
-// service PAT, a non-mutating check, and the read-only list of repositories
-// visible to that credential. Nothing on this page adds repositories,
-// changes roles, or proves provider-side scopes.
+// Forge access is the Administrator-only Forgejo connection and repository
+// identity-binding surface. Bindings are inert metadata: they do not add or
+// mutate repositories, grant authority, route operations, or prove scopes.
 
 const (
 	// forgeAccessSaveMaxBodyBytes caps POST /settings/forge-access before
@@ -47,6 +45,7 @@ const (
 
 	forgeAccessResetNotice          = "forge-reset"
 	forgeAccessResetStaleNotice     = "forge-reset-stale"
+	forgeAccessResetBindingsNotice  = "forge-reset-bindings"
 	forgeAccessResetAuthorityNotice = "forge-reset-authority"
 	forgeAccessResetUnknownNotice   = "forge-reset-unknown"
 )
@@ -55,11 +54,13 @@ const (
 // connection preview slice.
 type ForgeConnectionService interface {
 	Current(ctx context.Context) (forgeconnection.Connection, bool, error)
-	VisibleRepositories(ctx context.Context, connectionID int64) ([]forgeconnection.VisibleRepository, error)
+	RepositoryBindings(ctx context.Context, connectionID int64) (forgeconnection.RepositoryBindingReadModel, error)
 	Create(ctx context.Context, actorUserID int64, input forgeconnection.CreateInput) error
 	Edit(ctx context.Context, actorUserID int64, input forgeconnection.EditInput) error
 	Reset(ctx context.Context, actorUserID int64, input forgeconnection.ResetInput) error
 	Check(ctx context.Context, actorUserID int64, expectedConnectionID, expectedRevision int64) (forgeconnection.SetupCheck, error)
+	BindRepository(ctx context.Context, actorUserID int64, input forgeconnection.BindRepositoryInput) error
+	UnbindRepository(ctx context.Context, actorUserID int64, input forgeconnection.UnbindRepositoryInput) error
 }
 
 type forgeAccessFormView struct {
@@ -84,17 +85,32 @@ type forgeAccessCheckStateView struct {
 }
 
 type forgeAccessRepositoryRowView struct {
-	FullName        string
-	DefaultBranch   string
-	VisibilityLabel string
-	VisibilityTone  string
-	ObservedAt      string
+	RepositoryID        int64
+	RepositoryCreatedAt string
+	LocalFullName       string
+	LocalDefaultBranch  string
+	LocalStateLabel     string
+	LocalStateTone      string
+	RemoteFullName      string
+	// RemoteMissingLabel is the observed-repository cell text when no single
+	// remote locator can be displayed.
+	RemoteMissingLabel  string
+	RemoteDefaultBranch string
+	VisibilityLabel     string
+	VisibilityTone      string
+	ObservedAt          string
+	BindingLabel        string
+	BindingTone         string
+	BindingSummary      string
+	CanBind             bool
+	CanUnbind           bool
 }
 
 type forgeAccessPreviewQuery struct {
-	Search string
-	Status string
-	Page   int
+	Search  string
+	Status  string
+	Binding string
+	Page    int
 }
 
 type forgeAccessPageData struct {
@@ -129,9 +145,15 @@ type forgeAccessPageData struct {
 	PreviewEmpty     bool
 	PreviewNoMatch   bool
 	PreviewChips     []filterChip
+	BindingChips     []filterChip
 	PreviewSearch    string
+	PreviewStatus    string
+	BindingFilter    string
 	PreviewPager     *tablePager
 	PreviewTotal     int
+	HasBindings      bool
+	BindConfirm      *forgeAccessRepositoryRowView
+	UnbindConfirm    *forgeAccessRepositoryRowView
 
 	ResetConfirmOpen bool
 	LoadError        string
@@ -214,7 +236,7 @@ func (s *Server) handleForgeAccessCheck(w http.ResponseWriter, r *http.Request) 
 	if !ok || session.UserID == nil {
 		return
 	}
-	connectionID, revision, err := parseForgeAccessRevisionForm(r.URL, r.PostForm, nil)
+	connectionID, revision, err := parseForgeAccessRevisionForm(r.URL, r.PostForm)
 	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
@@ -254,9 +276,7 @@ func (s *Server) handleForgeAccessReset(w http.ResponseWriter, r *http.Request) 
 	if !ok || session.UserID == nil {
 		return
 	}
-	connectionID, revision, err := parseForgeAccessRevisionForm(r.URL, r.PostForm, map[string]string{
-		"confirm_reset": forgeAccessConfirmResetValue,
-	})
+	connectionID, revision, bindingRevision, err := parseForgeAccessResetForm(r.URL, r.PostForm)
 	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
@@ -266,14 +286,17 @@ func (s *Server) handleForgeAccessReset(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if err := s.cfg.ForgeConnectionService.Reset(r.Context(), *session.UserID, forgeconnection.ResetInput{
-		ExpectedConnectionID: connectionID,
-		ExpectedRevision:     revision,
-		ConfirmReset:         true,
+		ExpectedConnectionID:    connectionID,
+		ExpectedRevision:        revision,
+		ExpectedBindingRevision: bindingRevision,
+		ConfirmReset:            true,
 	}); err != nil {
 		notice := forgeAccessResetUnknownNotice
 		switch {
 		case errors.Is(err, forgeconnection.ErrConflict):
 			notice = forgeAccessResetStaleNotice
+		case errors.Is(err, forgeconnection.ErrBindingsExist):
+			notice = forgeAccessResetBindingsNotice
 		case errors.Is(err, forgeconnection.ErrAuthorization):
 			notice = forgeAccessResetAuthorityNotice
 		}
@@ -356,12 +379,15 @@ func (s *Server) renderForgeAccess(
 		}
 	}
 
-	repositories, err := s.cfg.ForgeConnectionService.VisibleRepositories(r.Context(), connection.ID)
-	if err != nil {
-		data.LoadError = "Thawguard could not load the retained repository preview."
+	repositories, err := s.cfg.ForgeConnectionService.RepositoryBindings(r.Context(), connection.ID)
+	if err != nil && !errors.Is(err, forgeconnection.ErrNoConnection) {
+		data.LoadError = "Thawguard could not load repository binding states."
 		s.renderPageStatus(w, http.StatusInternalServerError, "layouts/forge-access", data)
 		return
 	}
+	// ErrNoConnection means a concurrent reset removed the connection after
+	// Current loaded it; render the empty model and let the next load show
+	// the no-connection state.
 	s.buildForgeAccessPreview(&data, connection, repositories, r.URL.Query())
 	s.renderPageStatus(w, status, "layouts/forge-access", data)
 }
@@ -472,78 +498,88 @@ func forgeAccessResultText(check forgeconnection.SetupCheck) string {
 func (s *Server) buildForgeAccessPreview(
 	data *forgeAccessPageData,
 	connection forgeconnection.Connection,
-	repositories []forgeconnection.VisibleRepository,
+	repositories forgeconnection.RepositoryBindingReadModel,
 	query url.Values,
 ) {
-	// Evidence is current only while its revision and generation match the
-	// connection; a stale preview is the retained last observation.
-	currentEvidence := connection.SetupCheck != nil &&
-		connection.SetupCheck.ConfigRevision == connection.Revision &&
-		connection.SetupCheck.CheckGeneration == connection.CheckGeneration &&
-		connection.SetupCheck.ResultCode.Observed()
-
-	data.PreviewAvailable = len(repositories) > 0
-	if !data.PreviewAvailable {
-		// Preview rows change only on a successful check, so a bound
-		// connection with zero rows means the last successful check recorded
-		// an empty visible inventory — even when a later edit, failure, or
-		// interruption replaced the evidence row. Only a never-successfully-
-		// checked connection has no recorded preview at all.
-		if !connection.Bound() {
-			return
-		}
-		data.PreviewEmpty = true
-		data.PreviewStale = !currentEvidence
-		data.PreviewLabel = "Repositories visible to this attested credential"
-		if data.PreviewStale {
-			data.PreviewLabel = "Last observed preview"
-		}
+	data.PreviewAvailable = len(repositories.Rows) > 0
+	if !data.PreviewAvailable && !connection.Bound() {
+		// Nothing was ever observed: the section shows only the
+		// "No preview recorded yet" state, never a staleness label.
 		return
 	}
-	current := currentEvidence && repositories[0].ObservedCheckGeneration == connection.CheckGeneration
-	data.PreviewStale = !current
-	data.PreviewLabel = "Repositories visible to this attested credential"
+	data.PreviewStale = !repositories.Current
+	data.PreviewLabel = "Repository bindings and current preview"
 	if data.PreviewStale {
-		data.PreviewLabel = "Last observed preview"
+		data.PreviewLabel = "Repository bindings and last observed preview"
+	}
+	if !data.PreviewAvailable {
+		data.PreviewEmpty = true
+		return
 	}
 
 	previewQuery := forgeAccessPreviewQueryFromValues(query)
-	filtered := make([]forgeconnection.VisibleRepository, 0, len(repositories))
+	filtered := make([]forgeAccessRepositoryRowView, 0, len(repositories.Rows))
 	search := strings.ToLower(previewQuery.Search)
-	for _, repository := range repositories {
-		if previewQuery.Status == "private" && !repository.Private {
+	bindID, bindOpen := forgeAccessConfirmationRepositoryID(query, "bind")
+	unbindID, unbindOpen := forgeAccessConfirmationRepositoryID(query, "unbind")
+	for _, repository := range repositories.Rows {
+		view := forgeAccessRepositoryRow(repository)
+		if repository.State.Bound() {
+			data.HasBindings = true
+		}
+		if bindOpen && repository.RepositoryID == bindID && repository.State.CanBind() {
+			confirmation := view
+			data.BindConfirm = &confirmation
+		}
+		if unbindOpen && repository.RepositoryID == unbindID && repository.State.CanUnbind() {
+			confirmation := view
+			data.UnbindConfirm = &confirmation
+		}
+		if previewQuery.Status == "private" &&
+			(repository.RemotePrivate == nil || !*repository.RemotePrivate) {
 			continue
 		}
-		if previewQuery.Status == "public" && repository.Private {
+		if previewQuery.Status == "public" &&
+			(repository.RemotePrivate == nil || *repository.RemotePrivate) {
 			continue
 		}
-		if search != "" && !strings.Contains(strings.ToLower(repository.Owner+"/"+repository.Name), search) {
+		switch previewQuery.Binding {
+		case "ready":
+			if !repository.State.CanBind() {
+				continue
+			}
+		case "bound":
+			if repository.State != forgeconnection.RepositoryBindingCurrent {
+				continue
+			}
+		case "attention":
+			if !repository.State.Attention() {
+				continue
+			}
+		case "unmatched":
+			if repository.State != forgeconnection.RepositoryBindingUnmatched {
+				continue
+			}
+		}
+		// RemoteFullNames keeps conflict rows searchable by retained locators
+		// that are not selected for display.
+		searchText := strings.ToLower(repository.LocalFullName + " " + strings.Join(repository.RemoteFullNames, " "))
+		if search != "" && !strings.Contains(searchText, search) {
 			continue
 		}
-		filtered = append(filtered, repository)
+		filtered = append(filtered, view)
 	}
 	data.PreviewTotal = len(filtered)
 	data.PreviewNoMatch = len(filtered) == 0
 	data.PreviewSearch = previewQuery.Search
+	data.PreviewStatus = previewQuery.Status
+	data.BindingFilter = previewQuery.Binding
 
 	lastPage := max((len(filtered)+forgeAccessPreviewPageSize-1)/forgeAccessPreviewPageSize, 1)
 	page := min(max(previewQuery.Page, 1), lastPage)
 	start := (page - 1) * forgeAccessPreviewPageSize
 	end := min(start+forgeAccessPreviewPageSize, len(filtered))
-	for _, repository := range filtered[start:end] {
-		row := forgeAccessRepositoryRowView{
-			FullName:        repository.Owner + "/" + repository.Name,
-			DefaultBranch:   repository.DefaultBranch,
-			VisibilityLabel: "Public",
-			VisibilityTone:  "neutral",
-			ObservedAt:      repository.ObservedAt.UTC().Format("2006-01-02 15:04 UTC"),
-		}
-		if repository.Private {
-			row.VisibilityLabel = "Private"
-			row.VisibilityTone = "frozen"
-		}
-		data.PreviewRows = append(data.PreviewRows, row)
-	}
+	data.PreviewRows = append(data.PreviewRows, filtered[start:end]...)
 
 	urlFor := func(override func(*forgeAccessPreviewQuery)) string {
 		next := previewQuery
@@ -560,11 +596,89 @@ func (s *Server) buildForgeAccessPreview(
 	}, func(value string) string {
 		return urlFor(func(next *forgeAccessPreviewQuery) { next.Status = value })
 	})
+	data.BindingChips = filterChips(previewQuery.Binding, []filterChipOption{
+		{Value: "", Label: "All"},
+		{Value: "ready", Label: "Ready"},
+		{Value: "bound", Label: "Bound"},
+		{Value: "attention", Label: "Attention"},
+		{Value: "unmatched", Label: "Unmatched"},
+	}, func(value string) string {
+		return urlFor(func(next *forgeAccessPreviewQuery) { next.Binding = value })
+	})
 	data.PreviewPager = paginateTable(len(filtered), page, forgeAccessPreviewPageSize, func(page int) string {
 		next := previewQuery
 		next.Page = page
 		return forgeAccessURL(next)
 	})
+}
+
+func forgeAccessRepositoryRow(repository forgeconnection.RepositoryBindingRow) forgeAccessRepositoryRowView {
+	label, tone, summary := forgeAccessRepositoryBindingPresentation(repository.State)
+	row := forgeAccessRepositoryRowView{
+		RepositoryID:        repository.RepositoryID,
+		RepositoryCreatedAt: repository.RepositoryCreatedAt,
+		LocalFullName:       repository.LocalFullName,
+		LocalDefaultBranch:  repository.LocalDefaultBranch,
+		RemoteFullName:      repository.RemoteFullName,
+		RemoteMissingLabel:  "Not visible in the retained preview",
+		RemoteDefaultBranch: repository.RemoteDefaultBranch,
+		VisibilityLabel:     "Unknown",
+		VisibilityTone:      "neutral",
+		BindingLabel:        label,
+		BindingTone:         tone,
+		BindingSummary:      summary,
+		CanBind:             repository.State.CanBind(),
+		CanUnbind:           repository.State.CanUnbind(),
+	}
+	if repository.LocalFullName != "" {
+		row.LocalStateLabel = "Inactive"
+		row.LocalStateTone = "warning"
+		if repository.LocalActive {
+			row.LocalStateLabel = "Active"
+			row.LocalStateTone = "neutral"
+		}
+	}
+	if repository.State == forgeconnection.RepositoryBindingIdentityConflict && row.RemoteFullName == "" {
+		row.RemoteMissingLabel = "Conflicting current locators"
+	}
+	if repository.RemotePrivate != nil {
+		row.VisibilityLabel = "Public"
+		if *repository.RemotePrivate {
+			row.VisibilityLabel = "Private"
+			row.VisibilityTone = "frozen"
+		}
+	}
+	if !repository.ObservedAt.IsZero() {
+		row.ObservedAt = repository.ObservedAt.UTC().Format("2006-01-02 15:04 UTC")
+	}
+	return row
+}
+
+func forgeAccessRepositoryBindingPresentation(state forgeconnection.RepositoryBindingState) (string, string, string) {
+	switch state {
+	case forgeconnection.RepositoryBindingLastObservedOnly:
+		return "Last observed only", "warning", "The immutable binding remains, but no current successful preview can confirm its locator."
+	case forgeconnection.RepositoryBindingPreviewNotCurrent:
+		return "Preview not current", "warning", "This retained preview row cannot be used to create a binding. Run a successful current check."
+	case forgeconnection.RepositoryBindingIdentityConflict:
+		return "Identity conflict", "danger", "Current local or remote identities collide at this locator. Review the duplicate or replacement before changing the binding."
+	case forgeconnection.RepositoryBindingLocatorDrift:
+		return "Locator drift", "warning", "The bound remote identity is visible, but its current owner/name locator no longer exactly matches the local repository."
+	case forgeconnection.RepositoryBindingCurrent:
+		return "Bound and current", "success", "The immutable binding and current exact locator match. This does not prove authority, scopes, or enforcement readiness."
+	case forgeconnection.RepositoryBindingNotVisible:
+		return "Not visible in latest preview", "warning", "The immutable binding remains, but its remote identity was not visible to the latest successful credential check."
+	case forgeconnection.RepositoryBindingReady:
+		return "Ready to bind", "info", "Exactly one current remote identity matches exactly one existing local repository."
+	case forgeconnection.RepositoryBindingUnmatched:
+		return "Unmatched", "neutral", "No existing local repository has this exact canonical Forge locator. Local repositories recorded for another forge type are never matched."
+	case forgeconnection.RepositoryBindingMultipleLocalMatches:
+		return "Multiple local matches", "danger", "More than one compatible local repository has this canonical locator, so binding is ambiguous."
+	case forgeconnection.RepositoryBindingDuplicateRemoteLocator:
+		return "Duplicate remote locator", "danger", "More than one current remote identity reports this owner/name locator, so binding is ambiguous."
+	default:
+		return "Unavailable", "danger", "This repository binding state could not be displayed safely."
+	}
 }
 
 func forgeAccessPreviewQueryFromValues(values url.Values) forgeAccessPreviewQuery {
@@ -579,6 +693,10 @@ func forgeAccessPreviewQueryFromValues(values url.Values) forgeAccessPreviewQuer
 	case "public":
 		query.Status = "public"
 	}
+	switch values.Get("binding") {
+	case "ready", "bound", "attention", "unmatched":
+		query.Binding = values.Get("binding")
+	}
 	if page, err := strconv.Atoi(strings.TrimSpace(values.Get("page"))); err == nil && page > 1 && page <= 1_000_000 {
 		query.Page = page
 	}
@@ -592,6 +710,9 @@ func forgeAccessURL(query forgeAccessPreviewQuery) string {
 	}
 	if query.Status != "" {
 		params.Set("status", query.Status)
+	}
+	if query.Binding != "" {
+		params.Set("binding", query.Binding)
 	}
 	if query.Page > 1 {
 		params.Set("page", strconv.Itoa(query.Page))
@@ -651,28 +772,19 @@ func parseForgeAccessSaveForm(requestURL *url.URL, values url.Values) (forgeAcce
 	return form, connectionID, revision, attested, values.Get("service_pat"), nil
 }
 
-// parseForgeAccessRevisionForm accepts exactly the CSRF field, a positive
-// canonical expected connection id and revision, and any extra exact-value
-// fields.
-func parseForgeAccessRevisionForm(requestURL *url.URL, values url.Values, extra map[string]string) (int64, int64, error) {
-	if requestURL.RawQuery != "" || requestURL.ForceQuery {
-		return 0, 0, errors.New("query values are not allowed")
+// parseForgeAccessRevisionForm accepts exactly the CSRF field and a positive
+// canonical expected connection id and revision.
+func parseForgeAccessRevisionForm(requestURL *url.URL, values url.Values) (int64, int64, error) {
+	fields := []string{csrfFormField, "expected_connection_id", "expected_revision"}
+	if err := exactForgeAccessForm(requestURL, values, fields); err != nil {
+		return 0, 0, err
 	}
-	if len(values) != 3+len(extra) || len(values[csrfFormField]) != 1 ||
-		len(values["expected_connection_id"]) != 1 || len(values["expected_revision"]) != 1 {
-		return 0, 0, errors.New("form is malformed")
-	}
-	for field, want := range extra {
-		if len(values[field]) != 1 || values.Get(field) != want {
-			return 0, 0, errors.New("form is malformed")
-		}
-	}
-	connectionID, err := canonicalExpectedRevision(values.Get("expected_connection_id"))
-	if err != nil || connectionID == 0 {
+	connectionID, err := canonicalPositiveForgeAccessValue(values.Get("expected_connection_id"))
+	if err != nil {
 		return 0, 0, errors.New("expected connection id is invalid")
 	}
-	revision, err := canonicalExpectedRevision(values.Get("expected_revision"))
-	if err != nil || revision == 0 {
+	revision, err := canonicalPositiveForgeAccessValue(values.Get("expected_revision"))
+	if err != nil {
 		return 0, 0, errors.New("expected revision is invalid")
 	}
 	return connectionID, revision, nil
@@ -722,11 +834,39 @@ func forgeAccessNoticeToasts(values url.Values) []toastView {
 		tone = "success"
 	case forgeAccessResetStaleNotice:
 		message = "The saved connection changed before the reset. Reload Forge access and confirm again."
+	case forgeAccessResetBindingsNotice:
+		message = "Reset is blocked while repository bindings exist. Unbind every repository first; repository-owned data will remain unchanged."
 	case forgeAccessResetAuthorityNotice:
 		message = "Administrator authority changed before the reset could be recorded."
 		tone = "danger"
 	case forgeAccessResetUnknownNotice:
 		message = "Thawguard could not confirm the reset outcome. Reload Forge access before retrying."
+		tone = "danger"
+	case forgeAccessBoundNotice:
+		message = "Repository identity bound. No repository settings, credentials, grants, freezes, schedules, or enforcement state changed."
+		tone = "success"
+	case forgeAccessBindStaleNotice:
+		message = "The connection, preview, binding revision, or local repository incarnation changed before binding. Reload and review the current state."
+	case forgeAccessBindUnavailableNotice:
+		message = "This repository is not ready to bind. A current successful preview and one exact local and remote match are required."
+	case forgeAccessBindAuthorityNotice:
+		message = "Administrator authority changed before the repository binding could be recorded."
+		tone = "danger"
+	case forgeAccessBindUnknownNotice:
+		message = "Thawguard could not confirm the repository binding outcome. Reload Forge access before retrying."
+		tone = "danger"
+	case forgeAccessUnboundNotice:
+		message = "Repository identity unbound. All repository-owned data and operational state were left unchanged."
+		tone = "success"
+	case forgeAccessUnbindStaleNotice:
+		message = "The connection or binding revision changed before unbinding. Reload and review the current state."
+	case forgeAccessUnbindUnavailableNotice:
+		message = "This repository binding could not be removed from the submitted state. Reload Forge access and try again."
+	case forgeAccessUnbindAuthorityNotice:
+		message = "Administrator authority changed before the repository binding could be removed."
+		tone = "danger"
+	case forgeAccessUnbindUnknownNotice:
+		message = "Thawguard could not confirm the repository unbind outcome. Reload Forge access before retrying."
 		tone = "danger"
 	default:
 		return nil
