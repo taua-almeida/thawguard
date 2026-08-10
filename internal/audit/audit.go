@@ -81,6 +81,8 @@ const (
 	ActionForgeConnectionCheckStarted        = "forge.connection_check_started"
 	ActionForgeConnectionChecked             = "forge.connection_checked"
 	ActionForgeConnectionReset               = "forge.connection_reset"
+	ActionForgeRepositoryBound               = "forge.repository_bound"
+	ActionForgeRepositoryUnbound             = "forge.repository_unbound"
 
 	ActorKindPasswordRecoveryLink = "recovery_link"
 	ActorKindInvitationLink       = "invitation_link"
@@ -168,6 +170,8 @@ func KnownActions() []string {
 		ActionForgeConnectionCheckStarted,
 		ActionForgeConnectionChecked,
 		ActionForgeConnectionReset,
+		ActionForgeRepositoryBound,
+		ActionForgeRepositoryUnbound,
 	}
 }
 

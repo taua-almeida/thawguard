@@ -362,7 +362,7 @@ func TestEditAfterBindingFixesURLAndOrganization(t *testing.T) {
 	if connection.SetupCheck == nil || connection.SetupCheck.ConfigRevision != 1 {
 		t.Fatalf("expected retained stale evidence, got %+v", connection.SetupCheck)
 	}
-	preview, err := fixture.service.VisibleRepositories(fixture.ctx, connection.ID)
+	preview, err := loadRemoteRepositoryRecords(fixture.ctx, fixture.database, connection.ID)
 	if err != nil || len(preview) != 2 {
 		t.Fatalf("expected retained preview rows, got %d err=%v", len(preview), err)
 	}
@@ -443,13 +443,13 @@ func TestResetRequiresConfirmationAndDeletesEverything(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := fixture.service.Reset(fixture.ctx, fixture.adminID, ResetInput{ExpectedConnectionID: connection.ID, ExpectedRevision: 1}); !IsValidationError(err) {
+	if err := fixture.service.Reset(fixture.ctx, fixture.adminID, ResetInput{ExpectedConnectionID: connection.ID, ExpectedRevision: 1, ExpectedBindingRevision: 0}); !IsValidationError(err) {
 		t.Fatalf("expected confirmation requirement, got %v", err)
 	}
-	if err := fixture.service.Reset(fixture.ctx, fixture.adminID, ResetInput{ExpectedConnectionID: connection.ID, ExpectedRevision: 3, ConfirmReset: true}); !errors.Is(err, ErrConflict) {
+	if err := fixture.service.Reset(fixture.ctx, fixture.adminID, ResetInput{ExpectedConnectionID: connection.ID, ExpectedRevision: 3, ExpectedBindingRevision: 0, ConfirmReset: true}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("expected revision fence, got %v", err)
 	}
-	if err := fixture.service.Reset(fixture.ctx, fixture.adminID, ResetInput{ExpectedConnectionID: connection.ID, ExpectedRevision: 1, ConfirmReset: true}); err != nil {
+	if err := fixture.service.Reset(fixture.ctx, fixture.adminID, ResetInput{ExpectedConnectionID: connection.ID, ExpectedRevision: 1, ExpectedBindingRevision: 0, ConfirmReset: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -466,7 +466,8 @@ func TestResetRequiresConfirmationAndDeletesEverything(t *testing.T) {
 		}
 	}
 	assertForgeAudit(t, fixture.database, audit.ActionForgeConnectionReset, connection.ID, map[string]any{
-		"revision": float64(1),
+		"revision":         float64(1),
+		"binding_revision": float64(0),
 	})
 
 	// Recreation never reuses the deleted internal id.
@@ -539,7 +540,7 @@ VALUES (1, 'example.test')`, now, now, now, now, now, now); err != nil {
 	if err := fixture.service.Edit(fixture.ctx, fixture.adminID, nameEdit); err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.service.Reset(fixture.ctx, fixture.adminID, ResetInput{ExpectedConnectionID: connectionID, ExpectedRevision: 2, ConfirmReset: true}); err != nil {
+	if err := fixture.service.Reset(fixture.ctx, fixture.adminID, ResetInput{ExpectedConnectionID: connectionID, ExpectedRevision: 2, ExpectedBindingRevision: 0, ConfirmReset: true}); err != nil {
 		t.Fatal(err)
 	}
 	after := snapshot()

@@ -107,6 +107,36 @@ func TestStoreDefaultsDetailsAndCreatedAt(t *testing.T) {
 	}
 }
 
+func TestForgeRepositoryBindingEventsRemainAdministratorOnly(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, ctx)
+	for _, action := range []string{ActionForgeRepositoryBound, ActionForgeRepositoryUnbound} {
+		if err := store.Record(ctx, Event{
+			Action:      action,
+			SubjectType: SubjectTypeForgeConnection,
+			SubjectID:   "3",
+			DetailsJSON: `{"repository_id":11,"repository_created_at":"2026-08-02T10:00:00.000000011Z","config_revision":1,"check_generation":1,"binding_revision":1}`,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	bounded, total, err := store.ListPageForScope(ctx, repositoryscope.IDs(11), nil, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bounded) != 0 || total != 0 {
+		t.Fatalf("repository scope received Forge binding events: rows=%d total=%d", len(bounded), total)
+	}
+	all, total, err := store.ListPage(ctx, nil, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 || total != 2 {
+		t.Fatalf("administrator scope lost Forge binding events: rows=%d total=%d", len(all), total)
+	}
+}
+
 func TestStoreListsNewestFirstWithStableIDOrdering(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t, ctx)
@@ -365,6 +395,8 @@ func TestScopedActionClassificationCoversEveryKnownAction(t *testing.T) {
 		"forge.connection_check_started":             adminOnly,
 		"forge.connection_checked":                   adminOnly,
 		"forge.connection_reset":                     adminOnly,
+		"forge.repository_bound":                     adminOnly,
+		"forge.repository_unbound":                   adminOnly,
 	}
 
 	classified := map[string]string{}

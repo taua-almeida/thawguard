@@ -44,7 +44,7 @@ func TestCheckBindsIdentitiesAndReplacesPreview(t *testing.T) {
 		connection.Organization.Slug != "fixture-org" {
 		t.Fatalf("binding missing: %+v", connection)
 	}
-	preview, err := fixture.service.VisibleRepositories(fixture.ctx, connection.ID)
+	preview, err := loadRemoteRepositoryRecords(fixture.ctx, fixture.database, connection.ID)
 	if err != nil || len(preview) != 2 {
 		t.Fatalf("preview rows = %d err=%v", len(preview), err)
 	}
@@ -71,16 +71,16 @@ func TestCheckBindsIdentitiesAndReplacesPreview(t *testing.T) {
 		connection.Organization.DisplayName != "Renamed Organization" {
 		t.Fatalf("rename refresh missing: %+v", connection.Organization)
 	}
-	preview, err = fixture.service.VisibleRepositories(fixture.ctx, connection.ID)
+	preview, err = loadRemoteRepositoryRecords(fixture.ctx, fixture.database, connection.ID)
 	if err != nil || len(preview) != 2 {
 		t.Fatalf("replaced preview rows = %d err=%v", len(preview), err)
 	}
 	for _, repository := range preview {
-		if repository.RemoteID == "100" {
+		if repository.remoteID == "100" {
 			t.Fatal("disappeared repository was retained in the preview")
 		}
-		if repository.ObservedCheckGeneration != 2 {
-			t.Fatalf("preview generation = %d, want 2", repository.ObservedCheckGeneration)
+		if repository.generation != 2 {
+			t.Fatalf("preview generation = %d, want 2", repository.generation)
 		}
 	}
 }
@@ -110,13 +110,13 @@ func TestFailedCheckRetainsLastSuccessfulPreview(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	preview, err := fixture.service.VisibleRepositories(fixture.ctx, connection.ID)
+	preview, err := loadRemoteRepositoryRecords(fixture.ctx, fixture.database, connection.ID)
 	if err != nil || len(preview) != 2 {
 		t.Fatalf("failure dropped the retained preview: rows=%d err=%v", len(preview), err)
 	}
 	for _, repository := range preview {
-		if repository.ObservedCheckGeneration != 1 {
-			t.Fatalf("retained preview generation = %d, want 1", repository.ObservedCheckGeneration)
+		if repository.generation != 1 {
+			t.Fatalf("retained preview generation = %d, want 1", repository.generation)
 		}
 	}
 }
@@ -204,7 +204,7 @@ func TestConcurrentChecksPersistOnlyHighestGeneration(t *testing.T) {
 			if connection.SetupCheck == nil || connection.SetupCheck.CheckGeneration != 2 {
 				t.Fatalf("persisted evidence generation: %+v", connection.SetupCheck)
 			}
-			preview, err := fixture.service.VisibleRepositories(fixture.ctx, connection.ID)
+			preview, err := loadRemoteRepositoryRecords(fixture.ctx, fixture.database, connection.ID)
 			if err != nil || len(preview) != 1 {
 				t.Fatalf("persisted preview = %d rows err=%v (older check may have won)", len(preview), err)
 			}

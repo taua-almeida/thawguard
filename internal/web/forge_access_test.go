@@ -12,6 +12,7 @@ import (
 
 	"github.com/taua-almeida/thawguard/internal/audit"
 	"github.com/taua-almeida/thawguard/internal/auth"
+	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/forgeconnection"
 )
 
@@ -25,15 +26,17 @@ type fakeForgeConnectionService struct {
 	found      bool
 	currentErr error
 
-	repositories []forgeconnection.VisibleRepository
+	bindingModel forgeconnection.RepositoryBindingReadModel
 	listErr      error
 
-	createErr, editErr, resetErr, checkErr error
+	createErr, editErr, resetErr, checkErr, bindErr, unbindErr error
 
 	createCalls []forgeconnection.CreateInput
 	editCalls   []forgeconnection.EditInput
 	resetCalls  []forgeconnection.ResetInput
 	checkCalls  []forgeAccessCheckCall
+	bindCalls   []forgeconnection.BindRepositoryInput
+	unbindCalls []forgeconnection.UnbindRepositoryInput
 }
 
 type forgeAccessCheckCall struct {
@@ -45,8 +48,11 @@ func (f *fakeForgeConnectionService) Current(context.Context) (forgeconnection.C
 	return f.connection, f.found, f.currentErr
 }
 
-func (f *fakeForgeConnectionService) VisibleRepositories(context.Context, int64) ([]forgeconnection.VisibleRepository, error) {
-	return f.repositories, f.listErr
+func (f *fakeForgeConnectionService) RepositoryBindings(context.Context, int64) (forgeconnection.RepositoryBindingReadModel, error) {
+	if f.listErr != nil {
+		return forgeconnection.RepositoryBindingReadModel{}, f.listErr
+	}
+	return f.bindingModel, nil
 }
 
 func (f *fakeForgeConnectionService) Create(_ context.Context, _ int64, input forgeconnection.CreateInput) error {
@@ -67,6 +73,16 @@ func (f *fakeForgeConnectionService) Reset(_ context.Context, _ int64, input for
 func (f *fakeForgeConnectionService) Check(_ context.Context, _ int64, connectionID, revision int64) (forgeconnection.SetupCheck, error) {
 	f.checkCalls = append(f.checkCalls, forgeAccessCheckCall{ConnectionID: connectionID, Revision: revision})
 	return forgeconnection.SetupCheck{}, f.checkErr
+}
+
+func (f *fakeForgeConnectionService) BindRepository(_ context.Context, _ int64, input forgeconnection.BindRepositoryInput) error {
+	f.bindCalls = append(f.bindCalls, input)
+	return f.bindErr
+}
+
+func (f *fakeForgeConnectionService) UnbindRepository(_ context.Context, _ int64, input forgeconnection.UnbindRepositoryInput) error {
+	f.unbindCalls = append(f.unbindCalls, input)
+	return f.unbindErr
 }
 
 func newForgeAccessServer(service *fakeForgeConnectionService, encryption bool) *Server {
@@ -171,11 +187,34 @@ func checkedForgeConnection(code forgeconnection.CheckResultCode) forgeconnectio
 	return connection
 }
 
-func forgeVisibleRepositories(generation int64) []forgeconnection.VisibleRepository {
-	observed := time.Date(2026, 8, 1, 11, 0, 0, 0, time.UTC)
-	return []forgeconnection.VisibleRepository{
-		{RemoteID: "100", Owner: "fixture-org", Name: "alpha", DefaultBranch: "main", Private: false, ObservedCheckGeneration: generation, ObservedAt: observed},
-		{RemoteID: "101", Owner: "fixture-org", Name: "beta", DefaultBranch: "main", Private: true, ObservedCheckGeneration: generation, ObservedAt: observed},
+// forgePreviewRow is one unbound remote-only preview row as the service
+// derives it: RemoteFullNames always carries the row's retained locators.
+func forgePreviewRow(name string, private bool, state forgeconnection.RepositoryBindingState) forgeconnection.RepositoryBindingRow {
+	fullName := "fixture-org/" + name
+	return forgeconnection.RepositoryBindingRow{
+		State:               state,
+		RemoteFullName:      fullName,
+		RemoteFullNames:     []string{fullName},
+		RemoteDefaultBranch: "main",
+		RemotePrivate:       &private,
+		ObservedAt:          time.Date(2026, 8, 1, 11, 0, 0, 0, time.UTC),
+	}
+}
+
+// forgePreviewModel mirrors what the service derives for two retained
+// unbound rows: unmatched while the preview is current, preview-not-current
+// otherwise.
+func forgePreviewModel(current bool) forgeconnection.RepositoryBindingReadModel {
+	state := forgeconnection.RepositoryBindingUnmatched
+	if !current {
+		state = forgeconnection.RepositoryBindingPreviewNotCurrent
+	}
+	return forgeconnection.RepositoryBindingReadModel{
+		Current: current,
+		Rows: []forgeconnection.RepositoryBindingRow{
+			forgePreviewRow("alpha", false, state),
+			forgePreviewRow("beta", true, state),
+		},
 	}
 }
 
@@ -225,7 +264,7 @@ func TestForgeAccessRendersEmptyAndEncryptionStates(t *testing.T) {
 	body := response.Body.String()
 	for _, want := range []string{
 		"Forge access",
-		"Preview only",
+		"Identity metadata only",
 		"Configure Forgejo connection",
 		"Administrator attestation",
 		"read:user, read:organization, and read:repository",
@@ -258,16 +297,17 @@ func TestForgeAccessRendersEmptyAndEncryptionStates(t *testing.T) {
 
 func TestForgeAccessRendersEvidenceStates(t *testing.T) {
 	cases := []struct {
-		name         string
-		connection   forgeconnection.Connection
-		repositories []forgeconnection.VisibleRepository
-		want         []string
-		reject       []string
+		name       string
+		connection forgeconnection.Connection
+		model      forgeconnection.RepositoryBindingReadModel
+		want       []string
+		reject     []string
 	}{
 		{
 			name:       "saved never checked",
 			connection: savedForgeConnection(),
 			want:       []string{"Never checked", "No preview recorded yet", "Administrator-attested PAT stored", "Run connection check"},
+			reject:     []string{"Preview not current", "Repository bindings and last observed preview"},
 		},
 		{
 			name: "check incomplete",
@@ -279,25 +319,25 @@ func TestForgeAccessRendersEvidenceStates(t *testing.T) {
 			want: []string{"Check incomplete; run again."},
 		},
 		{
-			name:         "current visible inventory",
-			connection:   checkedForgeConnection(forgeconnection.CheckVisibleInventoryObserved),
-			repositories: forgeVisibleRepositories(1),
+			name:       "current visible inventory",
+			connection: checkedForgeConnection(forgeconnection.CheckVisibleInventoryObserved),
+			model:      forgePreviewModel(true),
 			want: []string{
 				"Visible inventory observed",
-				"Repositories visible to this attested credential",
+				"Repository bindings and current preview",
 				"fixture-org/alpha",
 				"fixture-org/beta",
 				"private-read capability was observed",
-				"Identities bound",
+				"Forge identities bound",
 				"Forgejo version 15.0.6",
 			},
 			reject: []string{"Last observed preview"},
 		},
 		{
-			name:         "private read unproven",
-			connection:   checkedForgeConnection(forgeconnection.CheckVisibleInventoryObservedPrivateReadUnproven),
-			repositories: forgeVisibleRepositories(1),
-			want:         []string{"private read unproven", "private-read capability is unproven"},
+			name:       "private read unproven",
+			connection: checkedForgeConnection(forgeconnection.CheckVisibleInventoryObservedPrivateReadUnproven),
+			model:      forgePreviewModel(true),
+			want:       []string{"private read unproven", "private-read capability is unproven"},
 		},
 		{
 			name: "failed with retained preview",
@@ -307,8 +347,8 @@ func TestForgeAccessRendersEvidenceStates(t *testing.T) {
 				connection.SetupCheck.CheckGeneration = 2
 				return connection
 			}(),
-			repositories: forgeVisibleRepositories(1),
-			want:         []string{"Check failed", "could not be reached", "Last observed preview"},
+			model: forgePreviewModel(false),
+			want:  []string{"Check failed", "could not be reached", "Repository bindings and last observed preview"},
 		},
 		{
 			name: "stale after edit",
@@ -317,8 +357,8 @@ func TestForgeAccessRendersEvidenceStates(t *testing.T) {
 				connection.Revision = 2
 				return connection
 			}(),
-			repositories: forgeVisibleRepositories(1),
-			want:         []string{"Evidence predates the current revision", "Last observed preview"},
+			model: forgePreviewModel(false),
+			want:  []string{"Evidence predates the current revision", "Repository bindings and last observed preview"},
 		},
 		{
 			name: "empty visible inventory",
@@ -329,6 +369,7 @@ func TestForgeAccessRendersEvidenceStates(t *testing.T) {
 				connection.SetupCheck.VisiblePrivateRepositoryCount = &zero
 				return connection
 			}(),
+			model:  forgeconnection.RepositoryBindingReadModel{Current: true},
 			want:   []string{"Empty visible inventory", "not what the organization contains"},
 			reject: []string{"Last observed preview", "(last observed)"},
 		},
@@ -344,7 +385,7 @@ func TestForgeAccessRendersEvidenceStates(t *testing.T) {
 				connection.Revision = 2
 				return connection
 			}(),
-			want:   []string{"Last observed preview", "Empty visible inventory (last observed)"},
+			want:   []string{"Repository bindings and last observed preview", "Empty visible inventory (last observed)"},
 			reject: []string{"No preview recorded yet"},
 		},
 		{
@@ -357,7 +398,7 @@ func TestForgeAccessRendersEvidenceStates(t *testing.T) {
 				connection.SetupCheck.CheckGeneration = 2
 				return connection
 			}(),
-			want:   []string{"Last observed preview", "Empty visible inventory (last observed)"},
+			want:   []string{"Repository bindings and last observed preview", "Empty visible inventory (last observed)"},
 			reject: []string{"No preview recorded yet"},
 		},
 		{
@@ -372,13 +413,13 @@ func TestForgeAccessRendersEvidenceStates(t *testing.T) {
 				connection.CheckGeneration = 2
 				return connection
 			}(),
-			want:   []string{"Last observed preview", "Empty visible inventory (last observed)"},
+			want:   []string{"Repository bindings and last observed preview", "Empty visible inventory (last observed)"},
 			reject: []string{"No preview recorded yet"},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			service := &fakeForgeConnectionService{connection: tc.connection, found: true, repositories: tc.repositories}
+			service := &fakeForgeConnectionService{connection: tc.connection, found: true, bindingModel: tc.model}
 			server := newForgeAccessServer(service, true)
 			session := forgeAccessAdminSession(t, server)
 			response := forgeAccessGET(server, session, "/settings/forge-access")
@@ -401,22 +442,17 @@ func TestForgeAccessRendersEvidenceStates(t *testing.T) {
 }
 
 func TestForgeAccessPreviewSearchFilterAndPagination(t *testing.T) {
-	repositories := make([]forgeconnection.VisibleRepository, 0, 45)
-	observed := time.Date(2026, 8, 1, 11, 0, 0, 0, time.UTC)
+	rows := make([]forgeconnection.RepositoryBindingRow, 0, 45)
 	for i := range 45 {
 		name := "repo-" + string(rune('a'+i%26)) + strings.Repeat("x", i/26+1)
-		repositories = append(repositories, forgeconnection.VisibleRepository{
-			RemoteID:                "10" + strings.Repeat("0", 1) + string(rune('0'+i%10)) + string(rune('0'+i/10)),
-			Owner:                   "fixture-org",
-			Name:                    name,
-			DefaultBranch:           "main",
-			Private:                 i%3 == 0,
-			ObservedCheckGeneration: 1,
-			ObservedAt:              observed,
-		})
+		rows = append(rows, forgePreviewRow(name, i%3 == 0, forgeconnection.RepositoryBindingUnmatched))
 	}
 	connection := checkedForgeConnection(forgeconnection.CheckVisibleInventoryObserved)
-	service := &fakeForgeConnectionService{connection: connection, found: true, repositories: repositories}
+	service := &fakeForgeConnectionService{
+		connection:   connection,
+		found:        true,
+		bindingModel: forgeconnection.RepositoryBindingReadModel{Current: true, Rows: rows},
+	}
 	server := newForgeAccessServer(service, true)
 	session := forgeAccessAdminSession(t, server)
 
@@ -450,6 +486,34 @@ func TestForgeAccessPreviewSearchFilterAndPagination(t *testing.T) {
 	noMatch := forgeAccessGET(server, session, "/settings/forge-access?q=zzz-none").Body.String()
 	if !strings.Contains(noMatch, "No repositories match") {
 		t.Fatalf("no-match state missing")
+	}
+}
+
+func TestForgeAccessPaginatesSeparateStaleIdentitiesAtOneLocator(t *testing.T) {
+	rows := make([]forgeconnection.RepositoryBindingRow, 0, 21)
+	for range 21 {
+		rows = append(rows, forgePreviewRow("same-locator", false, forgeconnection.RepositoryBindingPreviewNotCurrent))
+	}
+	service := &fakeForgeConnectionService{
+		connection: checkedForgeConnection(forgeconnection.CheckVisibleInventoryObserved),
+		found:      true,
+		bindingModel: forgeconnection.RepositoryBindingReadModel{
+			Current: false,
+			Rows:    rows,
+		},
+	}
+	server := newForgeAccessServer(service, true)
+	session := forgeAccessAdminSession(t, server)
+
+	page1 := forgeAccessGET(server, session, "/settings/forge-access").Body.String()
+	if !strings.Contains(page1, "Showing 1–20 of 21 repositories") ||
+		strings.Count(page1, "fixture-org/same-locator") != 20 {
+		t.Fatalf("first stale identity page collapsed rows")
+	}
+	page2 := forgeAccessGET(server, session, "/settings/forge-access?page=2").Body.String()
+	if !strings.Contains(page2, "Showing 21–21 of 21 repositories") ||
+		strings.Count(page2, "fixture-org/same-locator") != 1 {
+		t.Fatalf("second stale identity page did not retain the final row")
 	}
 }
 
@@ -641,17 +705,19 @@ func TestForgeAccessCheckAndResetPostContracts(t *testing.T) {
 		t.Fatalf("wrong confirm status=%d resets=%d", response.Code, len(service.resetCalls))
 	}
 	confirmed := url.Values{
-		csrfFormField:            {session.CSRFToken},
-		"expected_connection_id": {"3"},
-		"expected_revision":      {"1"},
-		"confirm_reset":          {forgeAccessConfirmResetValue},
+		csrfFormField:               {session.CSRFToken},
+		"expected_connection_id":    {"3"},
+		"expected_revision":         {"1"},
+		"expected_binding_revision": {"0"},
+		"confirm_reset":             {forgeAccessConfirmResetValue},
 	}
 	response = forgeAccessPOST(server, session, "/settings/forge-access/reset", confirmed, forgeAccessTestPublicURL)
 	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/settings/forge-access?notice=forge-reset" {
 		t.Fatalf("reset status=%d location=%q", response.Code, response.Header().Get("Location"))
 	}
 	if len(service.resetCalls) != 1 || service.resetCalls[0].ExpectedConnectionID != 3 ||
-		service.resetCalls[0].ExpectedRevision != 1 || !service.resetCalls[0].ConfirmReset {
+		service.resetCalls[0].ExpectedRevision != 1 || service.resetCalls[0].ExpectedBindingRevision != 0 ||
+		!service.resetCalls[0].ConfirmReset {
 		t.Fatalf("reset calls = %+v", service.resetCalls)
 	}
 }
@@ -687,6 +753,563 @@ func TestForgeAccessResetConfirmationDialog(t *testing.T) {
 	}
 }
 
+func TestForgeAccessBindingLoadFailuresDegradeByCause(t *testing.T) {
+	service := &fakeForgeConnectionService{
+		connection: checkedForgeConnection(forgeconnection.CheckVisibleInventoryObserved),
+		found:      true,
+		listErr:    errors.New("boom"),
+	}
+	server := newForgeAccessServer(service, true)
+	session := forgeAccessAdminSession(t, server)
+	response := forgeAccessGET(server, session, "/settings/forge-access")
+	if response.Code != http.StatusInternalServerError ||
+		!strings.Contains(response.Body.String(), "could not load repository binding states") {
+		t.Fatalf("unknown load failure: status=%d", response.Code)
+	}
+
+	// A concurrent reset between Current and RepositoryBindings surfaces as
+	// ErrNoConnection; the page renders the empty model instead of failing.
+	service.listErr = forgeconnection.ErrNoConnection
+	response = forgeAccessGET(server, session, "/settings/forge-access")
+	if response.Code != http.StatusOK ||
+		!strings.Contains(response.Body.String(), "Empty visible inventory (last observed)") {
+		t.Fatalf("concurrent reset render: status=%d", response.Code)
+	}
+}
+
+func forgeAccessBindingModel() forgeconnection.RepositoryBindingReadModel {
+	public := false
+	private := true
+	createdAt := func(nanosecond int) string {
+		return time.Date(2026, 8, 2, 10, 0, 0, nanosecond, time.UTC).Format(time.RFC3339Nano)
+	}
+	observedAt := time.Date(2026, 8, 2, 11, 0, 0, 0, time.UTC)
+	return forgeconnection.RepositoryBindingReadModel{
+		Current: true,
+		Rows: []forgeconnection.RepositoryBindingRow{
+			{
+				State:               forgeconnection.RepositoryBindingReady,
+				RepositoryID:        11,
+				RepositoryCreatedAt: createdAt(11),
+				LocalFullName:       "fixture-org/alpha-local",
+				LocalDefaultBranch:  "release",
+				LocalActive:         false,
+				RemoteFullName:      "fixture-org/alpha-remote",
+				RemoteFullNames:     []string{"fixture-org/alpha-remote"},
+				RemoteDefaultBranch: "main",
+				RemotePrivate:       &public,
+				ObservedAt:          observedAt,
+			},
+			{
+				State:               forgeconnection.RepositoryBindingCurrent,
+				RepositoryID:        12,
+				RepositoryCreatedAt: createdAt(12),
+				LocalFullName:       "fixture-org/beta-local",
+				LocalDefaultBranch:  "main",
+				LocalActive:         true,
+				RemoteFullName:      "fixture-org/beta-remote",
+				RemoteFullNames:     []string{"fixture-org/beta-remote"},
+				RemoteDefaultBranch: "trunk",
+				RemotePrivate:       &private,
+				ObservedAt:          observedAt,
+			},
+			{
+				State:               forgeconnection.RepositoryBindingIdentityConflict,
+				RepositoryID:        13,
+				RepositoryCreatedAt: createdAt(13),
+				LocalFullName:       "fixture-org/gamma-local",
+				LocalDefaultBranch:  "main",
+				LocalActive:         true,
+				RemoteFullName:      "fixture-org/gamma-local",
+				RemoteFullNames:     []string{"fixture-org/gamma-local", "fixture-org/gamma-replacement"},
+				RemoteDefaultBranch: "release",
+				RemotePrivate:       &public,
+				ObservedAt:          observedAt,
+			},
+			{
+				State:               forgeconnection.RepositoryBindingUnmatched,
+				RemoteFullName:      "fixture-org/delta-remote",
+				RemoteFullNames:     []string{"fixture-org/delta-remote"},
+				RemoteDefaultBranch: "main",
+				RemotePrivate:       &public,
+				ObservedAt:          observedAt,
+			},
+			{
+				State:               forgeconnection.RepositoryBindingDuplicateRemoteLocator,
+				RemoteFullName:      "fixture-org/epsilon-remote",
+				RemoteFullNames:     []string{"fixture-org/epsilon-remote"},
+				RemoteDefaultBranch: "",
+				RemotePrivate:       nil,
+				ObservedAt:          observedAt,
+			},
+		},
+	}
+}
+
+func forgeAccessBindingConnection() forgeconnection.Connection {
+	connection := checkedForgeConnection(forgeconnection.CheckVisibleInventoryObserved)
+	connection.BindingRevision = 4
+	return connection
+}
+
+func forgeAccessBindForm(session sessionState) url.Values {
+	return url.Values{
+		csrfFormField:               {session.CSRFToken},
+		"expected_connection_id":    {"3"},
+		"expected_config_revision":  {"1"},
+		"expected_check_generation": {"1"},
+		"expected_binding_revision": {"4"},
+		"repository_id":             {"11"},
+		"repository_created_at":     {"2026-08-02T10:00:00.000000011Z"},
+		"confirm_bind":              {forgeAccessConfirmBindValue},
+	}
+}
+
+func forgeAccessUnbindForm(session sessionState) url.Values {
+	return url.Values{
+		csrfFormField:               {session.CSRFToken},
+		"expected_connection_id":    {"3"},
+		"expected_config_revision":  {"1"},
+		"expected_binding_revision": {"4"},
+		"repository_id":             {"12"},
+		"confirm_unbind":            {forgeAccessConfirmUnbindValue},
+	}
+}
+
+func TestForgeAccessBindingStatesFiltersAndNoJavaScriptConfirmations(t *testing.T) {
+	service := &fakeForgeConnectionService{
+		connection:   forgeAccessBindingConnection(),
+		found:        true,
+		bindingModel: forgeAccessBindingModel(),
+	}
+	server := newForgeAccessServer(service, true)
+	session := forgeAccessAdminSession(t, server)
+
+	body := forgeAccessGET(server, session, "/settings/forge-access").Body.String()
+	for _, want := range []string{
+		"Repository bindings and current preview",
+		"Ready to bind",
+		"Bound and current",
+		"Identity conflict",
+		"Unmatched",
+		"Duplicate remote locator",
+		"fixture-org/alpha-local",
+		"fixture-org/alpha-remote",
+		"Inactive",
+		"Default branch:",
+		"unknown",
+		"Reset is blocked until every repository binding below is removed",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("binding page missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{"remote_repository_id", "Remote ID", ">100<", ">101<"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("binding page exposed %q", forbidden)
+		}
+	}
+
+	filters := []struct {
+		query  string
+		want   string
+		reject []string
+	}{
+		{query: "ready", want: "fixture-org/alpha-remote", reject: []string{"fixture-org/beta-remote", "fixture-org/delta-remote"}},
+		{query: "bound", want: "fixture-org/beta-remote", reject: []string{"fixture-org/alpha-remote", "fixture-org/gamma-local", "fixture-org/delta-remote"}},
+		{query: "attention", want: "fixture-org/gamma-local", reject: []string{"fixture-org/alpha-remote", "fixture-org/delta-remote"}},
+		{query: "unmatched", want: "fixture-org/delta-remote", reject: []string{"fixture-org/alpha-remote", "fixture-org/beta-remote"}},
+	}
+	for _, filter := range filters {
+		filtered := forgeAccessGET(server, session, "/settings/forge-access?binding="+filter.query).Body.String()
+		if !strings.Contains(filtered, filter.want) {
+			t.Fatalf("binding filter %s missing %q", filter.query, filter.want)
+		}
+		for _, reject := range filter.reject {
+			if strings.Contains(filtered, reject) {
+				t.Fatalf("binding filter %s unexpectedly rendered %q", filter.query, reject)
+			}
+		}
+	}
+	privateOnly := forgeAccessGET(server, session, "/settings/forge-access?status=private").Body.String()
+	if !strings.Contains(privateOnly, "fixture-org/beta-remote") || strings.Contains(privateOnly, "fixture-org/alpha-remote") ||
+		strings.Contains(privateOnly, "fixture-org/gamma-local") {
+		t.Fatalf("private visibility filter included public or unknown rows")
+	}
+	publicOnly := forgeAccessGET(server, session, "/settings/forge-access?status=public").Body.String()
+	if !strings.Contains(publicOnly, "fixture-org/gamma-local") || strings.Contains(publicOnly, "fixture-org/beta-remote") ||
+		strings.Contains(publicOnly, "fixture-org/epsilon-remote") {
+		t.Fatalf("public visibility filter omitted the agreed conflict group or included private/unknown rows")
+	}
+
+	// A conflict row keeps its remote display cleared but is still found by
+	// searching any of its retained remote locators.
+	conflictSearch := forgeAccessGET(server, session, "/settings/forge-access?q=gamma-replacement").Body.String()
+	if !strings.Contains(conflictSearch, "fixture-org/gamma-local") ||
+		!strings.Contains(conflictSearch, "Identity conflict") {
+		t.Fatalf("conflict row not searchable by retained remote locator")
+	}
+	if strings.Contains(conflictSearch, "fixture-org/alpha-local") {
+		t.Fatalf("conflict search rendered unrelated rows")
+	}
+
+	bindBody := forgeAccessGET(server, session, "/settings/forge-access?bind=11").Body.String()
+	if !strings.Contains(bindBody, `<dialog id="forge-bind-confirm" open`) ||
+		!strings.Contains(bindBody, `action="/settings/forge-access/repositories/bind"`) {
+		t.Fatalf("server-rendered bind confirmation missing")
+	}
+	bindForm := formForAction(t, bindBody, "/settings/forge-access/repositories/bind")
+	for _, field := range []string{
+		`name="expected_connection_id" value="3"`,
+		`name="expected_config_revision" value="1"`,
+		`name="expected_check_generation" value="1"`,
+		`name="expected_binding_revision" value="4"`,
+		`name="repository_id" value="11"`,
+		`name="repository_created_at" value="2026-08-02T10:00:00.000000011Z"`,
+		`name="confirm_bind" value="bind"`,
+	} {
+		if !strings.Contains(bindForm, field) {
+			t.Fatalf("bind form missing %q: %s", field, bindForm)
+		}
+	}
+	for _, forbidden := range []string{"remote_repository_id", "owner", "default_branch", "visibility", "alpha-remote"} {
+		if strings.Contains(bindForm, forbidden) {
+			t.Fatalf("bind mutation form contains %q: %s", forbidden, bindForm)
+		}
+	}
+
+	unbindBody := forgeAccessGET(server, session, "/settings/forge-access?unbind=12").Body.String()
+	if !strings.Contains(unbindBody, `<dialog id="forge-unbind-confirm" open`) ||
+		!strings.Contains(unbindBody, `action="/settings/forge-access/repositories/unbind"`) {
+		t.Fatalf("server-rendered unbind confirmation missing")
+	}
+	unbindForm := formForAction(t, unbindBody, "/settings/forge-access/repositories/unbind")
+	if strings.Contains(unbindForm, "repository_created_at") || strings.Contains(unbindForm, "remote_repository_id") {
+		t.Fatalf("unbind form contains an unsupported identity field: %s", unbindForm)
+	}
+
+	resetBody := forgeAccessGET(server, session, "/settings/forge-access?reset=confirm").Body.String()
+	if !strings.Contains(resetBody, "Reset blocked by repository bindings") ||
+		strings.Contains(resetBody, `action="/settings/forge-access/reset"`) {
+		t.Fatalf("reset was not visibly blocked by bindings")
+	}
+}
+
+func TestForgeAccessDriftedDuplicateConflictUsesAgreedVisibility(t *testing.T) {
+	private := true
+	service := &fakeForgeConnectionService{
+		connection: forgeAccessBindingConnection(),
+		found:      true,
+		bindingModel: forgeconnection.RepositoryBindingReadModel{
+			Current: true,
+			Rows: []forgeconnection.RepositoryBindingRow{
+				{
+					State:               forgeconnection.RepositoryBindingIdentityConflict,
+					RepositoryID:        41,
+					RepositoryCreatedAt: "2026-08-02T10:00:00.000000041Z",
+					LocalFullName:       "fixture-org/renamed-local",
+					LocalDefaultBranch:  "main",
+					LocalActive:         true,
+					RemoteFullName:      "fixture-org/renamed-remote",
+					RemoteFullNames:     []string{"fixture-org/renamed-remote"},
+					RemoteDefaultBranch: "release",
+					RemotePrivate:       &private,
+					ObservedAt:          time.Date(2040, 8, 10, 12, 34, 56, 789, time.UTC),
+				},
+			},
+		},
+	}
+	server := newForgeAccessServer(service, true)
+	session := forgeAccessAdminSession(t, server)
+
+	privateSearch := forgeAccessGET(
+		server,
+		session,
+		"/settings/forge-access?status=private&q=fixture-org%2Frenamed-remote",
+	).Body.String()
+	for _, want := range []string{
+		"fixture-org/renamed-local",
+		"fixture-org/renamed-remote",
+		"Identity conflict",
+		"release",
+	} {
+		if !strings.Contains(privateSearch, want) {
+			t.Fatalf("private conflict search missing %q", want)
+		}
+	}
+
+	publicOnly := forgeAccessGET(server, session, "/settings/forge-access?status=public").Body.String()
+	if strings.Contains(publicOnly, "fixture-org/renamed-local") ||
+		strings.Contains(publicOnly, "fixture-org/renamed-remote") {
+		t.Fatal("public filter included the agreed-private conflict row")
+	}
+}
+
+func TestForgeAccessBoundAndAttentionFiltersAreExclusive(t *testing.T) {
+	row := func(name string, state forgeconnection.RepositoryBindingState) forgeconnection.RepositoryBindingRow {
+		result := forgePreviewRow(name, false, state)
+		result.RepositoryID = int64(len(name))
+		result.LocalFullName = "fixture-org/local-" + name
+		return result
+	}
+	missing := row("missing", forgeconnection.RepositoryBindingNotVisible)
+	missing.RemoteFullName = ""
+	missing.RemoteFullNames = nil
+	service := &fakeForgeConnectionService{
+		connection: forgeAccessBindingConnection(),
+		found:      true,
+		bindingModel: forgeconnection.RepositoryBindingReadModel{
+			Current: true,
+			Rows: []forgeconnection.RepositoryBindingRow{
+				row("current-only", forgeconnection.RepositoryBindingCurrent),
+				row("last-observed", forgeconnection.RepositoryBindingLastObservedOnly),
+				row("conflict", forgeconnection.RepositoryBindingIdentityConflict),
+				row("drift", forgeconnection.RepositoryBindingLocatorDrift),
+				missing,
+				row("ready-row", forgeconnection.RepositoryBindingReady),
+				row("unmatched-row", forgeconnection.RepositoryBindingUnmatched),
+			},
+		},
+	}
+	server := newForgeAccessServer(service, true)
+	session := forgeAccessAdminSession(t, server)
+
+	bound := forgeAccessGET(server, session, "/settings/forge-access?binding=bound").Body.String()
+	if !strings.Contains(bound, "fixture-org/current-only") {
+		t.Fatal("Bound filter omitted the current binding")
+	}
+	for _, rejected := range []string{"last-observed", "conflict", "drift", "local-missing", "ready-row", "unmatched-row"} {
+		if strings.Contains(bound, "fixture-org/"+rejected) {
+			t.Fatalf("Bound filter included %q", rejected)
+		}
+	}
+
+	attention := forgeAccessGET(server, session, "/settings/forge-access?binding=attention").Body.String()
+	for _, expected := range []string{"last-observed", "conflict", "drift", "local-missing"} {
+		if !strings.Contains(attention, "fixture-org/"+expected) {
+			t.Fatalf("Attention filter omitted %q", expected)
+		}
+	}
+	for _, rejected := range []string{"current-only", "ready-row", "unmatched-row"} {
+		if strings.Contains(attention, "fixture-org/"+rejected) {
+			t.Fatalf("Attention filter included %q", rejected)
+		}
+	}
+}
+
+func TestForgeAccessUnbindConfirmationWorksWithoutCurrentPreviewOrEncryption(t *testing.T) {
+	connection := forgeAccessBindingConnection()
+	connection.CheckGeneration = 2
+	stale := forgeAccessBindingModel().Rows[1]
+	stale.State = forgeconnection.RepositoryBindingLastObservedOnly
+	service := &fakeForgeConnectionService{
+		connection: connection,
+		found:      true,
+		bindingModel: forgeconnection.RepositoryBindingReadModel{
+			Current: false,
+			Rows:    []forgeconnection.RepositoryBindingRow{stale},
+		},
+	}
+	server := newForgeAccessServer(service, false)
+	session := forgeAccessAdminSession(t, server)
+	body := forgeAccessGET(server, session, "/settings/forge-access?unbind=12").Body.String()
+	for _, want := range []string{"Service PAT encryption unavailable", "Last observed only", `<dialog id="forge-unbind-confirm" open`, "Unbind identity"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("stale no-encryption unbind page missing %q", want)
+		}
+	}
+}
+
+func TestForgeAccessBindingPostsEnforceSecurityAndExactForms(t *testing.T) {
+	service := &fakeForgeConnectionService{connection: forgeAccessBindingConnection(), found: true, bindingModel: forgeAccessBindingModel()}
+	server := newForgeAccessServer(service, true)
+	session := forgeAccessAdminSession(t, server)
+	bindForm := forgeAccessBindForm(session)
+	unbindForm := forgeAccessUnbindForm(session)
+
+	for _, route := range []struct {
+		path string
+		form url.Values
+	}{
+		{path: "/settings/forge-access/repositories/bind", form: bindForm},
+		{path: "/settings/forge-access/repositories/unbind", form: unbindForm},
+	} {
+		for _, origins := range [][]string{nil, {"null"}, {"https://attacker.example"}, {forgeAccessTestPublicURL, forgeAccessTestPublicURL}} {
+			response := forgeAccessPOST(server, session, route.path, route.form, origins...)
+			if response.Code != http.StatusForbidden {
+				t.Fatalf("%s origin %v status=%d", route.path, origins, response.Code)
+			}
+			assertForgeAccessSecurityHeaders(t, response.Header())
+		}
+	}
+	if len(service.bindCalls) != 0 || len(service.unbindCalls) != 0 {
+		t.Fatalf("origin rejection reached binding service: binds=%d unbinds=%d", len(service.bindCalls), len(service.unbindCalls))
+	}
+
+	badCSRF := cloneValues(bindForm)
+	badCSRF.Set(csrfFormField, "invalid")
+	if response := forgeAccessPOST(server, session, "/settings/forge-access/repositories/bind", badCSRF, forgeAccessTestPublicURL); response.Code != http.StatusForbidden {
+		t.Fatalf("bind bad CSRF status=%d", response.Code)
+	}
+	badCSRF = cloneValues(unbindForm)
+	badCSRF.Set(csrfFormField, "invalid")
+	if response := forgeAccessPOST(server, session, "/settings/forge-access/repositories/unbind", badCSRF, forgeAccessTestPublicURL); response.Code != http.StatusForbidden {
+		t.Fatalf("unbind bad CSRF status=%d", response.Code)
+	}
+
+	rejected := []struct {
+		name string
+		path string
+		form url.Values
+	}{
+		{name: "bind query", path: "/settings/forge-access/repositories/bind?x=1", form: cloneValues(bindForm)},
+		{name: "bind unknown", path: "/settings/forge-access/repositories/bind", form: withFormValue(bindForm, "remote_repository_id", "999")},
+		{name: "bind duplicate", path: "/settings/forge-access/repositories/bind", form: withDuplicateFormValue(bindForm, "repository_id", "11")},
+		{name: "bind missing generation", path: "/settings/forge-access/repositories/bind", form: withoutFormValue(bindForm, "expected_check_generation")},
+		{name: "bind noncanonical id", path: "/settings/forge-access/repositories/bind", form: withFormValue(withoutFormValue(bindForm, "repository_id"), "repository_id", "011")},
+		{name: "bind noncanonical timestamp", path: "/settings/forge-access/repositories/bind", form: withFormValue(withoutFormValue(bindForm, "repository_created_at"), "repository_created_at", "2026-08-02T10:00:00.000000000Z")},
+		{name: "bind wrong confirmation", path: "/settings/forge-access/repositories/bind", form: withFormValue(withoutFormValue(bindForm, "confirm_bind"), "confirm_bind", "yes")},
+		{name: "unbind query", path: "/settings/forge-access/repositories/unbind?x=1", form: cloneValues(unbindForm)},
+		{name: "unbind unknown", path: "/settings/forge-access/repositories/unbind", form: withFormValue(unbindForm, "owner", "fixture-org")},
+		{name: "unbind duplicate", path: "/settings/forge-access/repositories/unbind", form: withDuplicateFormValue(unbindForm, "expected_binding_revision", "4")},
+		{name: "unbind missing revision", path: "/settings/forge-access/repositories/unbind", form: withoutFormValue(unbindForm, "expected_binding_revision")},
+		{name: "unbind wrong confirmation", path: "/settings/forge-access/repositories/unbind", form: withFormValue(withoutFormValue(unbindForm, "confirm_unbind"), "confirm_unbind", "yes")},
+	}
+	for _, tc := range rejected {
+		response := forgeAccessPOST(server, session, tc.path, tc.form, forgeAccessTestPublicURL)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("%s status=%d", tc.name, response.Code)
+		}
+		assertForgeAccessSecurityHeaders(t, response.Header())
+	}
+	if len(service.bindCalls) != 0 || len(service.unbindCalls) != 0 {
+		t.Fatalf("malformed forms reached service: binds=%d unbinds=%d", len(service.bindCalls), len(service.unbindCalls))
+	}
+
+	bindResponse := forgeAccessPOST(server, session, "/settings/forge-access/repositories/bind", bindForm, forgeAccessTestPublicURL)
+	if bindResponse.Code != http.StatusSeeOther || bindResponse.Header().Get("Location") != "/settings/forge-access?notice="+forgeAccessBoundNotice {
+		t.Fatalf("bind status=%d location=%q", bindResponse.Code, bindResponse.Header().Get("Location"))
+	}
+	assertForgeAccessSecurityHeaders(t, bindResponse.Header())
+	if len(service.bindCalls) != 1 || service.bindCalls[0] != (forgeconnection.BindRepositoryInput{
+		ExpectedConnectionID:    3,
+		ExpectedConfigRevision:  1,
+		ExpectedCheckGeneration: 1,
+		ExpectedBindingRevision: 4,
+		RepositoryID:            11,
+		RepositoryCreatedAt:     "2026-08-02T10:00:00.000000011Z",
+		ConfirmBind:             true,
+	}) {
+		t.Fatalf("bind calls = %+v", service.bindCalls)
+	}
+	unbindResponse := forgeAccessPOST(server, session, "/settings/forge-access/repositories/unbind", unbindForm, forgeAccessTestPublicURL)
+	if unbindResponse.Code != http.StatusSeeOther || unbindResponse.Header().Get("Location") != "/settings/forge-access?notice="+forgeAccessUnboundNotice {
+		t.Fatalf("unbind status=%d location=%q", unbindResponse.Code, unbindResponse.Header().Get("Location"))
+	}
+	if len(service.unbindCalls) != 1 || service.unbindCalls[0] != (forgeconnection.UnbindRepositoryInput{
+		ExpectedConnectionID:    3,
+		ExpectedConfigRevision:  1,
+		ExpectedBindingRevision: 4,
+		RepositoryID:            12,
+		ConfirmUnbind:           true,
+	}) {
+		t.Fatalf("unbind calls = %+v", service.unbindCalls)
+	}
+}
+
+func TestForgeAccessBindingRoutesEnforceBodyAdminAndForcedPasswordGates(t *testing.T) {
+	service := &fakeForgeConnectionService{}
+	server := newForgeAccessServer(service, true)
+	admin := forgeAccessAdminSession(t, server)
+
+	oversized := forgeAccessBindForm(admin)
+	oversized.Set("repository_created_at", strings.Repeat("x", int(forgeAccessActionMaxBodyBytes)))
+	response := forgeAccessPOST(server, admin, "/settings/forge-access/repositories/bind", oversized, forgeAccessTestPublicURL)
+	if response.Code != http.StatusBadRequest || len(service.bindCalls) != 0 {
+		t.Fatalf("oversized bind status=%d calls=%d", response.Code, len(service.bindCalls))
+	}
+	assertForgeAccessSecurityHeaders(t, response.Header())
+
+	nonAdmin, err := server.sessions.create()
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID := int64(8)
+	nonAdmin.UserID = &userID
+	nonAdmin.Grants = auth.NewGrants(false, nil)
+	server.sessions.mu.Lock()
+	server.sessions.sessions[nonAdmin.ID] = nonAdmin
+	server.sessions.mu.Unlock()
+	for _, route := range []struct {
+		path string
+		form url.Values
+	}{
+		{path: "/settings/forge-access/repositories/bind", form: forgeAccessBindForm(nonAdmin)},
+		{path: "/settings/forge-access/repositories/unbind", form: forgeAccessUnbindForm(nonAdmin)},
+	} {
+		got := forgeAccessPOST(server, nonAdmin, route.path, route.form, forgeAccessTestPublicURL)
+		if got.Code != http.StatusForbidden {
+			t.Fatalf("non-admin %s status=%d", route.path, got.Code)
+		}
+	}
+
+	forced := admin
+	forced.MustChangePassword = true
+	server.sessions.mu.Lock()
+	server.sessions.sessions[forced.ID] = forced
+	server.sessions.mu.Unlock()
+	for _, route := range []struct {
+		path string
+		form url.Values
+	}{
+		{path: "/settings/forge-access/repositories/bind", form: forgeAccessBindForm(forced)},
+		{path: "/settings/forge-access/repositories/unbind", form: forgeAccessUnbindForm(forced)},
+	} {
+		got := forgeAccessPOST(server, forced, route.path, route.form, forgeAccessTestPublicURL)
+		if got.Code != http.StatusSeeOther || got.Header().Get("Location") != "/account/password" {
+			t.Fatalf("forced-password %s status=%d location=%q", route.path, got.Code, got.Header().Get("Location"))
+		}
+	}
+	if len(service.bindCalls) != 0 || len(service.unbindCalls) != 0 {
+		t.Fatalf("authorization gate reached service: binds=%d unbinds=%d", len(service.bindCalls), len(service.unbindCalls))
+	}
+}
+
+func TestForgeAccessResetRequiresBindingRevisionAndReportsBindingBlock(t *testing.T) {
+	service := &fakeForgeConnectionService{connection: forgeAccessBindingConnection(), found: true, bindingModel: forgeAccessBindingModel()}
+	server := newForgeAccessServer(service, true)
+	session := forgeAccessAdminSession(t, server)
+	preUpgrade := url.Values{
+		csrfFormField:            {session.CSRFToken},
+		"expected_connection_id": {"3"},
+		"expected_revision":      {"1"},
+		"confirm_reset":          {forgeAccessConfirmResetValue},
+	}
+	if response := forgeAccessPOST(server, session, "/settings/forge-access/reset", preUpgrade, forgeAccessTestPublicURL); response.Code != http.StatusBadRequest || len(service.resetCalls) != 0 {
+		t.Fatalf("pre-upgrade reset status=%d calls=%d", response.Code, len(service.resetCalls))
+	}
+	service.resetErr = forgeconnection.ErrBindingsExist
+	current := cloneValues(preUpgrade)
+	current.Set("expected_binding_revision", "4")
+	response := forgeAccessPOST(server, session, "/settings/forge-access/reset", current, forgeAccessTestPublicURL)
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/settings/forge-access?notice="+forgeAccessResetBindingsNotice {
+		t.Fatalf("blocked reset status=%d location=%q", response.Code, response.Header().Get("Location"))
+	}
+}
+
+func formForAction(t *testing.T, body, action string) string {
+	t.Helper()
+	start := strings.Index(body, `<form method="post" action="`+action+`"`)
+	if start < 0 {
+		t.Fatalf("form action %q missing", action)
+	}
+	end := strings.Index(body[start:], "</form>")
+	if end < 0 {
+		t.Fatalf("form action %q is not closed", action)
+	}
+	return body[start : start+end]
+}
+
 func TestForgeActivityPresentationIgnoresSensitiveUnexpectedDetails(t *testing.T) {
 	actorID := int64(7)
 	event := audit.Event{
@@ -712,5 +1335,106 @@ func TestForgeActivityPresentationIgnoresSensitiveUnexpectedDetails(t *testing.T
 	}
 	if !strings.Contains(view.Detail, "2 repositories visible to the attested credential (1 private)") {
 		t.Fatalf("checked detail: %q", view.Detail)
+	}
+}
+
+func TestForgeConnectionResetActivityAcceptsExactHistoricalAndCurrentShapes(t *testing.T) {
+	for _, details := range []string{
+		`{"revision":1}`,
+		`{"revision":1,"binding_revision":0}`,
+	} {
+		event := audit.Event{
+			Action:      audit.ActionForgeConnectionReset,
+			SubjectType: audit.SubjectTypeForgeConnection,
+			SubjectID:   "3",
+			DetailsJSON: details,
+		}
+		view := activityEventViewForEvent(nil, nil, event)
+		if view.ActionLabel != "Forge connection" || view.Outcome != "Reset" {
+			t.Fatalf("reset details %s rendered as %+v", details, view)
+		}
+	}
+	event := audit.Event{
+		Action:      audit.ActionForgeConnectionReset,
+		SubjectType: audit.SubjectTypeForgeConnection,
+		SubjectID:   "3",
+		DetailsJSON: `{"revision":1,"base_url":"canary"}`,
+	}
+	if view := activityEventViewForEvent(nil, nil, event); view.ActionLabel != "Unrecognized activity" {
+		t.Fatalf("reset activity accepted unexpected details: %+v", view)
+	}
+}
+
+func TestForgeRepositoryBindingActivityUsesMatchingRepositoryIncarnation(t *testing.T) {
+	actorID := int64(7)
+	createdAt := time.Date(2026, 8, 2, 10, 0, 0, 11, time.UTC)
+	event := audit.Event{
+		ActorUserID: &actorID,
+		Action:      audit.ActionForgeRepositoryBound,
+		SubjectType: audit.SubjectTypeForgeConnection,
+		SubjectID:   "3",
+		DetailsJSON: `{"repository_id":11,"repository_created_at":"2026-08-02T10:00:00.000000011Z","config_revision":1,"check_generation":2,"binding_revision":4}`,
+	}
+	repositories := map[int64]domain.Repository{
+		11: {ID: 11, Owner: "fixture-org", Name: "alpha", CreatedAt: createdAt},
+	}
+	view := activityEventViewForEvent(repositories, nil, event)
+	if view.ActionLabel != "Forge repository binding" || view.Target != "fixture-org/alpha" || view.Outcome != "Bound" {
+		t.Fatalf("matching binding activity: %+v", view)
+	}
+	if !strings.Contains(view.Detail, "binding revision 4") || strings.Contains(view.Detail, "remote") {
+		t.Fatalf("binding activity detail: %q", view.Detail)
+	}
+
+	replacement := repositories[11]
+	replacement.CreatedAt = createdAt.Add(time.Nanosecond)
+	repositories[11] = replacement
+	view = activityEventViewForEvent(repositories, nil, event)
+	if view.Target != "Former repository" {
+		t.Fatalf("reused repository id resolved to replacement: %+v", view)
+	}
+
+	for _, details := range []string{
+		`{"repository_id":11,"config_revision":1,"check_generation":2,"binding_revision":4}`,
+		`{"repository_id":11,"repository_created_at":"malformed","config_revision":1,"check_generation":2,"binding_revision":4}`,
+		`{"repository_id":"malformed","repository_created_at":"2026-08-02T10:00:00.000000011Z","config_revision":1,"check_generation":2,"binding_revision":4}`,
+	} {
+		fallback := event
+		fallback.DetailsJSON = details
+		view = activityEventViewForEvent(repositories, nil, fallback)
+		if view.ActionLabel != "Forge repository binding" || view.Target != "Former repository" || view.Outcome != "Bound" {
+			t.Fatalf("malformed or missing incarnation %s did not use the bounded fallback: %+v", details, view)
+		}
+	}
+	for _, details := range []string{
+		`{"repository_id":`,
+		`{"repository_id":11,"repository_id":12,"repository_created_at":"2026-08-02T10:00:00.000000011Z","config_revision":1,"check_generation":2,"binding_revision":4}`,
+	} {
+		fallback := event
+		fallback.DetailsJSON = details
+		view = activityEventViewForEvent(repositories, nil, fallback)
+		if view.ActionLabel != "Unrecognized activity" || view.Target != "Former repository" {
+			t.Fatalf("invalid binding audit %s did not use the bounded fallback: %+v", details, view)
+		}
+	}
+
+	unbound := event
+	unbound.Action = audit.ActionForgeRepositoryUnbound
+	unbound.DetailsJSON = `{"repository_id":11,"repository_created_at":"2026-08-02T10:00:00.000000011Z","config_revision":1,"binding_revision":5}`
+	view = activityEventViewForEvent(repositories, nil, unbound)
+	if view.ActionLabel != "Forge repository binding" || view.Outcome != "Unbound" ||
+		strings.Contains(view.Detail, "check ") || !strings.Contains(view.Detail, "binding revision 5") {
+		t.Fatalf("unbind activity shape: %+v", view)
+	}
+	unbound.DetailsJSON = `{"repository_id":11,"repository_created_at":"2026-08-02T10:00:00.000000011Z","config_revision":1,"check_generation":2,"binding_revision":5}`
+	if view = activityEventViewForEvent(repositories, nil, unbound); view.ActionLabel != "Unrecognized activity" {
+		t.Fatalf("unbind activity accepted bind-only check evidence: %+v", view)
+	}
+
+	unexpected := event
+	unexpected.DetailsJSON = `{"repository_id":11,"repository_created_at":"2026-08-02T10:00:00.000000011Z","config_revision":1,"check_generation":2,"binding_revision":4,"remote_repository_id":"remote-canary","base_url":"url-canary"}`
+	view = activityEventViewForEvent(repositories, nil, unexpected)
+	if view.ActionLabel != "Unrecognized activity" || strings.Contains(view.Target, "remote-canary") || strings.Contains(view.Detail, "url-canary") {
+		t.Fatalf("unexpected binding audit details leaked: %+v", view)
 	}
 }
