@@ -431,22 +431,23 @@ func encryptServicePAT(ctx context.Context, store secrets.Store, pat string) ([]
 // connectionRecord is the internal load model, PAT ciphertext included. It
 // never leaves this package.
 type connectionRecord struct {
-	ID                   int64
-	Provider             string
-	DisplayName          string
-	BaseURL              string
-	OrganizationSlug     string
-	ServicePATCiphertext []byte
-	ServiceUserRemoteID  string
-	Revision             int64
-	CheckGeneration      int64
-	BindingRevision      int64
-	PATAttestedAt        time.Time
-	OrganizationID       int64
-	Organization         *Organization
-	SetupCheck           *SetupCheck
-	CreatedAt            time.Time
-	UpdatedAt            time.Time
+	ID                     int64
+	Provider               string
+	DisplayName            string
+	BaseURL                string
+	OrganizationSlug       string
+	ServicePATCiphertext   []byte
+	ServiceUserRemoteID    string
+	Revision               int64
+	CheckGeneration        int64
+	BindingRevision        int64
+	AccessIdentityRevision int64
+	PATAttestedAt          time.Time
+	OrganizationID         int64
+	Organization           *Organization
+	SetupCheck             *SetupCheck
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
 }
 
 func (r connectionRecord) bound() bool {
@@ -461,7 +462,7 @@ type queryer interface {
 func loadConnectionRecord(ctx context.Context, q queryer) (connectionRecord, bool, error) {
 	row := q.QueryRowContext(ctx, `
 SELECT c.id, c.provider, c.display_name, c.base_url, c.config_revision, c.check_generation,
-	  c.binding_revision,
+	  c.binding_revision, c.access_identity_revision,
   c.created_at, c.updated_at,
   fc.organization_slug, fc.service_pat_ciphertext, fc.service_user_remote_id, fc.pat_attested_at,
   o.id, o.remote_organization_id, o.slug, o.display_name, o.observed_at,
@@ -488,6 +489,7 @@ WHERE c.provider = ?`, ProviderForgejo)
 		&record.Revision,
 		&record.CheckGeneration,
 		&record.BindingRevision,
+		&record.AccessIdentityRevision,
 		&createdAt,
 		&updatedAt,
 		&record.OrganizationSlug,
@@ -622,6 +624,7 @@ func publicConnection(record connectionRecord) (Connection, error) {
 		slugErr != nil || organizationSlug != record.OrganizationSlug ||
 		len(record.ServicePATCiphertext) == 0 ||
 		record.Revision <= 0 || record.CheckGeneration < 0 || record.BindingRevision < 0 ||
+		record.AccessIdentityRevision < 0 ||
 		record.CreatedAt.IsZero() || record.UpdatedAt.IsZero() ||
 		record.UpdatedAt.Before(record.CreatedAt) ||
 		(record.ServiceUserRemoteID != "") != (record.Organization != nil) {

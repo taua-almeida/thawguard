@@ -609,6 +609,17 @@ SELECT EXISTS(SELECT 1 FROM forgejo_identities WHERE connection_id = ? AND remot
 	if collision == 1 {
 		return s.rejectClaimedRow(ctx, tx, claim, LinkCollision, audit.ActionForgeIdentityLinkRejected)
 	}
+	// Linking atomically advances the connection's access-identity revision,
+	// which fences shadow-access snapshots against identity churn. A
+	// saturated revision blocks the link: unlike unlink and purge, a link
+	// may never ride the terminal same-revision reduction.
+	advanced, err := advanceAccessIdentityRevision(ctx, tx, claim.connectionID)
+	if err != nil {
+		return LinkStale, nil
+	}
+	if !advanced {
+		return s.rejectClaimedRow(ctx, tx, claim, LinkConfigurationUnavailable, "")
+	}
 	deleted, err := execExpectingOneRow(
 		ctx,
 		tx,

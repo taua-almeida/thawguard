@@ -175,6 +175,10 @@ type forgeAccessPageData struct {
 	OAuthFormError          string
 	OAuthDisableConfirmOpen bool
 	HasIdentities           bool
+
+	// Shadow is the manual shadow-access snapshot summary card.
+	Shadow               forgeShadowSectionView
+	ShadowRunConfirmOpen bool
 }
 
 // forgeAccessRenderState carries one render's submitted-form and error
@@ -397,9 +401,11 @@ func (s *Server) renderForgeAccess(
 	data.CheckState = forgeAccessCheckState(connection)
 	data.CheckReady = data.EncryptionAvailable
 	data.ResetConfirmOpen = r.URL.Query().Get("reset") == "confirm"
+	data.ShadowRunConfirmOpen = r.URL.Query().Get("shadow") == "run"
 	if !s.loadForgeAccessOAuthClient(w, &data, connection, r, state.OAuthFormError) {
 		return
 	}
+	s.loadForgeAccessShadowSection(r.Context(), &data)
 	if showSubmittedForm {
 		data.ShowForm = true
 		data.Editing = true
@@ -428,6 +434,20 @@ func (s *Server) renderForgeAccess(
 	// the no-connection state.
 	s.buildForgeAccessPreview(&data, connection, repositories, r.URL.Query())
 	s.renderPageStatus(w, status, "layouts/forge-access", data)
+}
+
+// loadForgeAccessShadowSection fills the shadow-access summary card. A load
+// failure degrades the card to its error state instead of failing the page.
+func (s *Server) loadForgeAccessShadowSection(ctx context.Context, data *forgeAccessPageData) {
+	if s.cfg.ForgeAccessShadowService == nil {
+		return
+	}
+	view, err := s.cfg.ForgeAccessShadowService.View(ctx)
+	if err != nil {
+		data.Shadow = forgeShadowSectionView{Available: true, LoadError: true}
+		return
+	}
+	data.Shadow = forgeShadowSection(view)
 }
 
 // loadForgeAccessOAuthClient fills the OAuth client card state. The
@@ -967,6 +987,29 @@ func forgeAccessNoticeToasts(values url.Values) []toastView {
 		message = "Saving the OAuth client is unavailable until secret encryption is configured."
 	case forgeOAuthUnknownNotice:
 		message = "Thawguard could not confirm whether the OAuth client change was recorded. Reload Forge access and inspect the saved state before retrying."
+		tone = "danger"
+	case forgeShadowCompleteNotice:
+		message = "Shadow snapshot completed. The evidence below covers exactly what this credential could observe; no roles or authority changed."
+		tone = "success"
+	case forgeShadowIncompleteNotice:
+		message = "The shadow snapshot attempt finished with a failure result and published no pair evidence. See the latest attempt state."
+	case forgeShadowSupersededNotice:
+		message = "The connection configuration or its identity/binding scope changed while the snapshot ran, so the attempt was superseded and published no pair evidence."
+	case forgeShadowStaleNotice:
+		message = "The connection, its evidence, or the run history changed before this snapshot could start. Reload and review the current state."
+	case forgeShadowRunningNotice:
+		message = "A shadow snapshot is already running. Wait for it to finish or become Interrupted after 75 seconds."
+	case forgeShadowInterruptedNotice:
+		message = "The shadow snapshot was interrupted before a result could be recorded. The next run recovers it safely."
+	case forgeShadowAuthorityNotice:
+		message = "Administrator authority changed before the shadow snapshot could start."
+		tone = "danger"
+	case forgeShadowUnavailableNotice:
+		message = "Shadow snapshots are unavailable until the Forge connection service and secret encryption are configured."
+	case forgeShadowInvalidNotice:
+		message = "The shadow snapshot cannot start from the submitted state. Review the prerequisites and the small-alpha limits."
+	case forgeShadowUnknownNotice:
+		message = "Thawguard could not confirm the shadow snapshot outcome. Reload Forge access and inspect the latest attempt before retrying."
 		tone = "danger"
 	default:
 		return nil

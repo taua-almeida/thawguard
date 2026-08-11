@@ -89,6 +89,8 @@ const (
 	ActionForgeIdentityLinkRejected          = "forge.identity_link_rejected"
 	ActionForgeIdentityUnlinked              = "forge.identity_unlinked"
 	ActionForgeIdentityPurged                = "forge.identity_purged"
+	ActionForgeAccessSyncStarted             = "forge.access_sync_started"
+	ActionForgeAccessSyncFinished            = "forge.access_sync_finished"
 
 	ActorKindPasswordRecoveryLink = "recovery_link"
 	ActorKindInvitationLink       = "invitation_link"
@@ -185,6 +187,8 @@ func KnownActions() []string {
 		ActionForgeIdentityLinkRejected,
 		ActionForgeIdentityUnlinked,
 		ActionForgeIdentityPurged,
+		ActionForgeAccessSyncStarted,
+		ActionForgeAccessSyncFinished,
 	}
 }
 

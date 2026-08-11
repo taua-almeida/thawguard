@@ -1,0 +1,81 @@
+{{ define "pages/forge-access-shadow" }}
+<div class="flex min-w-0 flex-col gap-6">
+  <header>
+    <h1 class="m-0 text-page-title font-bold text-text">Shadow access</h1>
+    <p class="m-0 mt-1 text-sm text-text-muted">Per-pair shadow evidence from the latest completed credential-visible snapshot. Everything here is observation only: no repository role, grant, or enforcement state is read or changed.</p>
+  </header>
+
+  {{ if .LoadError }}
+  <div role="alert">{{ template "ui/callout" dict "Tone" "danger" "Title" "Shadow access unavailable" "Body" .LoadError }}</div>
+  {{ else if not .HasConnection }}
+  <section class="flex min-h-72 flex-col items-center justify-center rounded-panel border border-border bg-surface px-5 py-10 text-center shadow-card" aria-labelledby="no-shadow-connection-title">
+    <span class="flex size-14 items-center justify-center rounded-pill bg-accent-soft text-accent-strong" aria-hidden="true"><svg class="h-7 w-7"><use href="#tg-i-lock"></use></svg></span>
+    <h2 id="no-shadow-connection-title" class="m-0 mt-4 text-lg font-bold text-text">No Forge connection configured</h2>
+    <p class="m-0 mt-2 max-w-2xl text-sm text-text-muted">Shadow snapshots require a saved Forge connection with linked identities and bound repositories.</p>
+    <div class="mt-4">{{ template "ui/button" dict "Label" "Open Forge access" "Variant" "secondary" "Href" "/settings/forge-access" }}</div>
+  </section>
+  {{ else }}
+
+  <section class="min-w-0 rounded-panel border border-border bg-surface p-4 shadow-card sm:p-6" aria-labelledby="forge-shadow-summary-title">
+    <div class="flex flex-wrap items-start justify-between gap-3">
+      <div>
+        <h2 id="forge-shadow-summary-title" class="m-0 text-lg font-bold text-text">Snapshot state</h2>
+        <p class="m-0 mt-1 text-sm text-text-muted">Snapshots run manually from the Forge access page. Ages are informational; manual evidence never expires on its own.</p>
+      </div>
+      {{ template "ui/button" dict "Label" "Open Forge access" "Variant" "secondary" "Href" "/settings/forge-access" }}
+    </div>
+    <div class="mt-5">
+      {{ template "components/forge-shadow-summary" dict "Shadow" .Shadow "DetailsLink" false }}
+    </div>
+  </section>
+
+  <section class="min-w-0 rounded-panel border border-border bg-surface p-4 shadow-card sm:p-6" aria-labelledby="forge-shadow-pairs-title">
+    <div>
+      <h2 id="forge-shadow-pairs-title" class="m-0 text-lg font-bold text-text">Pair evidence</h2>
+      <p class="m-0 mt-1 text-sm text-text-muted">Every current linked identity × bound repository pair, sorted by user, then repository. The username shown is the historical username observed at link time, never a current provider value. Remote identifiers, team names, and provider errors are never displayed.</p>
+    </div>
+    {{ if not .RowsAvailable }}
+    <div class="mt-4">{{ template "ui/empty-state" dict "Title" "No current pairs to display" "Hint" "Pair evidence appears once at least one Forgejo identity is linked and at least one repository is bound within the small-alpha limits." }}</div>
+    {{ else }}
+    <div class="mt-4 overflow-x-auto rounded-panel border border-border bg-surface shadow-card">
+      <table class="w-full border-collapse text-sm">
+        <caption class="sr-only">Shadow access pair evidence</caption>
+        <thead>
+          <tr class="bg-surface-muted text-left">
+            <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Local user</th>
+            <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Repository</th>
+            <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Latest observation</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{ range .Rows }}
+          <tr class="border-t border-border">
+            <td class="px-4 py-3 align-top">
+              <p class="m-0 font-semibold text-text">{{ .UserLabel }}</p>
+              <p class="m-0 mt-1 break-all text-xs text-text-muted">{{ .UserEmail }}</p>
+              <div class="mt-1">{{ template "ui/badge" dict "Label" .UserStateLabel "Tone" .UserStateTone }}</div>
+              <p class="m-0 mt-1 text-xs text-text-muted">Forgejo username at link (historical): <span class="break-all font-mono">{{ .UsernameAtLink }}</span></p>
+            </td>
+            <td class="px-4 py-3 align-top">
+              <p class="m-0 break-all font-mono text-text">{{ .RepositoryFullName }}</p>
+            </td>
+            <td class="px-4 py-3 align-top">
+              {{ template "ui/badge" dict "Label" .StateLabel "Tone" .StateTone }}
+              <p class="m-0 mt-2 text-xs text-text-muted">{{ .ReasonText }}</p>
+              {{ if .ObservedAt }}<p class="m-0 mt-1 text-xs text-text-muted">Observed {{ .ObservedAt }}</p>{{ end }}
+              {{ if .PriorConfirmedLabel }}
+              <p class="m-0 mt-2 text-xs text-text-muted">Previously confirmed in an earlier complete credential-visible snapshot: <span class="font-semibold text-text">{{ .PriorConfirmedLabel }}</span> at {{ .PriorConfirmedAt }}. {{ .PriorConfirmedReasonText }} Preserved beneath the newer unknown observation.</p>
+              {{ end }}
+            </td>
+          </tr>
+          {{ end }}
+        </tbody>
+      </table>
+    </div>
+    {{ end }}
+  </section>
+
+  <p class="m-0 text-sm text-text-muted">A completed snapshot is complete only for the graph visible to the attested credential within the approved limits. Shadow evidence never establishes Thawguard authority.</p>
+  {{ end }}
+</div>
+{{ end }}

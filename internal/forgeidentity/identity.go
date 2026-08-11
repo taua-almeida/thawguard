@@ -5,9 +5,38 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/taua-almeida/thawguard/internal/audit"
 )
+
+// advanceAccessIdentityRevision atomically advances the connection's
+// access-identity revision, which fences shadow-access snapshots against
+// identity churn. The revision never wraps: at math.MaxInt64 the row is left
+// unchanged and advanced is false, so a link can reject saturation while
+// unlink and purge proceed as a permitted terminal same-revision reduction
+// (exact identity-set rechecks still prevent stale snapshot completion).
+func advanceAccessIdentityRevision(ctx context.Context, tx *sql.Tx, connectionID int64) (bool, error) {
+	advanced, err := execExpectingOneRow(ctx, tx, `
+UPDATE forge_connections
+SET access_identity_revision = access_identity_revision + 1
+WHERE id = ? AND access_identity_revision < ?`, connectionID, int64(math.MaxInt64))
+	if err != nil {
+		return false, fmt.Errorf("advance forge access identity revision: %w", err)
+	}
+	if advanced {
+		return true, nil
+	}
+	var revision int64
+	if err := tx.QueryRowContext(ctx, `
+SELECT access_identity_revision FROM forge_connections WHERE id = ?`, connectionID).Scan(&revision); err != nil {
+		return false, fmt.Errorf("verify forge access identity revision: %w", err)
+	}
+	if revision != math.MaxInt64 {
+		return false, errors.New("forge access identity revision did not advance")
+	}
+	return false, nil
+}
 
 // IdentityForUser returns the user's linked identity, if any. The remote
 // numeric id is deliberately absent from the read model.
@@ -169,6 +198,9 @@ DELETE FROM forgejo_identity_link_transactions WHERE connection_id = ? AND user_
 		connectionID, input.ActorUserID); err != nil {
 		return fmt.Errorf("delete forge identity link transactions: %w", err)
 	}
+	if _, err := advanceAccessIdentityRevision(ctx, tx, connectionID); err != nil {
+		return err
+	}
 	if err := recordIdentityEvent(ctx, tx, input.ActorUserID, audit.ActionForgeIdentityUnlinked, input.IdentityID, connectionID); err != nil {
 		return err
 	}
@@ -245,6 +277,9 @@ DELETE FROM forgejo_identities WHERE id = ? AND user_id = ? AND connection_id = 
 DELETE FROM forgejo_identity_link_transactions WHERE connection_id = ? AND user_id = ?`,
 		connectionID, input.TargetUserID); err != nil {
 		return fmt.Errorf("delete forge identity link transactions for purge: %w", err)
+	}
+	if _, err := advanceAccessIdentityRevision(ctx, tx, connectionID); err != nil {
+		return err
 	}
 	if err := recordIdentityEvent(ctx, tx, input.ActorUserID, audit.ActionForgeIdentityPurged, input.IdentityID, connectionID); err != nil {
 		return err

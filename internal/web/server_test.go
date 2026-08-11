@@ -2994,6 +2994,16 @@ func TestActivityMappingsCoverEveryKnownAuditAction(t *testing.T) {
 			event.SubjectID = "1"
 			event.DetailsJSON = `{"reason":"remote_identity_collision"}`
 		}
+		if action == audit.ActionForgeAccessSyncStarted {
+			event.SubjectType = audit.SubjectTypeForgeConnection
+			event.SubjectID = "1"
+			event.DetailsJSON = `{"run_id":1,"identity_count":2,"repository_count":2}`
+		}
+		if action == audit.ActionForgeAccessSyncFinished {
+			event.SubjectType = audit.SubjectTypeForgeConnection
+			event.SubjectID = "1"
+			event.DetailsJSON = `{"run_id":1,"result_code":"complete","present_count":1,"unknown_count":1,"request_count":14}`
+		}
 		view := activityEventViewForEvent(nil, nil, event)
 		if view.ActionLabel == "Unrecognized activity" || view.ActionLabel == "" || view.Outcome == "" || view.Target == "" || view.Detail == "" {
 			t.Fatalf("audit action %q lacks a complete curated activity mapping: %+v", action, view)
