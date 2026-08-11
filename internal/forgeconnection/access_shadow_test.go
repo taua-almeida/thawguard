@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"math"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -257,7 +258,7 @@ func TestAccessShadowRunValidatesInput(t *testing.T) {
 		{name: "zero connection id", mutate: func(input *RunAccessShadowInput) { input.ExpectedConnectionID = 0 }},
 		{name: "zero config revision", mutate: func(input *RunAccessShadowInput) { input.ExpectedConfigRevision = 0 }},
 		{name: "zero check generation", mutate: func(input *RunAccessShadowInput) { input.ExpectedCheckGeneration = 0 }},
-		{name: "zero binding revision", mutate: func(input *RunAccessShadowInput) { input.ExpectedBindingRevision = 0 }},
+		{name: "negative binding revision", mutate: func(input *RunAccessShadowInput) { input.ExpectedBindingRevision = -1 }},
 		{name: "zero identity revision", mutate: func(input *RunAccessShadowInput) { input.ExpectedAccessIdentityRevision = 0 }},
 		{name: "negative newest run id", mutate: func(input *RunAccessShadowInput) { input.ExpectedNewestRunID = -1 }},
 		{name: "missing confirmation", mutate: func(input *RunAccessShadowInput) { input.ConfirmShadowOnly = false }},
@@ -602,8 +603,9 @@ UPDATE forgejo_connection_config SET service_pat_ciphertext = x'01020304'`); err
 	if len(finished) != 1 || finished[0]["result_code"] != "credential_unavailable" {
 		t.Fatalf("finished details: %v", finished)
 	}
-	if _, present := finished[0]["request_count"]; present {
-		t.Fatalf("credential failure must omit the request count: %v", finished[0])
+	// No provider I/O happened, so the request count is a known zero.
+	if finished[0]["request_count"] != float64(0) {
+		t.Fatalf("credential failure must record a zero request count: %v", finished[0])
 	}
 }
 
@@ -817,8 +819,9 @@ func TestAccessShadowViewDerivesAttemptSnapshotAndPairs(t *testing.T) {
 		t.Fatalf("pair evidence wrong: %+v", adminAlpha)
 	}
 
-	// A binding-revision change flips the attempt to superseded and the
-	// snapshot scope to changed.
+	// A later binding-revision change flips only the completed-snapshot
+	// axis to scope-changed; the historical attempt keeps its durable
+	// Completed result and is never relabeled Superseded.
 	if _, err := fixture.database.Exec(`UPDATE forge_connections SET binding_revision = 9`); err != nil {
 		t.Fatal(err)
 	}
@@ -826,12 +829,12 @@ func TestAccessShadowViewDerivesAttemptSnapshotAndPairs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if view.LatestAttempt.Status != AccessAttemptSuperseded || view.LatestSnapshot.ScopeCurrent {
+	if view.LatestAttempt.Status != AccessAttemptCompleted || view.LatestSnapshot.ScopeCurrent {
 		t.Fatalf("stale-scope view: attempt=%+v snapshot=%+v", view.LatestAttempt, view.LatestSnapshot)
 	}
 }
 
-func TestAccessShadowViewSupersedesTerminalReductionAtSaturatedRevision(t *testing.T) {
+func TestAccessShadowViewSnapshotScopeChangesOnTerminalReductionAtSaturatedRevision(t *testing.T) {
 	fixture := newAccessShadowFixture(t)
 	fixture.observer.observations = []AccessObservation{completeObservation(30, nil)}
 	if _, err := fixture.service.Run(fixture.ctx, fixture.adminID, fixture.validRunInput()); err != nil {
@@ -841,7 +844,8 @@ func TestAccessShadowViewSupersedesTerminalReductionAtSaturatedRevision(t *testi
 	// unlink is a permitted terminal same-revision reduction. Simulate it by
 	// removing an identity without touching the revision: the captured and
 	// current revisions still match, so only the shrunken identity count can
-	// expose that the completed snapshot no longer describes the scope.
+	// expose that the completed snapshot no longer describes the scope. The
+	// historical attempt keeps its durable Completed result.
 	if _, err := fixture.database.Exec(`DELETE FROM forgejo_identities WHERE id = 22`); err != nil {
 		t.Fatal(err)
 	}
@@ -849,7 +853,7 @@ func TestAccessShadowViewSupersedesTerminalReductionAtSaturatedRevision(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if view.LatestAttempt == nil || view.LatestAttempt.Status != AccessAttemptSuperseded {
+	if view.LatestAttempt == nil || view.LatestAttempt.Status != AccessAttemptCompleted {
 		t.Fatalf("attempt after terminal reduction = %+v", view.LatestAttempt)
 	}
 	if view.LatestSnapshot == nil || view.LatestSnapshot.ScopeCurrent {
@@ -899,6 +903,521 @@ func TestAccessShadowViewDerivesRunningAndInterrupted(t *testing.T) {
 	}
 	if view.LatestSnapshot != nil {
 		t.Fatal("failure must not create a snapshot anchor")
+	}
+}
+
+// auditActors returns each matching event's nullable actor in insert order.
+func (f *accessShadowFixture) auditActors(t *testing.T, action string) []sql.NullInt64 {
+	t.Helper()
+	rows, err := f.database.QueryContext(f.ctx, `
+SELECT actor_user_id FROM audit_events WHERE action = ? ORDER BY id`, action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	actors := make([]sql.NullInt64, 0)
+	for rows.Next() {
+		var actor sql.NullInt64
+		if err := rows.Scan(&actor); err != nil {
+			t.Fatal(err)
+		}
+		actors = append(actors, actor)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return actors
+}
+
+func (f *accessShadowFixture) insertSecondAdmin(t *testing.T, userID int64) {
+	t.Helper()
+	if _, err := f.database.Exec(`
+INSERT INTO users(id, email, display_name, created_at, updated_at)
+VALUES (?, 'second-admin@example.test', 'Second Admin', ?, ?)`,
+		userID, accessShadowFixtureTime, accessShadowFixtureTime); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.database.Exec(`
+INSERT INTO user_roles(user_id, role, created_at) VALUES (?, 'admin', ?)`,
+		userID, accessShadowFixtureTime); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAccessShadowOrphanInterruptionAttributedToPersistedRequester(t *testing.T) {
+	fixture := newAccessShadowFixture(t)
+	fixture.insertSecondAdmin(t, 4)
+	gate := make(chan struct{})
+	fixture.observer.gates = []chan struct{}{gate}
+	fixture.observer.started = make(chan struct{}, 1)
+	fixture.observer.observations = []AccessObservation{
+		completeObservation(30, nil),
+		completeObservation(30, nil),
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := fixture.service.Run(fixture.ctx, fixture.adminID, fixture.validRunInput())
+		firstDone <- err
+	}()
+	<-fixture.observer.started
+	orphanRunID := fixture.newestRunID(t)
+
+	// Administrator B recovers A's orphan. The interruption's finished
+	// event must still name the persisted requester A; only the new run's
+	// started event names B.
+	fixture.clock.Advance(2 * time.Minute)
+	input := fixture.validRunInput()
+	input.ExpectedNewestRunID = orphanRunID
+	if _, err := fixture.service.Run(fixture.ctx, 4, input); err != nil {
+		t.Fatal(err)
+	}
+	close(gate)
+	if err := <-firstDone; !errors.Is(err, ErrAccessSyncInterrupted) {
+		t.Fatalf("late first run = %v", err)
+	}
+
+	started := fixture.auditActors(t, audit.ActionForgeAccessSyncStarted)
+	finished := fixture.auditActors(t, audit.ActionForgeAccessSyncFinished)
+	if len(started) != 2 || !started[0].Valid || started[0].Int64 != 1 ||
+		!started[1].Valid || started[1].Int64 != 4 {
+		t.Fatalf("started actors = %+v", started)
+	}
+	if len(finished) != 2 || !finished[0].Valid || finished[0].Int64 != 1 ||
+		!finished[1].Valid || finished[1].Int64 != 4 {
+		t.Fatalf("finished actors = %+v", finished)
+	}
+}
+
+func TestAccessShadowFinalizationSurvivesActorDemotion(t *testing.T) {
+	fixture := newAccessShadowFixture(t)
+	gate := make(chan struct{})
+	fixture.observer.gates = []chan struct{}{gate}
+	fixture.observer.started = make(chan struct{}, 1)
+	fixture.observer.observations = []AccessObservation{completeObservation(30, nil)}
+
+	done := make(chan error, 1)
+	go func() {
+		result, err := fixture.service.Run(fixture.ctx, fixture.adminID, fixture.validRunInput())
+		if err == nil && result != AccessSyncComplete {
+			err = errors.New("result " + string(result))
+		}
+		done <- err
+	}()
+	<-fixture.observer.started
+	// The requester loses Administrator authority mid-run. Finalization is
+	// actor-independent — this slice can never publish authority — so the
+	// snapshot still completes and the finished event names the persisted
+	// requester.
+	if _, err := fixture.database.Exec(`DELETE FROM user_roles WHERE user_id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	close(gate)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	var observations int
+	if err := fixture.database.QueryRow(`SELECT count(*) FROM forge_access_shadow_observations`).Scan(&observations); err != nil {
+		t.Fatal(err)
+	}
+	if observations != 4 {
+		t.Fatalf("observations = %d", observations)
+	}
+	finished := fixture.auditActors(t, audit.ActionForgeAccessSyncFinished)
+	if len(finished) != 1 || !finished[0].Valid || finished[0].Int64 != 1 {
+		t.Fatalf("finished actors = %+v", finished)
+	}
+}
+
+func TestAccessShadowRunsWithCanonicalZeroBindingRevision(t *testing.T) {
+	fixture := newAccessShadowFixture(t)
+	// The exact-0047 schema permits bindings alongside binding_revision = 0;
+	// the state is accepted as-is, never backfilled.
+	if _, err := fixture.database.Exec(`UPDATE forge_connections SET binding_revision = 0 WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	fixture.observer.observations = []AccessObservation{completeObservation(30, nil)}
+	input := fixture.validRunInput()
+	input.ExpectedBindingRevision = 0
+	result, err := fixture.service.Run(fixture.ctx, fixture.adminID, input)
+	if err != nil || result != AccessSyncComplete {
+		t.Fatalf("Run: result=%v err=%v", result, err)
+	}
+	var runBindingRevision int64
+	if err := fixture.database.QueryRow(`SELECT binding_revision FROM forge_access_shadow_runs`).Scan(&runBindingRevision); err != nil {
+		t.Fatal(err)
+	}
+	if runBindingRevision != 0 {
+		t.Fatalf("captured binding revision = %d", runBindingRevision)
+	}
+	view, err := fixture.service.View(fixture.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.LatestSnapshot == nil || !view.LatestSnapshot.ScopeCurrent {
+		t.Fatalf("zero-binding-revision snapshot = %+v", view.LatestSnapshot)
+	}
+}
+
+// TestAccessShadowLifecycleNeverTouchesRepositoryGrants is the no-grant
+// canary: with the repository_grants table gone entirely, any read or
+// mutation anywhere in the reserve/observe/finalize/view lifecycle would
+// fail the statement.
+func TestAccessShadowLifecycleNeverTouchesRepositoryGrants(t *testing.T) {
+	fixture := newAccessShadowFixture(t)
+	if _, err := fixture.database.Exec(`DROP TABLE repository_grants`); err != nil {
+		t.Fatal(err)
+	}
+	fixture.observer.observations = []AccessObservation{completeObservation(30, nil)}
+	result, err := fixture.service.Run(fixture.ctx, fixture.adminID, fixture.validRunInput())
+	if err != nil || result != AccessSyncComplete {
+		t.Fatalf("Run without repository_grants: result=%v err=%v", result, err)
+	}
+	view, err := fixture.service.View(fixture.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Pairs) != 4 || view.LatestSnapshot == nil {
+		t.Fatalf("view without repository_grants = %+v", view)
+	}
+}
+
+func TestAccessShadowAuditFailureRollsBackReservationAndFinalization(t *testing.T) {
+	t.Run("finalization audit rollback", func(t *testing.T) {
+		fixture := newAccessShadowFixture(t)
+		fixture.observer.observations = []AccessObservation{
+			completeObservation(30, nil),
+			completeObservation(30, nil),
+		}
+		if _, err := fixture.database.Exec(`
+CREATE TRIGGER fail_access_sync_finished
+BEFORE INSERT ON audit_events
+WHEN NEW.action = 'forge.access_sync_finished'
+BEGIN
+  SELECT RAISE(ABORT, 'forced shadow finish audit failure');
+END`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.service.Run(fixture.ctx, fixture.adminID, fixture.validRunInput()); err == nil {
+			t.Fatal("finalization succeeded despite audit failure")
+		}
+		var observations int
+		if err := fixture.database.QueryRow(`SELECT count(*) FROM forge_access_shadow_observations`).Scan(&observations); err != nil {
+			t.Fatal(err)
+		}
+		if observations != 0 {
+			t.Fatalf("rolled-back finalization published %d observations", observations)
+		}
+		var running int
+		if err := fixture.database.QueryRow(`
+SELECT count(*) FROM forge_access_shadow_runs WHERE result_code IS NULL`).Scan(&running); err != nil {
+			t.Fatal(err)
+		}
+		if running != 1 {
+			t.Fatalf("expected the run row to stay running, got %d running rows", running)
+		}
+
+		// Once the audit path recovers, the orphan is recoverable normally.
+		if _, err := fixture.database.Exec(`DROP TRIGGER fail_access_sync_finished`); err != nil {
+			t.Fatal(err)
+		}
+		fixture.clock.Advance(2 * time.Minute)
+		input := fixture.validRunInput()
+		input.ExpectedNewestRunID = fixture.newestRunID(t)
+		result, err := fixture.service.Run(fixture.ctx, fixture.adminID, input)
+		if err != nil || result != AccessSyncComplete {
+			t.Fatalf("recovery run: result=%v err=%v", result, err)
+		}
+	})
+	t.Run("reservation audit rollback", func(t *testing.T) {
+		fixture := newAccessShadowFixture(t)
+		if _, err := fixture.database.Exec(`
+CREATE TRIGGER fail_access_sync_started
+BEFORE INSERT ON audit_events
+WHEN NEW.action = 'forge.access_sync_started'
+BEGIN
+  SELECT RAISE(ABORT, 'forced shadow start audit failure');
+END`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.service.Run(fixture.ctx, fixture.adminID, fixture.validRunInput()); err == nil {
+			t.Fatal("reservation succeeded despite audit failure")
+		}
+		var runs int
+		if err := fixture.database.QueryRow(`SELECT count(*) FROM forge_access_shadow_runs`).Scan(&runs); err != nil {
+			t.Fatal(err)
+		}
+		if runs != 0 {
+			t.Fatalf("rolled-back reservation persisted %d runs", runs)
+		}
+	})
+}
+
+// injectAccessShadowCommitFailure mirrors the repository-binding pattern: a
+// deferred foreign-key violation planted by the audit insert surfaces only
+// at COMMIT, so the transaction fails after every statement succeeded.
+func injectAccessShadowCommitFailure(t *testing.T, database *sql.DB, action string) {
+	t.Helper()
+	if _, err := database.Exec(`
+CREATE TABLE IF NOT EXISTS test_access_shadow_commit_failure (
+  missing_user_id INTEGER NOT NULL,
+  FOREIGN KEY (missing_user_id) REFERENCES users(id) DEFERRABLE INITIALLY DEFERRED
+);
+CREATE TRIGGER test_access_shadow_commit_failure_trigger
+AFTER INSERT ON audit_events
+WHEN NEW.action = '` + action + `'
+BEGIN
+  INSERT INTO test_access_shadow_commit_failure(missing_user_id) VALUES (-1);
+END;`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAccessShadowCommitFailuresReturnOutcomeUnknownAndRollBack(t *testing.T) {
+	t.Run("finalization commit", func(t *testing.T) {
+		fixture := newAccessShadowFixture(t)
+		fixture.observer.observations = []AccessObservation{completeObservation(30, nil)}
+		injectAccessShadowCommitFailure(t, fixture.database, "forge.access_sync_finished")
+		if _, err := fixture.service.Run(fixture.ctx, fixture.adminID, fixture.validRunInput()); !errors.Is(err, ErrAccessSyncOutcomeUnknown) {
+			t.Fatalf("finalization commit failure = %v, want ErrAccessSyncOutcomeUnknown", err)
+		}
+		var observations, running int
+		if err := fixture.database.QueryRow(`SELECT count(*) FROM forge_access_shadow_observations`).Scan(&observations); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.database.QueryRow(`
+SELECT count(*) FROM forge_access_shadow_runs WHERE result_code IS NULL`).Scan(&running); err != nil {
+			t.Fatal(err)
+		}
+		if observations != 0 || running != 1 {
+			t.Fatalf("after commit failure: observations=%d running=%d", observations, running)
+		}
+	})
+	t.Run("reservation commit", func(t *testing.T) {
+		fixture := newAccessShadowFixture(t)
+		injectAccessShadowCommitFailure(t, fixture.database, "forge.access_sync_started")
+		if _, err := fixture.service.Run(fixture.ctx, fixture.adminID, fixture.validRunInput()); !errors.Is(err, ErrAccessSyncOutcomeUnknown) {
+			t.Fatalf("reservation commit failure = %v, want ErrAccessSyncOutcomeUnknown", err)
+		}
+		var runs int
+		if err := fixture.database.QueryRow(`SELECT count(*) FROM forge_access_shadow_runs`).Scan(&runs); err != nil {
+			t.Fatal(err)
+		}
+		if runs != 0 {
+			t.Fatalf("ambiguous reservation persisted %d runs", runs)
+		}
+	})
+}
+
+// TestAccessShadowMidRunLifecycleChangesYieldScopeChanged pins every
+// contract-mandated in-flight lifecycle change to the scope_changed
+// finalization with zero publication: a fresh setup check, an identity
+// link, an unlink, and the saturated-revision terminal reduction that only
+// the exact identity-id-set recheck can catch.
+func TestAccessShadowMidRunLifecycleChangesYieldScopeChanged(t *testing.T) {
+	cases := []struct {
+		name    string
+		prepare func(t *testing.T, fixture *accessShadowFixture, input *RunAccessShadowInput)
+		mutate  func(t *testing.T, fixture *accessShadowFixture)
+	}{
+		{
+			name: "setup check advances mid-run",
+			mutate: func(t *testing.T, fixture *accessShadowFixture) {
+				t.Helper()
+				if _, err := fixture.database.Exec(`UPDATE forge_connections SET check_generation = 6 WHERE id = 1`); err != nil {
+					t.Error(err)
+				}
+			},
+		},
+		{
+			name: "identity linked mid-run",
+			mutate: func(t *testing.T, fixture *accessShadowFixture) {
+				t.Helper()
+				if _, err := fixture.database.Exec(`
+INSERT INTO users(id, email, display_name, created_at, updated_at)
+VALUES (5, 'late@example.test', 'Late Link', ?, ?)`,
+					accessShadowFixtureTime, accessShadowFixtureTime); err != nil {
+					t.Error(err)
+				}
+				if _, err := fixture.database.Exec(`
+INSERT INTO forgejo_identities(connection_id, user_id, remote_user_id, username_at_link, linked_at)
+VALUES (1, 5, '99', 'late-user', ?)`, accessShadowFixtureTime); err != nil {
+					t.Error(err)
+				}
+				if _, err := fixture.database.Exec(`UPDATE forge_connections SET access_identity_revision = 3 WHERE id = 1`); err != nil {
+					t.Error(err)
+				}
+			},
+		},
+		{
+			name: "identity unlinked mid-run",
+			mutate: func(t *testing.T, fixture *accessShadowFixture) {
+				t.Helper()
+				if _, err := fixture.database.Exec(`DELETE FROM forgejo_identities WHERE id = 22`); err != nil {
+					t.Error(err)
+				}
+				if _, err := fixture.database.Exec(`UPDATE forge_connections SET access_identity_revision = 3 WHERE id = 1`); err != nil {
+					t.Error(err)
+				}
+			},
+		},
+		{
+			name: "terminal reduction at the saturated revision",
+			prepare: func(t *testing.T, fixture *accessShadowFixture, input *RunAccessShadowInput) {
+				t.Helper()
+				if _, err := fixture.database.Exec(`
+UPDATE forge_connections SET access_identity_revision = ? WHERE id = 1`, int64(math.MaxInt64)); err != nil {
+					t.Fatal(err)
+				}
+				input.ExpectedAccessIdentityRevision = math.MaxInt64
+			},
+			mutate: func(t *testing.T, fixture *accessShadowFixture) {
+				t.Helper()
+				// The revision cannot advance at math.MaxInt64; only the
+				// exact captured identity-id-set recheck exposes the change.
+				if _, err := fixture.database.Exec(`DELETE FROM forgejo_identities WHERE id = 22`); err != nil {
+					t.Error(err)
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newAccessShadowFixture(t)
+			input := fixture.validRunInput()
+			if tc.prepare != nil {
+				tc.prepare(t, fixture, &input)
+			}
+			fixture.observer.observations = []AccessObservation{completeObservation(30, nil)}
+			fixture.observer.onObserve = func(int) { tc.mutate(t, fixture) }
+			result, err := fixture.service.Run(fixture.ctx, fixture.adminID, input)
+			if err != nil || result != AccessSyncScopeChanged {
+				t.Fatalf("Run: result=%v err=%v", result, err)
+			}
+			var observations int
+			if err := fixture.database.QueryRow(`SELECT count(*) FROM forge_access_shadow_observations`).Scan(&observations); err != nil {
+				t.Fatal(err)
+			}
+			if observations != 0 {
+				t.Fatalf("in-flight lifecycle change published %d observations", observations)
+			}
+		})
+	}
+}
+
+// TestAccessShadowResetCascadeRemovesRunsAndObservations proves the cascade
+// chain end to end: unlink/unbind cascade the pair evidence, and deleting
+// the connection (the reset's final act) cascades the run history.
+func TestAccessShadowResetCascadeRemovesRunsAndObservations(t *testing.T) {
+	fixture := newAccessShadowFixture(t)
+	fixture.observer.observations = []AccessObservation{completeObservation(30, nil)}
+	if _, err := fixture.service.Run(fixture.ctx, fixture.adminID, fixture.validRunInput()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.database.Exec(`DELETE FROM forgejo_identities`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.database.Exec(`DELETE FROM forge_repository_bindings`); err != nil {
+		t.Fatal(err)
+	}
+	var observations int
+	if err := fixture.database.QueryRow(`SELECT count(*) FROM forge_access_shadow_observations`).Scan(&observations); err != nil {
+		t.Fatal(err)
+	}
+	if observations != 0 {
+		t.Fatalf("observations survived identity and binding removal: %d", observations)
+	}
+	if _, err := fixture.database.Exec(`DELETE FROM forge_connections WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	var runs int
+	if err := fixture.database.QueryRow(`SELECT count(*) FROM forge_access_shadow_runs`).Scan(&runs); err != nil {
+		t.Fatal(err)
+	}
+	if runs != 0 {
+		t.Fatalf("runs survived the connection reset: %d", runs)
+	}
+}
+
+// TestAccessShadowRequesterDeletionMidRunNullsAttribution deletes the
+// requesting account while its run is in flight: the run row's requester
+// nulls out, finalization still completes actor-independently, and the
+// finished event carries a NULL actor.
+func TestAccessShadowRequesterDeletionMidRunNullsAttribution(t *testing.T) {
+	fixture := newAccessShadowFixture(t)
+	gate := make(chan struct{})
+	fixture.observer.gates = []chan struct{}{gate}
+	fixture.observer.started = make(chan struct{}, 1)
+	fixture.observer.observations = []AccessObservation{completeObservation(30, nil)}
+
+	done := make(chan error, 1)
+	var result AccessSyncResultCode
+	go func() {
+		var err error
+		result, err = fixture.service.Run(fixture.ctx, fixture.adminID, fixture.validRunInput())
+		done <- err
+	}()
+	<-fixture.observer.started
+	// Deleting the requester requires removing their linked identity first
+	// (RESTRICT), which also changes the captured identity scope.
+	for _, statement := range []string{
+		`DELETE FROM forgejo_identities WHERE id = 21`,
+		`DELETE FROM user_roles WHERE user_id = 1`,
+		`DELETE FROM users WHERE id = 1`,
+	} {
+		if _, err := fixture.database.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(gate)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if result != AccessSyncScopeChanged {
+		t.Fatalf("result = %v", result)
+	}
+	var requester sql.NullInt64
+	if err := fixture.database.QueryRow(`
+SELECT requested_by_user_id FROM forge_access_shadow_runs ORDER BY id DESC LIMIT 1`).Scan(&requester); err != nil {
+		t.Fatal(err)
+	}
+	if requester.Valid {
+		t.Fatalf("run requester survived deletion: %+v", requester)
+	}
+	finished := fixture.auditActors(t, audit.ActionForgeAccessSyncFinished)
+	if len(finished) != 1 || finished[0].Valid {
+		t.Fatalf("finished actors = %+v, want one NULL attribution", finished)
+	}
+}
+
+// TestAccessShadowPATReplacementMidRunYieldsScopeChanged pins the
+// credential-lifecycle race: the observation runs on the ciphertext
+// captured at reservation, and the config-revision fence turns the
+// finalization into scope_changed instead of publishing under a replaced
+// credential.
+func TestAccessShadowPATReplacementMidRunYieldsScopeChanged(t *testing.T) {
+	fixture := newAccessShadowFixture(t)
+	fixture.observer.observations = []AccessObservation{completeObservation(30, nil)}
+	fixture.observer.onObserve = func(int) {
+		if _, err := fixture.database.Exec(`
+UPDATE forgejo_connection_config SET service_pat_ciphertext = x'0102'`); err != nil {
+			t.Error(err)
+		}
+		if _, err := fixture.database.Exec(`
+UPDATE forge_connections SET config_revision = 4 WHERE id = 1`); err != nil {
+			t.Error(err)
+		}
+	}
+	result, err := fixture.service.Run(fixture.ctx, fixture.adminID, fixture.validRunInput())
+	if err != nil || result != AccessSyncScopeChanged {
+		t.Fatalf("Run: result=%v err=%v", result, err)
+	}
+	var observations int
+	if err := fixture.database.QueryRow(`SELECT count(*) FROM forge_access_shadow_observations`).Scan(&observations); err != nil {
+		t.Fatal(err)
+	}
+	if observations != 0 {
+		t.Fatalf("replaced-credential run published %d observations", observations)
 	}
 }
 

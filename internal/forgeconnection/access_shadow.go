@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/taua-almeida/thawguard/internal/audit"
@@ -66,8 +67,10 @@ func (s *AccessShadowService) Run(ctx context.Context, actorUserID int64, input 
 	if s.observer == nil {
 		return "", errors.New("forge access shadow observer is not configured")
 	}
+	// A zero binding revision is canonical for a connection whose bindings
+	// predate the revision column; it is accepted, never backfilled.
 	if input.ExpectedConnectionID <= 0 || input.ExpectedConfigRevision <= 0 ||
-		input.ExpectedCheckGeneration <= 0 || input.ExpectedBindingRevision <= 0 ||
+		input.ExpectedCheckGeneration <= 0 || input.ExpectedBindingRevision < 0 ||
 		input.ExpectedAccessIdentityRevision <= 0 || input.ExpectedNewestRunID < 0 {
 		return "", ValidationError{Message: "the expected connection, revision, and run ids must identify the rendered snapshot state"}
 	}
@@ -80,7 +83,7 @@ func (s *AccessShadowService) Run(ctx context.Context, actorUserID int64, input 
 		return "", err
 	}
 	observation, requestCountKnown := s.observeAccess(ctx, snapshot)
-	return s.finalizeRun(ctx, actorUserID, snapshot, observation, requestCountKnown)
+	return s.finalizeRun(ctx, snapshot, observation, requestCountKnown)
 }
 
 func (s *AccessShadowService) reserveRun(ctx context.Context, actorUserID int64, input RunAccessShadowInput) (accessShadowRunSnapshot, error) {
@@ -135,7 +138,7 @@ func (s *AccessShadowService) reserveRun(ctx context.Context, actorUserID int64,
 	}
 
 	now := s.now().UTC()
-	if err := s.validateNewestRunAndRecoverOrphan(ctx, tx, actorUserID, record.ID, input.ExpectedNewestRunID, now); err != nil {
+	if err := s.validateNewestRunAndRecoverOrphan(ctx, tx, record.ID, input.ExpectedNewestRunID, now); err != nil {
 		return accessShadowRunSnapshot{}, err
 	}
 
@@ -189,24 +192,27 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 
 // validateNewestRunAndRecoverOrphan enforces the newest-run CAS and
 // terminalizes an orphaned running row older than the interruption age. A
-// younger running row rejects the reservation instead.
+// younger running row rejects the reservation instead. The interruption's
+// finished event is attributed to the run's persisted requester (NULL when
+// that account was deleted), never to the Administrator whose reservation
+// happened to recover the orphan.
 func (s *AccessShadowService) validateNewestRunAndRecoverOrphan(
 	ctx context.Context,
 	tx *sql.Tx,
-	actorUserID int64,
 	connectionID int64,
 	expectedNewestRunID int64,
 	now time.Time,
 ) error {
 	var newestRunID int64
+	var requester sql.NullInt64
 	var resultCode sql.NullString
 	var startedAtText string
 	err := tx.QueryRowContext(ctx, `
-SELECT id, result_code, started_at
+SELECT id, requested_by_user_id, result_code, started_at
 FROM forge_access_shadow_runs
 WHERE connection_id = ?
 ORDER BY id DESC
-LIMIT 1`, connectionID).Scan(&newestRunID, &resultCode, &startedAtText)
+LIMIT 1`, connectionID).Scan(&newestRunID, &requester, &resultCode, &startedAtText)
 	if errors.Is(err, sql.ErrNoRows) {
 		if expectedNewestRunID != 0 {
 			return ErrConflict
@@ -248,7 +254,16 @@ WHERE id = ? AND result_code IS NULL`,
 		return err
 	}
 	// Orphan interruption omits the request count: it was never known.
-	return recordAccessSyncFinished(ctx, tx, actorUserID, connectionID, newestRunID, AccessSyncInterrupted, nil, nil, nil)
+	return recordAccessSyncFinished(ctx, tx, nullableActor(requester), connectionID, newestRunID, AccessSyncInterrupted, nil, nil, nil)
+}
+
+// nullableActor converts a scanned nullable requester into an audit actor.
+func nullableActor(requester sql.NullInt64) *int64 {
+	if !requester.Valid {
+		return nil
+	}
+	actor := requester.Int64
+	return &actor
 }
 
 // observeAccess decrypts the PAT outside SQLite and runs the provider
@@ -259,11 +274,12 @@ func (s *AccessShadowService) observeAccess(ctx context.Context, snapshot access
 	envelope, err := s.secrets.Decrypt(ctx, snapshot.patCiphertext)
 	if err != nil {
 		// Cause-neutral: a wrong key and a corrupt ciphertext read the same.
-		return AccessObservation{ResultCode: AccessSyncCredentialUnavailable}, false
+		// No provider I/O happened, so the request count is a known zero.
+		return AccessObservation{ResultCode: AccessSyncCredentialUnavailable, RequestCount: 0}, true
 	}
 	pat, err := unwrapServicePAT(envelope)
 	if err != nil {
-		return AccessObservation{ResultCode: AccessSyncCredentialUnavailable}, false
+		return AccessObservation{ResultCode: AccessSyncCredentialUnavailable, RequestCount: 0}, true
 	}
 	defer clearBytes(pat)
 
@@ -324,7 +340,6 @@ func validAccessObservation(snapshot accessShadowRunSnapshot, observation Access
 
 func (s *AccessShadowService) finalizeRun(
 	ctx context.Context,
-	actorUserID int64,
 	snapshot accessShadowRunSnapshot,
 	observation AccessObservation,
 	requestCountKnown bool,
@@ -340,11 +355,12 @@ UPDATE forge_access_shadow_runs SET id = id WHERE id = ?`, snapshot.runID); err 
 		return "", fmt.Errorf("lock forge access shadow run: %w", err)
 	}
 	var runConnectionID int64
+	var requester sql.NullInt64
 	var resultCode sql.NullString
 	err = tx.QueryRowContext(ctx, `
-SELECT connection_id, result_code
+SELECT connection_id, requested_by_user_id, result_code
 FROM forge_access_shadow_runs
-WHERE id = ?`, snapshot.runID).Scan(&runConnectionID, &resultCode)
+WHERE id = ?`, snapshot.runID).Scan(&runConnectionID, &requester, &resultCode)
 	if errors.Is(err, sql.ErrNoRows) {
 		// The row was terminalized by a later reservation and retained away;
 		// a late observer return can never publish.
@@ -403,7 +419,10 @@ WHERE id = ?`, snapshot.runID).Scan(&runConnectionID, &resultCode)
 		count := observation.RequestCount
 		requestCount = &count
 	}
-	if err := recordAccessSyncFinished(ctx, tx, actorUserID, snapshot.connectionID, snapshot.runID, result, presentCount, unknownCount, requestCount); err != nil {
+	// The finished event is attributed to the run's persisted requester, so
+	// finalization stays actor-independent even after a logout, demotion, or
+	// account deletion mid-run.
+	if err := recordAccessSyncFinished(ctx, tx, nullableActor(requester), snapshot.connectionID, snapshot.runID, result, presentCount, unknownCount, requestCount); err != nil {
 		return "", err
 	}
 	if err := tx.Commit(); err != nil {
@@ -668,7 +687,7 @@ func recordAccessSyncStarted(
 func recordAccessSyncFinished(
 	ctx context.Context,
 	tx *sql.Tx,
-	actorUserID int64,
+	actorUserID *int64,
 	connectionID int64,
 	runID int64,
 	result AccessSyncResultCode,
@@ -692,5 +711,14 @@ func recordAccessSyncFinished(
 	if err != nil {
 		return errors.New("encode forge access shadow finish audit evidence")
 	}
-	return recordForgeConnectionEvent(ctx, tx, actorUserID, audit.ActionForgeAccessSyncFinished, connectionID, string(details))
+	if err := audit.NewStoreTx(tx).Record(ctx, audit.Event{
+		ActorUserID: actorUserID,
+		Action:      audit.ActionForgeAccessSyncFinished,
+		SubjectType: audit.SubjectTypeForgeConnection,
+		SubjectID:   strconv.FormatInt(connectionID, 10),
+		DetailsJSON: string(details),
+	}); err != nil {
+		return fmt.Errorf("record forge connection audit event: %w", err)
+	}
+	return nil
 }

@@ -52,7 +52,7 @@
     </div>
     <p class="m-0 mt-2 text-sm text-text-muted">{{ $shadow.SnapshotDetail }}</p>
     {{ if $shadow.HasSnapshot }}
-    <dl class="mt-3 grid min-w-0 grid-cols-2 gap-x-6 gap-y-3 sm:grid-cols-4">
+    <dl class="mt-3 grid min-w-0 grid-cols-2 gap-x-6 gap-y-3">
       <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Pairs</dt><dd class="m-0 mt-1 text-sm text-text">{{ $shadow.PairCount }}</dd></div>
       <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Explicit access</dt><dd class="m-0 mt-1 text-sm text-text">{{ $shadow.PresentCount }}</dd></div>
       <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">No explicit access</dt><dd class="m-0 mt-1 text-sm text-text">{{ $shadow.AbsentCount }}</dd></div>

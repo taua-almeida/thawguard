@@ -21,6 +21,7 @@ const (
 
 	forgeShadowCompleteNotice    = "forge-shadow-complete"
 	forgeShadowIncompleteNotice  = "forge-shadow-incomplete"
+	forgeShadowSupersededNotice  = "forge-shadow-superseded"
 	forgeShadowStaleNotice       = "forge-shadow-stale"
 	forgeShadowRunningNotice     = "forge-shadow-running"
 	forgeShadowInterruptedNotice = "forge-shadow-interrupted"
@@ -87,10 +88,12 @@ type forgeShadowPairRowView struct {
 	StateTone          string
 	ReasonText         string
 	ObservedAt         string
-	// PriorConfirmedLabel and PriorConfirmedAt render beneath a newer
-	// unknown when an earlier confirmation is preserved.
-	PriorConfirmedLabel string
-	PriorConfirmedAt    string
+	// PriorConfirmedLabel, PriorConfirmedReasonText, and PriorConfirmedAt
+	// render beneath a newer unknown when an earlier confirmation is
+	// preserved.
+	PriorConfirmedLabel      string
+	PriorConfirmedReasonText string
+	PriorConfirmedAt         string
 }
 
 type forgeShadowPageData struct {
@@ -182,11 +185,16 @@ func (s *Server) handleForgeAccessShadowRun(w http.ResponseWriter, r *http.Reque
 		redirectForgeAccessNotice(w, r, notice)
 		return
 	}
-	if result == forgeconnection.AccessSyncComplete {
+	switch result {
+	case forgeconnection.AccessSyncComplete:
 		redirectForgeAccessNotice(w, r, forgeShadowCompleteNotice)
-		return
+	case forgeconnection.AccessSyncScopeChanged:
+		// Superseded is not a failure; the notice must match the attempt
+		// axis and the audit trail.
+		redirectForgeAccessNotice(w, r, forgeShadowSupersededNotice)
+	default:
+		redirectForgeAccessNotice(w, r, forgeShadowIncompleteNotice)
 	}
-	redirectForgeAccessNotice(w, r, forgeShadowIncompleteNotice)
 }
 
 // parseForgeShadowRunForm accepts exactly the CSRF field, the five revision
@@ -218,9 +226,10 @@ func parseForgeShadowRunForm(requestURL *url.URL, values url.Values) (forgeconne
 	if err != nil {
 		return forgeconnection.RunAccessShadowInput{}, err
 	}
-	bindingRevision, err := canonicalPositiveForgeAccessValue(values.Get("expected_binding_revision"))
+	// Zero is canonical for bindings that predate the revision column.
+	bindingRevision, err := canonicalExpectedRevision(values.Get("expected_binding_revision"))
 	if err != nil {
-		return forgeconnection.RunAccessShadowInput{}, err
+		return forgeconnection.RunAccessShadowInput{}, errors.New("expected binding revision is invalid")
 	}
 	identityRevision, err := canonicalPositiveForgeAccessValue(values.Get("expected_access_identity_revision"))
 	if err != nil {
@@ -293,7 +302,7 @@ func forgeShadowAttemptPresentation(attempt forgeconnection.AccessShadowAttempt)
 	case forgeconnection.AccessAttemptFailed:
 		return "Failed", "danger", "The attempt finished without publishing: " + forgeShadowResultText(attempt.ResultCode)
 	case forgeconnection.AccessAttemptSuperseded:
-		return "Superseded", "warning", "The attempt predates the current connection scope; its result no longer describes the current configuration."
+		return "Superseded", "warning", "The connection configuration, its evidence, or its identity/binding scope changed while the snapshot ran, so the attempt was superseded and published nothing."
 	default:
 		return "Outcome unknown", "danger", "The attempt state could not be displayed safely."
 	}
@@ -324,7 +333,7 @@ func forgeShadowResultText(code forgeconnection.AccessSyncResultCode) string {
 	case forgeconnection.AccessSyncWorkLimitExceeded:
 		return "the snapshot exceeded the approved work limits."
 	case forgeconnection.AccessSyncScopeChanged:
-		return "the connection scope changed while the snapshot ran."
+		return "the connection configuration or its identity/binding scope changed while the snapshot ran."
 	case forgeconnection.AccessSyncInterrupted:
 		return "the attempt was interrupted before a result could be recorded."
 	default:
@@ -337,7 +346,7 @@ func forgeShadowSnapshotPresentation(snapshot *forgeconnection.AccessShadowSnaps
 	case snapshot == nil:
 		return "Never observed", "neutral", "No completed credential-visible snapshot exists yet."
 	case !snapshot.ScopeCurrent:
-		return "Scope changed", "warning", "The identity or binding scope changed after this snapshot; its evidence predates the current scope."
+		return "Scope changed", "warning", "The connection configuration or its identity/binding scope changed after this snapshot; its evidence predates the current scope."
 	case snapshot.UnknownCount == 0:
 		return "Scope unchanged · complete", "success", "Every current pair carries confirmed evidence from the complete credential-visible snapshot."
 	default:
@@ -389,6 +398,7 @@ func forgeShadowPairRows(pairs []forgeconnection.AccessShadowPairRow) []forgeSha
 		if pair.PriorConfirmedReason != "" {
 			label, _ := forgeShadowStatePresentation(pair.PriorConfirmedReason.State())
 			row.PriorConfirmedLabel = label
+			row.PriorConfirmedReasonText = forgeShadowReasonText(pair.PriorConfirmedReason)
 			row.PriorConfirmedAt = pair.PriorConfirmedAt.UTC().Format("2006-01-02 15:04:05 UTC")
 		}
 		rows = append(rows, row)

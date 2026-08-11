@@ -52,8 +52,11 @@ CREATE TABLE forge_access_shadow_runs (
     CHECK (typeof(config_revision) = 'integer' AND config_revision > 0),
   check_generation INTEGER NOT NULL
     CHECK (typeof(check_generation) = 'integer' AND check_generation > 0),
+  -- Zero is a legitimate captured binding revision: the exact-0047 schema
+  -- permits binding rows alongside binding_revision = 0, and that state is
+  -- accepted as-is rather than backfilled.
   binding_revision INTEGER NOT NULL
-    CHECK (typeof(binding_revision) = 'integer' AND binding_revision > 0),
+    CHECK (typeof(binding_revision) = 'integer' AND binding_revision >= 0),
   access_identity_revision INTEGER NOT NULL
     CHECK (typeof(access_identity_revision) = 'integer' AND access_identity_revision > 0),
   identity_count INTEGER NOT NULL
@@ -227,9 +230,19 @@ CREATE TABLE forge_access_shadow_observations (
         AND last_confirmed_at IS NOT NULL)
     END
   ),
-  -- The latest observation may never precede its preserved confirmation.
+  -- The latest observation may never precede its preserved confirmation,
+  -- and a preserved confirmation under an unknown latest reason must come
+  -- from a strictly earlier run: one run can never be both the unknown
+  -- observation and the "earlier complete snapshot" it claims to preserve.
+  -- A confirmed latest reason is its own confirmation at the same run.
   CHECK (
     last_confirmed_run_id IS NULL
-    OR (latest_run_id >= last_confirmed_run_id AND latest_observed_at >= last_confirmed_at)
+    OR (
+      CASE WHEN latest_reason IN ('direct_collaborator', 'team_access', 'no_explicit_access_none')
+      THEN latest_run_id = last_confirmed_run_id
+      ELSE latest_run_id > last_confirmed_run_id
+      END
+      AND latest_observed_at >= last_confirmed_at
+    )
   )
 );

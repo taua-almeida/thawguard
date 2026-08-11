@@ -269,6 +269,16 @@ func TestForgeShadowRunPostRunsAndRedirects(t *testing.T) {
 	if response := forgeAccessPOST(server, session, "/settings/forge-access/shadow-access/run", first, forgeAccessTestPublicURL); response.Code != http.StatusSeeOther {
 		t.Fatalf("zero newest-run status = %d", response.Code)
 	}
+	// A zero binding revision is canonical for bindings that predate the
+	// revision column and must pass the form boundary.
+	zeroBinding := validForgeShadowRunForm(session)
+	zeroBinding.Set("expected_binding_revision", "0")
+	if response := forgeAccessPOST(server, session, "/settings/forge-access/shadow-access/run", zeroBinding, forgeAccessTestPublicURL); response.Code != http.StatusSeeOther {
+		t.Fatalf("zero binding-revision status = %d", response.Code)
+	}
+	if last := shadow.runCalls[len(shadow.runCalls)-1]; last.ExpectedBindingRevision != 0 {
+		t.Fatalf("zero binding revision reached the service as %d", last.ExpectedBindingRevision)
+	}
 }
 
 func TestForgeShadowRunPostNoticeMapping(t *testing.T) {
@@ -279,6 +289,7 @@ func TestForgeShadowRunPostNoticeMapping(t *testing.T) {
 		notice string
 	}{
 		{name: "failure result", result: forgeconnection.AccessSyncUnavailable, notice: forgeShadowIncompleteNotice},
+		{name: "superseded result", result: forgeconnection.AccessSyncScopeChanged, notice: forgeShadowSupersededNotice},
 		{name: "stale", err: forgeconnection.ErrConflict, notice: forgeShadowStaleNotice},
 		{name: "running", err: forgeconnection.ErrAccessSyncRunning, notice: forgeShadowRunningNotice},
 		{name: "interrupted", err: forgeconnection.ErrAccessSyncInterrupted, notice: forgeShadowInterruptedNotice},
@@ -366,15 +377,24 @@ func TestActivityForgeAccessSyncPresentation(t *testing.T) {
 		`{"run_id":4,"result_code":"complete","present_count":2,"unknown_count":1,"request_count":40}`))
 	if complete.Outcome != "Completed" || complete.OutcomeClass != "ok" ||
 		!strings.Contains(complete.Detail, "2 explicit-access and 1 unknown pairs") ||
-		!strings.Contains(complete.Detail, "40 provider requests") {
+		!strings.Contains(complete.Detail, "40 provider request attempts") {
 		t.Fatalf("complete view = %+v", complete)
 	}
 
 	interrupted := activityEventViewForEvent(nil, nil, event(audit.ActionForgeAccessSyncFinished,
 		`{"run_id":4,"result_code":"interrupted"}`))
 	if interrupted.Outcome != "Interrupted" || interrupted.OutcomeClass != "warning" ||
-		strings.Contains(interrupted.Detail, "provider requests") {
+		strings.Contains(interrupted.Detail, "provider request attempts") {
 		t.Fatalf("interrupted view = %+v", interrupted)
+	}
+
+	// The durable scope_changed result renders as Superseded, matching the
+	// attempt axis, never as a failure.
+	superseded := activityEventViewForEvent(nil, nil, event(audit.ActionForgeAccessSyncFinished,
+		`{"run_id":4,"result_code":"scope_changed","request_count":12}`))
+	if superseded.Outcome != "Superseded" || superseded.OutcomeClass != "warning" ||
+		!strings.Contains(superseded.Detail, "identity/binding scope changed") {
+		t.Fatalf("superseded view = %+v", superseded)
 	}
 
 	failed := activityEventViewForEvent(nil, nil, event(audit.ActionForgeAccessSyncFinished,

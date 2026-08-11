@@ -98,7 +98,7 @@ func (s *AccessShadowService) View(ctx context.Context) (AccessShadowView, error
 	}
 	if hasNewestRun {
 		view.NewestRunID = newestRun.id
-		attempt := s.deriveAccessShadowAttempt(record, newestRun, len(identities), len(bindings))
+		attempt := s.deriveAccessShadowAttempt(newestRun)
 		view.LatestAttempt = &attempt
 	}
 	newestComplete, hasComplete, err := loadNewestAccessShadowRun(ctx, tx, record.ID, true)
@@ -124,15 +124,12 @@ func (s *AccessShadowService) View(ctx context.Context) (AccessShadowView, error
 }
 
 // deriveAccessShadowAttempt maps the newest run onto the latest-attempt
-// axis. A running row older than the interruption age reads as interrupted;
-// a terminal result whose captured scope no longer matches the connection
-// reads as superseded.
-func (s *AccessShadowService) deriveAccessShadowAttempt(
-	record connectionRecord,
-	run accessShadowRunRecord,
-	identityCount int,
-	bindingCount int,
-) AccessShadowAttempt {
+// axis from its durable state alone. A running row older than the
+// interruption age reads as interrupted, and Superseded is exactly the
+// durable scope_changed result: later scope drift never relabels a
+// historical attempt — scope currency belongs to the completed-snapshot
+// axis only.
+func (s *AccessShadowService) deriveAccessShadowAttempt(run accessShadowRunRecord) AccessShadowAttempt {
 	attempt := AccessShadowAttempt{
 		ResultCode: run.resultCode,
 		StartedAt:  run.startedAt,
@@ -147,7 +144,7 @@ func (s *AccessShadowService) deriveAccessShadowAttempt(
 		}
 	case run.resultCode == AccessSyncInterrupted:
 		attempt.Status = AccessAttemptInterrupted
-	case !accessShadowRunScopeCurrent(record, run, identityCount, bindingCount):
+	case run.resultCode == AccessSyncScopeChanged:
 		attempt.Status = AccessAttemptSuperseded
 	case run.resultCode == AccessSyncComplete:
 		attempt.Status = AccessAttemptCompleted
@@ -244,7 +241,7 @@ LIMIT 1`
 	}
 	malformed := errors.New("forge access shadow run data is malformed")
 	if run.id <= 0 || run.configRevision <= 0 || run.checkGeneration <= 0 ||
-		run.bindingRevision <= 0 || run.accessIdentityRevision <= 0 ||
+		run.bindingRevision < 0 || run.accessIdentityRevision <= 0 ||
 		run.identityCount < 1 || run.identityCount > maxAccessShadowIdentities ||
 		run.repositoryCount < 1 || run.repositoryCount > maxAccessShadowRepositories {
 		return accessShadowRunRecord{}, false, malformed
@@ -393,6 +390,18 @@ WHERE connection_id = ?`, connectionID)
 			record.lastConfirmedRunID = confirmedRunID.Int64
 			record.lastConfirmedAt, err = parseForgeConnectionTime(confirmedAt.String)
 			if err != nil {
+				return nil, malformed
+			}
+			// A confirmed latest reason is its own confirmation; an unknown
+			// latest reason may only preserve a strictly earlier run's
+			// confirmation, never render one run as both.
+			if record.latestReason.Confirmed() {
+				if record.lastConfirmedReason != record.latestReason ||
+					record.lastConfirmedRunID != record.latestRunID ||
+					!record.lastConfirmedAt.Equal(record.latestObservedAt) {
+					return nil, malformed
+				}
+			} else if record.lastConfirmedRunID >= record.latestRunID {
 				return nil, malformed
 			}
 		}

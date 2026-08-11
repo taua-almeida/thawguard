@@ -3754,7 +3754,7 @@ func activityForgeAccessSyncFinishedDetail(
 	requestDetail := ""
 	expectedDetails := 2
 	if hasRequestCount {
-		requestDetail = fmt.Sprintf(" %d provider requests were issued.", requestCount)
+		requestDetail = fmt.Sprintf(" %d provider request attempts were made.", requestCount)
 		expectedDetails++
 	}
 	prefix := fmt.Sprintf("Run %d: ", runID)
@@ -3776,10 +3776,16 @@ func activityForgeAccessSyncFinishedDetail(
 	}
 	detailText := prefix + "the snapshot finished without publishing: " + forgeShadowResultText(result) +
 		" Earlier evidence was preserved." + requestDetail
-	if result == forgeconnection.AccessSyncInterrupted {
+	switch result {
+	case forgeconnection.AccessSyncInterrupted:
 		return detailText, "Interrupted", "warning", true
+	case forgeconnection.AccessSyncScopeChanged:
+		// The durable scope_changed result is the Superseded state on the
+		// attempt axis; the audit trail must not contradict it as a failure.
+		return detailText, "Superseded", "warning", true
+	default:
+		return detailText, "Failed", "failed", true
 	}
-	return detailText, "Failed", "failed", true
 }
 
 func activitySetupCheckDetail(details activityDetails) string {

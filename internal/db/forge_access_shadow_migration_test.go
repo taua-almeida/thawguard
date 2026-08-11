@@ -39,7 +39,7 @@ INSERT INTO forge_connections(
   id, provider, display_name, base_url, config_revision, check_generation,
   binding_revision, created_at, updated_at
 )
-VALUES (1, 'forgejo', 'Fixture forge', 'https://forge.example.test', 1, 1, 1, ?, ?);
+VALUES (1, 'forgejo', 'Fixture forge', 'https://forge.example.test', 1, 1, 0, ?, ?);
 INSERT INTO forgejo_connection_config(
   connection_id, organization_slug, service_pat_ciphertext, service_user_remote_id,
   pat_attested_at, attested_by_user_id
@@ -90,6 +90,7 @@ VALUES (2, 'gitea', 'Identity-free forge', 'https://other.example.test', 1, 0, 0
 	}{
 		{name: "linked connection backfilled to its identity count", query: `SELECT count(*) FROM forge_connections WHERE id = 1 AND access_identity_revision = 1 AND typeof(access_identity_revision) = 'integer'`, want: 1},
 		{name: "identity-free connection stays at zero revision", query: `SELECT count(*) FROM forge_connections WHERE id = 2 AND access_identity_revision = 0 AND typeof(access_identity_revision) = 'integer'`, want: 1},
+		{name: "exact-0047 zero binding revision preserved with its binding", query: `SELECT count(*) FROM forge_connections WHERE id = 1 AND binding_revision = 0`, want: 1},
 		{name: "preserved binding", query: `SELECT count(*) FROM forge_repository_bindings WHERE repository_id = 11 AND remote_repository_id = '100'`, want: 1},
 		{name: "preserved identity", query: `SELECT count(*) FROM forgejo_identities WHERE id = 21 AND remote_user_id = '77' AND username_at_link = 'fixture-user'`, want: 1},
 		{name: "no backfilled runs", query: `SELECT count(*) FROM forge_access_shadow_runs`, want: 0},
@@ -324,12 +325,13 @@ SET result_code = 'complete', present_count = 1, unknown_count = 1, finished_at 
 WHERE connection_id = 1 AND result_code IS NULL`, forgeAccessShadowLaterTimestamp); err != nil {
 		t.Fatal(err)
 	}
+	// A zero captured binding revision is the accepted exact-0047 state.
 	if _, err := database.ExecContext(ctx, `
 INSERT INTO forge_access_shadow_runs(
   connection_id, config_revision, check_generation, binding_revision,
   access_identity_revision, identity_count, repository_count, started_at,
   result_code, finished_at
-) VALUES (1, 1, 1, 2, 2, 2, 2, ?, 'interrupted', ?)`,
+) VALUES (1, 1, 1, 0, 2, 2, 2, ?, 'interrupted', ?)`,
 		forgePreviewTimestamp, forgeAccessShadowLaterTimestamp); err != nil {
 		t.Fatal(err)
 	}
@@ -428,6 +430,13 @@ VALUES
   connection_id, identity_id, repository_id, latest_reason, latest_run_id, latest_observed_at,
   last_confirmed_reason, last_confirmed_run_id, last_confirmed_at
 ) VALUES (1, 22, 12, 'permission_unavailable', 3, '` + forgeAccessShadowLaterTimestamp + `', 'team_access', 4, '` + forgePreviewTimestamp + `')`,
+		},
+		{
+			name: "unknown observation claiming its own run as the earlier confirmation",
+			sql: `INSERT INTO forge_access_shadow_observations(
+  connection_id, identity_id, repository_id, latest_reason, latest_run_id, latest_observed_at,
+  last_confirmed_reason, last_confirmed_run_id, last_confirmed_at
+) VALUES (1, 22, 12, 'permission_unavailable', 5, '` + forgeAccessShadowLaterTimestamp + `', 'team_access', 5, '` + forgeAccessShadowLaterTimestamp + `')`,
 		},
 		{
 			name: "latest time behind the preserved confirmation",

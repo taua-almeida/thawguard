@@ -197,7 +197,9 @@ type AccessObserveInput struct {
 // AccessObservation is the sanitized result of one provider snapshot. Pairs
 // are meaningful only when ResultCode is complete, and then must classify
 // every identity x binding pair exactly once. RequestCount is the
-// request-local count of provider requests actually issued.
+// request-local count of attempted provider RoundTrips: a budget rejection
+// never counts, while an attempt that fails before reaching the provider
+// (canceled context, DNS, TLS) still counts as one attempt.
 type AccessObservation struct {
 	ResultCode   AccessSyncResultCode
 	Pairs        []AccessPairObservation

@@ -993,6 +993,8 @@ func forgeAccessNoticeToasts(values url.Values) []toastView {
 		tone = "success"
 	case forgeShadowIncompleteNotice:
 		message = "The shadow snapshot attempt finished with a failure result and published no pair evidence. See the latest attempt state."
+	case forgeShadowSupersededNotice:
+		message = "The connection configuration or its identity/binding scope changed while the snapshot ran, so the attempt was superseded and published no pair evidence."
 	case forgeShadowStaleNotice:
 		message = "The connection, its evidence, or the run history changed before this snapshot could start. Reload and review the current state."
 	case forgeShadowRunningNotice:

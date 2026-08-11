@@ -4,10 +4,62 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
 )
+
+var shadowTemplateClassAttribute = regexp.MustCompile(`class="([^"]+)"`)
+
+// TestForgeShadowTemplatesUseOnlyCompiledSelectors proves every static
+// utility class the shadow-access templates use has a compiled selector in
+// web/static/app.css, so the pages render styled without CSS generation.
+// Class lists computed by primitives carry template actions and are covered
+// by the primitives' own compiled sources.
+func TestForgeShadowTemplatesUseOnlyCompiledSelectors(t *testing.T) {
+	css, err := os.ReadFile("static/app.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	compiled := string(css)
+	for _, file := range []string{
+		"../internal/web/templates/components/forge-shadow-summary.html",
+		"../internal/web/templates/pages/forge-access-shadow.html",
+		"../internal/web/templates/layouts/forge-access-shadow.html",
+	} {
+		source, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, match := range shadowTemplateClassAttribute.FindAllStringSubmatch(string(source), -1) {
+			if strings.Contains(match[1], "{{") {
+				continue
+			}
+			for token := range strings.FieldsSeq(match[1]) {
+				// The selector must end at the class boundary: '.gap-1'
+				// may not be satisfied by '.gap-1\.5'.
+				selector := regexp.MustCompile(`\.` + regexp.QuoteMeta(cssEscapedClass(token)) + `[^A-Za-z0-9_\\-]`)
+				if !selector.MatchString(compiled) {
+					t.Errorf("%s uses class %q with no compiled selector", file, token)
+				}
+			}
+		}
+	}
+}
+
+// cssEscapedClass mirrors how Tailwind escapes utility names in selectors.
+func cssEscapedClass(token string) string {
+	var escaped strings.Builder
+	for _, character := range token {
+		switch character {
+		case ':', '.', '/', '(', ')', '[', ']', '%', '#':
+			escaped.WriteByte('\\')
+		}
+		escaped.WriteRune(character)
+	}
+	return escaped.String()
+}
 
 func TestTailwindSourcesCoverEveryPageTemplateAndAuthenticationLayout(t *testing.T) {
 	source, err := os.ReadFile("styles/app.css")

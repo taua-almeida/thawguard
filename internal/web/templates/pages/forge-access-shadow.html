@@ -61,10 +61,10 @@
             </td>
             <td class="px-4 py-3 align-top">
               {{ template "ui/badge" dict "Label" .StateLabel "Tone" .StateTone }}
-              <p class="m-0 mt-2 min-w-64 text-xs text-text-muted">{{ .ReasonText }}</p>
+              <p class="m-0 mt-2 text-xs text-text-muted">{{ .ReasonText }}</p>
               {{ if .ObservedAt }}<p class="m-0 mt-1 text-xs text-text-muted">Observed {{ .ObservedAt }}</p>{{ end }}
               {{ if .PriorConfirmedLabel }}
-              <p class="m-0 mt-2 text-xs text-text-muted">Previously confirmed: <span class="font-semibold text-text">{{ .PriorConfirmedLabel }}</span> at {{ .PriorConfirmedAt }}. Preserved beneath the newer unknown observation.</p>
+              <p class="m-0 mt-2 text-xs text-text-muted">Previously confirmed in an earlier complete credential-visible snapshot: <span class="font-semibold text-text">{{ .PriorConfirmedLabel }}</span> at {{ .PriorConfirmedAt }}. {{ .PriorConfirmedReasonText }} Preserved beneath the newer unknown observation.</p>
               {{ end }}
             </td>
           </tr>

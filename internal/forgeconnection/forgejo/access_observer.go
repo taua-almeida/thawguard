@@ -2,6 +2,7 @@ package forgejo
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"net/http"
 	"slices"
@@ -19,6 +20,9 @@ import (
 // identifiers in its report beyond the internal-id pair classifications.
 type AccessObserver struct {
 	transport http.RoundTripper
+	// requestLimit is a package-private test seam; zero means the approved
+	// production budget. Production code never sets it.
+	requestLimit int64
 }
 
 func NewAccessObserver(transport http.RoundTripper) *AccessObserver {
@@ -41,6 +45,15 @@ const (
 	accessMaxTeams           = 8
 )
 
+// Approved small-alpha scope ceilings, validated by the observer
+// independently of its caller: a scope beyond them fails closed before any
+// provider work.
+const (
+	accessMaxIdentities   = 10
+	accessMaxRepositories = 10
+	accessMaxPairs        = 25
+)
+
 // Sentinels for shadow-specific protocol failures.
 var (
 	errAccessDuplicateRecord  = errors.New("listing repeated an immutable id")
@@ -61,14 +74,26 @@ func (o *AccessObserver) ObserveAccess(ctx context.Context, input forgeconnectio
 	}
 	budget := &bodyBudget{}
 	budget.remaining.Store(maxCumulativeBodyBytes)
-	requests := &requestBudget{limit: forgeconnection.AccessSyncRequestLimit}
+	limit := o.requestLimit
+	if limit <= 0 {
+		limit = forgeconnection.AccessSyncRequestLimit
+	}
+	requests := &requestBudget{limit: limit}
+	// Transport order matters for truthful accounting: the cumulative-body
+	// budget preflight runs OUTSIDE the counter, so a request rejected for
+	// an exhausted body budget never increments the count, and the counter
+	// rejects the first request past the limit before delegating. The
+	// metric is attempted RoundTrips: an attempt that fails before an HTTP
+	// request is written (canceled context, DNS, TLS) still counts as one
+	// attempt, so the count bounds — and can slightly exceed — what the
+	// provider observed, never the reverse.
 	client := &forgeclient.Client{
 		BaseURL: input.BaseURL,
 		Token:   string(input.PAT),
 		HTTPClient: &http.Client{
-			Transport: &requestCountingTransport{
-				inner:    &budgetTransport{inner: o.transport, budget: budget},
-				requests: requests,
+			Transport: &budgetTransport{
+				inner:  &requestCountingTransport{inner: singleAttemptTransport(o.transport), requests: requests},
+				budget: budget,
 			},
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
@@ -81,14 +106,56 @@ func (o *AccessObserver) ObserveAccess(ctx context.Context, input forgeconnectio
 	return result
 }
 
+// singleAttemptTransport makes one counted request equal one wire request.
+// Two transparent retry channels exist inside a single outer RoundTrip:
+// net/http retries an idempotent GET that failed on a reused HTTP/1.x
+// keep-alive connection, and the HTTP/2 transport retries streams the
+// server rejected (REFUSED_STREAM, GOAWAY). Disabling keep-alives removes
+// HTTP/1.x connection reuse — net/http never retries a request that failed
+// on a first-use connection — and the client is forced to HTTP/1.x only:
+// the explicit protocol set, a cleared automatic-upgrade hook, and an ALPN
+// offer without h2 keep every HTTP/2 code path unreachable, including at
+// TLS negotiation. The 96-request budget therefore bounds the wire
+// exactly. A non-*http.Transport round tripper is the caller's
+// responsibility and passes through unchanged.
+func singleAttemptTransport(transport http.RoundTripper) http.RoundTripper {
+	base, ok := transport.(*http.Transport)
+	if !ok {
+		return transport
+	}
+	cloned := base.Clone()
+	cloned.DisableKeepAlives = true
+	cloned.ForceAttemptHTTP2 = false
+	cloned.Protocols = new(http.Protocols)
+	cloned.Protocols.SetHTTP1(true)
+	cloned.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	if cloned.TLSClientConfig != nil {
+		tlsConfig := cloned.TLSClientConfig.Clone()
+		withoutH2 := tlsConfig.NextProtos[:0:0]
+		for _, protocol := range tlsConfig.NextProtos {
+			if protocol != "h2" {
+				withoutH2 = append(withoutH2, protocol)
+			}
+		}
+		tlsConfig.NextProtos = withoutH2
+		cloned.TLSClientConfig = tlsConfig
+	}
+	return cloned
+}
+
 // requestBudget caps the total provider requests of one snapshot.
 type requestBudget struct {
 	used  atomic.Int64
 	limit int64
 }
 
-// requestCountingTransport counts every issued request and rejects the
-// first request past the cap before any network activity.
+func (b *requestBudget) remaining() int64 {
+	return b.limit - b.used.Load()
+}
+
+// requestCountingTransport counts every attempted RoundTrip and rejects
+// the first attempt past the cap before any network activity. A budget
+// rejection never counts; an attempt that fails mid-flight does.
 type requestCountingTransport struct {
 	inner    http.RoundTripper
 	requests *requestBudget
@@ -105,28 +172,40 @@ func (t *requestCountingTransport) RoundTrip(request *http.Request) (*http.Respo
 // accessGraph is the bounded immutable-id graph merged across every shared
 // listing. Duplicate edges collapse into set entries; the same id with
 // conflicting fields, or the same login on different ids, fails the graph.
+// Only orgRepositories establishes bound-repository availability: a
+// repository surfaced solely through a team listing is never treated as
+// part of the credential-visible top-level inventory.
 type accessGraph struct {
-	usersByID    map[int64]string // immutable user id -> exact current login
-	userIDLogins map[string]int64 // exact current login -> immutable user id
-	repositories map[int64]accessGraphRepository
-	teamRepos    map[int64]map[int64]bool // team id -> repository ids
-	teamMembers  map[int64]map[int64]bool // team id -> user ids
-	collabs      map[int64]map[int64]bool // repository id -> direct collaborator user ids
+	usersByID       map[int64]string // immutable user id -> exact current login
+	userIDLogins    map[string]int64 // exact current login -> immutable user id
+	repositories    map[int64]accessGraphRepository
+	repoIDByLocator map[string]int64         // exact owner/name locator -> immutable repository id
+	orgRepositories map[int64]bool           // top-level organization listing membership
+	teamRepos       map[int64]map[int64]bool // team id -> repository ids
+	teamMembers     map[int64]map[int64]bool // team id -> user ids
+	collabs         map[int64]map[int64]bool // repository id -> direct collaborator user ids
 }
 
+// accessGraphRepository carries the approved conflict-equality fields:
+// owner/name (the immutable id keys the map) plus the decoded visibility.
+// The mutable default branch is deliberately excluded — a branch rename
+// between listings must never invalidate access evidence.
 type accessGraphRepository struct {
-	owner string
-	name  string
+	owner   string
+	name    string
+	private bool
 }
 
 func newAccessGraph() *accessGraph {
 	return &accessGraph{
-		usersByID:    make(map[int64]string),
-		userIDLogins: make(map[string]int64),
-		repositories: make(map[int64]accessGraphRepository),
-		teamRepos:    make(map[int64]map[int64]bool),
-		teamMembers:  make(map[int64]map[int64]bool),
-		collabs:      make(map[int64]map[int64]bool),
+		usersByID:       make(map[int64]string),
+		userIDLogins:    make(map[string]int64),
+		repositories:    make(map[int64]accessGraphRepository),
+		repoIDByLocator: make(map[string]int64),
+		orgRepositories: make(map[int64]bool),
+		teamRepos:       make(map[int64]map[int64]bool),
+		teamMembers:     make(map[int64]map[int64]bool),
+		collabs:         make(map[int64]map[int64]bool),
 	}
 }
 
@@ -149,10 +228,24 @@ func (g *accessGraph) mergeRepository(repository forgeclient.ConnectionRepositor
 	if repository.ID <= 0 || !validForgejoName(repository.Owner) || !validForgejoName(repository.Name) {
 		return errAccessInvalidRecord
 	}
-	merged := accessGraphRepository{owner: repository.Owner, name: repository.Name}
+	merged := accessGraphRepository{
+		owner:   repository.Owner,
+		name:    repository.Name,
+		private: repository.Private,
+	}
 	if existing, known := g.repositories[repository.ID]; known && existing != merged {
 		return errAccessConflictingData
 	}
+	// The same exact owner/name locator on two immutable ids fails the
+	// graph, mirroring the login rule for users: collaborator and
+	// permission reads travel by locator, so a replacement repository at a
+	// bound repository's locator could otherwise answer for the bound
+	// immutable id and be published as its evidence.
+	locator := repository.Owner + "/" + repository.Name
+	if existingID, known := g.repoIDByLocator[locator]; known && existingID != repository.ID {
+		return errAccessConflictingData
+	}
+	g.repoIDByLocator[locator] = repository.ID
 	g.repositories[repository.ID] = merged
 	return nil
 }
@@ -216,6 +309,14 @@ func (r *accessRun) observe(input forgeconnection.AccessObserveInput) forgeconne
 	fail := func(code forgeconnection.AccessSyncResultCode) forgeconnection.AccessObservation {
 		return forgeconnection.AccessObservation{ResultCode: code}
 	}
+	// The observer validates the small-alpha scope itself: a caller handing
+	// it more work than the approved ceilings fails closed before any
+	// provider request is issued.
+	if len(input.Identities) > accessMaxIdentities ||
+		len(input.Bindings) > accessMaxRepositories ||
+		len(input.Identities)*len(input.Bindings) > accessMaxPairs {
+		return fail(forgeconnection.AccessSyncWorkLimitExceeded)
+	}
 	identities, bindings, ok := parseAccessScope(input)
 	if !ok {
 		return fail(forgeconnection.AccessSyncInvalidResponse)
@@ -262,6 +363,11 @@ func (r *accessRun) observe(input forgeconnection.AccessObserveInput) forgeconne
 		return fail(code)
 	}
 
+	// Phase preflight: the whole worst-case resolution phase must fit the
+	// remaining budget before its first request is issued.
+	if code := r.reserveResolutionRequests(graph, identities, bindings); code != "" {
+		return fail(code)
+	}
 	logins, unresolved, code := r.resolveIdentities(graph, identities)
 	if code != "" {
 		return fail(code)
@@ -290,8 +396,11 @@ func (r *accessRun) verifyServiceUser(boundRemoteID string) forgeconnection.Acce
 }
 
 // verifyOrganization reads the organization by its last-known slug and
-// requires the immutable bound id. A 404 means the known slug no longer
-// names the bound organization.
+// requires the immutable bound id. Per the systemic matrix, a 404 on this
+// control read is masking and classifies as invalid_response;
+// organization_changed is reserved for a resolved organization whose
+// immutable id no longer matches, or a stored slug that cannot travel as a
+// path segment at all.
 func (r *accessRun) verifyOrganization(slug, boundRemoteID string) (string, forgeconnection.AccessSyncResultCode) {
 	if !validForgejoName(slug) {
 		return "", forgeconnection.AccessSyncOrganizationChanged
@@ -300,7 +409,7 @@ func (r *accessRun) verifyOrganization(slug, boundRemoteID string) (string, forg
 	defer cancel()
 	organization, err := r.client.ReadOrganization(requestCtx, slug)
 	if err != nil {
-		return "", r.classifySystemic(err, forgeconnection.AccessSyncOrganizationChanged)
+		return "", r.classifySystemic(err, forgeconnection.AccessSyncInvalidResponse)
 	}
 	if strconv.FormatInt(organization.ID, 10) != boundRemoteID {
 		return "", forgeconnection.AccessSyncOrganizationChanged
@@ -331,6 +440,7 @@ func (r *accessRun) readOrganizationRepositories(graph *accessGraph, organizatio
 				if err := graph.mergeRepository(repository); err != nil {
 					return 0, 0, err
 				}
+				graph.orgRepositories[repository.ID] = true
 			}
 			return len(repositories), total, nil
 		})
@@ -453,18 +563,19 @@ func (r *accessRun) readTeamMembers(graph *accessGraph, teamID int64) forgeconne
 }
 
 // readBoundRepositoryCollaborators reads the complete direct-collaborator
-// list of every graph-visible bound repository, ascending by internal
-// repository id. A bound repository absent from the graph is skipped here
-// and classifies as repository_unavailable per pair.
+// list of every bound repository present in the top-level organization
+// listing, ascending by internal repository id. A bound repository absent
+// from that listing is skipped here and classifies as
+// repository_unavailable per pair, even when a team listing mentions it.
 func (r *accessRun) readBoundRepositoryCollaborators(
 	graph *accessGraph,
 	bindings []accessBoundRepository,
 ) forgeconnection.AccessSyncResultCode {
 	for _, binding := range bindings {
-		repository, visible := graph.repositories[binding.remoteID]
-		if !visible {
+		if !graph.orgRepositories[binding.remoteID] {
 			continue
 		}
+		repository := graph.repositories[binding.remoteID]
 		collaborators := make(map[int64]bool)
 		code := r.paginateAccess(accessNestedMaxPages, accessNestedMaxRecords, forgeconnection.AccessSyncInvalidResponse,
 			func(page int) (int, int64, error) {
@@ -489,6 +600,45 @@ func (r *accessRun) readBoundRepositoryCollaborators(
 			return code
 		}
 		graph.collabs[binding.remoteID] = collaborators
+	}
+	return ""
+}
+
+// reserveResolutionRequests runs after the shared graph and before the
+// first identity-fallback or effective-permission request. It reserves the
+// worst case of the remaining phase — one fallback per identity absent from
+// the graph whose username-at-link can travel as a path segment, plus one
+// permission request per pair whose identity could resolve and whose bound
+// repository is in the top-level organization listing — and fails closed as
+// work_limit_exceeded when that reservation exceeds the remaining request
+// budget, so the resolution phase can never start work it cannot finish.
+func (r *accessRun) reserveResolutionRequests(
+	graph *accessGraph,
+	identities []accessLinkedIdentity,
+	bindings []accessBoundRepository,
+) forgeconnection.AccessSyncResultCode {
+	fallbacks := int64(0)
+	resolvable := int64(0)
+	for _, identity := range identities {
+		if _, known := graph.usersByID[identity.remoteID]; known {
+			resolvable++
+			continue
+		}
+		if validForgejoName(identity.usernameAtLink) {
+			// Worst case: the fallback request succeeds and the identity
+			// then needs a permission request per visible pair.
+			fallbacks++
+			resolvable++
+		}
+	}
+	visibleBindings := int64(0)
+	for _, binding := range bindings {
+		if graph.orgRepositories[binding.remoteID] {
+			visibleBindings++
+		}
+	}
+	if fallbacks+resolvable*visibleBindings > r.requests.remaining() {
+		return forgeconnection.AccessSyncWorkLimitExceeded
 	}
 	return ""
 }
@@ -575,10 +725,12 @@ func (r *accessRun) classifyPair(
 	if unresolved[identity.identityID] {
 		return forgeconnection.AccessReasonIdentityUnresolved, ""
 	}
-	repository, visible := graph.repositories[repositoryRemoteID]
-	if !visible {
+	// Availability requires the top-level organization listing; a team-only
+	// mention never counts as credential-visible inventory.
+	if !graph.orgRepositories[repositoryRemoteID] {
 		return forgeconnection.AccessReasonRepositoryUnavailable, ""
 	}
+	repository := graph.repositories[repositoryRemoteID]
 	login, resolved := logins[identity.identityID]
 	if !resolved {
 		return forgeconnection.AccessReasonIdentityUnresolved, ""
