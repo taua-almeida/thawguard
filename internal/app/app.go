@@ -17,6 +17,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/forge/forgejo"
 	"github.com/taua-almeida/thawguard/internal/forgeconnection"
 	connectionforgejo "github.com/taua-almeida/thawguard/internal/forgeconnection/forgejo"
+	"github.com/taua-almeida/thawguard/internal/forgeidentity"
 	"github.com/taua-almeida/thawguard/internal/freeze"
 	"github.com/taua-almeida/thawguard/internal/jobs"
 	"github.com/taua-almeida/thawguard/internal/pullrequest"
@@ -78,6 +79,7 @@ func (a *App) Run(ctx context.Context) error {
 	companyOIDCChecker := companyoidc.NewChecker(http.DefaultTransport)
 	companyOIDCService := companyoidc.NewServiceWithChecker(database, secretStore, companyOIDCChecker, publicURL)
 	forgeConnectionService := forgeconnection.NewService(database, secretStore, connectionforgejo.NewAdapter(http.DefaultTransport))
+	forgeIdentityService := forgeidentity.NewService(database, secretStore, http.DefaultTransport, publicURL)
 	repositoryStore := repository.NewStore(database)
 	setupCheckStore := setupcheck.NewStore(database)
 	webhookDeliveryStore := webhook.NewDeliveryStore(database)
@@ -117,6 +119,7 @@ func (a *App) Run(ctx context.Context) error {
 			CompanyOIDCSecretEncryptionConfigured:     secretStore != nil,
 			ForgeConnectionService:                    forgeConnectionService,
 			ForgeConnectionSecretEncryptionConfigured: secretStore != nil,
+			ForgeIdentityService:                      forgeIdentityService,
 			SetupCheckStore:                           setupCheckStore,
 			SetupCheckRunner:                          setupCheckRunner,
 			FreezeStore:                               freezeStoreForWeb,

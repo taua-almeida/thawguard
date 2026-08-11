@@ -1,0 +1,71 @@
+{{/*
+  pages/account — the signed-in user's own account page (GET /account).
+  View: accountPageData. The Forgejo card states come from ForgeStatus:
+  unavailable, ready, in_progress, linked; failure/expired/cancelled,
+  collision, and outcome-unknown arrive as notice toasts. Linking proves
+  identity only and grants no repository role.
+*/}}
+{{ define "pages/account" }}
+<div class="flex min-w-0 flex-col gap-6">
+  <header>
+    <h1 class="m-0 text-page-title font-bold text-text">Account</h1>
+    <p class="m-0 mt-1 text-sm text-text-muted">Your sign-in and linked identities.</p>
+  </header>
+
+  <section class="min-w-0 rounded-panel border border-border bg-surface p-4 shadow-card sm:p-6" aria-labelledby="account-signin-title">
+    <h2 id="account-signin-title" class="m-0 text-lg font-bold text-text">Sign-in</h2>
+    <p class="m-0 mt-1 text-sm text-text-muted">{{ if .CurrentUser.CanChangePassword }}Password sign-in is enabled for this account.{{ else }}This account has no local password.{{ end }}</p>
+    {{ if .CurrentUser.CanChangePassword }}<div class="mt-3">{{ template "ui/button" dict "Label" "Change password" "Variant" "secondary" "Size" "sm" "Href" "/account/password" }}</div>{{ end }}
+  </section>
+
+  <section class="min-w-0 rounded-panel border border-border bg-surface p-4 shadow-card sm:p-6" aria-labelledby="account-forgejo-title">
+    <div class="flex flex-wrap items-start justify-between gap-3">
+      <div>
+        <h2 id="account-forgejo-title" class="m-0 text-lg font-bold text-text">Forgejo identity</h2>
+        <p class="m-0 mt-1 text-sm text-text-muted">Linking proves which Forgejo account is yours. It grants no repository access, role, or authority, and Thawguard never stores Forgejo tokens for it.</p>
+      </div>
+      {{ if eq .ForgeStatus "linked" }}{{ template "ui/badge" dict "Label" "Linked" "Tone" "success" }}{{ end }}
+    </div>
+
+    {{ if eq .ForgeStatus "linked" }}
+    {{ with .ForgeIdentity }}
+    <dl class="mt-4 grid min-w-0 grid-cols-1 gap-x-6 gap-y-4 sm:grid-cols-2">
+      <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Username at link time</dt><dd class="m-0 mt-1 break-all font-mono text-sm text-text">{{ .Username }}</dd><dd class="m-0 mt-1 text-xs text-text-muted">Recorded when the link was made; later Forgejo renames are not tracked.</dd></div>
+      <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Linked</dt><dd class="m-0 mt-1 text-sm text-text">{{ .LinkedAt }}</dd></div>
+    </dl>
+    {{ end }}
+    <div class="mt-4">{{ template "ui/button" dict "Label" "Unlink Forgejo identity" "Variant" "danger" "Href" "/account?unlink=confirm" "DialogTarget" "forgejo-unlink-confirm" }}</div>
+    {{ else if eq .ForgeStatus "in_progress" }}
+    <div class="mt-4" role="status">{{ template "ui/callout" dict "Tone" "info" "Title" "Link attempt in progress" "Body" "A link attempt is already in progress for this account. Finish it in the tab that started it, or wait up to ten minutes for it to expire before starting again." }}</div>
+    {{ else if eq .ForgeStatus "ready" }}
+    <form method="post" action="/account/forgejo/link" class="mt-4 flex max-w-md flex-col gap-4">
+      <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+      <input type="hidden" name="expected_connection_id" value="{{ .ForgeConnectionID }}">
+      <input type="hidden" name="expected_oauth_revision" value="{{ .ForgeOAuthRevision }}">
+      {{ template "ui/input" dict "ID" "forgejo-link-password" "Name" "current_password" "Label" "Current password" "Type" "password" "Autocomplete" "current-password" "Required" true "Hint" "Confirms it is you before Thawguard prepares the one-time link request." }}
+      <div>{{ template "ui/button" dict "Label" "Link Forgejo account" "Variant" "primary" "Type" "submit" }}</div>
+    </form>
+    <p class="m-0 mt-3 text-xs text-text-muted">You will continue to the configured Forgejo installation, approve read-only access to your account identity, and return here. The one-time request expires after ten minutes.</p>
+    {{ else }}
+    <p class="m-0 mt-4 text-sm text-text-muted">Forgejo identity linking is not available right now. An Administrator must configure and enable the Forgejo OAuth client first.</p>
+    {{ end }}
+  </section>
+</div>
+
+{{ if .ForgeIdentity }}
+<dialog id="forgejo-unlink-confirm"{{ if .UnlinkConfirmOpen }} open{{ end }} class="m-auto w-[min(32rem,90vw)] rounded-panel border border-border bg-surface p-6 text-text shadow-card" aria-labelledby="forgejo-unlink-confirm-title">
+  <h2 id="forgejo-unlink-confirm-title" class="m-0 text-base font-bold">Unlink Forgejo identity?</h2>
+  <p class="m-0 mt-2 break-words text-sm font-semibold text-text">{{ .ForgeIdentity.Username }} · linked {{ .ForgeIdentity.LinkedAt }}</p>
+  <p class="m-0 mt-2 text-sm text-text-muted">The identity record is removed and any pending link attempt is cancelled. Nothing else changes: no repository role, grant, or session.</p>
+  <form method="post" action="/account/forgejo/unlink" class="mt-4 flex flex-col gap-4">
+    <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+    <input type="hidden" name="identity_id" value="{{ .ForgeIdentity.ID }}">
+    {{ template "ui/input" dict "ID" "forgejo-unlink-password" "Name" "current_password" "Label" "Current password" "Type" "password" "Autocomplete" "current-password" "Required" true }}
+    <div class="flex flex-row-reverse gap-2">
+      {{ template "ui/button" dict "Label" "Unlink identity" "Variant" "danger" "Type" "submit" }}
+      {{ template "ui/button" dict "Label" "Cancel" "Variant" "secondary" "Type" "submit" "Dismiss" true }}
+    </div>
+  </form>
+</dialog>
+{{ end }}
+{{ end }}

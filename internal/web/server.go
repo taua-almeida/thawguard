@@ -21,6 +21,7 @@ import (
 	"github.com/taua-almeida/thawguard/internal/companyoidc"
 	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/forgeconnection"
+	"github.com/taua-almeida/thawguard/internal/forgeidentity"
 	"github.com/taua-almeida/thawguard/internal/freeze"
 	"github.com/taua-almeida/thawguard/internal/jobs"
 	"github.com/taua-almeida/thawguard/internal/repository"
@@ -90,6 +91,10 @@ type Config struct {
 	// unavailable notice when absent).
 	ForgeConnectionService                    ForgeConnectionService
 	ForgeConnectionSecretEncryptionConfigured bool
+	// ForgeIdentityService backs Forgejo identity linking: the /account
+	// card, the fixed callback, and the Administrator OAuth client and
+	// purge surfaces; optional (every surface degrades to unavailable).
+	ForgeIdentityService ForgeIdentityService
 	// PullRequestStore feeds the freeze-impact preview from the
 	// webhook-synced local cache; optional (the preview degrades to the
 	// zero state when absent).
@@ -382,8 +387,14 @@ func NewServer(cfg Config) *Server {
 
 func (s *Server) Routes() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The callback guard runs before ServeMux path cleaning so a
+		// cleaned-equivalent spelling is rejected instead of redirected.
+		if s.forgeIdentityCallbackGuard(w, r) {
+			return
+		}
 		if isAuthenticationSettingsPath(r.URL.Path) || isForgeAccessPath(r.URL.Path) || r.URL.Path == "/login" ||
-			isPasswordRecoveryPath(r.URL.Path) || isInvitationSensitivePath(r.URL.Path) {
+			isPasswordRecoveryPath(r.URL.Path) || isInvitationSensitivePath(r.URL.Path) ||
+			isForgeIdentityHeaderPath(r.URL.Path) {
 			w.Header().Set("Cache-Control", "no-store")
 			// no-referrer makes browsers serialize Origin as "null" for form
 			// posts initiated by sensitive documents, so exact-Origin validation
@@ -540,6 +551,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /users/{id}/password-recovery", s.handleIssuePasswordRecovery)
 	s.mux.HandleFunc("GET /account/password", s.handleAccountPassword)
 	s.mux.HandleFunc("POST /account/password", s.handleAccountPasswordPost)
+	s.mux.HandleFunc("GET /account", s.handleAccount)
+	s.mux.HandleFunc("POST /account/forgejo/link", s.handleForgeIdentityLinkStart)
+	s.mux.HandleFunc("POST /account/forgejo/unlink", s.handleForgeIdentityUnlink)
+	s.mux.HandleFunc("GET "+forgeidentity.CallbackPath, s.handleForgeIdentityCallback)
+	s.mux.HandleFunc("POST /settings/forge-access/oauth", s.handleForgeOAuthClientSave)
+	s.mux.HandleFunc("POST /settings/forge-access/oauth/disable", s.handleForgeOAuthClientDisable)
+	s.mux.HandleFunc("POST /users/{id}/forge-identity/purge", s.handleForgeIdentityPurge)
 	s.mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(webassets.StaticFS()))))
 	if s.cfg.DevMode {
 		s.mux.HandleFunc("GET /dev/preview", s.handleDevPreview)
@@ -2344,6 +2362,12 @@ var activityActionDefinitions = map[string]activityActionDefinition{
 	audit.ActionForgeConnectionReset:               {Label: "Forge connection", Outcome: "Reset", OutcomeClass: "warning"},
 	audit.ActionForgeRepositoryBound:               {Label: "Forge repository binding", Outcome: "Bound", OutcomeClass: "ok"},
 	audit.ActionForgeRepositoryUnbound:             {Label: "Forge repository binding", Outcome: "Unbound", OutcomeClass: "warning"},
+	audit.ActionForgeOAuthClientUpdated:            {Label: "Forgejo OAuth client", Outcome: "Saved", OutcomeClass: "ok"},
+	audit.ActionForgeOAuthClientDisabled:           {Label: "Forgejo OAuth client", Outcome: "Disabled", OutcomeClass: "warning"},
+	audit.ActionForgeIdentityLinked:                {Label: "Forgejo identity", Outcome: "Linked", OutcomeClass: "ok"},
+	audit.ActionForgeIdentityLinkRejected:          {Label: "Forgejo identity link", Outcome: "Rejected", OutcomeClass: "warning"},
+	audit.ActionForgeIdentityUnlinked:              {Label: "Forgejo identity", Outcome: "Unlinked", OutcomeClass: "warning"},
+	audit.ActionForgeIdentityPurged:                {Label: "Forgejo identity", Outcome: "Purged", OutcomeClass: "warning"},
 }
 
 func activityEventViews(repositories []domain.Repository, users []auth.User, events []audit.Event) []activityEventView {
@@ -2609,6 +2633,27 @@ func activityEventViewForEvent(repositories map[int64]domain.Repository, users m
 			return fallbackActivityEventView(users, event, details, true, forceUnknownInvitationActor)
 		}
 		view.Target = target
+		view.Detail = detail
+	case audit.ActionForgeOAuthClientUpdated, audit.ActionForgeOAuthClientDisabled:
+		detail, ok := activityForgeOAuthClientDetail(event, details)
+		if !ok {
+			return fallbackActivityEventView(users, event, details, true, forceUnknownInvitationActor)
+		}
+		view.Target = activityForgeConnectionTarget(event)
+		view.Detail = detail
+	case audit.ActionForgeIdentityLinked, audit.ActionForgeIdentityUnlinked, audit.ActionForgeIdentityPurged:
+		detail, ok := activityForgeIdentityDetail(event, details)
+		if !ok {
+			return fallbackActivityEventView(users, event, details, true, forceUnknownInvitationActor)
+		}
+		view.Target = "Forgejo identity " + event.SubjectID
+		view.Detail = detail
+	case audit.ActionForgeIdentityLinkRejected:
+		detail, ok := activityForgeIdentityLinkRejectedDetail(event, details)
+		if !ok {
+			return fallbackActivityEventView(users, event, details, true, forceUnknownInvitationActor)
+		}
+		view.Target = activityForgeConnectionTarget(event)
 		view.Detail = detail
 	case audit.ActionRepositoryGrantAdded:
 		view.Target = activityRepositoryTarget(repositories, event, details, "")
@@ -3366,6 +3411,77 @@ func validForgeConnectionSubject(event audit.Event) bool {
 
 func activityForgeConnectionTarget(event audit.Event) string {
 	return "Forge connection " + event.SubjectID
+}
+
+// validForgeIdentitySubject requires the forge_identity subject type and a
+// canonical positive decimal identity row id.
+func validForgeIdentitySubject(event audit.Event) bool {
+	if event.SubjectType != audit.SubjectTypeForgeIdentity || event.SubjectID == "" || len(event.SubjectID) > 19 {
+		return false
+	}
+	if event.SubjectID[0] < '1' || event.SubjectID[0] > '9' {
+		return false
+	}
+	for i := range len(event.SubjectID) {
+		if event.SubjectID[i] < '0' || event.SubjectID[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func activityForgeOAuthClientDetail(event audit.Event, details activityDetails) (string, bool) {
+	if !validForgeConnectionSubject(event) || len(details) != 1 {
+		return "", false
+	}
+	var revision int64
+	if raw, present := details["oauth_revision"]; !present || json.Unmarshal(raw, &revision) != nil || revision <= 0 {
+		return "", false
+	}
+	if event.Action == audit.ActionForgeOAuthClientDisabled {
+		return fmt.Sprintf(
+			"OAuth revision %d: identity linking disabled and the stored client credentials destroyed. Pending link attempts were cancelled; linked identities remain.",
+			revision,
+		), true
+	}
+	return fmt.Sprintf(
+		"OAuth revision %d: client credentials stored and identity linking enabled. Pending link attempts under earlier configurations were cancelled.",
+		revision,
+	), true
+}
+
+func activityForgeIdentityDetail(event audit.Event, details activityDetails) (string, bool) {
+	if !validForgeIdentitySubject(event) || len(details) != 1 {
+		return "", false
+	}
+	var connectionID int64
+	if raw, present := details["connection_id"]; !present || json.Unmarshal(raw, &connectionID) != nil || connectionID <= 0 {
+		return "", false
+	}
+	prefix := "Forge connection " + strconv.FormatInt(connectionID, 10) + ": "
+	switch event.Action {
+	case audit.ActionForgeIdentityLinked:
+		return prefix + "a Forgejo identity was linked to this account. Linking proves identity only; no repository role or authority changed.", true
+	case audit.ActionForgeIdentityUnlinked:
+		return prefix + "the owner removed their linked Forgejo identity. Pending link attempts were cancelled.", true
+	case audit.ActionForgeIdentityPurged:
+		return prefix + "an Administrator purged a disabled account's linked Forgejo identity. Pending link attempts were cancelled.", true
+	default:
+		return "", false
+	}
+}
+
+// activityForgeIdentityLinkRejectedDetail renders the fixed collision
+// evidence; it never names the other account.
+func activityForgeIdentityLinkRejectedDetail(event audit.Event, details activityDetails) (string, bool) {
+	if !validForgeConnectionSubject(event) || len(details) != 1 {
+		return "", false
+	}
+	reason, ok := activityExactStringDetail(details, "reason")
+	if !ok || reason != "remote_identity_collision" {
+		return "", false
+	}
+	return "A link attempt was rejected because the Forgejo account is already linked on this installation. No identity changed.", true
 }
 
 func activityForgeConnectionSavedDetail(event audit.Event, details activityDetails) (string, bool) {

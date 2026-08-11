@@ -214,33 +214,38 @@ func parseForgeRepositoryUnbindForm(requestURL *url.URL, values url.Values) (for
 	}, nil
 }
 
-func parseForgeAccessResetForm(requestURL *url.URL, values url.Values) (int64, int64, int64, error) {
+func parseForgeAccessResetForm(requestURL *url.URL, values url.Values) (int64, int64, int64, int64, error) {
 	fields := []string{
 		csrfFormField,
 		"expected_connection_id",
 		"expected_revision",
 		"expected_binding_revision",
+		"expected_oauth_revision",
 		"confirm_reset",
 	}
 	if err := exactForgeAccessForm(requestURL, values, fields); err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, err
 	}
 	connectionID, err := canonicalPositiveForgeAccessValue(values.Get("expected_connection_id"))
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, err
 	}
 	revision, err := canonicalPositiveForgeAccessValue(values.Get("expected_revision"))
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, err
 	}
 	bindingRevision, err := canonicalExpectedRevision(values.Get("expected_binding_revision"))
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, err
+	}
+	oauthRevision, err := canonicalExpectedRevision(values.Get("expected_oauth_revision"))
+	if err != nil {
+		return 0, 0, 0, 0, err
 	}
 	if values.Get("confirm_reset") != forgeAccessConfirmResetValue {
-		return 0, 0, 0, errors.New("reset confirmation is invalid")
+		return 0, 0, 0, 0, errors.New("reset confirmation is invalid")
 	}
-	return connectionID, revision, bindingRevision, nil
+	return connectionID, revision, bindingRevision, oauthRevision, nil
 }
 
 func exactForgeAccessForm(requestURL *url.URL, values url.Values, fields []string) error {

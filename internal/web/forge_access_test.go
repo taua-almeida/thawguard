@@ -709,6 +709,7 @@ func TestForgeAccessCheckAndResetPostContracts(t *testing.T) {
 		"expected_connection_id":    {"3"},
 		"expected_revision":         {"1"},
 		"expected_binding_revision": {"0"},
+		"expected_oauth_revision":   {"0"},
 		"confirm_reset":             {forgeAccessConfirmResetValue},
 	}
 	response = forgeAccessPOST(server, session, "/settings/forge-access/reset", confirmed, forgeAccessTestPublicURL)
@@ -1291,6 +1292,7 @@ func TestForgeAccessResetRequiresBindingRevisionAndReportsBindingBlock(t *testin
 	service.resetErr = forgeconnection.ErrBindingsExist
 	current := cloneValues(preUpgrade)
 	current.Set("expected_binding_revision", "4")
+	current.Set("expected_oauth_revision", "0")
 	response := forgeAccessPOST(server, session, "/settings/forge-access/reset", current, forgeAccessTestPublicURL)
 	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/settings/forge-access?notice="+forgeAccessResetBindingsNotice {
 		t.Fatalf("blocked reset status=%d location=%q", response.Code, response.Header().Get("Location"))

@@ -148,6 +148,10 @@ type ResetInput struct {
 	ExpectedConnectionID    int64
 	ExpectedRevision        int64
 	ExpectedBindingRevision int64
+	// ExpectedOAuthRevision fences the reset against the identity-linking
+	// OAuth client state: 0 when unconfigured, its current positive revision
+	// otherwise. A reset confirmed before an OAuth change never applies after.
+	ExpectedOAuthRevision int64
 	// ConfirmReset must be explicitly true; reset deletes the connection and
 	// every cascaded preview and evidence row.
 	ConfirmReset bool
@@ -273,6 +277,7 @@ var (
 	ErrBindingUnavailable    = errors.New("the repository is not ready for this binding change")
 	ErrBindingOutcomeUnknown = errors.New("the repository binding outcome could not be confirmed")
 	ErrBindingsExist         = errors.New("remove every repository binding before resetting the Forge connection")
+	ErrIdentitiesExist       = errors.New("remove every linked Forgejo identity before resetting the Forge connection")
 )
 
 const (

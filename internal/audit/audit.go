@@ -83,6 +83,12 @@ const (
 	ActionForgeConnectionReset               = "forge.connection_reset"
 	ActionForgeRepositoryBound               = "forge.repository_bound"
 	ActionForgeRepositoryUnbound             = "forge.repository_unbound"
+	ActionForgeOAuthClientUpdated            = "forge.oauth_client_updated"
+	ActionForgeOAuthClientDisabled           = "forge.oauth_client_disabled"
+	ActionForgeIdentityLinked                = "forge.identity_linked"
+	ActionForgeIdentityLinkRejected          = "forge.identity_link_rejected"
+	ActionForgeIdentityUnlinked              = "forge.identity_unlinked"
+	ActionForgeIdentityPurged                = "forge.identity_purged"
 
 	ActorKindPasswordRecoveryLink = "recovery_link"
 	ActorKindInvitationLink       = "invitation_link"
@@ -95,6 +101,7 @@ const (
 	SubjectTypeInvitation      = "invitation"
 	SubjectTypeOIDCConnection  = "oidc_connection"
 	SubjectTypeForgeConnection = "forge_connection"
+	SubjectTypeForgeIdentity   = "forge_identity"
 )
 
 // KnownActions returns every audit action the application currently writes.
@@ -172,6 +179,12 @@ func KnownActions() []string {
 		ActionForgeConnectionReset,
 		ActionForgeRepositoryBound,
 		ActionForgeRepositoryUnbound,
+		ActionForgeOAuthClientUpdated,
+		ActionForgeOAuthClientDisabled,
+		ActionForgeIdentityLinked,
+		ActionForgeIdentityLinkRejected,
+		ActionForgeIdentityUnlinked,
+		ActionForgeIdentityPurged,
 	}
 }
 

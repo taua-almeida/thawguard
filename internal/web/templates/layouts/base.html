@@ -66,6 +66,7 @@
         <p class="m-0 truncate text-text-muted">{{ .CurrentUser.Email }}</p>
         <p class="m-0 mt-1">{{ template "ui/badge" dict "Label" .CurrentUser.RoleLabel "Tone" "info" }}</p>
         <div class="mt-2 flex flex-col gap-1.5">
+          <a class="font-semibold text-accent-strong no-underline hover:underline" href="/account">Account</a>
           {{ if .CurrentUser.CanChangePassword }}<a class="font-semibold text-accent-strong no-underline hover:underline" href="/account/password">Change password</a>{{ end }}
           <form method="post" action="/logout">
             <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
