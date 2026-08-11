@@ -1,0 +1,70 @@
+{{/*
+  components/forge-shadow-summary — the shadow-access evidence card shared by
+  the Forge access page and the details page.
+  dict keys: Shadow (forgeShadowSectionView, required), DetailsLink (bool).
+*/}}
+{{ define "components/forge-shadow-summary" }}
+{{ $shadow := .Shadow }}
+<div class="flex min-w-0 flex-col gap-4">
+  {{ if $shadow.LoadError }}
+  <div role="alert">{{ template "ui/callout" dict "Tone" "danger" "Title" "Shadow access evidence unavailable" "Body" "Thawguard could not load the shadow access evidence. No secret value was retrieved. Reload after checking the installation database." }}</div>
+  {{ else }}
+
+  <div>
+    <p class="m-0 text-xs font-semibold uppercase tracking-wide text-text-muted">Prerequisites</p>
+    <ul class="m-0 mt-2 flex list-none flex-col gap-1.5 p-0 text-sm text-text">
+      <li class="flex items-center gap-2">
+        {{ if $shadow.SetupEvidenceCurrent }}{{ template "ui/badge" dict "Label" "Met" "Tone" "success" }}{{ else }}{{ template "ui/badge" dict "Label" "Not met" "Tone" "warning" }}{{ end }}
+        <span>Bound connection with a current successful connection check.</span>
+      </li>
+      <li class="flex items-center gap-2">
+        {{ if gt $shadow.IdentityCount 0 }}{{ template "ui/badge" dict "Label" "Met" "Tone" "success" }}{{ else }}{{ template "ui/badge" dict "Label" "Not met" "Tone" "warning" }}{{ end }}
+        <span>{{ $shadow.IdentityCount }} linked Forgejo identities (at least 1, at most 10; disabled owners included as evidence only).</span>
+      </li>
+      <li class="flex items-center gap-2">
+        {{ if gt $shadow.BindingCount 0 }}{{ template "ui/badge" dict "Label" "Met" "Tone" "success" }}{{ else }}{{ template "ui/badge" dict "Label" "Not met" "Tone" "warning" }}{{ end }}
+        <span>{{ $shadow.BindingCount }} bound repositories (at least 1, at most 10).</span>
+      </li>
+      <li class="flex items-center gap-2">
+        {{ if $shadow.WithinLimits }}{{ template "ui/badge" dict "Label" "Met" "Tone" "success" }}{{ else }}{{ template "ui/badge" dict "Label" "Not met" "Tone" "warning" }}{{ end }}
+        <span>Identity × repository pairs within the small-alpha limit of 25.</span>
+      </li>
+    </ul>
+  </div>
+
+  <div>
+    <div class="flex flex-wrap items-center gap-2">
+      <p class="m-0 text-xs font-semibold uppercase tracking-wide text-text-muted">Latest attempt</p>
+      {{ if $shadow.HasAttempt }}{{ template "ui/badge" dict "Label" $shadow.AttemptLabel "Tone" $shadow.AttemptTone }}{{ else }}{{ template "ui/badge" dict "Label" "Never run" "Tone" "neutral" }}{{ end }}
+    </div>
+    {{ if $shadow.HasAttempt }}
+    <p class="m-0 mt-2 text-sm text-text-muted">{{ $shadow.AttemptDetail }}</p>
+    <p class="m-0 mt-1 text-xs text-text-muted">Started {{ $shadow.AttemptStartedAt }}{{ if $shadow.AttemptFinishedAt }} · finished {{ $shadow.AttemptFinishedAt }}{{ end }}.</p>
+    {{ else }}
+    <p class="m-0 mt-2 text-sm text-text-muted">No shadow snapshot has been attempted for this connection.</p>
+    {{ end }}
+  </div>
+
+  <div>
+    <div class="flex flex-wrap items-center gap-2">
+      <p class="m-0 text-xs font-semibold uppercase tracking-wide text-text-muted">Latest completed snapshot</p>
+      {{ template "ui/badge" dict "Label" $shadow.SnapshotLabel "Tone" $shadow.SnapshotTone }}
+    </div>
+    <p class="m-0 mt-2 text-sm text-text-muted">{{ $shadow.SnapshotDetail }}</p>
+    {{ if $shadow.HasSnapshot }}
+    <dl class="mt-3 grid min-w-0 grid-cols-2 gap-x-6 gap-y-3 sm:grid-cols-4">
+      <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Pairs</dt><dd class="m-0 mt-1 text-sm text-text">{{ $shadow.PairCount }}</dd></div>
+      <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Explicit access</dt><dd class="m-0 mt-1 text-sm text-text">{{ $shadow.PresentCount }}</dd></div>
+      <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">No explicit access</dt><dd class="m-0 mt-1 text-sm text-text">{{ $shadow.AbsentCount }}</dd></div>
+      <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Unknown</dt><dd class="m-0 mt-1 text-sm text-text">{{ $shadow.UnknownCount }}</dd></div>
+    </dl>
+    <p class="m-0 mt-2 text-xs text-text-muted">Observed {{ $shadow.SnapshotObservedAt }} · {{ $shadow.SnapshotAge }}. A completed snapshot is complete only for the graph visible to the attested credential within the approved limits.</p>
+    {{ end }}
+  </div>
+
+  {{ if .DetailsLink }}
+  <div>{{ template "ui/button" dict "Label" "View pair evidence" "Variant" "secondary" "Href" "/settings/forge-access/shadow-access" }}</div>
+  {{ end }}
+  {{ end }}
+</div>
+{{ end }}

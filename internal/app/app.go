@@ -79,6 +79,7 @@ func (a *App) Run(ctx context.Context) error {
 	companyOIDCChecker := companyoidc.NewChecker(http.DefaultTransport)
 	companyOIDCService := companyoidc.NewServiceWithChecker(database, secretStore, companyOIDCChecker, publicURL)
 	forgeConnectionService := forgeconnection.NewService(database, secretStore, connectionforgejo.NewAdapter(http.DefaultTransport))
+	forgeAccessShadowService := forgeconnection.NewAccessShadowService(database, secretStore, connectionforgejo.NewAccessObserver(http.DefaultTransport))
 	forgeIdentityService := forgeidentity.NewService(database, secretStore, http.DefaultTransport, publicURL)
 	repositoryStore := repository.NewStore(database)
 	setupCheckStore := setupcheck.NewStore(database)
@@ -120,6 +121,7 @@ func (a *App) Run(ctx context.Context) error {
 			ForgeConnectionService:                    forgeConnectionService,
 			ForgeConnectionSecretEncryptionConfigured: secretStore != nil,
 			ForgeIdentityService:                      forgeIdentityService,
+			ForgeAccessShadowService:                  forgeAccessShadowService,
 			SetupCheckStore:                           setupCheckStore,
 			SetupCheckRunner:                          setupCheckRunner,
 			FreezeStore:                               freezeStoreForWeb,

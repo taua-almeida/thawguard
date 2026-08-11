@@ -95,6 +95,10 @@ type Config struct {
 	// card, the fixed callback, and the Administrator OAuth client and
 	// purge surfaces; optional (every surface degrades to unavailable).
 	ForgeIdentityService ForgeIdentityService
+	// ForgeAccessShadowService backs the Administrator-only manual shadow
+	// access snapshot on /settings/forge-access; optional (the section and
+	// details page degrade to unavailable).
+	ForgeAccessShadowService ForgeAccessShadowService
 	// PullRequestStore feeds the freeze-impact preview from the
 	// webhook-synced local cache; optional (the preview degrades to the
 	// zero state when absent).
@@ -536,6 +540,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /settings/forge-access/reset", s.handleForgeAccessReset)
 	s.mux.HandleFunc("POST /settings/forge-access/repositories/bind", s.handleForgeRepositoryBind)
 	s.mux.HandleFunc("POST /settings/forge-access/repositories/unbind", s.handleForgeRepositoryUnbind)
+	s.mux.HandleFunc("GET /settings/forge-access/shadow-access", s.handleForgeAccessShadow)
+	s.mux.HandleFunc("POST /settings/forge-access/shadow-access/run", s.handleForgeAccessShadowRun)
 	s.mux.HandleFunc("POST /users", s.handleCreateUser)
 	s.mux.HandleFunc("POST /users/invitations", s.handleCreateInvitation)
 	s.mux.HandleFunc("POST /users/invitations/{id}/cancel", s.handleCancelInvitation)
@@ -2368,6 +2374,8 @@ var activityActionDefinitions = map[string]activityActionDefinition{
 	audit.ActionForgeIdentityLinkRejected:          {Label: "Forgejo identity link", Outcome: "Rejected", OutcomeClass: "warning"},
 	audit.ActionForgeIdentityUnlinked:              {Label: "Forgejo identity", Outcome: "Unlinked", OutcomeClass: "warning"},
 	audit.ActionForgeIdentityPurged:                {Label: "Forgejo identity", Outcome: "Purged", OutcomeClass: "warning"},
+	audit.ActionForgeAccessSyncStarted:             {Label: "Shadow access snapshot", Outcome: "Started", OutcomeClass: "pending"},
+	audit.ActionForgeAccessSyncFinished:            {Label: "Shadow access snapshot", Outcome: "Finished", OutcomeClass: "ok"},
 }
 
 func activityEventViews(repositories []domain.Repository, users []auth.User, events []audit.Event) []activityEventView {
@@ -2655,6 +2663,22 @@ func activityEventViewForEvent(repositories map[int64]domain.Repository, users m
 		}
 		view.Target = activityForgeConnectionTarget(event)
 		view.Detail = detail
+	case audit.ActionForgeAccessSyncStarted:
+		detail, ok := activityForgeAccessSyncStartedDetail(event, details)
+		if !ok {
+			return fallbackActivityEventView(users, event, details, true, forceUnknownInvitationActor)
+		}
+		view.Target = activityForgeConnectionTarget(event)
+		view.Detail = detail
+	case audit.ActionForgeAccessSyncFinished:
+		detail, outcome, outcomeClass, ok := activityForgeAccessSyncFinishedDetail(event, details)
+		if !ok {
+			return fallbackActivityEventView(users, event, details, true, forceUnknownInvitationActor)
+		}
+		view.Target = activityForgeConnectionTarget(event)
+		view.Detail = detail
+		view.Outcome = outcome
+		view.OutcomeClass = outcomeClass
 	case audit.ActionRepositoryGrantAdded:
 		view.Target = activityRepositoryTarget(repositories, event, details, "")
 		if provenance, ok := activityExactStringDetail(details, "provenance"); ok && provenance == "invitation_acceptance" {
@@ -2764,7 +2788,9 @@ func activityHasGuardedDetails(action string) bool {
 		audit.ActionForgeConnectionChecked,
 		audit.ActionForgeConnectionReset,
 		audit.ActionForgeRepositoryBound,
-		audit.ActionForgeRepositoryUnbound:
+		audit.ActionForgeRepositoryUnbound,
+		audit.ActionForgeAccessSyncStarted,
+		audit.ActionForgeAccessSyncFinished:
 		return true
 	default:
 		return false
@@ -2806,6 +2832,11 @@ func activityGuardedDetail(action, key string) bool {
 	case audit.ActionForgeRepositoryUnbound:
 		return key == "repository_id" || key == "repository_created_at" ||
 			key == "config_revision" || key == "binding_revision"
+	case audit.ActionForgeAccessSyncStarted:
+		return key == "run_id" || key == "identity_count" || key == "repository_count"
+	case audit.ActionForgeAccessSyncFinished:
+		return key == "run_id" || key == "result_code" ||
+			key == "present_count" || key == "unknown_count" || key == "request_count"
 	default:
 		return false
 	}
@@ -3671,6 +3702,84 @@ func activityForgeRepositoryBindingDetail(
 		configRevision,
 		bindingRevision,
 	), true
+}
+
+// activityForgeAccessSyncStartedDetail renders the fixed reservation
+// evidence: internal run id and aggregate scope counts only.
+func activityForgeAccessSyncStartedDetail(event audit.Event, details activityDetails) (string, bool) {
+	if !validForgeConnectionSubject(event) || len(details) != 3 {
+		return "", false
+	}
+	runID, runOK := activityPositiveInt64Detail(details, "run_id")
+	identityCount, identityOK := activityPositiveInt64Detail(details, "identity_count")
+	repositoryCount, repositoryOK := activityPositiveInt64Detail(details, "repository_count")
+	if !runOK || !identityOK || !repositoryOK {
+		return "", false
+	}
+	return fmt.Sprintf(
+		"Run %d reserved for %d linked identities and %d bound repositories. Shadow evidence only; no roles or authority change.",
+		runID,
+		identityCount,
+		repositoryCount,
+	), true
+}
+
+// activityForgeAccessSyncFinishedDetail renders the fixed finalization
+// evidence. Pair counts appear only for a complete snapshot and the request
+// count only when it was known at ordinary finalization.
+func activityForgeAccessSyncFinishedDetail(
+	event audit.Event,
+	details activityDetails,
+) (detail string, outcome string, outcomeClass string, ok bool) {
+	if !validForgeConnectionSubject(event) {
+		return "", "", "", false
+	}
+	runID, ok := activityPositiveInt64Detail(details, "run_id")
+	if !ok {
+		return "", "", "", false
+	}
+	resultText, ok := activityExactStringDetail(details, "result_code")
+	if !ok {
+		return "", "", "", false
+	}
+	result := forgeconnection.AccessSyncResultCode(resultText)
+	if !result.Valid() {
+		return "", "", "", false
+	}
+	requestCount, hasRequestCount := activityNonnegativeInt64Detail(details, "request_count")
+	if _, present := details["request_count"]; present &&
+		(!hasRequestCount || requestCount > forgeconnection.AccessSyncRequestLimit) {
+		return "", "", "", false
+	}
+	requestDetail := ""
+	expectedDetails := 2
+	if hasRequestCount {
+		requestDetail = fmt.Sprintf(" %d provider requests were issued.", requestCount)
+		expectedDetails++
+	}
+	prefix := fmt.Sprintf("Run %d: ", runID)
+	if result == forgeconnection.AccessSyncComplete {
+		present, presentOK := activityNonnegativeInt64Detail(details, "present_count")
+		unknown, unknownOK := activityNonnegativeInt64Detail(details, "unknown_count")
+		if !presentOK || !unknownOK || len(details) != expectedDetails+2 {
+			return "", "", "", false
+		}
+		return prefix + fmt.Sprintf(
+			"the credential-visible snapshot completed with %d explicit-access and %d unknown pairs; the remainder showed no explicit access. No roles or authority changed.%s",
+			present,
+			unknown,
+			requestDetail,
+		), "Completed", "ok", true
+	}
+	if len(details) != expectedDetails {
+		return "", "", "", false
+	}
+	detailText := prefix + "the snapshot finished without publishing: " + forgeShadowResultText(result) +
+		" Earlier evidence was preserved." + requestDetail
+	if result == forgeconnection.AccessSyncInterrupted {
+		return detailText, "Interrupted", "warning", true
+	}
+	return detailText, "Failed", "failed", true
 }
 
 func activitySetupCheckDetail(details activityDetails) string {

@@ -164,32 +164,7 @@ func (c *Client) ReadCurrentUserOrganizations(ctx context.Context, page, limit i
 // repository list plus the advertised total. A page carrying more records
 // than the requested limit is rejected during decoding.
 func (c *Client) ReadOrganizationRepositories(ctx context.Context, organization string, page, limit int) ([]ConnectionRepository, int64, error) {
-	if limit < 1 {
-		return nil, 0, errors.New("page limit must be positive")
-	}
-	body, total, err := c.connectionRead(ctx, pageQuery(page, limit), "api", "v1", "orgs", organization, "repos")
-	if err != nil {
-		return nil, 0, err
-	}
-	payload := make([]connectionRepositoryPayload, 0, limit)
-	if err := strictDecodeJSONArray(body, limit, repositoryObjectRule, func() any {
-		payload = append(payload, connectionRepositoryPayload{})
-		return &payload[len(payload)-1]
-	}); err != nil {
-		return nil, 0, err
-	}
-	repositories := make([]ConnectionRepository, 0, len(payload))
-	for _, item := range payload {
-		repository, err := item.validated()
-		if err != nil {
-			return nil, 0, err
-		}
-		repositories = append(repositories, repository)
-	}
-	if total < 0 {
-		return nil, 0, ErrTotalCountInvalid
-	}
-	return repositories, total, nil
+	return c.readRepositoryPage(ctx, page, limit, "api", "v1", "orgs", organization, "repos")
 }
 
 // ReadRepositoryByID reads one repository directly by its immutable id.
