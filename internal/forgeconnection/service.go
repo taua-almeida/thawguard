@@ -221,6 +221,21 @@ func (s *Service) Edit(ctx context.Context, actorUserID int64, input EditInput) 
 	if existing.BaseURL != normalized.baseURL && !patReplaced {
 		return ValidationError{Message: "changing the installation URL requires a replacement service PAT attested for the new destination"}
 	}
+	// A linked Forgejo identity is scoped to its connection, and its remote
+	// numeric id is meaningful only against the installation it was linked
+	// at. Retargeting the URL would silently re-home every identity, so the
+	// destination is frozen while any identity exists — even before the
+	// first successful check binds the service-user and organization.
+	if existing.BaseURL != normalized.baseURL {
+		var identityExists int
+		if err := tx.QueryRowContext(ctx, `
+SELECT EXISTS(SELECT 1 FROM forgejo_identities WHERE connection_id = ?)`, existing.ID).Scan(&identityExists); err != nil {
+			return fmt.Errorf("check forgejo identities before URL edit: %w", err)
+		}
+		if identityExists == 1 {
+			return ValidationError{Message: "the installation URL cannot change while Forgejo identities are linked; unlink or purge every identity first"}
+		}
+	}
 	if !patReplaced &&
 		existing.DisplayName == normalized.displayName &&
 		existing.BaseURL == normalized.baseURL &&
@@ -292,7 +307,8 @@ func (s *Service) Reset(ctx context.Context, actorUserID int64, input ResetInput
 	if s == nil || s.db == nil {
 		return errors.New("forge connection service has no database")
 	}
-	if input.ExpectedConnectionID <= 0 || input.ExpectedRevision <= 0 || input.ExpectedBindingRevision < 0 {
+	if input.ExpectedConnectionID <= 0 || input.ExpectedRevision <= 0 || input.ExpectedBindingRevision < 0 ||
+		input.ExpectedOAuthRevision < 0 {
 		return ValidationError{Message: "the expected connection id and revision must identify the connection being reset"}
 	}
 	if !input.ConfirmReset {
@@ -323,6 +339,29 @@ SELECT EXISTS(SELECT 1 FROM forge_repository_bindings WHERE connection_id = ?)`,
 	}
 	if bindingExists == 1 {
 		return ErrBindingsExist
+	}
+	// The identity-linking OAuth client state is fenced by revision (an
+	// absent row is revision 0), and linked identities block the reset the
+	// same way bindings do. Their ON DELETE RESTRICT foreign keys make this
+	// check authoritative rather than advisory.
+	var oauthRevision int64
+	err = tx.QueryRowContext(ctx, `
+SELECT oauth_revision FROM forgejo_identity_oauth_clients WHERE connection_id = ?`, existing.ID).Scan(&oauthRevision)
+	if errors.Is(err, sql.ErrNoRows) {
+		oauthRevision = 0
+	} else if err != nil {
+		return fmt.Errorf("check forgejo OAuth client before reset: %w", err)
+	}
+	if oauthRevision != input.ExpectedOAuthRevision {
+		return ErrConflict
+	}
+	var identityExists int
+	if err := tx.QueryRowContext(ctx, `
+SELECT EXISTS(SELECT 1 FROM forgejo_identities WHERE connection_id = ?)`, existing.ID).Scan(&identityExists); err != nil {
+		return fmt.Errorf("check forgejo identities before reset: %w", err)
+	}
+	if identityExists == 1 {
+		return ErrIdentitiesExist
 	}
 	deleted, err := execExpectingOneRow(ctx, tx, `
 DELETE FROM forge_connections

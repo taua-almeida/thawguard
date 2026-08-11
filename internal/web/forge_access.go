@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/taua-almeida/thawguard/internal/forgeconnection"
+	"github.com/taua-almeida/thawguard/internal/forgeidentity"
 )
 
 // Forge access is the Administrator-only Forgejo connection and repository
@@ -43,11 +44,12 @@ const (
 	forgeAccessCheckAuthorityNotice   = "forge-check-authority"
 	forgeAccessCheckUnknownNotice     = "forge-check-unknown"
 
-	forgeAccessResetNotice          = "forge-reset"
-	forgeAccessResetStaleNotice     = "forge-reset-stale"
-	forgeAccessResetBindingsNotice  = "forge-reset-bindings"
-	forgeAccessResetAuthorityNotice = "forge-reset-authority"
-	forgeAccessResetUnknownNotice   = "forge-reset-unknown"
+	forgeAccessResetNotice           = "forge-reset"
+	forgeAccessResetStaleNotice      = "forge-reset-stale"
+	forgeAccessResetBindingsNotice   = "forge-reset-bindings"
+	forgeAccessResetIdentitiesNotice = "forge-reset-identities"
+	forgeAccessResetAuthorityNotice  = "forge-reset-authority"
+	forgeAccessResetUnknownNotice    = "forge-reset-unknown"
 )
 
 // ForgeConnectionService is the narrow consumer boundary of the Forge
@@ -157,6 +159,31 @@ type forgeAccessPageData struct {
 
 	ResetConfirmOpen bool
 	LoadError        string
+
+	// OAuth client card for Forgejo identity linking. States: unavailable
+	// (no service), unconfigured, enabled, disabled, stale (bound base URL
+	// no longer matches the connection), plus encryption-unavailable and
+	// outcome-unknown notices.
+	OAuthAvailable          bool
+	OAuthConfigured         bool
+	OAuthEnabled            bool
+	OAuthStale              bool
+	OAuthClientID           string
+	OAuthRevision           string
+	OAuthCallbackURI        string
+	OAuthFormOpen           bool
+	OAuthFormError          string
+	OAuthDisableConfirmOpen bool
+	HasIdentities           bool
+}
+
+// forgeAccessRenderState carries one render's submitted-form and error
+// state so rejected saves re-render without echoing credentials.
+type forgeAccessRenderState struct {
+	SubmittedForm     forgeAccessFormView
+	FormError         string
+	ShowSubmittedForm bool
+	OAuthFormError    string
 }
 
 func (s *Server) handleForgeAccess(w http.ResponseWriter, r *http.Request) {
@@ -164,7 +191,7 @@ func (s *Server) handleForgeAccess(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	s.renderForgeAccess(w, r, http.StatusOK, session, forgeAccessFormView{}, "", false)
+	s.renderForgeAccess(w, r, http.StatusOK, session, forgeAccessRenderState{})
 }
 
 func (s *Server) handleForgeAccessSave(w http.ResponseWriter, r *http.Request) {
@@ -213,7 +240,11 @@ func (s *Server) handleForgeAccessSave(w http.ResponseWriter, r *http.Request) {
 	case forgeconnection.IsValidationError(err):
 		// Re-render the form with the submitted non-secret values; the PAT
 		// is never redisplayed.
-		s.renderForgeAccess(w, r, http.StatusBadRequest, session, form, err.Error(), true)
+		s.renderForgeAccess(w, r, http.StatusBadRequest, session, forgeAccessRenderState{
+			SubmittedForm:     form,
+			FormError:         err.Error(),
+			ShowSubmittedForm: true,
+		})
 	case errors.Is(err, forgeconnection.ErrConflict):
 		redirectForgeAccessNotice(w, r, forgeAccessSaveStaleNotice)
 	case errors.Is(err, forgeconnection.ErrConfiguration):
@@ -276,7 +307,7 @@ func (s *Server) handleForgeAccessReset(w http.ResponseWriter, r *http.Request) 
 	if !ok || session.UserID == nil {
 		return
 	}
-	connectionID, revision, bindingRevision, err := parseForgeAccessResetForm(r.URL, r.PostForm)
+	connectionID, revision, bindingRevision, oauthRevision, err := parseForgeAccessResetForm(r.URL, r.PostForm)
 	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
@@ -289,6 +320,7 @@ func (s *Server) handleForgeAccessReset(w http.ResponseWriter, r *http.Request) 
 		ExpectedConnectionID:    connectionID,
 		ExpectedRevision:        revision,
 		ExpectedBindingRevision: bindingRevision,
+		ExpectedOAuthRevision:   oauthRevision,
 		ConfirmReset:            true,
 	}); err != nil {
 		notice := forgeAccessResetUnknownNotice
@@ -297,6 +329,8 @@ func (s *Server) handleForgeAccessReset(w http.ResponseWriter, r *http.Request) 
 			notice = forgeAccessResetStaleNotice
 		case errors.Is(err, forgeconnection.ErrBindingsExist):
 			notice = forgeAccessResetBindingsNotice
+		case errors.Is(err, forgeconnection.ErrIdentitiesExist):
+			notice = forgeAccessResetIdentitiesNotice
 		case errors.Is(err, forgeconnection.ErrAuthorization):
 			notice = forgeAccessResetAuthorityNotice
 		}
@@ -307,17 +341,18 @@ func (s *Server) handleForgeAccessReset(w http.ResponseWriter, r *http.Request) 
 }
 
 // renderForgeAccess assembles the whole page: connection metadata, check
-// evidence state, and the retained preview with its bounded search, status
-// filter, and fixed 20-row pagination.
+// evidence state, the OAuth client card, and the retained preview with its
+// bounded search, status filter, and fixed 20-row pagination.
 func (s *Server) renderForgeAccess(
 	w http.ResponseWriter,
 	r *http.Request,
 	status int,
 	session sessionState,
-	submittedForm forgeAccessFormView,
-	formError string,
-	showSubmittedForm bool,
+	state forgeAccessRenderState,
 ) {
+	submittedForm := state.SubmittedForm
+	formError := state.FormError
+	showSubmittedForm := state.ShowSubmittedForm
 	data := forgeAccessPageData{
 		AppName:             s.cfg.AppName,
 		PageTitle:           "Forge access",
@@ -362,6 +397,9 @@ func (s *Server) renderForgeAccess(
 	data.CheckState = forgeAccessCheckState(connection)
 	data.CheckReady = data.EncryptionAvailable
 	data.ResetConfirmOpen = r.URL.Query().Get("reset") == "confirm"
+	if !s.loadForgeAccessOAuthClient(w, &data, connection, r, state.OAuthFormError) {
+		return
+	}
 	if showSubmittedForm {
 		data.ShowForm = true
 		data.Editing = true
@@ -390,6 +428,50 @@ func (s *Server) renderForgeAccess(
 	// the no-connection state.
 	s.buildForgeAccessPreview(&data, connection, repositories, r.URL.Query())
 	s.renderPageStatus(w, status, "layouts/forge-access", data)
+}
+
+// loadForgeAccessOAuthClient fills the OAuth client card state. The
+// expected OAuth revision also fences the connection reset, so it is
+// resolved even when the card itself is unavailable ("0" fails closed).
+// It reports false when it already wrote an error response.
+func (s *Server) loadForgeAccessOAuthClient(
+	w http.ResponseWriter,
+	data *forgeAccessPageData,
+	connection forgeconnection.Connection,
+	r *http.Request,
+	oauthFormError string,
+) bool {
+	data.OAuthRevision = "0"
+	data.OAuthAvailable = s.cfg.ForgeIdentityService != nil
+	if !data.OAuthAvailable {
+		return true
+	}
+	client, configured, err := s.cfg.ForgeIdentityService.OAuthClient(r.Context())
+	if err != nil {
+		data.LoadError = "Thawguard could not load the Forgejo OAuth client configuration. No secret value was retrieved."
+		s.renderPageStatus(w, http.StatusInternalServerError, "layouts/forge-access", *data)
+		return false
+	}
+	hasIdentities, err := s.cfg.ForgeIdentityService.HasIdentities(r.Context())
+	if err != nil {
+		data.LoadError = "Thawguard could not load the linked Forgejo identity state."
+		s.renderPageStatus(w, http.StatusInternalServerError, "layouts/forge-access", *data)
+		return false
+	}
+	data.HasIdentities = hasIdentities
+	data.OAuthConfigured = configured
+	data.OAuthCallbackURI = s.cfg.PublicURL + forgeidentity.CallbackPath
+	data.OAuthFormError = oauthFormError
+	if configured {
+		data.OAuthEnabled = client.Enabled
+		data.OAuthClientID = client.ClientID
+		data.OAuthRevision = strconv.FormatInt(client.Revision, 10)
+		data.OAuthStale = client.Enabled && client.BoundBaseURL != connection.BaseURL
+	}
+	data.OAuthFormOpen = oauthFormError != "" ||
+		(r.URL.Query().Get("oauth") == "edit" && data.EncryptionAvailable)
+	data.OAuthDisableConfirmOpen = r.URL.Query().Get("oauth") == "disable"
+	return true
 }
 
 // forgeAccessCheckState derives the evidence state shown at the top of the
@@ -836,6 +918,8 @@ func forgeAccessNoticeToasts(values url.Values) []toastView {
 		message = "The saved connection changed before the reset. Reload Forge access and confirm again."
 	case forgeAccessResetBindingsNotice:
 		message = "Reset is blocked while repository bindings exist. Unbind every repository first; repository-owned data will remain unchanged."
+	case forgeAccessResetIdentitiesNotice:
+		message = "Reset is blocked while linked Forgejo identities exist. Every identity must be unlinked or purged first."
 	case forgeAccessResetAuthorityNotice:
 		message = "Administrator authority changed before the reset could be recorded."
 		tone = "danger"
@@ -867,6 +951,22 @@ func forgeAccessNoticeToasts(values url.Values) []toastView {
 		tone = "danger"
 	case forgeAccessUnbindUnknownNotice:
 		message = "Thawguard could not confirm the repository unbind outcome. Reload Forge access before retrying."
+		tone = "danger"
+	case forgeOAuthSavedNotice:
+		message = "Forgejo OAuth client saved and enabled. Every pending link attempt started under the previous configuration was cancelled."
+		tone = "success"
+	case forgeOAuthDisabledNotice:
+		message = "Forgejo OAuth client disabled. Its credentials were destroyed and every pending link attempt was cancelled. Linked identities remain."
+		tone = "success"
+	case forgeOAuthStaleNotice:
+		message = "The OAuth client configuration changed before this save. Reload Forge access and review the saved state before retrying. No submitted secret is retained."
+	case forgeOAuthAuthorityNotice:
+		message = "Administrator authority changed before the OAuth client change could be recorded."
+		tone = "danger"
+	case forgeOAuthUnavailableNotice:
+		message = "Saving the OAuth client is unavailable until secret encryption is configured."
+	case forgeOAuthUnknownNotice:
+		message = "Thawguard could not confirm whether the OAuth client change was recorded. Reload Forge access and inspect the saved state before retrying."
 		tone = "danger"
 	default:
 		return nil

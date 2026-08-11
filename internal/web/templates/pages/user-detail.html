@@ -23,6 +23,22 @@
     </div>
   </section>
 
+  {{ if .ForgeIdentity }}
+  <section class="rounded-panel border border-border bg-surface p-(--card-spacing) shadow-card" aria-labelledby="user-forge-identity-title">
+    <div class="flex flex-wrap items-start justify-between gap-3">
+      <div>
+        <h2 id="user-forge-identity-title" class="m-0 text-lg font-bold text-text">Forgejo identity</h2>
+        <p class="m-0 mt-1 text-sm text-text-muted">Linked as <code class="break-all font-mono text-sm text-text">{{ .ForgeIdentity.Username }}</code> (username at link time) on {{ .ForgeIdentity.LinkedAt }}. Identity only; it carries no role or authority.</p>
+      </div>
+      {{ if .User.Disabled }}
+      {{ template "ui/button" dict "Label" "Purge identity" "Variant" "danger" "Href" (printf "/users/%d?forge-purge=confirm" .User.ID) "DialogTarget" "user-forge-purge-confirm" }}
+      {{ else }}
+      <p class="m-0 text-sm text-text-muted">Only the owner can unlink while the account is enabled.</p>
+      {{ end }}
+    </div>
+  </section>
+  {{ end }}
+
   <section class="rounded-panel border border-accent bg-surface p-(--card-spacing) shadow-card" aria-labelledby="user-admin-title">
     <h2 id="user-admin-title" class="m-0 text-lg font-bold text-text">Admin</h2>
     <p class="m-0 mt-1 text-sm text-text-muted">Manages repositories, connections, people, and access across the whole installation, and can view every repository. Not repository-scoped. To freeze or approve thaws, an Admin still needs those roles per repository below.</p>
@@ -51,6 +67,24 @@
     {{ else }}<div class="p-(--card-spacing)">{{ template "ui/empty-state" dict "Title" "No repositories configured" "Hint" "Add a repository before granting repository access." "Icon" "tg-i-repositories" }}</div>{{ end }}
   </section>
 </div>
+
+{{ if and .ForgeIdentity .User.Disabled }}
+<dialog id="user-forge-purge-confirm"{{ if .ForgePurgeConfirmOpen }} open{{ end }} class="m-auto w-[min(32rem,90vw)] rounded-panel border border-border bg-surface p-6 text-text shadow-card" aria-labelledby="user-forge-purge-confirm-title">
+  <h2 id="user-forge-purge-confirm-title" class="m-0 text-base font-bold">Purge Forgejo identity?</h2>
+  <p class="m-0 mt-2 break-words text-sm font-semibold text-text">{{ .User.DisplayName }} · <code class="font-mono text-xs text-text-muted">{{ .ForgeIdentity.Username }}</code> · linked {{ .ForgeIdentity.LinkedAt }}</p>
+  <p class="m-0 mt-2 text-sm text-text-muted">Removes this disabled account&rsquo;s linked Forgejo identity and cancels any pending link attempt. Purge is only possible while the account remains disabled; nothing else about the account changes.</p>
+  <form method="post" action="/users/{{ .User.ID }}/forge-identity/purge" class="mt-4 flex flex-col gap-4">
+    <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+    <input type="hidden" name="identity_id" value="{{ .ForgeIdentity.ID }}">
+    <input type="hidden" name="confirm_purge" value="purge">
+    {{ template "ui/input" dict "ID" "user-forge-purge-password" "Name" "current_password" "Label" "Your current password" "Type" "password" "Autocomplete" "current-password" "Required" true }}
+    <div class="flex flex-row-reverse gap-2">
+      {{ template "ui/button" dict "Label" "Purge identity" "Variant" "danger" "Type" "submit" }}
+      {{ template "ui/button" dict "Label" "Cancel" "Variant" "secondary" "Type" "submit" "Dismiss" true }}
+    </div>
+  </form>
+</dialog>
+{{ end }}
 
 {{ if and (not .IsSelf) (not .User.Disabled) .User.HasLocalPassword }}
 <dialog id="user-password-recovery" class="m-auto w-[min(32rem,90vw)] rounded-panel border border-border bg-surface p-6 text-text shadow-card" aria-labelledby="user-password-recovery-title">

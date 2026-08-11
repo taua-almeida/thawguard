@@ -1,0 +1,16 @@
+{{/*
+  pages/forge-provider-navigation — buffered same-origin continuation page
+  for the Forgejo link ceremony. Rendered fully before the browser-binding
+  cookie is emitted; reuses the existing provider-navigation script, which
+  degrades to the button without JavaScript.
+*/}}
+{{ define "pages/forge-provider-navigation" }}
+<h1 class="m-0 mb-3 text-base font-bold text-text">Continue to Forgejo</h1>
+<p class="m-0 text-sm text-text-muted">Thawguard prepared a one-time link request. Continue to the configured Forgejo installation to approve it.</p>
+<div id="oidc-provider-navigation" class="mt-4">
+  {{ template "ui/button" dict "Label" "Continue to Forgejo" "Variant" "primary" "Href" .AuthorizationURL }}
+</div>
+<noscript><p class="m-0 mt-3 text-xs text-text-muted">Automatic navigation needs JavaScript. Use the button above to continue.</p></noscript>
+<p class="m-0 mt-4 text-sm"><a class="font-semibold text-accent-strong" href="/account">Back to account</a></p>
+<script src="/static/js/oidc-provider-navigation.js" defer></script>
+{{ end }}

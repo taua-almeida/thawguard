@@ -128,6 +128,10 @@ type userDetailPageData struct {
 	User    auth.User
 	IsSelf  bool
 	IsAdmin bool
+	// ForgeIdentity is the target's linked Forgejo identity, if any. The
+	// purge confirmation opens only while the target remains disabled.
+	ForgeIdentity         *forgeIdentityView
+	ForgePurgeConfirmOpen bool
 	// IsLastRecoveryAdmin marks the only enabled Admin with a local password.
 	// Demoting or disabling that account is blocked because it would leave the
 	// installation without local password recovery.
@@ -381,6 +385,16 @@ func (s *Server) handleUserDetail(w http.ResponseWriter, r *http.Request) {
 		data.Toasts = []toastView{{Message: "User disabled and sessions revoked.", Tone: "success", DismissHref: fmt.Sprintf("/users/%d", userID)}}
 	case "enabled":
 		data.Toasts = []toastView{{Message: "User re-enabled. Previous sessions were not restored.", Tone: "success", DismissHref: fmt.Sprintf("/users/%d", userID)}}
+	case forgeIdentityPurgedNotice:
+		data.Toasts = []toastView{{Message: "The linked Forgejo identity was purged. No repository role or authority changed.", Tone: "success", DismissHref: fmt.Sprintf("/users/%d", userID)}}
+	case forgePurgePasswordNotice:
+		data.Toasts = []toastView{{Message: "The current password was not accepted. The identity was not purged.", Tone: "warning", DismissHref: fmt.Sprintf("/users/%d", userID)}}
+	case forgePurgeStaleNotice:
+		data.Toasts = []toastView{{Message: "The identity or account state changed before the purge. Reload and review before trying again.", Tone: "warning", DismissHref: fmt.Sprintf("/users/%d", userID)}}
+	case forgePurgeAuthorityNotice:
+		data.Toasts = []toastView{{Message: "Administrator authority or session state changed before the purge could be recorded.", Tone: "danger", DismissHref: fmt.Sprintf("/users/%d", userID)}}
+	case forgePurgeUnknownNotice:
+		data.Toasts = []toastView{{Message: "Thawguard could not confirm the purge outcome. Review this page and Activity before trying again.", Tone: "danger", DismissHref: fmt.Sprintf("/users/%d", userID)}}
 	}
 	s.renderPage(w, "layouts/user-detail", data)
 }
@@ -442,6 +456,21 @@ func (s *Server) loadUserDetailPageData(w http.ResponseWriter, r *http.Request, 
 		data.AdminChecked = state.AdminValue
 	}
 	data.Repositories = userRepositoryAccessViews(repositories, grants, state)
+	if s.cfg.ForgeIdentityService != nil {
+		identity, linked, err := s.cfg.ForgeIdentityService.IdentityForUser(r.Context(), user.ID)
+		if err != nil {
+			s.renderErrorPage(w, http.StatusInternalServerError, false)
+			return userDetailPageData{}, false
+		}
+		if linked {
+			data.ForgeIdentity = &forgeIdentityView{
+				ID:       strconv.FormatInt(identity.ID, 10),
+				Username: identity.UsernameAtLink,
+				LinkedAt: identity.LinkedAt.UTC().Format("2006-01-02 15:04:05 UTC"),
+			}
+			data.ForgePurgeConfirmOpen = user.Disabled() && r.URL.Query().Get("forge-purge") == "confirm"
+		}
+	}
 	return data, true
 }
 

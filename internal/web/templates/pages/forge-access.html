@@ -95,6 +95,7 @@
       {{ template "ui/button" dict "Label" "Reset connection" "Variant" "danger" "Href" "/settings/forge-access?reset=confirm" "DialogTarget" "forge-reset-confirm" }}
     </div>
     {{ if .HasBindings }}<p class="m-0 mt-2 text-sm font-semibold text-warning">Reset is blocked until every repository binding below is removed.</p>{{ end }}
+    {{ if .HasIdentities }}<p class="m-0 mt-2 text-sm font-semibold text-warning">Reset is blocked until every linked Forgejo identity is unlinked or purged.</p>{{ end }}
     <p class="m-0 mt-2 text-xs text-text-muted">The check is non-mutating: it reads the installation version, the service account, its organizations, and every repository page visible to the credential. It never probes a write endpoint and never claims write scopes are absent.</p>
 
     <section class="mt-5" aria-labelledby="forge-preview-title">
@@ -176,12 +177,90 @@
     </section>
   </section>
 
+  <section class="min-w-0 rounded-panel border border-border bg-surface p-4 shadow-card sm:p-6" aria-labelledby="forge-oauth-title">
+    <div class="flex flex-wrap items-start justify-between gap-3">
+      <div>
+        <h2 id="forge-oauth-title" class="m-0 text-lg font-bold text-text">Identity linking OAuth client</h2>
+        <p class="m-0 mt-1 text-sm text-text-muted">Lets enabled users with a local password link their own Forgejo account identity. Linking proves identity only: it grants no repository role, reads no memberships, and stores no provider tokens.</p>
+      </div>
+      {{ if not .OAuthAvailable }}{{ template "ui/badge" dict "Label" "Unavailable" "Tone" "neutral" }}
+      {{ else if not .OAuthConfigured }}{{ template "ui/badge" dict "Label" "Not configured" "Tone" "neutral" }}
+      {{ else if and .OAuthEnabled .OAuthStale }}{{ template "ui/badge" dict "Label" "Stale" "Tone" "warning" }}
+      {{ else if .OAuthEnabled }}{{ template "ui/badge" dict "Label" "Enabled" "Tone" "success" }}
+      {{ else }}{{ template "ui/badge" dict "Label" "Disabled" "Tone" "warning" }}{{ end }}
+    </div>
+
+    {{ if not .OAuthAvailable }}
+    <p class="m-0 mt-4 text-sm text-text-muted">Identity linking is not configured on this installation.</p>
+    {{ else }}
+    {{ if .OAuthFormError }}<div class="mt-4" role="alert">{{ template "ui/callout" dict "Tone" "danger" "Body" .OAuthFormError }}</div>{{ end }}
+    {{ if and .OAuthConfigured .OAuthEnabled }}
+    {{ if .OAuthStale }}<div class="mt-4" role="alert">{{ template "ui/callout" dict "Tone" "warning" "Title" "Bound installation URL is stale" "Body" "The OAuth client was saved for a different installation URL than the current connection. Linking is paused until the client is saved again with fresh credentials." }}</div>{{ end }}
+    <dl class="mt-4 grid min-w-0 grid-cols-1 gap-x-6 gap-y-4 sm:grid-cols-2">
+      <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Client ID</dt><dd class="m-0 mt-1 break-all font-mono text-sm text-text">{{ .OAuthClientID }}</dd></div>
+      <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">OAuth revision</dt><dd class="m-0 mt-1 text-sm text-text">{{ .OAuthRevision }}</dd></div>
+      <div class="min-w-0 sm:col-span-2"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Redirect URI</dt><dd class="m-0 mt-1 break-all font-mono text-sm text-text">{{ .OAuthCallbackURI }}</dd><dd class="m-0 mt-1 text-xs text-text-muted">Register exactly this redirect URI on the Forgejo OAuth application. The client secret is write-only and never redisplayed.</dd></div>
+    </dl>
+    {{ else if .OAuthConfigured }}
+    <div class="mt-4" role="status">{{ template "ui/callout" dict "Tone" "warning" "Title" "Identity linking disabled" "Body" "The stored client credentials were destroyed when linking was disabled. Enabling again requires a fresh client ID and secret." }}</div>
+    {{ else }}
+    <p class="m-0 mt-4 text-sm text-text-muted">No OAuth client is configured. Create an OAuth application on the connected Forgejo installation with the redirect URI below, then save its credentials here.</p>
+    <p class="m-0 mt-2 break-all font-mono text-sm text-text">{{ .OAuthCallbackURI }}</p>
+    {{ end }}
+
+    {{ if not .EncryptionAvailable }}
+    <p class="m-0 mt-4 text-sm font-semibold text-warning">Saving the OAuth client is disabled until secret encryption is configured.</p>
+    {{ else if or .OAuthFormOpen (not (and .OAuthConfigured .OAuthEnabled)) }}
+    <form method="post" action="/settings/forge-access/oauth" class="mt-5 flex max-w-xl min-w-0 flex-col gap-4">
+      <input type="hidden" name="{{ .CSRFField }}" value="{{ .CSRFToken }}">
+      <input type="hidden" name="expected_connection_id" value="{{ .Connection.ID }}">
+      <input type="hidden" name="expected_revision" value="{{ .Connection.Revision }}">
+      <input type="hidden" name="expected_oauth_revision" value="{{ .OAuthRevision }}">
+      {{ template "ui/input" dict "ID" "forge-oauth-client-id" "Name" "client_id" "Label" "OAuth client ID" "Maxlength" 255 "Required" true "Autocomplete" "off" "Mono" true }}
+      <div class="flex flex-col gap-1.5">
+        <label for="forge-oauth-client-secret" class="text-sm font-semibold text-text">OAuth client secret<span class="text-danger" aria-hidden="true"> *</span></label>
+        <p id="forge-oauth-client-secret-hint" class="m-0 text-xs text-text-muted">Stored encrypted, write-only, and never shown again. Every save requires a fresh secret and cancels pending link attempts.</p>
+        <input id="forge-oauth-client-secret" name="client_secret" type="password" class="h-(--control-height) w-full rounded-control border border-border-input bg-surface px-3 text-sm text-text placeholder:text-text-muted" maxlength="1024" autocomplete="new-password" aria-describedby="forge-oauth-client-secret-hint" required>
+      </div>
+      <div>{{ template "ui/button" dict "Label" "Save and enable linking" "Variant" "primary" "Type" "submit" }}</div>
+    </form>
+    {{ else }}
+    <div class="mt-5 flex flex-wrap items-center gap-3">
+      {{ template "ui/button" dict "Label" "Replace client credentials" "Variant" "secondary" "Href" "/settings/forge-access?oauth=edit" }}
+      {{ template "ui/button" dict "Label" "Disable linking" "Variant" "danger" "Href" "/settings/forge-access?oauth=disable" "DialogTarget" "forge-oauth-disable-confirm" }}
+    </div>
+    {{ end }}
+    {{ end }}
+  </section>
+
+  {{ if and .OAuthConfigured .OAuthEnabled }}
+  {{ template "ui/modal" dict
+    "ID" "forge-oauth-disable-confirm"
+    "Open" .OAuthDisableConfirmOpen
+    "Title" "Disable Forgejo identity linking?"
+    "Body" "The stored client credentials are destroyed and every pending link attempt is cancelled. Linked identities remain recorded. Enabling again requires a fresh client ID and secret."
+    "ConfirmLabel" "Disable linking"
+    "ConfirmVariant" "danger"
+    "Action" "/settings/forge-access/oauth/disable"
+    "CSRFField" .CSRFField
+    "CSRFToken" .CSRFToken
+    "Fields" (dict "expected_connection_id" (printf "%d" .Connection.ID) "expected_revision" (printf "%d" .Connection.Revision) "expected_oauth_revision" .OAuthRevision "confirm_disable" "disable")
+  }}
+  {{ end }}
+
   {{ if .HasBindings }}
   {{ template "ui/modal" dict
     "ID" "forge-reset-confirm"
     "Open" .ResetConfirmOpen
     "Title" "Reset blocked by repository bindings"
     "Body" "Every repository binding must first be removed. Unbinding leaves repository credentials, grants, freezes, schedules, setup, and enforcement state unchanged."
+  }}
+  {{ else if .HasIdentities }}
+  {{ template "ui/modal" dict
+    "ID" "forge-reset-confirm"
+    "Open" .ResetConfirmOpen
+    "Title" "Reset blocked by linked Forgejo identities"
+    "Body" "Every linked Forgejo identity must first be unlinked by its owner, or purged after its owner is disabled. Identities are inert metadata; nothing else is affected."
   }}
   {{ else }}
   {{ template "ui/modal" dict
@@ -194,7 +273,7 @@
     "Action" "/settings/forge-access/reset"
     "CSRFField" .CSRFField
     "CSRFToken" .CSRFToken
-    "Fields" (dict "expected_connection_id" (printf "%d" .Connection.ID) "expected_revision" (printf "%d" .Connection.Revision) "expected_binding_revision" (printf "%d" .Connection.BindingRevision) "confirm_reset" "delete")
+    "Fields" (dict "expected_connection_id" (printf "%d" .Connection.ID) "expected_revision" (printf "%d" .Connection.Revision) "expected_binding_revision" (printf "%d" .Connection.BindingRevision) "expected_oauth_revision" .OAuthRevision "confirm_reset" "delete")
   }}
   {{ end }}
 

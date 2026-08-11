@@ -397,6 +397,12 @@ func TestScopedActionClassificationCoversEveryKnownAction(t *testing.T) {
 		"forge.connection_reset":                     adminOnly,
 		"forge.repository_bound":                     adminOnly,
 		"forge.repository_unbound":                   adminOnly,
+		"forge.oauth_client_updated":                 adminOnly,
+		"forge.oauth_client_disabled":                adminOnly,
+		"forge.identity_linked":                      adminOnly,
+		"forge.identity_link_rejected":               adminOnly,
+		"forge.identity_unlinked":                    adminOnly,
+		"forge.identity_purged":                      adminOnly,
 	}
 
 	classified := map[string]string{}
