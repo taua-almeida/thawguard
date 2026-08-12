@@ -6,18 +6,20 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"time"
 
 	"github.com/taua-almeida/thawguard/internal/forgeconnection"
 )
 
-// Shadow access is the Administrator-only manual snapshot of explicit
-// Forgejo relationships for every linked-identity x bound-repository pair.
-// Everything shown here is evidence from one credential-visible snapshot:
-// it never grants authority, changes enforcement, or predicts role changes.
+// Shadow access is the bounded manual and explicitly enabled periodic
+// snapshot of explicit Forgejo relationships for every linked-identity x
+// bound-repository pair. Everything shown here is credential-visible
+// evidence: it never grants authority, changes enforcement, or predicts role
+// changes.
 
 const (
-	forgeShadowConfirmValue = "shadow-only"
+	forgeShadowConfirmValue          = "shadow-only"
+	forgePeriodicEnableConfirmValue  = "periodic-shadow-enable"
+	forgePeriodicDisableConfirmValue = "periodic-shadow-disable"
 
 	forgeShadowCompleteNotice    = "forge-shadow-complete"
 	forgeShadowIncompleteNotice  = "forge-shadow-incomplete"
@@ -29,13 +31,25 @@ const (
 	forgeShadowUnavailableNotice = "forge-shadow-unavailable"
 	forgeShadowInvalidNotice     = "forge-shadow-invalid"
 	forgeShadowUnknownNotice     = "forge-shadow-unknown"
+
+	forgePeriodicEnabledNotice        = "forge-periodic-enabled"
+	forgePeriodicAlreadyEnabledNotice = "forge-periodic-already-enabled"
+	forgePeriodicDisabledNotice       = "forge-periodic-disabled"
+	forgePeriodicStaleNotice          = "forge-periodic-stale"
+	forgePeriodicAuthorityNotice      = "forge-periodic-authority"
+	forgePeriodicUnavailableNotice    = "forge-periodic-unavailable"
+	forgePeriodicInvalidNotice        = "forge-periodic-invalid"
+	forgePeriodicExhaustedNotice      = "forge-periodic-exhausted"
+	forgePeriodicUnknownNotice        = "forge-periodic-unknown"
 )
 
-// ForgeAccessShadowService is the narrow consumer boundary of the manual
+// ForgeAccessShadowService is the narrow web consumer boundary of the
 // shadow-access snapshot slice.
 type ForgeAccessShadowService interface {
 	View(ctx context.Context) (forgeconnection.AccessShadowView, error)
 	Run(ctx context.Context, actorUserID int64, input forgeconnection.RunAccessShadowInput) (forgeconnection.AccessSyncResultCode, error)
+	EnablePeriodic(ctx context.Context, actorUserID int64, input forgeconnection.EnableAccessShadowPeriodicInput) (bool, error)
+	DisablePeriodic(ctx context.Context, actorUserID int64, input forgeconnection.DisableAccessShadowPeriodicInput) error
 }
 
 // forgeShadowSectionView is the summary card state shared by the Forge
@@ -44,16 +58,31 @@ type forgeShadowSectionView struct {
 	Available bool
 	LoadError bool
 	Ready     bool
+	// EncryptionAvailable copies the shadow service's explicit readiness fact;
+	// handlers also retain their conservative installation-config guard.
+	EncryptionAvailable bool
 
 	SetupEvidenceCurrent bool
 	IdentityCount        int
 	BindingCount         int
 	WithinLimits         bool
 
+	PeriodicEnableReady  bool
+	PeriodicConfigLabel  string
+	PeriodicConfigTone   string
+	PeriodicConfigDetail string
+	PeriodicBlockers     []string
+	PeriodicDueLabel     string
+	PeriodicDueTone      string
+	PeriodicDueDetail    string
+	PeriodicNextDueAt    string
+	PeriodicRevision     string
+
 	HasAttempt        bool
 	AttemptLabel      string
 	AttemptTone       string
 	AttemptDetail     string
+	AttemptTrigger    string
 	AttemptStartedAt  string
 	AttemptFinishedAt string
 
@@ -62,7 +91,6 @@ type forgeShadowSectionView struct {
 	SnapshotTone       string
 	SnapshotDetail     string
 	SnapshotObservedAt string
-	SnapshotAge        string
 	PresentCount       int64
 	AbsentCount        int64
 	UnknownCount       int64
@@ -127,7 +155,7 @@ func (s *Server) handleForgeAccessShadow(w http.ResponseWriter, r *http.Request)
 		CSRFField:   csrfFormField,
 		Toasts:      forgeAccessNoticeToasts(r.URL.Query()),
 	}
-	if s.cfg.ForgeAccessShadowService == nil {
+	if s.cfg.ForgeAccessShadowService == nil || !s.cfg.ForgeConnectionSecretEncryptionConfigured {
 		data.LoadError = "Shadow access is not configured on this installation."
 		s.renderPageStatus(w, http.StatusServiceUnavailable, "layouts/forge-access-shadow", data)
 		return
@@ -197,6 +225,82 @@ func (s *Server) handleForgeAccessShadowRun(w http.ResponseWriter, r *http.Reque
 	}
 }
 
+func (s *Server) handleForgeAccessShadowPeriodicEnable(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, forgeAccessActionMaxBodyBytes)
+	if !s.validExactPublicOrigin(r) {
+		s.logRequestRejected(r, originRejectionReason(r))
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	session, ok := s.requireAdminForm(w, r)
+	if !ok || session.UserID == nil {
+		return
+	}
+	input, err := parseForgeShadowPeriodicEnableForm(r.URL, r.PostForm)
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if s.cfg.ForgeAccessShadowService == nil || !s.cfg.ForgeConnectionSecretEncryptionConfigured {
+		redirectForgeAccessNotice(w, r, forgePeriodicUnavailableNotice)
+		return
+	}
+	changed, err := s.cfg.ForgeAccessShadowService.EnablePeriodic(r.Context(), *session.UserID, input)
+	if err != nil {
+		redirectForgeAccessNotice(w, r, forgePeriodicNoticeForError(err))
+		return
+	}
+	if !changed {
+		redirectForgeAccessNotice(w, r, forgePeriodicAlreadyEnabledNotice)
+		return
+	}
+	redirectForgeAccessNotice(w, r, forgePeriodicEnabledNotice)
+}
+
+func (s *Server) handleForgeAccessShadowPeriodicDisable(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, forgeAccessActionMaxBodyBytes)
+	if !s.validExactPublicOrigin(r) {
+		s.logRequestRejected(r, originRejectionReason(r))
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	session, ok := s.requireAdminForm(w, r)
+	if !ok || session.UserID == nil {
+		return
+	}
+	input, err := parseForgeShadowPeriodicDisableForm(r.URL, r.PostForm)
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if s.cfg.ForgeAccessShadowService == nil {
+		redirectForgeAccessNotice(w, r, forgePeriodicUnavailableNotice)
+		return
+	}
+	if err := s.cfg.ForgeAccessShadowService.DisablePeriodic(r.Context(), *session.UserID, input); err != nil {
+		redirectForgeAccessNotice(w, r, forgePeriodicNoticeForError(err))
+		return
+	}
+	redirectForgeAccessNotice(w, r, forgePeriodicDisabledNotice)
+}
+
+func forgePeriodicNoticeForError(err error) string {
+	switch {
+	case forgeconnection.IsValidationError(err):
+		return forgePeriodicInvalidNotice
+	case errors.Is(err, forgeconnection.ErrConflict), errors.Is(err, forgeconnection.ErrNoConnection):
+		return forgePeriodicStaleNotice
+	case errors.Is(err, forgeconnection.ErrAuthorization):
+		return forgePeriodicAuthorityNotice
+	case errors.Is(err, forgeconnection.ErrConfiguration):
+		return forgePeriodicUnavailableNotice
+	case errors.Is(err, forgeconnection.ErrAccessPeriodicRevisionExhausted):
+		return forgePeriodicExhaustedNotice
+	default:
+		return forgePeriodicUnknownNotice
+	}
+}
+
 // parseForgeShadowRunForm accepts exactly the CSRF field, the five revision
 // fences, the newest-run CAS token, and the explicit shadow-only
 // confirmation.
@@ -253,16 +357,111 @@ func parseForgeShadowRunForm(requestURL *url.URL, values url.Values) (forgeconne
 	}, nil
 }
 
-// forgeShadowSection derives the two display axes: the latest attempt and
-// the latest completed snapshot.
+func parseForgeShadowPeriodicEnableForm(
+	requestURL *url.URL,
+	values url.Values,
+) (forgeconnection.EnableAccessShadowPeriodicInput, error) {
+	fields := []string{
+		csrfFormField,
+		"expected_connection_id",
+		"expected_config_revision",
+		"expected_check_generation",
+		"expected_binding_revision",
+		"expected_access_identity_revision",
+		"expected_newest_run_id",
+		"expected_periodic_revision",
+		"confirm_periodic_enable",
+	}
+	if err := exactForgeAccessForm(requestURL, values, fields); err != nil {
+		return forgeconnection.EnableAccessShadowPeriodicInput{}, err
+	}
+	connectionID, err := canonicalPositiveForgeAccessValue(values.Get("expected_connection_id"))
+	if err != nil {
+		return forgeconnection.EnableAccessShadowPeriodicInput{}, errors.New("expected connection id is invalid")
+	}
+	configRevision, err := canonicalPositiveForgeAccessValue(values.Get("expected_config_revision"))
+	if err != nil {
+		return forgeconnection.EnableAccessShadowPeriodicInput{}, errors.New("expected configuration revision is invalid")
+	}
+	checkGeneration, err := canonicalPositiveForgeAccessValue(values.Get("expected_check_generation"))
+	if err != nil {
+		return forgeconnection.EnableAccessShadowPeriodicInput{}, errors.New("expected check generation is invalid")
+	}
+	bindingRevision, err := canonicalExpectedRevision(values.Get("expected_binding_revision"))
+	if err != nil {
+		return forgeconnection.EnableAccessShadowPeriodicInput{}, errors.New("expected binding revision is invalid")
+	}
+	identityRevision, err := canonicalPositiveForgeAccessValue(values.Get("expected_access_identity_revision"))
+	if err != nil {
+		return forgeconnection.EnableAccessShadowPeriodicInput{}, errors.New("expected access identity revision is invalid")
+	}
+	newestRunID, err := canonicalExpectedRevision(values.Get("expected_newest_run_id"))
+	if err != nil {
+		return forgeconnection.EnableAccessShadowPeriodicInput{}, errors.New("expected newest run id is invalid")
+	}
+	periodicRevision, err := canonicalExpectedRevision(values.Get("expected_periodic_revision"))
+	if err != nil {
+		return forgeconnection.EnableAccessShadowPeriodicInput{}, errors.New("expected periodic revision is invalid")
+	}
+	if values.Get("confirm_periodic_enable") != forgePeriodicEnableConfirmValue {
+		return forgeconnection.EnableAccessShadowPeriodicInput{}, errors.New("periodic enable confirmation is invalid")
+	}
+	return forgeconnection.EnableAccessShadowPeriodicInput{
+		ExpectedConnectionID:           connectionID,
+		ExpectedConfigRevision:         configRevision,
+		ExpectedCheckGeneration:        checkGeneration,
+		ExpectedBindingRevision:        bindingRevision,
+		ExpectedAccessIdentityRevision: identityRevision,
+		ExpectedNewestRunID:            newestRunID,
+		ExpectedPeriodicRevision:       periodicRevision,
+		ConfirmPeriodicEnable:          true,
+	}, nil
+}
+
+func parseForgeShadowPeriodicDisableForm(
+	requestURL *url.URL,
+	values url.Values,
+) (forgeconnection.DisableAccessShadowPeriodicInput, error) {
+	fields := []string{
+		csrfFormField,
+		"expected_connection_id",
+		"expected_periodic_revision",
+		"confirm_periodic_disable",
+	}
+	if err := exactForgeAccessForm(requestURL, values, fields); err != nil {
+		return forgeconnection.DisableAccessShadowPeriodicInput{}, err
+	}
+	connectionID, err := canonicalPositiveForgeAccessValue(values.Get("expected_connection_id"))
+	if err != nil {
+		return forgeconnection.DisableAccessShadowPeriodicInput{}, errors.New("expected connection id is invalid")
+	}
+	periodicRevision, err := canonicalExpectedRevision(values.Get("expected_periodic_revision"))
+	if err != nil {
+		return forgeconnection.DisableAccessShadowPeriodicInput{}, errors.New("expected periodic revision is invalid")
+	}
+	if values.Get("confirm_periodic_disable") != forgePeriodicDisableConfirmValue {
+		return forgeconnection.DisableAccessShadowPeriodicInput{}, errors.New("periodic disable confirmation is invalid")
+	}
+	return forgeconnection.DisableAccessShadowPeriodicInput{
+		ExpectedConnectionID:     connectionID,
+		ExpectedPeriodicRevision: periodicRevision,
+		ConfirmPeriodicDisable:   true,
+	}, nil
+}
+
+// forgeShadowSection derives the independent configuration, due, latest
+// attempt, and completed-evidence axes.
 func forgeShadowSection(view forgeconnection.AccessShadowView) forgeShadowSectionView {
 	section := forgeShadowSectionView{
 		Available:              true,
 		Ready:                  view.Ready(),
+		EncryptionAvailable:    view.EncryptionAvailable,
 		SetupEvidenceCurrent:   view.SetupEvidenceCurrent,
 		IdentityCount:          view.IdentityCount,
 		BindingCount:           view.BindingCount,
 		WithinLimits:           view.WithinLimits,
+		PeriodicEnableReady:    view.PeriodicEnableReady(),
+		PeriodicRevision:       strconv.FormatInt(view.PeriodicRevision, 10),
 		ConnectionID:           strconv.FormatInt(view.ConnectionID, 10),
 		ConfigRevision:         strconv.FormatInt(view.ConfigRevision, 10),
 		CheckGeneration:        strconv.FormatInt(view.CheckGeneration, 10),
@@ -270,9 +469,18 @@ func forgeShadowSection(view forgeconnection.AccessShadowView) forgeShadowSectio
 		AccessIdentityRevision: strconv.FormatInt(view.AccessIdentityRevision, 10),
 		NewestRunID:            strconv.FormatInt(view.NewestRunID, 10),
 	}
+	section.PeriodicConfigLabel, section.PeriodicConfigTone, section.PeriodicConfigDetail =
+		forgeShadowPeriodicConfigPresentation(view)
+	section.PeriodicBlockers = forgeShadowPeriodicBlockerText(view.PeriodicBlockers)
+	section.PeriodicDueLabel, section.PeriodicDueTone, section.PeriodicDueDetail =
+		forgeShadowPeriodicDuePresentation(view.PeriodicDueStatus)
+	if view.PeriodicNextDueAt != nil {
+		section.PeriodicNextDueAt = view.PeriodicNextDueAt.UTC().Format("2006-01-02 15:04:05 UTC")
+	}
 	if view.LatestAttempt != nil {
 		section.HasAttempt = true
 		section.AttemptLabel, section.AttemptTone, section.AttemptDetail = forgeShadowAttemptPresentation(*view.LatestAttempt)
+		section.AttemptTrigger = forgeShadowRunTriggerLabel(view.LatestAttempt.Trigger)
 		section.AttemptStartedAt = view.LatestAttempt.StartedAt.UTC().Format("2006-01-02 15:04:05 UTC")
 		if view.LatestAttempt.FinishedAt != nil {
 			section.AttemptFinishedAt = view.LatestAttempt.FinishedAt.UTC().Format("2006-01-02 15:04:05 UTC")
@@ -286,9 +494,69 @@ func forgeShadowSection(view forgeconnection.AccessShadowView) forgeShadowSectio
 		section.UnknownCount = view.LatestSnapshot.UnknownCount
 		section.PairCount = view.LatestSnapshot.PairCount
 		section.SnapshotObservedAt = view.LatestSnapshot.ObservedAt.UTC().Format("2006-01-02 15:04:05 UTC")
-		section.SnapshotAge = forgeShadowAge(view.LatestSnapshot.ObservedAt)
 	}
 	return section
+}
+
+func forgeShadowPeriodicConfigPresentation(
+	view forgeconnection.AccessShadowView,
+) (string, string, string) {
+	if view.PeriodicNextDueAt == nil {
+		return "Disabled", "neutral", "Automatic snapshots are off. Manual snapshots remain available."
+	}
+	if len(view.PeriodicBlockers) > 0 {
+		return "Enabled · blocked", "warning", "Local prerequisites currently block automatic snapshots. No provider call occurs; the five-minute schedule advances and refresh resumes automatically when the blockers clear."
+	}
+	return "Enabled", "info", "Thawguard attempts one automatic shadow snapshot per five-minute due window."
+}
+
+func forgeShadowPeriodicBlockerText(
+	blockers []forgeconnection.AccessShadowPeriodicBlocker,
+) []string {
+	text := make([]string, 0, len(blockers))
+	for _, blocker := range blockers {
+		switch blocker {
+		case forgeconnection.AccessPeriodicEncryptionUnavailable:
+			text = append(text, "Service PAT encryption is unavailable.")
+		case forgeconnection.AccessPeriodicSetupEvidenceNotCurrent:
+			text = append(text, "Forge connection setup evidence is not current.")
+		case forgeconnection.AccessPeriodicNoLinkedIdentities:
+			text = append(text, "No Forgejo identities are linked.")
+		case forgeconnection.AccessPeriodicNoBindings:
+			text = append(text, "No repositories are bound.")
+		case forgeconnection.AccessPeriodicScopeExceedsLimits:
+			text = append(text, "The current identity × repository scope exceeds the 3A limits.")
+		}
+	}
+	return text
+}
+
+func forgeShadowPeriodicDuePresentation(
+	status forgeconnection.AccessShadowPeriodicDueStatus,
+) (string, string, string) {
+	switch status {
+	case forgeconnection.AccessPeriodicScheduled:
+		return "Scheduled", "scheduled", "The next persisted due time is in the future."
+	case forgeconnection.AccessPeriodicDue:
+		return "Due", "warning", "The persisted due time has arrived and is no more than 30 seconds past."
+	case forgeconnection.AccessPeriodicOverdue:
+		return "Overdue", "danger", "The persisted due time is more than 30 seconds past and no live periodic run explains it."
+	case forgeconnection.AccessPeriodicRunning:
+		return "Running", "scheduled", "A periodic snapshot is running. Disabling prevents later reservations but does not cancel this run."
+	default:
+		return "Not scheduled", "neutral", "Periodic refresh is disabled and no periodic run is live."
+	}
+}
+
+func forgeShadowRunTriggerLabel(trigger forgeconnection.AccessShadowRunTrigger) string {
+	switch trigger {
+	case forgeconnection.AccessShadowRunManual:
+		return "Manual"
+	case forgeconnection.AccessShadowRunPeriodic:
+		return "Periodic"
+	default:
+		return "Unknown"
+	}
 }
 
 func forgeShadowAttemptPresentation(attempt forgeconnection.AccessShadowAttempt) (string, string, string) {
@@ -347,26 +615,14 @@ func forgeShadowSnapshotPresentation(snapshot *forgeconnection.AccessShadowSnaps
 		return "Never observed", "neutral", "No completed credential-visible snapshot exists yet."
 	case !snapshot.ScopeCurrent:
 		return "Scope changed", "warning", "The connection configuration or its identity/binding scope changed after this snapshot; its evidence predates the current scope."
+	case snapshot.Fresh && snapshot.UnknownCount == 0:
+		return "Current · complete", "success", "Every current pair carries confirmed evidence from a completed snapshot less than ten minutes old."
+	case snapshot.Fresh:
+		return "Current · incomplete", "warning", "The completed snapshot is less than ten minutes old, but some pairs stayed unknown; earlier confirmations, where present, are preserved beneath them."
 	case snapshot.UnknownCount == 0:
-		return "Scope unchanged · complete", "success", "Every current pair carries confirmed evidence from the complete credential-visible snapshot."
+		return "Stale · complete", "warning", "Every pair was confirmed, but the completed snapshot is at least ten minutes old."
 	default:
-		return "Scope unchanged · incomplete", "warning", "The snapshot completed but some pairs stayed unknown; earlier confirmations, where present, are preserved beneath them."
-	}
-}
-
-// forgeShadowAge renders a coarse age. Ages inform the Administrator; the
-// manual-only slice applies no freshness expiry.
-func forgeShadowAge(observedAt time.Time) string {
-	elapsed := time.Since(observedAt)
-	switch {
-	case elapsed < time.Minute:
-		return "moments ago"
-	case elapsed < time.Hour:
-		return strconv.Itoa(int(elapsed.Minutes())) + " min ago"
-	case elapsed < 48*time.Hour:
-		return strconv.Itoa(int(elapsed.Hours())) + " h ago"
-	default:
-		return strconv.Itoa(int(elapsed.Hours()/24)) + " days ago"
+		return "Stale · incomplete", "warning", "The completed snapshot is at least ten minutes old and some pairs stayed unknown; earlier confirmations, where present, are preserved beneath them."
 	}
 }
 

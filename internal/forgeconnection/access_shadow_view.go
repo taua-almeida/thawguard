@@ -12,6 +12,7 @@ import (
 // accessShadowRunRecord is the internal load model of one run row.
 type accessShadowRunRecord struct {
 	id                     int64
+	runTrigger             AccessShadowRunTrigger
 	configRevision         int64
 	checkGeneration        int64
 	bindingRevision        int64
@@ -69,6 +70,7 @@ func (s *AccessShadowService) View(ctx context.Context) (AccessShadowView, error
 	if !found {
 		return AccessShadowView{}, nil
 	}
+	now := s.now().UTC()
 	view := AccessShadowView{
 		HasConnection:          true,
 		ConnectionID:           record.ID,
@@ -77,6 +79,7 @@ func (s *AccessShadowService) View(ctx context.Context) (AccessShadowView, error
 		BindingRevision:        record.BindingRevision,
 		AccessIdentityRevision: record.AccessIdentityRevision,
 		SetupEvidenceCurrent:   currentAccessSetupEvidence(record),
+		EncryptionAvailable:    s.secrets != nil,
 	}
 	identities, err := loadAccessShadowIdentityLabels(ctx, tx, record.ID)
 	if err != nil {
@@ -88,9 +91,24 @@ func (s *AccessShadowService) View(ctx context.Context) (AccessShadowView, error
 	}
 	view.IdentityCount = len(identities)
 	view.BindingCount = len(bindings)
-	view.WithinLimits = len(identities) <= maxAccessShadowIdentities &&
-		len(bindings) <= maxAccessShadowRepositories &&
-		len(identities)*len(bindings) <= maxAccessShadowPairs
+	view.WithinLimits = accessShadowScopeWithinLimits(len(identities), len(bindings))
+	view.PeriodicBlockers = accessShadowPeriodicBlockers(
+		view.EncryptionAvailable,
+		view.SetupEvidenceCurrent,
+		view.IdentityCount,
+		view.BindingCount,
+	)
+	periodic, hasPeriodic, err := loadAccessShadowPeriodicConfig(ctx, tx, record.ID)
+	if err != nil {
+		return AccessShadowView{}, err
+	}
+	if hasPeriodic {
+		view.PeriodicRevision = periodic.revision
+		if periodic.nextDueAt != nil {
+			nextDueAt := *periodic.nextDueAt
+			view.PeriodicNextDueAt = &nextDueAt
+		}
+	}
 
 	newestRun, hasNewestRun, err := loadNewestAccessShadowRun(ctx, tx, record.ID, false)
 	if err != nil {
@@ -98,15 +116,26 @@ func (s *AccessShadowService) View(ctx context.Context) (AccessShadowView, error
 	}
 	if hasNewestRun {
 		view.NewestRunID = newestRun.id
-		attempt := s.deriveAccessShadowAttempt(newestRun)
+		attempt := deriveAccessShadowAttempt(newestRun, now)
 		view.LatestAttempt = &attempt
 	}
+	view.PeriodicDueStatus = deriveAccessShadowPeriodicDueStatus(
+		now,
+		view.PeriodicNextDueAt,
+		view.LatestAttempt,
+	)
 	newestComplete, hasComplete, err := loadNewestAccessShadowRun(ctx, tx, record.ID, true)
 	if err != nil {
 		return AccessShadowView{}, err
 	}
 	if hasComplete {
-		snapshot, err := deriveAccessShadowSnapshot(record, newestComplete, len(identities), len(bindings))
+		snapshot, err := deriveAccessShadowSnapshot(
+			record,
+			newestComplete,
+			len(identities),
+			len(bindings),
+			now,
+		)
 		if err != nil {
 			return AccessShadowView{}, err
 		}
@@ -129,15 +158,16 @@ func (s *AccessShadowService) View(ctx context.Context) (AccessShadowView, error
 // durable scope_changed result: later scope drift never relabels a
 // historical attempt — scope currency belongs to the completed-snapshot
 // axis only.
-func (s *AccessShadowService) deriveAccessShadowAttempt(run accessShadowRunRecord) AccessShadowAttempt {
+func deriveAccessShadowAttempt(run accessShadowRunRecord, now time.Time) AccessShadowAttempt {
 	attempt := AccessShadowAttempt{
 		ResultCode: run.resultCode,
+		Trigger:    run.runTrigger,
 		StartedAt:  run.startedAt,
 		FinishedAt: run.finishedAt,
 	}
 	switch {
 	case run.resultCode == "":
-		if s.now().UTC().Sub(run.startedAt) < accessShadowInterruptionAge {
+		if now.Sub(run.startedAt) < accessShadowInterruptionAge {
 			attempt.Status = AccessAttemptRunning
 		} else {
 			attempt.Status = AccessAttemptInterrupted
@@ -161,6 +191,7 @@ func deriveAccessShadowSnapshot(
 	run accessShadowRunRecord,
 	identityCount int,
 	bindingCount int,
+	now time.Time,
 ) (AccessShadowSnapshot, error) {
 	if run.resultCode != AccessSyncComplete || run.presentCount == nil || run.unknownCount == nil || run.finishedAt == nil {
 		return AccessShadowSnapshot{}, errors.New("forge access shadow snapshot data is malformed")
@@ -172,8 +203,30 @@ func deriveAccessShadowSnapshot(
 		AbsentCount:  pairCount - *run.presentCount - *run.unknownCount,
 		PairCount:    pairCount,
 		ScopeCurrent: accessShadowRunScopeCurrent(record, run, identityCount, bindingCount),
+		Fresh:        now.Sub(*run.finishedAt) < accessShadowEvidenceFreshness,
 		ObservedAt:   *run.finishedAt,
 	}, nil
+}
+
+func deriveAccessShadowPeriodicDueStatus(
+	now time.Time,
+	nextDueAt *time.Time,
+	latestAttempt *AccessShadowAttempt,
+) AccessShadowPeriodicDueStatus {
+	if latestAttempt != nil && latestAttempt.Trigger == AccessShadowRunPeriodic &&
+		latestAttempt.Status == AccessAttemptRunning {
+		return AccessPeriodicRunning
+	}
+	if nextDueAt == nil {
+		return AccessPeriodicNotScheduled
+	}
+	if nextDueAt.After(now) {
+		return AccessPeriodicScheduled
+	}
+	if now.Sub(*nextDueAt) > accessShadowPeriodicOverdueAge {
+		return AccessPeriodicOverdue
+	}
+	return AccessPeriodicDue
 }
 
 // accessShadowRunScopeCurrent compares the run's captured pair-scope fences
@@ -203,7 +256,7 @@ func loadNewestAccessShadowRun(
 	completeOnly bool,
 ) (accessShadowRunRecord, bool, error) {
 	query := `
-SELECT id, config_revision, check_generation, binding_revision, access_identity_revision,
+SELECT id, run_trigger, config_revision, check_generation, binding_revision, access_identity_revision,
   identity_count, repository_count, result_code, present_count, unknown_count,
   started_at, finished_at
 FROM forge_access_shadow_runs
@@ -221,6 +274,7 @@ LIMIT 1`
 	var finishedAtText sql.NullString
 	err := q.QueryRowContext(ctx, query, connectionID).Scan(
 		&run.id,
+		&run.runTrigger,
 		&run.configRevision,
 		&run.checkGeneration,
 		&run.bindingRevision,
@@ -240,7 +294,7 @@ LIMIT 1`
 		return accessShadowRunRecord{}, false, fmt.Errorf("read forge access shadow run: %w", err)
 	}
 	malformed := errors.New("forge access shadow run data is malformed")
-	if run.id <= 0 || run.configRevision <= 0 || run.checkGeneration <= 0 ||
+	if run.id <= 0 || !run.runTrigger.Valid() || run.configRevision <= 0 || run.checkGeneration <= 0 ||
 		run.bindingRevision < 0 || run.accessIdentityRevision <= 0 ||
 		run.identityCount < 1 || run.identityCount > maxAccessShadowIdentities ||
 		run.repositoryCount < 1 || run.repositoryCount > maxAccessShadowRepositories {

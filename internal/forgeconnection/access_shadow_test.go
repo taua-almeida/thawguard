@@ -66,7 +66,11 @@ func (o *scriptedAccessObserver) ObserveAccess(ctx context.Context, input Access
 		onObserve(call)
 	}
 	if gate != nil {
-		<-gate
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return AccessObservation{ResultCode: AccessSyncUnavailable, RequestCount: 1}
+		}
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -74,6 +78,29 @@ func (o *scriptedAccessObserver) ObserveAccess(ctx context.Context, input Access
 		return o.observations[call]
 	}
 	return AccessObservation{ResultCode: AccessSyncUnavailable, RequestCount: 1}
+}
+
+func TestTerminalizeAccessShadowOrphanReportsLostRaceWithoutNilWrap(t *testing.T) {
+	fixture := newAccessShadowFixture(t)
+	tx, err := fixture.database.BeginTx(fixture.ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	err = terminalizeAccessShadowOrphan(
+		fixture.ctx,
+		tx,
+		1,
+		999,
+		sql.NullInt64{},
+		AccessShadowRunPeriodic,
+		fixture.clock.Now(),
+	)
+	const want = "terminalize orphaned forge access shadow run: run is no longer active"
+	if err == nil || err.Error() != want {
+		t.Fatalf("terminalize error = %v, want %q", err, want)
+	}
 }
 
 type accessShadowFixture struct {
@@ -117,7 +144,7 @@ func newAccessShadowFixture(t *testing.T) *accessShadowFixture {
 		clock:    &testClock{now: start},
 		adminID:  1,
 	}
-	fixture.service = NewAccessShadowService(database, secretStore, fixture.observer)
+	fixture.service = NewAccessShadowService(context.Background(), database, secretStore, fixture.observer)
 	fixture.service.now = fixture.clock.Now
 
 	ciphertext, err := encryptServicePAT(ctx, secretStore, testServicePAT)
@@ -423,6 +450,9 @@ FROM forge_access_shadow_observations`).Scan(&total, &confirmed, &unknownRows); 
 	if started[0]["identity_count"] != float64(2) || started[0]["repository_count"] != float64(2) {
 		t.Fatalf("started details: %v", started[0])
 	}
+	if started[0]["run_trigger"] != "manual" || finished[0]["run_trigger"] != "manual" {
+		t.Fatalf("manual trigger details: started=%v finished=%v", started[0], finished[0])
+	}
 	if finished[0]["result_code"] != "complete" || finished[0]["present_count"] != float64(2) ||
 		finished[0]["unknown_count"] != float64(1) || finished[0]["request_count"] != float64(40) {
 		t.Fatalf("finished details: %v", finished[0])
@@ -430,7 +460,7 @@ FROM forge_access_shadow_observations`).Scan(&total, &confirmed, &unknownRows); 
 	for _, details := range append(started, finished...) {
 		for key := range details {
 			switch key {
-			case "run_id", "identity_count", "repository_count", "result_code", "present_count", "unknown_count", "request_count":
+			case "run_id", "identity_count", "repository_count", "run_trigger", "result_code", "present_count", "unknown_count", "request_count":
 			default:
 				t.Fatalf("unexpected audit detail key %q", key)
 			}
@@ -606,6 +636,83 @@ UPDATE forgejo_connection_config SET service_pat_ciphertext = x'01020304'`); err
 	// No provider I/O happened, so the request count is a known zero.
 	if finished[0]["request_count"] != float64(0) {
 		t.Fatalf("credential failure must record a zero request count: %v", finished[0])
+	}
+}
+
+func TestAccessShadowManualRunLifecycleCancellationDoesNotCancelRequestContext(t *testing.T) {
+	fixture := newAccessShadowFixture(t)
+	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+	fixture.service.lifecycleCtx = lifecycleCtx
+	gate := make(chan struct{})
+	fixture.observer.gates = []chan struct{}{gate}
+	fixture.observer.started = make(chan struct{}, 1)
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	defer cancelRequest()
+	type runResult struct {
+		code AccessSyncResultCode
+		err  error
+	}
+	done := make(chan runResult, 1)
+	go func() {
+		code, err := fixture.service.Run(requestCtx, fixture.adminID, fixture.validRunInput())
+		done <- runResult{code: code, err: err}
+	}()
+	<-fixture.observer.started
+	cancelLifecycle()
+	result := <-done
+	if result.err != nil || result.code != AccessSyncInterrupted {
+		t.Fatalf("lifecycle-cancelled manual run = %q, %v", result.code, result.err)
+	}
+	if requestCtx.Err() != nil {
+		t.Fatalf("shadow lifecycle cancellation escaped into request context: %v", requestCtx.Err())
+	}
+
+	var resultCode string
+	if err := fixture.database.QueryRow(`
+SELECT result_code
+FROM forge_access_shadow_runs
+ORDER BY id DESC
+LIMIT 1`).Scan(&resultCode); err != nil {
+		t.Fatal(err)
+	}
+	if resultCode != string(AccessSyncInterrupted) {
+		t.Fatalf("lifecycle-cancelled manual reservation = %q", resultCode)
+	}
+}
+
+func TestAccessShadowCompleteObservationWinsCancellationAfterObserverReturn(t *testing.T) {
+	fixture := newAccessShadowFixture(t)
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	fixture.observer.observations = []AccessObservation{completeObservation(30, nil)}
+	fixture.observer.onObserve = func(int) {
+		cancelRequest()
+	}
+
+	result, err := fixture.service.Run(requestCtx, fixture.adminID, fixture.validRunInput())
+	if err != nil || result != AccessSyncComplete {
+		t.Fatalf("completed observation cancellation race = %q, %v", result, err)
+	}
+	var resultCode string
+	var observations int
+	if err := fixture.database.QueryRow(`
+SELECT result_code
+FROM forge_access_shadow_runs
+ORDER BY id DESC
+LIMIT 1`).Scan(&resultCode); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.database.QueryRow(`
+SELECT count(*)
+FROM forge_access_shadow_observations`).Scan(&observations); err != nil {
+		t.Fatal(err)
+	}
+	if resultCode != string(AccessSyncComplete) || observations != 4 {
+		t.Fatalf("completed observation persistence = %q with %d pairs", resultCode, observations)
+	}
+	finished := fixture.auditDetails(t, audit.ActionForgeAccessSyncFinished)
+	if len(finished) != 1 || finished[0]["result_code"] != string(AccessSyncComplete) ||
+		finished[0]["request_count"] != float64(30) {
+		t.Fatalf("completed observation finish Activity = %v", finished)
 	}
 }
 
@@ -1065,13 +1172,21 @@ func TestAccessShadowRunsWithCanonicalZeroBindingRevision(t *testing.T) {
 // fail the statement.
 func TestAccessShadowLifecycleNeverTouchesRepositoryGrants(t *testing.T) {
 	fixture := newAccessShadowFixture(t)
+	fixture.enablePeriodic(t)
 	if _, err := fixture.database.Exec(`DROP TABLE repository_grants`); err != nil {
 		t.Fatal(err)
 	}
-	fixture.observer.observations = []AccessObservation{completeObservation(30, nil)}
+	fixture.observer.observations = []AccessObservation{
+		completeObservation(30, nil),
+		completeObservation(30, nil),
+	}
 	result, err := fixture.service.Run(fixture.ctx, fixture.adminID, fixture.validRunInput())
 	if err != nil || result != AccessSyncComplete {
 		t.Fatalf("Run without repository_grants: result=%v err=%v", result, err)
+	}
+	fixture.clock.Advance(accessShadowPeriodicCadence)
+	if err := fixture.service.RunPeriodicDue(fixture.ctx); err != nil {
+		t.Fatalf("RunPeriodicDue without repository_grants: %v", err)
 	}
 	view, err := fixture.service.View(fixture.ctx)
 	if err != nil {

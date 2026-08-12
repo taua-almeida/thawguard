@@ -6,31 +6,42 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 	"time"
 
 	"github.com/taua-almeida/thawguard/internal/audit"
+	"github.com/taua-almeida/thawguard/internal/domain"
 	"github.com/taua-almeida/thawguard/internal/secrets"
 )
 
-// AccessShadowService owns the manual, bounded, connection-wide shadow
-// access snapshot. It is deliberately separate from the connection Service:
-// snapshots reuse the connection's stored credential and evidence fences but
-// never change connection, binding, identity, or repository-owned state,
-// and no code path here reads or mutates repository_grants.
+// AccessShadowService owns the bounded, connection-wide shadow access
+// snapshot and its explicitly enabled periodic cadence. It is deliberately
+// separate from the connection Service: snapshots reuse the connection's
+// stored credential and evidence fences but never change connection, binding,
+// identity, or repository-owned state, and no code path here reads or mutates
+// repository_grants.
 type AccessShadowService struct {
-	db       *sql.DB
-	secrets  secrets.Store
-	observer AccessShadowObserver
-	now      func() time.Time
+	lifecycleCtx context.Context
+	db           *sql.DB
+	secrets      secrets.Store
+	observer     AccessShadowObserver
+	now          func() time.Time
 }
 
-func NewAccessShadowService(db *sql.DB, secretStore secrets.Store, observer AccessShadowObserver) *AccessShadowService {
+func NewAccessShadowService(
+	lifecycleCtx context.Context,
+	db *sql.DB,
+	secretStore secrets.Store,
+	observer AccessShadowObserver,
+) *AccessShadowService {
+	if lifecycleCtx == nil {
+		lifecycleCtx = context.Background()
+	}
 	return &AccessShadowService{
-		db:       db,
-		secrets:  secretStore,
-		observer: observer,
-		now:      func() time.Time { return time.Now().UTC() },
+		lifecycleCtx: lifecycleCtx,
+		db:           db,
+		secrets:      secretStore,
+		observer:     observer,
+		now:          func() time.Time { return time.Now().UTC() },
 	}
 }
 
@@ -38,6 +49,7 @@ func NewAccessShadowService(db *sql.DB, secretStore secrets.Store, observer Acce
 // transaction, the provider observation, and the finalization transaction.
 type accessShadowRunSnapshot struct {
 	runID                  int64
+	runTrigger             AccessShadowRunTrigger
 	connectionID           int64
 	configRevision         int64
 	checkGeneration        int64
@@ -67,6 +79,9 @@ func (s *AccessShadowService) Run(ctx context.Context, actorUserID int64, input 
 	if s.observer == nil {
 		return "", errors.New("forge access shadow observer is not configured")
 	}
+	if actorUserID <= 0 {
+		return "", ErrAuthorization
+	}
 	// A zero binding revision is canonical for a connection whose bindings
 	// predate the revision column; it is accepted, never backfilled.
 	if input.ExpectedConnectionID <= 0 || input.ExpectedConfigRevision <= 0 ||
@@ -78,12 +93,54 @@ func (s *AccessShadowService) Run(ctx context.Context, actorUserID int64, input 
 		return "", ValidationError{Message: "confirm the shadow-only snapshot before running it"}
 	}
 
-	snapshot, err := s.reserveRun(ctx, actorUserID, input)
+	// Manual provider work stops with either its request or the application
+	// lifecycle. The lifecycle context is scoped here instead of serving as
+	// http.Server.BaseContext, so graceful shutdown does not cancel unrelated
+	// handlers before http.Server.Shutdown can drain them.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	stopLifecycleCancellation := context.AfterFunc(s.lifecycleCtx, cancelRun)
+	if s.lifecycleCtx.Err() != nil {
+		cancelRun()
+	}
+	defer func() {
+		stopLifecycleCancellation()
+		cancelRun()
+	}()
+
+	snapshot, err := s.reserveRun(runCtx, actorUserID, input)
 	if err != nil {
 		return "", err
 	}
+	return s.executeRun(runCtx, snapshot)
+}
+
+// executeRun is the shared post-reservation path for manual and periodic
+// snapshots. Both triggers decrypt, observe, validate, finalize, retain, and
+// audit through exactly the same implementation.
+func (s *AccessShadowService) executeRun(
+	ctx context.Context,
+	snapshot accessShadowRunSnapshot,
+) (AccessSyncResultCode, error) {
 	observation, requestCountKnown := s.observeAccess(ctx, snapshot)
-	return s.finalizeRun(ctx, snapshot, observation, requestCountKnown)
+	if ctx.Err() != nil && observation.ResultCode != AccessSyncComplete {
+		// Cancellation belongs to the service lifecycle, not the provider
+		// error matrix. The detached finalizer below records that durable truth
+		// without guessing how many requests completed before cancellation. A
+		// validated complete observation wins a cancellation race after observer
+		// return because all bounded provider evidence has already been collected.
+		observation = AccessObservation{ResultCode: AccessSyncInterrupted}
+		requestCountKnown = false
+	}
+	// Reservation committed before provider work, so cancellation must stop
+	// provider I/O without preventing the attempt from recording its bounded,
+	// sanitized result. WithoutCancel preserves request values while this
+	// independent deadline keeps finalization from outliving shutdown forever.
+	finalizeCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		accessShadowFinalizationDeadline,
+	)
+	defer cancel()
+	return s.finalizeRun(finalizeCtx, snapshot, observation, requestCountKnown)
 }
 
 func (s *AccessShadowService) reserveRun(ctx context.Context, actorUserID int64, input RunAccessShadowInput) (accessShadowRunSnapshot, error) {
@@ -129,9 +186,7 @@ func (s *AccessShadowService) reserveRun(ctx context.Context, actorUserID int64,
 			Message: "link at least one Forgejo identity and bind at least one repository before running a shadow snapshot",
 		}
 	}
-	if len(identities) > maxAccessShadowIdentities ||
-		len(bindings) > maxAccessShadowRepositories ||
-		len(identities)*len(bindings) > maxAccessShadowPairs {
+	if !accessShadowScopeWithinLimits(len(identities), len(bindings)) {
 		return accessShadowRunSnapshot{}, ValidationError{
 			Message: "the snapshot scope exceeds the small-alpha limits; reduce linked identities or bound repositories",
 		}
@@ -145,9 +200,10 @@ func (s *AccessShadowService) reserveRun(ctx context.Context, actorUserID int64,
 	result, err := tx.ExecContext(ctx, `
 INSERT INTO forge_access_shadow_runs(
   connection_id, requested_by_user_id, config_revision, check_generation,
-  binding_revision, access_identity_revision, identity_count, repository_count, started_at
+  binding_revision, access_identity_revision, identity_count, repository_count,
+  run_trigger, started_at
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		record.ID,
 		actorUserID,
 		record.Revision,
@@ -156,6 +212,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		record.AccessIdentityRevision,
 		len(identities),
 		len(bindings),
+		string(AccessShadowRunManual),
 		formatForgeConnectionTime(now),
 	)
 	if err != nil {
@@ -165,7 +222,17 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	if err != nil || runID <= 0 {
 		return accessShadowRunSnapshot{}, errors.New("determine forge access shadow run id")
 	}
-	if err := recordAccessSyncStarted(ctx, tx, actorUserID, record.ID, runID, len(identities), len(bindings)); err != nil {
+	actor := actorUserID
+	if err := recordAccessSyncStarted(
+		ctx,
+		tx,
+		&actor,
+		AccessShadowRunManual,
+		record.ID,
+		runID,
+		len(identities),
+		len(bindings),
+	); err != nil {
 		return accessShadowRunSnapshot{}, err
 	}
 	// Commit before any PAT decryption or provider I/O.
@@ -174,6 +241,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	}
 	return accessShadowRunSnapshot{
 		runID:                  runID,
+		runTrigger:             AccessShadowRunManual,
 		connectionID:           record.ID,
 		configRevision:         record.Revision,
 		checkGeneration:        record.CheckGeneration,
@@ -190,6 +258,53 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	}, nil
 }
 
+type newestAccessShadowReservation struct {
+	id         int64
+	requester  sql.NullInt64
+	runTrigger AccessShadowRunTrigger
+	resultCode sql.NullString
+	startedAt  time.Time
+}
+
+func loadNewestAccessShadowReservation(
+	ctx context.Context,
+	q queryer,
+	connectionID int64,
+) (newestAccessShadowReservation, bool, error) {
+	var record newestAccessShadowReservation
+	var triggerText, startedAtText string
+	err := q.QueryRowContext(ctx, `
+SELECT id, requested_by_user_id, run_trigger, result_code, started_at
+FROM forge_access_shadow_runs
+WHERE connection_id = ?
+ORDER BY id DESC
+LIMIT 1`, connectionID).Scan(
+		&record.id,
+		&record.requester,
+		&triggerText,
+		&record.resultCode,
+		&startedAtText,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return newestAccessShadowReservation{}, false, nil
+	}
+	if err != nil {
+		return newestAccessShadowReservation{}, false, fmt.Errorf("read newest forge access shadow reservation: %w", err)
+	}
+	record.runTrigger = AccessShadowRunTrigger(triggerText)
+	record.startedAt, err = parseForgeConnectionTime(startedAtText)
+	if record.id <= 0 || !record.runTrigger.Valid() || err != nil {
+		return newestAccessShadowReservation{}, false, errors.New("forge access shadow run data is malformed")
+	}
+	if record.runTrigger == AccessShadowRunPeriodic && record.requester.Valid {
+		return newestAccessShadowReservation{}, false, errors.New("forge access shadow run data is malformed")
+	}
+	if record.resultCode.Valid && !AccessSyncResultCode(record.resultCode.String).Valid() {
+		return newestAccessShadowReservation{}, false, errors.New("forge access shadow run data is malformed")
+	}
+	return record, true, nil
+}
+
 // validateNewestRunAndRecoverOrphan enforces the newest-run CAS and
 // terminalizes an orphaned running row older than the interruption age. A
 // younger running row rejects the reservation instead. The interruption's
@@ -203,58 +318,79 @@ func (s *AccessShadowService) validateNewestRunAndRecoverOrphan(
 	expectedNewestRunID int64,
 	now time.Time,
 ) error {
-	var newestRunID int64
-	var requester sql.NullInt64
-	var resultCode sql.NullString
-	var startedAtText string
-	err := tx.QueryRowContext(ctx, `
-SELECT id, requested_by_user_id, result_code, started_at
-FROM forge_access_shadow_runs
-WHERE connection_id = ?
-ORDER BY id DESC
-LIMIT 1`, connectionID).Scan(&newestRunID, &requester, &resultCode, &startedAtText)
-	if errors.Is(err, sql.ErrNoRows) {
+	newest, found, err := loadNewestAccessShadowReservation(ctx, tx, connectionID)
+	if err != nil {
+		return err
+	}
+	if !found {
 		if expectedNewestRunID != 0 {
 			return ErrConflict
 		}
 		return nil
 	}
-	if err != nil {
-		return fmt.Errorf("read newest forge access shadow run: %w", err)
-	}
-	if newestRunID != expectedNewestRunID {
+	if newest.id != expectedNewestRunID {
 		return ErrConflict
 	}
-	if resultCode.Valid {
+	if newest.resultCode.Valid {
 		return nil
 	}
-	startedAt, err := parseForgeConnectionTime(startedAtText)
-	if err != nil {
-		return errors.New("forge access shadow run data is malformed")
-	}
-	if now.Sub(startedAt) < accessShadowInterruptionAge {
+	if now.Sub(newest.startedAt) < accessShadowInterruptionAge {
 		return ErrAccessSyncRunning
 	}
 	finishedAt := now
-	if finishedAt.Before(startedAt) {
-		finishedAt = startedAt
+	if finishedAt.Before(newest.startedAt) {
+		finishedAt = newest.startedAt
 	}
+	return terminalizeAccessShadowOrphan(
+		ctx,
+		tx,
+		connectionID,
+		newest.id,
+		newest.requester,
+		newest.runTrigger,
+		finishedAt,
+	)
+}
+
+func terminalizeAccessShadowOrphan(
+	ctx context.Context,
+	tx *sql.Tx,
+	connectionID int64,
+	runID int64,
+	requester sql.NullInt64,
+	runTrigger AccessShadowRunTrigger,
+	finishedAt time.Time,
+) error {
 	terminalized, err := execExpectingOneRow(ctx, tx, `
 UPDATE forge_access_shadow_runs
 SET result_code = ?, finished_at = ?
 WHERE id = ? AND result_code IS NULL`,
 		string(AccessSyncInterrupted),
 		formatForgeConnectionTime(finishedAt),
-		newestRunID,
+		runID,
 	)
-	if err != nil || !terminalized {
+	if err != nil {
 		return fmt.Errorf("terminalize orphaned forge access shadow run: %w", err)
+	}
+	if !terminalized {
+		return errors.New("terminalize orphaned forge access shadow run: run is no longer active")
 	}
 	if err := applyAccessShadowRetention(ctx, tx, connectionID); err != nil {
 		return err
 	}
 	// Orphan interruption omits the request count: it was never known.
-	return recordAccessSyncFinished(ctx, tx, nullableActor(requester), connectionID, newestRunID, AccessSyncInterrupted, nil, nil, nil)
+	return recordAccessSyncFinished(
+		ctx,
+		tx,
+		nullableActor(requester),
+		runTrigger,
+		connectionID,
+		runID,
+		AccessSyncInterrupted,
+		nil,
+		nil,
+		nil,
+	)
 }
 
 // nullableActor converts a scanned nullable requester into an audit actor.
@@ -357,10 +493,11 @@ UPDATE forge_access_shadow_runs SET id = id WHERE id = ?`, snapshot.runID); err 
 	var runConnectionID int64
 	var requester sql.NullInt64
 	var resultCode sql.NullString
+	var runTriggerText string
 	err = tx.QueryRowContext(ctx, `
-SELECT connection_id, requested_by_user_id, result_code
+SELECT connection_id, requested_by_user_id, run_trigger, result_code
 FROM forge_access_shadow_runs
-WHERE id = ?`, snapshot.runID).Scan(&runConnectionID, &requester, &resultCode)
+WHERE id = ?`, snapshot.runID).Scan(&runConnectionID, &requester, &runTriggerText, &resultCode)
 	if errors.Is(err, sql.ErrNoRows) {
 		// The row was terminalized by a later reservation and retained away;
 		// a late observer return can never publish.
@@ -369,7 +506,9 @@ WHERE id = ?`, snapshot.runID).Scan(&runConnectionID, &requester, &resultCode)
 	if err != nil {
 		return "", fmt.Errorf("read forge access shadow run for finalization: %w", err)
 	}
-	if resultCode.Valid || runConnectionID != snapshot.connectionID {
+	runTrigger := AccessShadowRunTrigger(runTriggerText)
+	if resultCode.Valid || runConnectionID != snapshot.connectionID ||
+		!runTrigger.Valid() || runTrigger != snapshot.runTrigger {
 		return "", ErrAccessSyncInterrupted
 	}
 
@@ -411,6 +550,11 @@ WHERE id = ?`, snapshot.runID).Scan(&runConnectionID, &requester, &resultCode)
 	if !finalized {
 		return "", ErrAccessSyncInterrupted
 	}
+	if result == AccessSyncComplete && snapshot.runTrigger == AccessShadowRunManual {
+		if err := advanceAccessShadowPeriodicAfterManualComplete(ctx, tx, snapshot); err != nil {
+			return "", err
+		}
+	}
 	if err := applyAccessShadowRetention(ctx, tx, snapshot.connectionID); err != nil {
 		return "", err
 	}
@@ -422,7 +566,18 @@ WHERE id = ?`, snapshot.runID).Scan(&runConnectionID, &requester, &resultCode)
 	// The finished event is attributed to the run's persisted requester, so
 	// finalization stays actor-independent even after a logout, demotion, or
 	// account deletion mid-run.
-	if err := recordAccessSyncFinished(ctx, tx, nullableActor(requester), snapshot.connectionID, snapshot.runID, result, presentCount, unknownCount, requestCount); err != nil {
+	if err := recordAccessSyncFinished(
+		ctx,
+		tx,
+		nullableActor(requester),
+		runTrigger,
+		snapshot.connectionID,
+		snapshot.runID,
+		result,
+		presentCount,
+		unknownCount,
+		requestCount,
+	); err != nil {
 		return "", err
 	}
 	if err := tx.Commit(); err != nil {
@@ -667,27 +822,56 @@ func loadAccessShadowBindings(ctx context.Context, q queryer, connectionID int64
 func recordAccessSyncStarted(
 	ctx context.Context,
 	tx *sql.Tx,
-	actorUserID int64,
+	actorUserID *int64,
+	runTrigger AccessShadowRunTrigger,
 	connectionID int64,
 	runID int64,
 	identityCount int,
 	repositoryCount int,
 ) error {
+	if !runTrigger.Valid() ||
+		(runTrigger == AccessShadowRunManual && (actorUserID == nil || *actorUserID <= 0)) ||
+		(runTrigger == AccessShadowRunPeriodic && actorUserID != nil) {
+		return errors.New("forge access shadow start audit attribution is malformed")
+	}
+	actorKind, actorRole := "", ""
+	if runTrigger == AccessShadowRunPeriodic {
+		actorKind = domain.ActorKindSystem
+		actorRole = AccessShadowRunnerActorRole
+	}
 	details, err := json.Marshal(struct {
-		RunID           int64 `json:"run_id"`
-		IdentityCount   int   `json:"identity_count"`
-		RepositoryCount int   `json:"repository_count"`
-	}{RunID: runID, IdentityCount: identityCount, RepositoryCount: repositoryCount})
+		RunID           int64                  `json:"run_id"`
+		IdentityCount   int                    `json:"identity_count"`
+		RepositoryCount int                    `json:"repository_count"`
+		RunTrigger      AccessShadowRunTrigger `json:"run_trigger"`
+		ActorKind       string                 `json:"actor_kind,omitempty"`
+		ActorRole       string                 `json:"actor_role,omitempty"`
+	}{
+		RunID:           runID,
+		IdentityCount:   identityCount,
+		RepositoryCount: repositoryCount,
+		RunTrigger:      runTrigger,
+		ActorKind:       actorKind,
+		ActorRole:       actorRole,
+	})
 	if err != nil {
 		return errors.New("encode forge access shadow start audit evidence")
 	}
-	return recordForgeConnectionEvent(ctx, tx, actorUserID, audit.ActionForgeAccessSyncStarted, connectionID, string(details))
+	return recordForgeConnectionEventForActor(
+		ctx,
+		tx,
+		actorUserID,
+		audit.ActionForgeAccessSyncStarted,
+		connectionID,
+		string(details),
+	)
 }
 
 func recordAccessSyncFinished(
 	ctx context.Context,
 	tx *sql.Tx,
 	actorUserID *int64,
+	runTrigger AccessShadowRunTrigger,
 	connectionID int64,
 	runID int64,
 	result AccessSyncResultCode,
@@ -695,30 +879,42 @@ func recordAccessSyncFinished(
 	unknownCount *int64,
 	requestCount *int64,
 ) error {
+	if !runTrigger.Valid() || runTrigger == AccessShadowRunPeriodic && actorUserID != nil {
+		return errors.New("forge access shadow finish audit attribution is malformed")
+	}
+	actorKind, actorRole := "", ""
+	if runTrigger == AccessShadowRunPeriodic {
+		actorKind = domain.ActorKindSystem
+		actorRole = AccessShadowRunnerActorRole
+	}
 	details, err := json.Marshal(struct {
-		RunID        int64                `json:"run_id"`
-		ResultCode   AccessSyncResultCode `json:"result_code"`
-		PresentCount *int64               `json:"present_count,omitempty"`
-		UnknownCount *int64               `json:"unknown_count,omitempty"`
-		RequestCount *int64               `json:"request_count,omitempty"`
+		RunID        int64                  `json:"run_id"`
+		ResultCode   AccessSyncResultCode   `json:"result_code"`
+		RunTrigger   AccessShadowRunTrigger `json:"run_trigger"`
+		PresentCount *int64                 `json:"present_count,omitempty"`
+		UnknownCount *int64                 `json:"unknown_count,omitempty"`
+		RequestCount *int64                 `json:"request_count,omitempty"`
+		ActorKind    string                 `json:"actor_kind,omitempty"`
+		ActorRole    string                 `json:"actor_role,omitempty"`
 	}{
 		RunID:        runID,
 		ResultCode:   result,
+		RunTrigger:   runTrigger,
 		PresentCount: presentCount,
 		UnknownCount: unknownCount,
 		RequestCount: requestCount,
+		ActorKind:    actorKind,
+		ActorRole:    actorRole,
 	})
 	if err != nil {
 		return errors.New("encode forge access shadow finish audit evidence")
 	}
-	if err := audit.NewStoreTx(tx).Record(ctx, audit.Event{
-		ActorUserID: actorUserID,
-		Action:      audit.ActionForgeAccessSyncFinished,
-		SubjectType: audit.SubjectTypeForgeConnection,
-		SubjectID:   strconv.FormatInt(connectionID, 10),
-		DetailsJSON: string(details),
-	}); err != nil {
-		return fmt.Errorf("record forge connection audit event: %w", err)
-	}
-	return nil
+	return recordForgeConnectionEventForActor(
+		ctx,
+		tx,
+		actorUserID,
+		audit.ActionForgeAccessSyncFinished,
+		connectionID,
+		string(details),
+	)
 }

@@ -51,7 +51,7 @@ func New(cfg config.Config, logger *slog.Logger) *App {
 	return &App{cfg: cfg, logger: logger}
 }
 
-func (a *App) Run(ctx context.Context) error {
+func (a *App) Run(ctx context.Context) (runErr error) {
 	publicURL, err := config.CanonicalPublicURL(a.cfg.PublicURL)
 	if err != nil {
 		return err
@@ -61,7 +61,15 @@ func (a *App) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer database.Close()
+	closeDatabase := true
+	defer func() {
+		if !closeDatabase {
+			return
+		}
+		if err := database.Close(); err != nil && runErr == nil {
+			runErr = fmt.Errorf("close database: %w", err)
+		}
+	}()
 
 	migrations, err := db.LoadMigrations(db.DefaultMigrationsDir)
 	if err != nil {
@@ -75,11 +83,18 @@ func (a *App) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	applicationCtx, cancelApplication := context.WithCancel(ctx)
+	defer cancelApplication()
 	repositorySetup := repositorysetup.NewServiceWithSecrets(database, secretStore)
 	companyOIDCChecker := companyoidc.NewChecker(http.DefaultTransport)
 	companyOIDCService := companyoidc.NewServiceWithChecker(database, secretStore, companyOIDCChecker, publicURL)
 	forgeConnectionService := forgeconnection.NewService(database, secretStore, connectionforgejo.NewAdapter(http.DefaultTransport))
-	forgeAccessShadowService := forgeconnection.NewAccessShadowService(database, secretStore, connectionforgejo.NewAccessObserver(http.DefaultTransport))
+	forgeAccessShadowService := forgeconnection.NewAccessShadowService(
+		applicationCtx,
+		database,
+		secretStore,
+		connectionforgejo.NewAccessObserver(http.DefaultTransport),
+	)
 	forgeIdentityService := forgeidentity.NewService(database, secretStore, http.DefaultTransport, publicURL)
 	repositoryStore := repository.NewStore(database)
 	setupCheckStore := setupcheck.NewStore(database)
@@ -145,24 +160,24 @@ func (a *App) Run(ctx context.Context) error {
 		ReadTimeout:       10 * time.Second,
 	}
 
-	errc := make(chan error, 1)
 	lifecycleRunner := newFreezeLifecycleRunner(freezeStoreForWeb, a.logger)
 	lifecycleRunner.materializer = scheduleMaterializer
-	go lifecycleRunner.Start(ctx)
-	go newRepositoryReconciliationRunner(jobStore, enforcementService, a.logger).Start(ctx)
-	go func() {
-		a.logger.Info("starting thawguard", "addr", a.cfg.HTTPAddr, "db", a.cfg.DatabasePath, "public_url", publicURL)
-		errc <- server.ListenAndServe()
-	}()
-
-	select {
-	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		return server.Shutdown(shutdownCtx)
-	case err := <-errc:
-		return err
+	reconciliationRunner := newRepositoryReconciliationRunner(jobStore, enforcementService, a.logger)
+	shadowRunner := newForgeAccessShadowRunner(forgeAccessShadowService, a.logger)
+	a.logger.Info("starting thawguard", "addr", a.cfg.HTTPAddr, "db", a.cfg.DatabasePath, "public_url", publicURL)
+	safeToClose, err := runApplicationLifecycle(
+		applicationCtx,
+		cancelApplication,
+		server,
+		lifecycleRunner.Start,
+		reconciliationRunner.Start,
+		shadowRunner.Start,
+		10*time.Second,
+	)
+	if !safeToClose {
+		closeDatabase = false
 	}
+	return err
 }
 
 // newRuntimeStatusPublisher is the only status publisher construction path:

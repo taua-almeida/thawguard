@@ -177,8 +177,10 @@ type forgeAccessPageData struct {
 	HasIdentities           bool
 
 	// Shadow is the manual shadow-access snapshot summary card.
-	Shadow               forgeShadowSectionView
-	ShadowRunConfirmOpen bool
+	Shadow                           forgeShadowSectionView
+	ShadowRunConfirmOpen             bool
+	ShadowPeriodicEnableConfirmOpen  bool
+	ShadowPeriodicDisableConfirmOpen bool
 }
 
 // forgeAccessRenderState carries one render's submitted-form and error
@@ -402,6 +404,8 @@ func (s *Server) renderForgeAccess(
 	data.CheckReady = data.EncryptionAvailable
 	data.ResetConfirmOpen = r.URL.Query().Get("reset") == "confirm"
 	data.ShadowRunConfirmOpen = r.URL.Query().Get("shadow") == "run"
+	data.ShadowPeriodicEnableConfirmOpen = r.URL.Query().Get("periodic") == "enable"
+	data.ShadowPeriodicDisableConfirmOpen = r.URL.Query().Get("periodic") == "disable"
 	if !s.loadForgeAccessOAuthClient(w, &data, connection, r, state.OAuthFormError) {
 		return
 	}
@@ -1010,6 +1014,28 @@ func forgeAccessNoticeToasts(values url.Values) []toastView {
 		message = "The shadow snapshot cannot start from the submitted state. Review the prerequisites and the small-alpha limits."
 	case forgeShadowUnknownNotice:
 		message = "Thawguard could not confirm the shadow snapshot outcome. Reload Forge access and inspect the latest attempt before retrying."
+		tone = "danger"
+	case forgePeriodicEnabledNotice:
+		message = "Periodic shadow refresh enabled. The first automatic attempt is scheduled five minutes after Enable."
+		tone = "success"
+	case forgePeriodicAlreadyEnabledNotice:
+		message = "Periodic shadow refresh was already enabled. Its existing due time was not changed."
+	case forgePeriodicDisabledNotice:
+		message = "Periodic shadow refresh disabled. A run already in progress may finish; manual snapshots remain available."
+	case forgePeriodicStaleNotice:
+		message = "The Forge access or periodic configuration state changed before this update. Reload and review the current revisions before retrying."
+	case forgePeriodicAuthorityNotice:
+		message = "Administrator authority changed before periodic shadow refresh could be updated."
+		tone = "danger"
+	case forgePeriodicUnavailableNotice:
+		message = "Periodic shadow refresh is unavailable until the Forge connection service and secret encryption are configured."
+	case forgePeriodicInvalidNotice:
+		message = "Periodic shadow refresh cannot be enabled from the submitted state. Review every local prerequisite and the 3A limits."
+	case forgePeriodicExhaustedNotice:
+		message = "Periodic shadow refresh configuration cannot change because its revision is exhausted."
+		tone = "danger"
+	case forgePeriodicUnknownNotice:
+		message = "Thawguard could not confirm the periodic shadow refresh update. Reload Forge access and derive the durable state before retrying."
 		tone = "danger"
 	default:
 		return nil
