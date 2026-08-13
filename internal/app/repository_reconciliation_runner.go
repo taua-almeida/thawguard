@@ -35,7 +35,7 @@ func newRepositoryReconciliationRunner(jobStore reconciliationJobStore, processo
 }
 
 func (r *repositoryReconciliationRunner) Start(ctx context.Context) {
-	if r == nil || r.jobs == nil || r.processor == nil {
+	if r == nil || r.jobs == nil || r.processor == nil || ctx.Err() != nil {
 		return
 	}
 	r.runAndLog(ctx)

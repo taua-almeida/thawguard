@@ -55,15 +55,15 @@ func TestFreezeLifecycleRunnerContinuesAfterOneItemFails(t *testing.T) {
 	}
 }
 
-func TestFreezeLifecycleRunnerStartupPassHandlesOverdueEndAndCancellation(t *testing.T) {
+func TestFreezeLifecycleRunnerCancelledContextSkipsStartupPass(t *testing.T) {
 	store := &fakeScheduledFreezeRuntimeStore{dueEnds: []domain.BranchFreeze{{ID: 9}}}
 	runner := newFreezeLifecycleRunner(store, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
 	runner.Start(ctx)
-	if len(store.ended) != 1 || store.ended[0] != 9 {
-		t.Fatalf("expected startup pass before cancellation exit, got %+v", store.ended)
+	if len(store.ended) != 0 {
+		t.Fatalf("cancelled startup processed %+v", store.ended)
 	}
 }
 

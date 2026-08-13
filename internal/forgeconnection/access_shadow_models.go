@@ -55,6 +55,22 @@ func (code AccessSyncResultCode) Valid() bool {
 	}
 }
 
+// AccessShadowRunTrigger records who reserved a snapshot independently of
+// whether a manual requester's account still exists later.
+type AccessShadowRunTrigger string
+
+const (
+	AccessShadowRunManual   AccessShadowRunTrigger = "manual"
+	AccessShadowRunPeriodic AccessShadowRunTrigger = "periodic"
+	// AccessShadowRunnerActorRole is the fixed system role persisted for
+	// periodic shadow-refresh Activity.
+	AccessShadowRunnerActorRole = "shadow_refresh_runner"
+)
+
+func (trigger AccessShadowRunTrigger) Valid() bool {
+	return trigger == AccessShadowRunManual || trigger == AccessShadowRunPeriodic
+}
+
 // observerReturnable reports whether an observer may hand this code back.
 // credential_unavailable, scope_changed, and interrupted belong to the
 // service lifecycle, never to provider observation.
@@ -148,16 +164,39 @@ func (reason AccessObservationReason) Confirmed() bool {
 
 // Small-alpha limits. The snapshot fails closed beyond them.
 const (
-	maxAccessShadowIdentities   = 10
-	maxAccessShadowRepositories = 10
-	maxAccessShadowPairs        = 25
+	// AccessShadowIdentityLimit caps linked identities in one snapshot scope.
+	AccessShadowIdentityLimit = 10
+	// AccessShadowRepositoryLimit caps bound repositories in one snapshot scope.
+	AccessShadowRepositoryLimit = 10
+	// AccessShadowPairLimit caps the identity x repository product.
+	AccessShadowPairLimit = 25
+	// AccessSyncConstructiveRequestMaximum is the largest request count for
+	// the bounded valid scope when every accepted listing reaches its limit.
+	AccessSyncConstructiveRequestMaximum = 89
 	// AccessSyncRequestLimit caps the requests of one provider operation.
 	AccessSyncRequestLimit = 96
+	// AccessShadowPeriodicIntervalSeconds is the fixed periodic cadence
+	// recorded in configuration Activity.
+	AccessShadowPeriodicIntervalSeconds = 5 * 60
 	// accessShadowInterruptionAge is how old a still-running row must be
 	// before it is treated as interrupted and may be terminalized.
 	accessShadowInterruptionAge = 75 * time.Second
 	// accessShadowOverallDeadline bounds the whole provider operation.
 	accessShadowOverallDeadline = 60 * time.Second
+	// accessShadowFinalizationDeadline lets a reserved run durably record the
+	// observer result after its request or runner context is cancelled. It
+	// stays below the outer ten-second app shutdown deadline so a timed-out
+	// finalizer can return before HTTP and runner joining reaches that edge.
+	accessShadowFinalizationDeadline = 9 * time.Second
+	// accessShadowPeriodicCadence is fixed for this slice. Persisted due time,
+	// rather than process uptime, decides when work may be reserved.
+	accessShadowPeriodicCadence = time.Duration(AccessShadowPeriodicIntervalSeconds) * time.Second
+	// accessShadowEvidenceFreshness is the exact completed-snapshot freshness
+	// boundary: age equal to the duration is stale.
+	accessShadowEvidenceFreshness = 10 * time.Minute
+	// accessShadowPeriodicOverdueAge distinguishes an arrived due time from an
+	// unexplained overdue schedule in the UI.
+	accessShadowPeriodicOverdueAge = 30 * time.Second
 )
 
 // AccessShadowObserver performs the read-only provider snapshot for one
@@ -230,6 +269,50 @@ type RunAccessShadowInput struct {
 	ConfirmShadowOnly bool
 }
 
+// EnableAccessShadowPeriodicInput fences one explicit enable to the exact
+// connection, scope, newest-run, and periodic configuration state rendered.
+type EnableAccessShadowPeriodicInput struct {
+	ExpectedConnectionID           int64
+	ExpectedConfigRevision         int64
+	ExpectedCheckGeneration        int64
+	ExpectedBindingRevision        int64
+	ExpectedAccessIdentityRevision int64
+	ExpectedNewestRunID            int64
+	ExpectedPeriodicRevision       int64
+	ConfirmPeriodicEnable          bool
+}
+
+// DisableAccessShadowPeriodicInput fences one explicit disable. Disable does
+// not depend on setup evidence, encryption, identities, or bindings.
+type DisableAccessShadowPeriodicInput struct {
+	ExpectedConnectionID     int64
+	ExpectedPeriodicRevision int64
+	ConfirmPeriodicDisable   bool
+}
+
+// AccessShadowPeriodicBlocker is one local reason an enabled periodic scan
+// will advance cadence without reserving a run or calling the provider.
+type AccessShadowPeriodicBlocker string
+
+const (
+	AccessPeriodicEncryptionUnavailable   AccessShadowPeriodicBlocker = "encryption_unavailable"
+	AccessPeriodicSetupEvidenceNotCurrent AccessShadowPeriodicBlocker = "setup_evidence_not_current"
+	AccessPeriodicNoLinkedIdentities      AccessShadowPeriodicBlocker = "no_linked_identities"
+	AccessPeriodicNoBindings              AccessShadowPeriodicBlocker = "no_bindings"
+	AccessPeriodicScopeExceedsLimits      AccessShadowPeriodicBlocker = "scope_exceeds_limits"
+)
+
+// AccessShadowPeriodicDueStatus is the independent runner-schedule axis.
+type AccessShadowPeriodicDueStatus string
+
+const (
+	AccessPeriodicNotScheduled AccessShadowPeriodicDueStatus = "not_scheduled"
+	AccessPeriodicScheduled    AccessShadowPeriodicDueStatus = "scheduled"
+	AccessPeriodicDue          AccessShadowPeriodicDueStatus = "due"
+	AccessPeriodicOverdue      AccessShadowPeriodicDueStatus = "overdue"
+	AccessPeriodicRunning      AccessShadowPeriodicDueStatus = "running"
+)
+
 // AccessAttemptStatus is the derived latest-attempt axis.
 type AccessAttemptStatus string
 
@@ -245,6 +328,7 @@ const (
 // AccessShadowAttempt is the newest run in either axis-relevant form.
 type AccessShadowAttempt struct {
 	Status     AccessAttemptStatus
+	Trigger    AccessShadowRunTrigger
 	ResultCode AccessSyncResultCode // empty while running or interrupted-by-age
 	StartedAt  time.Time
 	FinishedAt *time.Time
@@ -259,7 +343,16 @@ type AccessShadowSnapshot struct {
 	// ScopeCurrent reports whether the captured config, binding, and
 	// access-identity revisions still match the connection.
 	ScopeCurrent bool
-	ObservedAt   time.Time
+	// Age is derived from the same service clock sample used by the rest of
+	// the view.
+	Age        time.Duration
+	ObservedAt time.Time
+}
+
+// Fresh reports whether the completed snapshot is strictly less than ten
+// minutes old.
+func (s AccessShadowSnapshot) Fresh() bool {
+	return s.Age < accessShadowEvidenceFreshness
 }
 
 // AccessShadowPairRow is one current pair for the details page. It carries
@@ -294,26 +387,42 @@ type AccessShadowView struct {
 	// SetupEvidenceCurrent reports bound identities plus a current
 	// successful setup check at the exact revision and generation.
 	SetupEvidenceCurrent bool
+	EncryptionAvailable  bool
 	IdentityCount        int
 	BindingCount         int
 	WithinLimits         bool
 	NewestRunID          int64
 	LatestAttempt        *AccessShadowAttempt
 	LatestSnapshot       *AccessShadowSnapshot
+	// PeriodicRevision is zero when no configuration row exists.
+	PeriodicRevision  int64
+	PeriodicNextDueAt *time.Time
+	PeriodicDueStatus AccessShadowPeriodicDueStatus
+	PeriodicBlockers  []AccessShadowPeriodicBlocker
 	// Pairs is populated only within limits, sorted by local user label,
 	// repository label, then internal ids.
 	Pairs []AccessShadowPairRow
 }
 
+// PeriodicEnableReady reports whether the currently disabled configuration
+// meets the local prerequisites for an explicit enable.
+func (v AccessShadowView) PeriodicEnableReady() bool {
+	return v.HasConnection && v.PeriodicNextDueAt == nil && len(v.PeriodicBlockers) == 0
+}
+
 // Ready reports whether a new snapshot may be reserved from this view.
 func (v AccessShadowView) Ready() bool {
-	return v.HasConnection && v.SetupEvidenceCurrent && v.WithinLimits &&
+	return v.HasConnection && v.EncryptionAvailable && v.SetupEvidenceCurrent && v.WithinLimits &&
 		v.IdentityCount >= 1 && v.BindingCount >= 1 &&
 		(v.LatestAttempt == nil || v.LatestAttempt.Status != AccessAttemptRunning)
 }
 
 var (
-	ErrAccessSyncRunning        = errors.New("a shadow snapshot is already running; wait for it to finish or become interrupted")
-	ErrAccessSyncInterrupted    = errors.New("the shadow snapshot was interrupted before a result could be recorded")
-	ErrAccessSyncOutcomeUnknown = errors.New("the shadow snapshot outcome could not be confirmed")
+	ErrAccessSyncRunning               = errors.New("a shadow snapshot is already running; wait for it to finish or become interrupted")
+	ErrAccessSyncInterrupted           = errors.New("the shadow snapshot was interrupted before a result could be recorded")
+	ErrAccessSyncOutcomeUnknown        = errors.New("the shadow snapshot outcome could not be confirmed")
+	ErrAccessPeriodicOutcomeUnknown    = errors.New("the periodic shadow refresh outcome could not be confirmed")
+	ErrAccessPeriodicRevisionExhausted = errors.New("the periodic shadow refresh revision is exhausted")
+	ErrAccessPeriodicReservationFailed = errors.New("the periodic shadow refresh reservation failed")
+	ErrAccessPeriodicExecutionFailed   = errors.New("the periodic shadow refresh execution failed")
 )

@@ -44,7 +44,7 @@ func newFreezeLifecycleRunner(store freezeLifecycleRuntimeStore, logger *slog.Lo
 }
 
 func (r *freezeLifecycleRunner) Start(ctx context.Context) {
-	if r == nil || r.store == nil {
+	if r == nil || r.store == nil || ctx.Err() != nil {
 		return
 	}
 	r.runAndLog(ctx)
@@ -73,6 +73,9 @@ func (r *freezeLifecycleRunner) runAndLog(ctx context.Context) {
 func (r *freezeLifecycleRunner) RunDue(ctx context.Context) error {
 	if r == nil || r.store == nil {
 		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	actor := domain.Actor{Kind: domain.ActorKindSystem, Role: "scheduler"}
 	dueStarts, err := r.store.ListDueScheduled(ctx, freezeLifecycleRunnerLimit)

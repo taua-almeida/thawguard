@@ -403,6 +403,8 @@ func TestScopedActionClassificationCoversEveryKnownAction(t *testing.T) {
 		"forge.identity_link_rejected":               adminOnly,
 		"forge.identity_unlinked":                    adminOnly,
 		"forge.identity_purged":                      adminOnly,
+		"forge.access_periodic_enabled":              adminOnly,
+		"forge.access_periodic_disabled":             adminOnly,
 		"forge.access_sync_started":                  adminOnly,
 		"forge.access_sync_finished":                 adminOnly,
 	}

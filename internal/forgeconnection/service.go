@@ -725,8 +725,26 @@ func recordForgeConnectionEvent(
 	detailsJSON string,
 ) error {
 	actor := actorUserID
+	return recordForgeConnectionEventForActor(
+		ctx,
+		tx,
+		&actor,
+		action,
+		connectionID,
+		detailsJSON,
+	)
+}
+
+func recordForgeConnectionEventForActor(
+	ctx context.Context,
+	tx *sql.Tx,
+	actorUserID *int64,
+	action string,
+	connectionID int64,
+	detailsJSON string,
+) error {
 	if err := audit.NewStoreTx(tx).Record(ctx, audit.Event{
-		ActorUserID: &actor,
+		ActorUserID: actorUserID,
 		Action:      action,
 		SubjectType: audit.SubjectTypeForgeConnection,
 		SubjectID:   strconv.FormatInt(connectionID, 10),

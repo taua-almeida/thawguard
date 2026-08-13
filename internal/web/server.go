@@ -542,6 +542,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /settings/forge-access/repositories/unbind", s.handleForgeRepositoryUnbind)
 	s.mux.HandleFunc("GET /settings/forge-access/shadow-access", s.handleForgeAccessShadow)
 	s.mux.HandleFunc("POST /settings/forge-access/shadow-access/run", s.handleForgeAccessShadowRun)
+	s.mux.HandleFunc("POST /settings/forge-access/shadow-access/periodic/enable", s.handleForgeAccessShadowPeriodicEnable)
+	s.mux.HandleFunc("POST /settings/forge-access/shadow-access/periodic/disable", s.handleForgeAccessShadowPeriodicDisable)
 	s.mux.HandleFunc("POST /users", s.handleCreateUser)
 	s.mux.HandleFunc("POST /users/invitations", s.handleCreateInvitation)
 	s.mux.HandleFunc("POST /users/invitations/{id}/cancel", s.handleCancelInvitation)
@@ -2374,6 +2376,8 @@ var activityActionDefinitions = map[string]activityActionDefinition{
 	audit.ActionForgeIdentityLinkRejected:          {Label: "Forgejo identity link", Outcome: "Rejected", OutcomeClass: "warning"},
 	audit.ActionForgeIdentityUnlinked:              {Label: "Forgejo identity", Outcome: "Unlinked", OutcomeClass: "warning"},
 	audit.ActionForgeIdentityPurged:                {Label: "Forgejo identity", Outcome: "Purged", OutcomeClass: "warning"},
+	audit.ActionForgeAccessPeriodicEnabled:         {Label: "Periodic shadow refresh", Outcome: "Enabled", OutcomeClass: "ok"},
+	audit.ActionForgeAccessPeriodicDisabled:        {Label: "Periodic shadow refresh", Outcome: "Disabled", OutcomeClass: "warning"},
 	audit.ActionForgeAccessSyncStarted:             {Label: "Shadow access snapshot", Outcome: "Started", OutcomeClass: "pending"},
 	audit.ActionForgeAccessSyncFinished:            {Label: "Shadow access snapshot", Outcome: "Finished", OutcomeClass: "ok"},
 }
@@ -2663,6 +2667,13 @@ func activityEventViewForEvent(repositories map[int64]domain.Repository, users m
 		}
 		view.Target = activityForgeConnectionTarget(event)
 		view.Detail = detail
+	case audit.ActionForgeAccessPeriodicEnabled, audit.ActionForgeAccessPeriodicDisabled:
+		detail, ok := activityForgeAccessPeriodicConfigurationDetail(event, details)
+		if !ok {
+			return fallbackActivityEventView(users, event, details, true, forceUnknownInvitationActor)
+		}
+		view.Target = activityForgeConnectionTarget(event)
+		view.Detail = detail
 	case audit.ActionForgeAccessSyncStarted:
 		detail, ok := activityForgeAccessSyncStartedDetail(event, details)
 		if !ok {
@@ -2789,6 +2800,8 @@ func activityHasGuardedDetails(action string) bool {
 		audit.ActionForgeConnectionReset,
 		audit.ActionForgeRepositoryBound,
 		audit.ActionForgeRepositoryUnbound,
+		audit.ActionForgeAccessPeriodicEnabled,
+		audit.ActionForgeAccessPeriodicDisabled,
 		audit.ActionForgeAccessSyncStarted,
 		audit.ActionForgeAccessSyncFinished:
 		return true
@@ -2832,11 +2845,17 @@ func activityGuardedDetail(action, key string) bool {
 	case audit.ActionForgeRepositoryUnbound:
 		return key == "repository_id" || key == "repository_created_at" ||
 			key == "config_revision" || key == "binding_revision"
+	case audit.ActionForgeAccessPeriodicEnabled, audit.ActionForgeAccessPeriodicDisabled:
+		return key == "revision" || key == "interval_seconds" ||
+			key == "constructive_max_requests" || key == "hard_cap_requests" ||
+			key == "identity_count" || key == "repository_count"
 	case audit.ActionForgeAccessSyncStarted:
-		return key == "run_id" || key == "identity_count" || key == "repository_count"
+		return key == "run_id" || key == "identity_count" || key == "repository_count" ||
+			key == "run_trigger" || key == "actor_kind" || key == "actor_role"
 	case audit.ActionForgeAccessSyncFinished:
-		return key == "run_id" || key == "result_code" ||
-			key == "present_count" || key == "unknown_count" || key == "request_count"
+		return key == "run_id" || key == "result_code" || key == "run_trigger" ||
+			key == "present_count" || key == "unknown_count" || key == "request_count" ||
+			key == "actor_kind" || key == "actor_role"
 	default:
 		return false
 	}
@@ -2922,6 +2941,21 @@ func activityActor(users map[int64]auth.User, event audit.Event, details activit
 	if allowInvitationLink && activityExactStringDetailEquals(details, "actor_kind", audit.ActorKindInvitationLink) {
 		return "Invitation link"
 	}
+	if event.Action == audit.ActionForgeAccessSyncStarted || event.Action == audit.ActionForgeAccessSyncFinished {
+		_, hasTrigger := details["run_trigger"]
+		_, hasActorKind := details["actor_kind"]
+		_, hasActorRole := details["actor_role"]
+		if activityExactStringDetailEquals(details, "run_trigger", string(forgeconnection.AccessShadowRunManual)) ||
+			(!hasTrigger && !hasActorKind && !hasActorRole) {
+			return "Deleted user"
+		}
+	}
+	if event.Action == audit.ActionForgeAccessPeriodicEnabled ||
+		event.Action == audit.ActionForgeAccessPeriodicDisabled {
+		// Configuration mutations are always Administrator-authorized. A NULL
+		// actor here can only be the retained event after that user was deleted.
+		return "Deleted user"
+	}
 	kind, _ := activityTextDetail(details, "actor_kind", 64)
 	role, _ := activityTextDetail(details, "actor_role", 64)
 	switch kind {
@@ -2939,6 +2973,8 @@ func activityActor(users map[int64]auth.User, event audit.Event, details activit
 			return "Scheduler"
 		case "reconciliation_runner":
 			return "Reconciliation runner"
+		case forgeconnection.AccessShadowRunnerActorRole:
+			return "Shadow refresh runner"
 		case "runtime":
 			return "Runtime process"
 		case "":
@@ -3704,10 +3740,131 @@ func activityForgeRepositoryBindingDetail(
 	), true
 }
 
+func activityForgeAccessPeriodicConfigurationDetail(
+	event audit.Event,
+	details activityDetails,
+) (string, bool) {
+	if !validForgeConnectionSubject(event) {
+		return "", false
+	}
+	revision, revisionOK := activityCanonicalJSONInt64Detail(details, "revision")
+	if !revisionOK || revision <= 0 {
+		return "", false
+	}
+	intervalSeconds, intervalOK := activityCanonicalJSONInt64Detail(details, "interval_seconds")
+	constructiveMaximum, constructiveOK := activityCanonicalJSONInt64Detail(details, "constructive_max_requests")
+	hardCap, hardCapOK := activityCanonicalJSONInt64Detail(details, "hard_cap_requests")
+	if !intervalOK || intervalSeconds != forgeconnection.AccessShadowPeriodicIntervalSeconds ||
+		!constructiveOK || constructiveMaximum != forgeconnection.AccessSyncConstructiveRequestMaximum ||
+		!hardCapOK || hardCap != forgeconnection.AccessSyncRequestLimit {
+		return "", false
+	}
+
+	switch event.Action {
+	case audit.ActionForgeAccessPeriodicEnabled:
+		if len(details) != 6 {
+			return "", false
+		}
+		identityCount, identityOK := activityCanonicalJSONInt64Detail(details, "identity_count")
+		repositoryCount, repositoryOK := activityCanonicalJSONInt64Detail(details, "repository_count")
+		if !identityOK || identityCount < 1 || identityCount > forgeconnection.AccessShadowIdentityLimit ||
+			!repositoryOK || repositoryCount < 1 || repositoryCount > forgeconnection.AccessShadowRepositoryLimit {
+			return "", false
+		}
+		pairCount := identityCount * repositoryCount
+		if pairCount > constructiveMaximum || pairCount > forgeconnection.AccessShadowPairLimit {
+			return "", false
+		}
+		return fmt.Sprintf(
+			"Periodic configuration revision %d enabled a fixed %d-second interval for %d linked identities and %d bound repositories. Each attempt has an %d-request constructive maximum and a %d-request hard cap. Shadow evidence only; no roles or authority change.",
+			revision,
+			intervalSeconds,
+			identityCount,
+			repositoryCount,
+			constructiveMaximum,
+			hardCap,
+		), true
+	case audit.ActionForgeAccessPeriodicDisabled:
+		if len(details) != 4 {
+			return "", false
+		}
+		return fmt.Sprintf(
+			"Periodic configuration revision %d disabled the fixed %d-second interval. Each configured attempt used an %d-request constructive maximum and a %d-request hard cap. Existing shadow evidence remains; no roles or authority change.",
+			revision,
+			intervalSeconds,
+			constructiveMaximum,
+			hardCap,
+		), true
+	default:
+		return "", false
+	}
+}
+
+// activityCanonicalJSONInt64Detail accepts only a canonical, unquoted JSON
+// integer. Periodic configuration Activity deliberately rejects the broader
+// legacy string-number compatibility used by other Activity schemas.
+func activityCanonicalJSONInt64Detail(details activityDetails, key string) (int64, bool) {
+	raw, ok := details[key]
+	if !ok {
+		return 0, false
+	}
+	var value int64
+	if err := json.Unmarshal(raw, &value); err != nil || string(raw) != strconv.FormatInt(value, 10) {
+		return 0, false
+	}
+	return value, true
+}
+
+func activityForgeAccessRunTrigger(
+	event audit.Event,
+	details activityDetails,
+) (forgeconnection.AccessShadowRunTrigger, int, bool) {
+	if _, present := details["run_trigger"]; !present {
+		// Events written by the shipped manual-only schema have no trigger
+		// field. They remain durable manual Activity after the additive 0049
+		// upgrade; system attribution is never valid for that legacy shape.
+		if _, present := details["actor_kind"]; present {
+			return "", 0, false
+		}
+		if _, present := details["actor_role"]; present {
+			return "", 0, false
+		}
+		return forgeconnection.AccessShadowRunManual, 0, true
+	}
+	triggerText, ok := activityExactStringDetail(details, "run_trigger")
+	if !ok {
+		return "", 0, false
+	}
+	trigger := forgeconnection.AccessShadowRunTrigger(triggerText)
+	switch trigger {
+	case forgeconnection.AccessShadowRunManual:
+		if _, present := details["actor_kind"]; present {
+			return "", 0, false
+		}
+		if _, present := details["actor_role"]; present {
+			return "", 0, false
+		}
+		return trigger, 1, true
+	case forgeconnection.AccessShadowRunPeriodic:
+		if event.ActorUserID != nil ||
+			!activityExactStringDetailEquals(details, "actor_kind", domain.ActorKindSystem) ||
+			!activityExactStringDetailEquals(details, "actor_role", forgeconnection.AccessShadowRunnerActorRole) {
+			return "", 0, false
+		}
+		return trigger, 3, true
+	default:
+		return "", 0, false
+	}
+}
+
 // activityForgeAccessSyncStartedDetail renders the fixed reservation
-// evidence: internal run id and aggregate scope counts only.
+// evidence: trigger, internal run id, and aggregate scope counts only.
 func activityForgeAccessSyncStartedDetail(event audit.Event, details activityDetails) (string, bool) {
-	if !validForgeConnectionSubject(event) || len(details) != 3 {
+	if !validForgeConnectionSubject(event) {
+		return "", false
+	}
+	trigger, attributionDetails, ok := activityForgeAccessRunTrigger(event, details)
+	if !ok || len(details) != 3+attributionDetails {
 		return "", false
 	}
 	runID, runOK := activityPositiveInt64Detail(details, "run_id")
@@ -3717,7 +3874,8 @@ func activityForgeAccessSyncStartedDetail(event audit.Event, details activityDet
 		return "", false
 	}
 	return fmt.Sprintf(
-		"Run %d reserved for %d linked identities and %d bound repositories. Shadow evidence only; no roles or authority change.",
+		"%s run %d reserved for %d linked identities and %d bound repositories. Shadow evidence only; no roles or authority change.",
+		forgeShadowRunTriggerLabel(trigger),
 		runID,
 		identityCount,
 		repositoryCount,
@@ -3746,18 +3904,22 @@ func activityForgeAccessSyncFinishedDetail(
 	if !result.Valid() {
 		return "", "", "", false
 	}
+	trigger, attributionDetails, ok := activityForgeAccessRunTrigger(event, details)
+	if !ok {
+		return "", "", "", false
+	}
 	requestCount, hasRequestCount := activityNonnegativeInt64Detail(details, "request_count")
 	if _, present := details["request_count"]; present &&
 		(!hasRequestCount || requestCount > forgeconnection.AccessSyncRequestLimit) {
 		return "", "", "", false
 	}
 	requestDetail := ""
-	expectedDetails := 2
+	expectedDetails := 2 + attributionDetails
 	if hasRequestCount {
 		requestDetail = fmt.Sprintf(" %d provider request attempts were made.", requestCount)
 		expectedDetails++
 	}
-	prefix := fmt.Sprintf("Run %d: ", runID)
+	prefix := fmt.Sprintf("%s run %d: ", forgeShadowRunTriggerLabel(trigger), runID)
 	if result == forgeconnection.AccessSyncComplete {
 		present, presentOK := activityNonnegativeInt64Detail(details, "present_count")
 		unknown, unknownOK := activityNonnegativeInt64Detail(details, "unknown_count")

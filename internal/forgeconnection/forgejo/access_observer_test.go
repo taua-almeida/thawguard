@@ -610,8 +610,12 @@ func TestAccessObserverCompletesAtTheRequestFormulaMaximum(t *testing.T) {
 	}
 	// 1 user + 1 org + 4 org repos + 4 members + 4 teams + 16 team repos +
 	// 16 team members + 16 collaborators + 3 fallbacks + 24 permissions.
-	if observation.RequestCount != 89 {
-		t.Fatalf("requests = %d, want the 89-request maximum", observation.RequestCount)
+	if observation.RequestCount != forgeconnection.AccessSyncConstructiveRequestMaximum {
+		t.Fatalf(
+			"requests = %d, want the %d-request maximum",
+			observation.RequestCount,
+			forgeconnection.AccessSyncConstructiveRequestMaximum,
+		)
 	}
 	if observation.RequestCount > forgeconnection.AccessSyncRequestLimit {
 		t.Fatalf("maximum %d exceeds the %d budget", observation.RequestCount, forgeconnection.AccessSyncRequestLimit)
