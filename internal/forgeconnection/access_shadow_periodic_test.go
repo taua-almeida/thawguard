@@ -91,9 +91,37 @@ func TestAccessShadowPeriodicEnableDisableCASAndAudit(t *testing.T) {
 	}
 	enabled := fixture.auditDetails(t, audit.ActionForgeAccessPeriodicEnabled)
 	actors := fixture.auditActors(t, audit.ActionForgeAccessPeriodicEnabled)
-	if len(enabled) != 1 || enabled[0]["revision"] != float64(1) ||
+	if len(enabled) != 1 || len(enabled[0]) != 6 ||
+		enabled[0]["revision"] != float64(1) ||
+		enabled[0]["interval_seconds"] != float64(AccessShadowPeriodicIntervalSeconds) ||
+		enabled[0]["constructive_max_requests"] != float64(AccessSyncConstructiveRequestMaximum) ||
+		enabled[0]["hard_cap_requests"] != float64(AccessSyncRequestLimit) ||
+		enabled[0]["identity_count"] != float64(2) ||
+		enabled[0]["repository_count"] != float64(2) ||
 		len(actors) != 1 || !actors[0].Valid || actors[0].Int64 != fixture.adminID {
 		t.Fatalf("enable audit details=%v actors=%v", enabled, actors)
+	}
+	var enabledRaw string
+	if err := fixture.database.QueryRow(`
+SELECT details_json FROM audit_events WHERE action = ?`,
+		audit.ActionForgeAccessPeriodicEnabled,
+	).Scan(&enabledRaw); err != nil {
+		t.Fatal(err)
+	}
+	for _, excluded := range []string{
+		"fixture-org",
+		"alpha",
+		"Administrator",
+		"admin@example.test",
+		"admin-user",
+		"forge.example.test",
+		"next_due_at",
+		"base_url",
+		"provider",
+	} {
+		if strings.Contains(enabledRaw, excluded) {
+			t.Fatalf("enable audit leaked excluded detail %q in %q", excluded, enabledRaw)
+		}
 	}
 
 	// Stale expected state wins over the already-enabled no-op.
@@ -127,8 +155,18 @@ func TestAccessShadowPeriodicEnableDisableCASAndAudit(t *testing.T) {
 		t.Fatalf("disable config = revision %d due %+v", revision, due)
 	}
 	disabled := fixture.auditDetails(t, audit.ActionForgeAccessPeriodicDisabled)
-	if len(disabled) != 1 || disabled[0]["revision"] != float64(2) {
+	if len(disabled) != 1 || len(disabled[0]) != 4 ||
+		disabled[0]["revision"] != float64(2) ||
+		disabled[0]["interval_seconds"] != float64(AccessShadowPeriodicIntervalSeconds) ||
+		disabled[0]["constructive_max_requests"] != float64(AccessSyncConstructiveRequestMaximum) ||
+		disabled[0]["hard_cap_requests"] != float64(AccessSyncRequestLimit) {
 		t.Fatalf("disable audit = %v", disabled)
+	}
+	if _, present := disabled[0]["identity_count"]; present {
+		t.Fatalf("disable audit unexpectedly recorded identity_count: %v", disabled[0])
+	}
+	if _, present := disabled[0]["repository_count"]; present {
+		t.Fatalf("disable audit unexpectedly recorded repository_count: %v", disabled[0])
 	}
 
 	// Stale expected state also wins over the already-disabled no-op.
@@ -377,6 +415,9 @@ END`); err != nil {
 		if configs != 0 {
 			t.Fatalf("enable audit rollback left %d configurations", configs)
 		}
+		if got := len(fixture.auditDetails(t, audit.ActionForgeAccessPeriodicEnabled)); got != 0 {
+			t.Fatalf("enable audit rollback left %d Activity events", got)
+		}
 	})
 
 	t.Run("disable audit", func(t *testing.T) {
@@ -403,6 +444,9 @@ END`); err != nil {
 		if revision != 1 || !due.Valid {
 			t.Fatalf("disable audit rollback config = revision %d due %+v", revision, due)
 		}
+		if got := len(fixture.auditDetails(t, audit.ActionForgeAccessPeriodicDisabled)); got != 0 {
+			t.Fatalf("disable audit rollback left %d Activity events", got)
+		}
 	})
 
 	t.Run("enable commit", func(t *testing.T) {
@@ -418,6 +462,9 @@ END`); err != nil {
 		}
 		if configs != 0 {
 			t.Fatalf("ambiguous enable persisted %d configurations", configs)
+		}
+		if got := len(fixture.auditDetails(t, audit.ActionForgeAccessPeriodicEnabled)); got != 0 {
+			t.Fatalf("ambiguous enable persisted %d Activity events", got)
 		}
 	})
 
@@ -436,6 +483,9 @@ END`); err != nil {
 		revision, due := fixture.periodicConfig(t)
 		if revision != 1 || !due.Valid {
 			t.Fatalf("ambiguous disable config = revision %d due %+v", revision, due)
+		}
+		if got := len(fixture.auditDetails(t, audit.ActionForgeAccessPeriodicDisabled)); got != 0 {
+			t.Fatalf("ambiguous disable persisted %d Activity events", got)
 		}
 	})
 }
@@ -1241,8 +1291,14 @@ func TestAccessShadowViewPeriodicAndFreshnessAxes(t *testing.T) {
 		t.Fatal(err)
 	}
 	view, err = fixture.service.View(fixture.ctx)
-	if err != nil || view.LatestSnapshot == nil || !view.LatestSnapshot.Fresh {
+	if err != nil || view.LatestSnapshot == nil || !view.LatestSnapshot.Fresh() || view.LatestSnapshot.Age != 0 {
 		t.Fatalf("fresh snapshot view = %+v err=%v", view.LatestSnapshot, err)
+	}
+	fixture.service.secrets = nil
+	view, err = fixture.service.View(fixture.ctx)
+	if err != nil || view.EncryptionAvailable || view.LatestSnapshot == nil || len(view.Pairs) != 4 ||
+		len(view.PeriodicBlockers) != 1 || view.PeriodicBlockers[0] != AccessPeriodicEncryptionUnavailable {
+		t.Fatalf("encryption-unavailable retained evidence view = %+v err=%v", view, err)
 	}
 	if err := fixture.service.DisablePeriodic(fixture.ctx, fixture.adminID, DisableAccessShadowPeriodicInput{
 		ExpectedConnectionID:     1,
@@ -1253,7 +1309,8 @@ func TestAccessShadowViewPeriodicAndFreshnessAxes(t *testing.T) {
 	}
 	fixture.clock.Advance(accessShadowEvidenceFreshness)
 	view, err = fixture.service.View(fixture.ctx)
-	if err != nil || view.PeriodicNextDueAt != nil || view.LatestSnapshot == nil || view.LatestSnapshot.Fresh {
+	if err != nil || view.PeriodicNextDueAt != nil || view.LatestSnapshot == nil ||
+		view.LatestSnapshot.Fresh() || view.LatestSnapshot.Age != accessShadowEvidenceFreshness {
 		t.Fatalf("exact stale boundary view = %+v err=%v", view.LatestSnapshot, err)
 	}
 }

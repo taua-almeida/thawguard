@@ -2846,7 +2846,9 @@ func activityGuardedDetail(action, key string) bool {
 		return key == "repository_id" || key == "repository_created_at" ||
 			key == "config_revision" || key == "binding_revision"
 	case audit.ActionForgeAccessPeriodicEnabled, audit.ActionForgeAccessPeriodicDisabled:
-		return key == "revision"
+		return key == "revision" || key == "interval_seconds" ||
+			key == "constructive_max_requests" || key == "hard_cap_requests" ||
+			key == "identity_count" || key == "repository_count"
 	case audit.ActionForgeAccessSyncStarted:
 		return key == "run_id" || key == "identity_count" || key == "repository_count" ||
 			key == "run_trigger" || key == "actor_kind" || key == "actor_role"
@@ -3742,17 +3744,75 @@ func activityForgeAccessPeriodicConfigurationDetail(
 	event audit.Event,
 	details activityDetails,
 ) (string, bool) {
-	if !validForgeConnectionSubject(event) || len(details) != 1 {
+	if !validForgeConnectionSubject(event) {
 		return "", false
 	}
-	revision, ok := activityPositiveInt64Detail(details, "revision")
+	revision, revisionOK := activityCanonicalJSONInt64Detail(details, "revision")
+	if !revisionOK || revision <= 0 {
+		return "", false
+	}
+	intervalSeconds, intervalOK := activityCanonicalJSONInt64Detail(details, "interval_seconds")
+	constructiveMaximum, constructiveOK := activityCanonicalJSONInt64Detail(details, "constructive_max_requests")
+	hardCap, hardCapOK := activityCanonicalJSONInt64Detail(details, "hard_cap_requests")
+	if !intervalOK || intervalSeconds != forgeconnection.AccessShadowPeriodicIntervalSeconds ||
+		!constructiveOK || constructiveMaximum != forgeconnection.AccessSyncConstructiveRequestMaximum ||
+		!hardCapOK || hardCap != forgeconnection.AccessSyncRequestLimit {
+		return "", false
+	}
+
+	switch event.Action {
+	case audit.ActionForgeAccessPeriodicEnabled:
+		if len(details) != 6 {
+			return "", false
+		}
+		identityCount, identityOK := activityCanonicalJSONInt64Detail(details, "identity_count")
+		repositoryCount, repositoryOK := activityCanonicalJSONInt64Detail(details, "repository_count")
+		if !identityOK || identityCount < 1 || identityCount > forgeconnection.AccessShadowIdentityLimit ||
+			!repositoryOK || repositoryCount < 1 || repositoryCount > forgeconnection.AccessShadowRepositoryLimit {
+			return "", false
+		}
+		pairCount := identityCount * repositoryCount
+		if pairCount > constructiveMaximum || pairCount > forgeconnection.AccessShadowPairLimit {
+			return "", false
+		}
+		return fmt.Sprintf(
+			"Periodic configuration revision %d enabled a fixed %d-second interval for %d linked identities and %d bound repositories. Each attempt has an %d-request constructive maximum and a %d-request hard cap. Shadow evidence only; no roles or authority change.",
+			revision,
+			intervalSeconds,
+			identityCount,
+			repositoryCount,
+			constructiveMaximum,
+			hardCap,
+		), true
+	case audit.ActionForgeAccessPeriodicDisabled:
+		if len(details) != 4 {
+			return "", false
+		}
+		return fmt.Sprintf(
+			"Periodic configuration revision %d disabled the fixed %d-second interval. Each configured attempt used an %d-request constructive maximum and a %d-request hard cap. Existing shadow evidence remains; no roles or authority change.",
+			revision,
+			intervalSeconds,
+			constructiveMaximum,
+			hardCap,
+		), true
+	default:
+		return "", false
+	}
+}
+
+// activityCanonicalJSONInt64Detail accepts only a canonical, unquoted JSON
+// integer. Periodic configuration Activity deliberately rejects the broader
+// legacy string-number compatibility used by other Activity schemas.
+func activityCanonicalJSONInt64Detail(details activityDetails, key string) (int64, bool) {
+	raw, ok := details[key]
 	if !ok {
-		return "", false
+		return 0, false
 	}
-	return fmt.Sprintf(
-		"Periodic configuration revision %d. The fixed cadence affects shadow evidence only; no roles or authority change.",
-		revision,
-	), true
+	var value int64
+	if err := json.Unmarshal(raw, &value); err != nil || string(raw) != strconv.FormatInt(value, 10) {
+		return 0, false
+	}
+	return value, true
 }
 
 func activityForgeAccessRunTrigger(

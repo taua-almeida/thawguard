@@ -142,6 +142,8 @@ VALUES (?, 1, ?)`, record.ID, formatForgeConnectionTime(nextDueAt)); err != nil 
 		audit.ActionForgeAccessPeriodicEnabled,
 		record.ID,
 		nextRevision,
+		len(identities),
+		len(bindings),
 	); err != nil {
 		return false, err
 	}
@@ -228,6 +230,8 @@ WHERE connection_id = ? AND revision = ? AND next_due_at IS NOT NULL`,
 		audit.ActionForgeAccessPeriodicDisabled,
 		connectionID,
 		nextRevision,
+		0,
+		0,
 	); err != nil {
 		return err
 	}
@@ -631,9 +635,9 @@ SELECT id FROM forge_connections WHERE provider = ?`, ProviderForgejo).Scan(&con
 }
 
 func accessShadowScopeWithinLimits(identityCount, bindingCount int) bool {
-	return identityCount <= maxAccessShadowIdentities &&
-		bindingCount <= maxAccessShadowRepositories &&
-		identityCount*bindingCount <= maxAccessShadowPairs
+	return identityCount <= AccessShadowIdentityLimit &&
+		bindingCount <= AccessShadowRepositoryLimit &&
+		identityCount*bindingCount <= AccessShadowPairLimit
 }
 
 func accessShadowPeriodicBlockers(
@@ -693,10 +697,41 @@ func recordAccessPeriodicConfiguration(
 	action string,
 	connectionID int64,
 	revision int64,
+	identityCount int,
+	repositoryCount int,
 ) error {
-	details, err := json.Marshal(struct {
-		Revision int64 `json:"revision"`
-	}{Revision: revision})
+	type periodicConfigurationDetails struct {
+		Revision                int64  `json:"revision"`
+		IntervalSeconds         int64  `json:"interval_seconds"`
+		ConstructiveMaxRequests int64  `json:"constructive_max_requests"`
+		HardCapRequests         int64  `json:"hard_cap_requests"`
+		IdentityCount           *int64 `json:"identity_count,omitempty"`
+		RepositoryCount         *int64 `json:"repository_count,omitempty"`
+	}
+	detailsRecord := periodicConfigurationDetails{
+		Revision:                revision,
+		IntervalSeconds:         AccessShadowPeriodicIntervalSeconds,
+		ConstructiveMaxRequests: AccessSyncConstructiveRequestMaximum,
+		HardCapRequests:         AccessSyncRequestLimit,
+	}
+	switch action {
+	case audit.ActionForgeAccessPeriodicEnabled:
+		if identityCount < 1 || repositoryCount < 1 ||
+			!accessShadowScopeWithinLimits(identityCount, repositoryCount) {
+			return errors.New("periodic shadow refresh enable audit scope is invalid")
+		}
+		identityCount64 := int64(identityCount)
+		repositoryCount64 := int64(repositoryCount)
+		detailsRecord.IdentityCount = &identityCount64
+		detailsRecord.RepositoryCount = &repositoryCount64
+	case audit.ActionForgeAccessPeriodicDisabled:
+		if identityCount != 0 || repositoryCount != 0 {
+			return errors.New("periodic shadow refresh disable audit scope is invalid")
+		}
+	default:
+		return errors.New("periodic shadow refresh audit action is invalid")
+	}
+	details, err := json.Marshal(detailsRecord)
 	if err != nil {
 		return errors.New("encode periodic shadow refresh audit evidence")
 	}

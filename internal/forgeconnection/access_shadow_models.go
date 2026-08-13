@@ -164,11 +164,20 @@ func (reason AccessObservationReason) Confirmed() bool {
 
 // Small-alpha limits. The snapshot fails closed beyond them.
 const (
-	maxAccessShadowIdentities   = 10
-	maxAccessShadowRepositories = 10
-	maxAccessShadowPairs        = 25
+	// AccessShadowIdentityLimit caps linked identities in one snapshot scope.
+	AccessShadowIdentityLimit = 10
+	// AccessShadowRepositoryLimit caps bound repositories in one snapshot scope.
+	AccessShadowRepositoryLimit = 10
+	// AccessShadowPairLimit caps the identity x repository product.
+	AccessShadowPairLimit = 25
+	// AccessSyncConstructiveRequestMaximum is the largest request count for
+	// the bounded valid scope when every accepted listing reaches its limit.
+	AccessSyncConstructiveRequestMaximum = 89
 	// AccessSyncRequestLimit caps the requests of one provider operation.
 	AccessSyncRequestLimit = 96
+	// AccessShadowPeriodicIntervalSeconds is the fixed periodic cadence
+	// recorded in configuration Activity.
+	AccessShadowPeriodicIntervalSeconds = 5 * 60
 	// accessShadowInterruptionAge is how old a still-running row must be
 	// before it is treated as interrupted and may be terminalized.
 	accessShadowInterruptionAge = 75 * time.Second
@@ -181,7 +190,7 @@ const (
 	accessShadowFinalizationDeadline = 9 * time.Second
 	// accessShadowPeriodicCadence is fixed for this slice. Persisted due time,
 	// rather than process uptime, decides when work may be reserved.
-	accessShadowPeriodicCadence = 5 * time.Minute
+	accessShadowPeriodicCadence = time.Duration(AccessShadowPeriodicIntervalSeconds) * time.Second
 	// accessShadowEvidenceFreshness is the exact completed-snapshot freshness
 	// boundary: age equal to the duration is stale.
 	accessShadowEvidenceFreshness = 10 * time.Minute
@@ -334,9 +343,16 @@ type AccessShadowSnapshot struct {
 	// ScopeCurrent reports whether the captured config, binding, and
 	// access-identity revisions still match the connection.
 	ScopeCurrent bool
-	// Fresh is true only while age is strictly less than ten minutes.
-	Fresh      bool
+	// Age is derived from the same service clock sample used by the rest of
+	// the view.
+	Age        time.Duration
 	ObservedAt time.Time
+}
+
+// Fresh reports whether the completed snapshot is strictly less than ten
+// minutes old.
+func (s AccessShadowSnapshot) Fresh() bool {
+	return s.Age < accessShadowEvidenceFreshness
 }
 
 // AccessShadowPairRow is one current pair for the details page. It carries

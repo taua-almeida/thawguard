@@ -94,7 +94,7 @@ func readyShadowView() forgeconnection.AccessShadowView {
 			UnknownCount: 1,
 			PairCount:    4,
 			ScopeCurrent: true,
-			Fresh:        true,
+			Age:          4*time.Minute + 30*time.Second,
 			ObservedAt:   finished,
 		},
 		Pairs: []forgeconnection.AccessShadowPairRow{
@@ -299,7 +299,11 @@ func TestForgeShadowPresentationFreshnessAndRunningPrecedence(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			snapshot := *base
-			snapshot.Fresh = tc.fresh
+			if tc.fresh {
+				snapshot.Age = time.Minute
+			} else {
+				snapshot.Age = 10 * time.Minute
+			}
 			snapshot.UnknownCount = tc.unknown
 			label, _, _ := forgeShadowSnapshotPresentation(&snapshot)
 			if label != tc.label {
@@ -353,10 +357,54 @@ func TestForgeShadowDetailsPageRendersPairEvidence(t *testing.T) {
 		"Previously confirmed",
 		"No explicit access observed",
 		"Disabled",
+		"4 min ago",
+		"Completed evidence becomes stale at ten minutes.",
+		"Scope-changed evidence remains retained and marked until a later complete snapshot replaces it or the Forge connection is reset.",
 	} {
 		if !strings.Contains(body, fragment) {
 			t.Fatalf("details page is missing %q", fragment)
 		}
+	}
+}
+
+func TestForgeShadowDetailsPageRendersRetainedEvidenceWithoutEncryption(t *testing.T) {
+	view := readyShadowView()
+	view.EncryptionAvailable = false
+	view.LatestSnapshot.Age = 12*time.Minute + 15*time.Second
+	view.PeriodicRevision = 3
+	due := time.Date(2026, 8, 10, 12, 10, 0, 0, time.UTC)
+	view.PeriodicNextDueAt = &due
+	view.PeriodicDueStatus = forgeconnection.AccessPeriodicScheduled
+	view.PeriodicBlockers = []forgeconnection.AccessShadowPeriodicBlocker{
+		forgeconnection.AccessPeriodicEncryptionUnavailable,
+	}
+	shadow := &fakeForgeAccessShadowService{view: view}
+	server, _ := newForgeShadowServer(shadow, false)
+	session := forgeAccessAdminSession(t, server)
+
+	response := forgeAccessGET(server, session, "/settings/forge-access/shadow-access")
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%q", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	for _, fragment := range []string{
+		"Enabled · blocked",
+		"Service PAT encryption is unavailable.",
+		"Scheduled",
+		"Trigger: Manual",
+		"Stale · incomplete",
+		"12 min ago",
+		"Pair evidence",
+		"Administrator",
+		"admin-user",
+		"fixture-org/alpha",
+	} {
+		if !strings.Contains(body, fragment) {
+			t.Fatalf("encryption-unavailable details page is missing %q", fragment)
+		}
+	}
+	if strings.Contains(body, "Shadow access is not configured on this installation.") {
+		t.Fatal("read-only evidence page rendered the installation-unavailable state")
 	}
 }
 
@@ -802,11 +850,23 @@ func TestActivityForgeAccessSyncPresentation(t *testing.T) {
 	if legacyManualView.Actor != "Deleted user" || !strings.Contains(legacyManualView.Detail, "Manual run 3") {
 		t.Fatalf("legacy manual event view = %+v", legacyManualView)
 	}
-	periodicConfig := event(audit.ActionForgeAccessPeriodicEnabled, `{"revision":3}`)
+	periodicConfig := event(audit.ActionForgeAccessPeriodicEnabled, `{"revision":3,"interval_seconds":300,"constructive_max_requests":89,"hard_cap_requests":96,"identity_count":2,"repository_count":3}`)
 	periodicConfigView := activityEventViewForEvent(nil, nil, periodicConfig)
 	if periodicConfigView.ActionLabel != "Periodic shadow refresh" || periodicConfigView.Outcome != "Enabled" ||
-		!strings.Contains(periodicConfigView.Detail, "revision 3") {
+		!strings.Contains(periodicConfigView.Detail, "revision 3") ||
+		!strings.Contains(periodicConfigView.Detail, "2 linked identities and 3 bound repositories") ||
+		!strings.Contains(periodicConfigView.Detail, "89-request constructive maximum") ||
+		!strings.Contains(periodicConfigView.Detail, "96-request hard cap") {
 		t.Fatalf("periodic config view = %+v", periodicConfigView)
+	}
+	periodicDisabled := event(audit.ActionForgeAccessPeriodicDisabled, `{"revision":4,"interval_seconds":300,"constructive_max_requests":89,"hard_cap_requests":96}`)
+	periodicDisabledView := activityEventViewForEvent(nil, nil, periodicDisabled)
+	if periodicDisabledView.Outcome != "Disabled" ||
+		!strings.Contains(periodicDisabledView.Detail, "revision 4") ||
+		!strings.Contains(periodicDisabledView.Detail, "300-second interval") ||
+		!strings.Contains(periodicDisabledView.Detail, "89-request constructive maximum") ||
+		!strings.Contains(periodicDisabledView.Detail, "96-request hard cap") {
+		t.Fatalf("periodic disabled view = %+v", periodicDisabledView)
 	}
 	deletedConfig := periodicConfig
 	deletedConfig.ActorUserID = nil
@@ -829,6 +889,63 @@ func TestActivityForgeAccessSyncPresentation(t *testing.T) {
 		if view.ActionLabel != "Unrecognized activity" {
 			t.Fatalf("%s rendered as %+v", name, view)
 		}
+	}
+
+}
+
+func TestActivityForgeAccessPeriodicConfigurationRejectsMalformedDetails(t *testing.T) {
+	event := func(action, details string) audit.Event {
+		actorID := int64(7)
+		return audit.Event{
+			ActorUserID: &actorID,
+			Action:      action,
+			SubjectType: audit.SubjectTypeForgeConnection,
+			SubjectID:   "1",
+			DetailsJSON: details,
+			CreatedAt:   time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC),
+		}
+	}
+	validEnable := `"revision":3,"interval_seconds":300,"constructive_max_requests":89,"hard_cap_requests":96,"identity_count":2,"repository_count":3`
+	for _, tc := range []struct {
+		name    string
+		action  string
+		details string
+	}{
+		{name: "missing scope count", action: audit.ActionForgeAccessPeriodicEnabled, details: `{"revision":3,"interval_seconds":300,"constructive_max_requests":89,"hard_cap_requests":96,"identity_count":2}`},
+		{name: "unexpected provider data", action: audit.ActionForgeAccessPeriodicEnabled, details: `{` + validEnable + `,"provider_url":"provider-canary.example.test"}`},
+		{name: "duplicate count", action: audit.ActionForgeAccessPeriodicEnabled, details: `{"revision":3,"interval_seconds":300,"constructive_max_requests":89,"hard_cap_requests":96,"identity_count":2,"identity_count":3,"repository_count":3}`},
+		{name: "string revision", action: audit.ActionForgeAccessPeriodicEnabled, details: `{"revision":"3","interval_seconds":300,"constructive_max_requests":89,"hard_cap_requests":96,"identity_count":2,"repository_count":3}`},
+		{name: "signed string revision", action: audit.ActionForgeAccessPeriodicEnabled, details: `{"revision":"+3","interval_seconds":300,"constructive_max_requests":89,"hard_cap_requests":96,"identity_count":2,"repository_count":3}`},
+		{name: "leading-zero JSON revision", action: audit.ActionForgeAccessPeriodicEnabled, details: `{"revision":03,"interval_seconds":300,"constructive_max_requests":89,"hard_cap_requests":96,"identity_count":2,"repository_count":3}`},
+		{name: "leading-zero string interval", action: audit.ActionForgeAccessPeriodicEnabled, details: `{"revision":3,"interval_seconds":"0300","constructive_max_requests":89,"hard_cap_requests":96,"identity_count":2,"repository_count":3}`},
+		{name: "wrong fixed interval", action: audit.ActionForgeAccessPeriodicEnabled, details: `{"revision":3,"interval_seconds":301,"constructive_max_requests":89,"hard_cap_requests":96,"identity_count":2,"repository_count":3}`},
+		{name: "wrong constructive maximum", action: audit.ActionForgeAccessPeriodicEnabled, details: `{"revision":3,"interval_seconds":300,"constructive_max_requests":90,"hard_cap_requests":96,"identity_count":2,"repository_count":3}`},
+		{name: "wrong hard cap", action: audit.ActionForgeAccessPeriodicEnabled, details: `{"revision":3,"interval_seconds":300,"constructive_max_requests":89,"hard_cap_requests":97,"identity_count":2,"repository_count":3}`},
+		{name: "fractional interval", action: audit.ActionForgeAccessPeriodicEnabled, details: `{"revision":3,"interval_seconds":300.0,"constructive_max_requests":89,"hard_cap_requests":96,"identity_count":2,"repository_count":3}`},
+		{name: "exponent constructive maximum", action: audit.ActionForgeAccessPeriodicEnabled, details: `{"revision":3,"interval_seconds":300,"constructive_max_requests":8.9e1,"hard_cap_requests":96,"identity_count":2,"repository_count":3}`},
+		{name: "string hard cap", action: audit.ActionForgeAccessPeriodicEnabled, details: `{"revision":3,"interval_seconds":300,"constructive_max_requests":89,"hard_cap_requests":"96","identity_count":2,"repository_count":3}`},
+		{name: "out-of-range revision", action: audit.ActionForgeAccessPeriodicEnabled, details: `{"revision":9223372036854775808,"interval_seconds":300,"constructive_max_requests":89,"hard_cap_requests":96,"identity_count":2,"repository_count":3}`},
+		{name: "negative revision", action: audit.ActionForgeAccessPeriodicEnabled, details: `{"revision":-3,"interval_seconds":300,"constructive_max_requests":89,"hard_cap_requests":96,"identity_count":2,"repository_count":3}`},
+		{name: "string identity count", action: audit.ActionForgeAccessPeriodicEnabled, details: `{"revision":3,"interval_seconds":300,"constructive_max_requests":89,"hard_cap_requests":96,"identity_count":"2","repository_count":3}`},
+		{name: "string repository count", action: audit.ActionForgeAccessPeriodicEnabled, details: `{"revision":3,"interval_seconds":300,"constructive_max_requests":89,"hard_cap_requests":96,"identity_count":2,"repository_count":"3"}`},
+		{name: "zero identity count", action: audit.ActionForgeAccessPeriodicEnabled, details: `{"revision":3,"interval_seconds":300,"constructive_max_requests":89,"hard_cap_requests":96,"identity_count":0,"repository_count":3}`},
+		{name: "identity count above limit", action: audit.ActionForgeAccessPeriodicEnabled, details: `{"revision":3,"interval_seconds":300,"constructive_max_requests":89,"hard_cap_requests":96,"identity_count":11,"repository_count":1}`},
+		{name: "repository count above limit", action: audit.ActionForgeAccessPeriodicEnabled, details: `{"revision":3,"interval_seconds":300,"constructive_max_requests":89,"hard_cap_requests":96,"identity_count":1,"repository_count":11}`},
+		{name: "pair count above limit", action: audit.ActionForgeAccessPeriodicEnabled, details: `{"revision":3,"interval_seconds":300,"constructive_max_requests":89,"hard_cap_requests":96,"identity_count":6,"repository_count":5}`},
+		{name: "aggregate above constructive ceiling", action: audit.ActionForgeAccessPeriodicEnabled, details: `{"revision":3,"interval_seconds":300,"constructive_max_requests":89,"hard_cap_requests":96,"identity_count":10,"repository_count":10}`},
+		{name: "disable with scope counts", action: audit.ActionForgeAccessPeriodicDisabled, details: `{"revision":4,"interval_seconds":300,"constructive_max_requests":89,"hard_cap_requests":96,"identity_count":2,"repository_count":3}`},
+		{name: "disable missing hard cap", action: audit.ActionForgeAccessPeriodicDisabled, details: `{"revision":4,"interval_seconds":300,"constructive_max_requests":89}`},
+		{name: "disable string interval", action: audit.ActionForgeAccessPeriodicDisabled, details: `{"revision":4,"interval_seconds":"300","constructive_max_requests":89,"hard_cap_requests":96}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			view := activityEventViewForEvent(nil, nil, event(tc.action, tc.details))
+			if view.ActionLabel != "Unrecognized activity" {
+				t.Fatalf("malformed periodic configuration rendered as %+v", view)
+			}
+			if strings.Contains(view.Detail, "provider-canary") || strings.Contains(view.Target, "provider-canary") {
+				t.Fatalf("malformed periodic configuration leaked provider canary in %+v", view)
+			}
+		})
 	}
 }
 

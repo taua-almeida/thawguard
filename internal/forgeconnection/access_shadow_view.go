@@ -197,13 +197,17 @@ func deriveAccessShadowSnapshot(
 		return AccessShadowSnapshot{}, errors.New("forge access shadow snapshot data is malformed")
 	}
 	pairCount := run.identityCount * run.repositoryCount
+	age := now.Sub(*run.finishedAt)
+	if age < 0 {
+		age = 0
+	}
 	return AccessShadowSnapshot{
 		PresentCount: *run.presentCount,
 		UnknownCount: *run.unknownCount,
 		AbsentCount:  pairCount - *run.presentCount - *run.unknownCount,
 		PairCount:    pairCount,
 		ScopeCurrent: accessShadowRunScopeCurrent(record, run, identityCount, bindingCount),
-		Fresh:        now.Sub(*run.finishedAt) < accessShadowEvidenceFreshness,
+		Age:          age,
 		ObservedAt:   *run.finishedAt,
 	}, nil
 }
@@ -296,8 +300,8 @@ LIMIT 1`
 	malformed := errors.New("forge access shadow run data is malformed")
 	if run.id <= 0 || !run.runTrigger.Valid() || run.configRevision <= 0 || run.checkGeneration <= 0 ||
 		run.bindingRevision < 0 || run.accessIdentityRevision <= 0 ||
-		run.identityCount < 1 || run.identityCount > maxAccessShadowIdentities ||
-		run.repositoryCount < 1 || run.repositoryCount > maxAccessShadowRepositories {
+		run.identityCount < 1 || run.identityCount > AccessShadowIdentityLimit ||
+		run.repositoryCount < 1 || run.repositoryCount > AccessShadowRepositoryLimit {
 		return accessShadowRunRecord{}, false, malformed
 	}
 	run.startedAt, err = parseForgeConnectionTime(startedAtText)
@@ -343,7 +347,7 @@ ORDER BY i.id`, connectionID)
 		return nil, fmt.Errorf("read forge access shadow identity labels: %w", err)
 	}
 	defer rows.Close()
-	labels := make([]accessShadowIdentityLabel, 0, maxAccessShadowIdentities)
+	labels := make([]accessShadowIdentityLabel, 0, AccessShadowIdentityLimit)
 	for rows.Next() {
 		var label accessShadowIdentityLabel
 		var disabled int64
@@ -373,7 +377,7 @@ ORDER BY b.repository_id`, connectionID)
 		return nil, fmt.Errorf("read forge access shadow binding labels: %w", err)
 	}
 	defer rows.Close()
-	labels := make([]accessShadowBindingLabel, 0, maxAccessShadowRepositories)
+	labels := make([]accessShadowBindingLabel, 0, AccessShadowRepositoryLimit)
 	for rows.Next() {
 		var label accessShadowBindingLabel
 		var owner, name string
@@ -402,7 +406,7 @@ WHERE connection_id = ?`, connectionID)
 		return nil, fmt.Errorf("read forge access shadow observations: %w", err)
 	}
 	defer rows.Close()
-	observations := make(map[[2]int64]accessShadowObservationRecord, maxAccessShadowPairs)
+	observations := make(map[[2]int64]accessShadowObservationRecord, AccessShadowPairLimit)
 	for rows.Next() {
 		var record accessShadowObservationRecord
 		var latestReason, latestObservedAt string

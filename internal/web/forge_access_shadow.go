@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"time"
 
 	"github.com/taua-almeida/thawguard/internal/forgeconnection"
 )
@@ -59,7 +60,7 @@ type forgeShadowSectionView struct {
 	LoadError bool
 	Ready     bool
 	// EncryptionAvailable copies the shadow service's explicit readiness fact;
-	// handlers also retain their conservative installation-config guard.
+	// provider-changing handlers also retain their installation-config guard.
 	EncryptionAvailable bool
 
 	SetupEvidenceCurrent bool
@@ -91,6 +92,7 @@ type forgeShadowSectionView struct {
 	SnapshotTone       string
 	SnapshotDetail     string
 	SnapshotObservedAt string
+	SnapshotAge        string
 	PresentCount       int64
 	AbsentCount        int64
 	UnknownCount       int64
@@ -155,7 +157,7 @@ func (s *Server) handleForgeAccessShadow(w http.ResponseWriter, r *http.Request)
 		CSRFField:   csrfFormField,
 		Toasts:      forgeAccessNoticeToasts(r.URL.Query()),
 	}
-	if s.cfg.ForgeAccessShadowService == nil || !s.cfg.ForgeConnectionSecretEncryptionConfigured {
+	if s.cfg.ForgeAccessShadowService == nil {
 		data.LoadError = "Shadow access is not configured on this installation."
 		s.renderPageStatus(w, http.StatusServiceUnavailable, "layouts/forge-access-shadow", data)
 		return
@@ -494,6 +496,7 @@ func forgeShadowSection(view forgeconnection.AccessShadowView) forgeShadowSectio
 		section.UnknownCount = view.LatestSnapshot.UnknownCount
 		section.PairCount = view.LatestSnapshot.PairCount
 		section.SnapshotObservedAt = view.LatestSnapshot.ObservedAt.UTC().Format("2006-01-02 15:04:05 UTC")
+		section.SnapshotAge = forgeShadowAge(view.LatestSnapshot.Age)
 	}
 	return section
 }
@@ -615,14 +618,32 @@ func forgeShadowSnapshotPresentation(snapshot *forgeconnection.AccessShadowSnaps
 		return "Never observed", "neutral", "No completed credential-visible snapshot exists yet."
 	case !snapshot.ScopeCurrent:
 		return "Scope changed", "warning", "The connection configuration or its identity/binding scope changed after this snapshot; its evidence predates the current scope."
-	case snapshot.Fresh && snapshot.UnknownCount == 0:
+	case snapshot.Fresh() && snapshot.UnknownCount == 0:
 		return "Current · complete", "success", "Every current pair carries confirmed evidence from a completed snapshot less than ten minutes old."
-	case snapshot.Fresh:
+	case snapshot.Fresh():
 		return "Current · incomplete", "warning", "The completed snapshot is less than ten minutes old, but some pairs stayed unknown; earlier confirmations, where present, are preserved beneath them."
 	case snapshot.UnknownCount == 0:
 		return "Stale · complete", "warning", "Every pair was confirmed, but the completed snapshot is at least ten minutes old."
 	default:
 		return "Stale · incomplete", "warning", "The completed snapshot is at least ten minutes old and some pairs stayed unknown; earlier confirmations, where present, are preserved beneath them."
+	}
+}
+
+// forgeShadowAge renders the nonnegative age sampled by the shadow service
+// in fixed coarse units. It does not sample the web process clock.
+func forgeShadowAge(age time.Duration) string {
+	if age < 0 {
+		age = 0
+	}
+	switch {
+	case age < time.Minute:
+		return "moments ago"
+	case age < time.Hour:
+		return strconv.Itoa(int(age.Minutes())) + " min ago"
+	case age < 48*time.Hour:
+		return strconv.Itoa(int(age.Hours())) + " h ago"
+	default:
+		return strconv.Itoa(int(age.Hours()/24)) + " days ago"
 	}
 }
 

@@ -51,6 +51,12 @@ One-time scheduled freezes are pending windows for an exact repository and manag
 
 Only pending one-time schedules can be edited, cancelled, or started now. Schedule archive controls remain deferred.
 
+## Periodic shadow access evidence
+
+An Administrator can explicitly enable a fixed five-minute refresh of retained Forgejo shadow-access evidence. This is credential-visible observation only: it grants no repository role or authority and changes no policy or enforcement state.
+
+Periodic shadow refresh supports one Thawguard process per SQLite database; it does not provide multi-process leader election. After periodic configuration or run state exists, rollback to an older Thawguard binary is unsupported, and mixed-version writers must not share that database.
+
 ## Roadmap and issue tracking
 
 The current direction is documented in [ROADMAP.md](ROADMAP.md). GitHub is the canonical public issue tracker so plans and discussion do not fragment between mirrors. The [Codeberg repository](https://codeberg.org/taua-almeida/thawguard) remains available as a source mirror and carries the same versioned roadmap and contributor documentation.

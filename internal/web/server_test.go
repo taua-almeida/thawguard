@@ -2994,10 +2994,15 @@ func TestActivityMappingsCoverEveryKnownAuditAction(t *testing.T) {
 			event.SubjectID = "1"
 			event.DetailsJSON = `{"reason":"remote_identity_collision"}`
 		}
-		if action == audit.ActionForgeAccessPeriodicEnabled || action == audit.ActionForgeAccessPeriodicDisabled {
+		if action == audit.ActionForgeAccessPeriodicEnabled {
 			event.SubjectType = audit.SubjectTypeForgeConnection
 			event.SubjectID = "1"
-			event.DetailsJSON = `{"revision":1}`
+			event.DetailsJSON = `{"revision":1,"interval_seconds":300,"constructive_max_requests":89,"hard_cap_requests":96,"identity_count":2,"repository_count":2}`
+		}
+		if action == audit.ActionForgeAccessPeriodicDisabled {
+			event.SubjectType = audit.SubjectTypeForgeConnection
+			event.SubjectID = "1"
+			event.DetailsJSON = `{"revision":2,"interval_seconds":300,"constructive_max_requests":89,"hard_cap_requests":96}`
 		}
 		if action == audit.ActionForgeAccessSyncStarted {
 			event.SubjectType = audit.SubjectTypeForgeConnection

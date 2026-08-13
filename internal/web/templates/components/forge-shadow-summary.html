@@ -80,7 +80,7 @@
       <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">No explicit access</dt><dd class="m-0 mt-1 text-sm text-text">{{ $shadow.AbsentCount }}</dd></div>
       <div class="min-w-0"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Unknown</dt><dd class="m-0 mt-1 text-sm text-text">{{ $shadow.UnknownCount }}</dd></div>
     </dl>
-    <p class="m-0 mt-2 text-xs text-text-muted">Observed {{ $shadow.SnapshotObservedAt }}. A completed snapshot is complete only for the graph visible to the attested credential within the approved limits.</p>
+    <p class="m-0 mt-2 text-xs text-text-muted">Observed {{ $shadow.SnapshotObservedAt }} · {{ $shadow.SnapshotAge }}. A completed snapshot is complete only for the graph visible to the attested credential within the approved limits.</p>
     {{ end }}
   </div>
 

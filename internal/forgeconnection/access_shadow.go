@@ -786,7 +786,7 @@ ORDER BY id`, connectionID)
 		return nil, fmt.Errorf("read forge access shadow identities: %w", err)
 	}
 	defer rows.Close()
-	identities := make([]AccessShadowIdentity, 0, maxAccessShadowIdentities)
+	identities := make([]AccessShadowIdentity, 0, AccessShadowIdentityLimit)
 	for rows.Next() {
 		var identity AccessShadowIdentity
 		if err := rows.Scan(&identity.IdentityID, &identity.RemoteUserID, &identity.UsernameAtLink); err != nil {
