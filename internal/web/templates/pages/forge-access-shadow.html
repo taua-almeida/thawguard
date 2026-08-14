@@ -22,7 +22,10 @@
         <h2 id="forge-shadow-summary-title" class="m-0 text-lg font-bold text-text">Snapshot state</h2>
         <p class="m-0 mt-1 text-sm text-text-muted">Manual and explicitly enabled periodic snapshots share the same bounded evidence operation. Completed evidence becomes stale at ten minutes. Scope-changed evidence remains retained and marked until a later complete snapshot replaces it or the Forge connection is reset.</p>
       </div>
-      {{ template "ui/button" dict "Label" "Open Forge access" "Variant" "secondary" "Href" "/settings/forge-access" }}
+      <div class="flex flex-wrap gap-2">
+        {{ template "ui/button" dict "Label" "Current role evidence" "Variant" "secondary" "Href" "/settings/forge-access/role-evidence" }}
+        {{ template "ui/button" dict "Label" "Open Forge access" "Variant" "secondary" "Href" "/settings/forge-access" }}
+      </div>
     </div>
     <div class="mt-5">
       {{ template "components/forge-shadow-summary" dict "Shadow" .Shadow "DetailsLink" false }}

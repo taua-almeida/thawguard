@@ -28,15 +28,11 @@ type accessShadowRunRecord struct {
 
 type accessShadowIdentityLabel struct {
 	identityID     int64
+	userID         int64
 	usernameAtLink string
 	displayName    string
 	email          string
 	disabled       bool
-}
-
-type accessShadowBindingLabel struct {
-	repositoryID int64
-	fullName     string
 }
 
 type accessShadowObservationRecord struct {
@@ -85,13 +81,14 @@ func (s *AccessShadowService) View(ctx context.Context) (AccessShadowView, error
 	if err != nil {
 		return AccessShadowView{}, err
 	}
-	bindings, err := loadAccessShadowBindingLabels(ctx, tx, record.ID)
+	bindings, err := loadAccessShadowBoundRepositories(ctx, tx, record.ID)
 	if err != nil {
 		return AccessShadowView{}, err
 	}
 	view.IdentityCount = len(identities)
 	view.BindingCount = len(bindings)
 	view.WithinLimits = accessShadowScopeWithinLimits(len(identities), len(bindings))
+	view.BoundRepositories = bindings
 	view.PeriodicBlockers = accessShadowPeriodicBlockers(
 		view.EncryptionAvailable,
 		view.SetupEvidenceCurrent,
@@ -147,7 +144,10 @@ func (s *AccessShadowService) View(ctx context.Context) (AccessShadowView, error
 		if err != nil {
 			return AccessShadowView{}, err
 		}
-		view.Pairs = buildAccessShadowPairRows(identities, bindings, observations)
+		view.Pairs, err = buildAccessShadowPairRows(identities, bindings, observations)
+		if err != nil {
+			return AccessShadowView{}, err
+		}
 	}
 	return view, nil
 }
@@ -202,6 +202,7 @@ func deriveAccessShadowSnapshot(
 		age = 0
 	}
 	return AccessShadowSnapshot{
+		RunID:        run.id,
 		PresentCount: *run.presentCount,
 		UnknownCount: *run.unknownCount,
 		AbsentCount:  pairCount - *run.presentCount - *run.unknownCount,
@@ -338,7 +339,7 @@ LIMIT 1`
 
 func loadAccessShadowIdentityLabels(ctx context.Context, q queryer, connectionID int64) ([]accessShadowIdentityLabel, error) {
 	rows, err := q.QueryContext(ctx, `
-SELECT i.id, i.username_at_link, u.display_name, u.email, u.disabled_at IS NOT NULL
+SELECT i.id, i.user_id, i.username_at_link, u.display_name, u.email, u.disabled_at IS NOT NULL
 FROM forgejo_identities i
 JOIN users u ON u.id = i.user_id
 WHERE i.connection_id = ?
@@ -351,10 +352,18 @@ ORDER BY i.id`, connectionID)
 	for rows.Next() {
 		var label accessShadowIdentityLabel
 		var disabled int64
-		if err := rows.Scan(&label.identityID, &label.usernameAtLink, &label.displayName, &label.email, &disabled); err != nil {
+		if err := rows.Scan(
+			&label.identityID,
+			&label.userID,
+			&label.usernameAtLink,
+			&label.displayName,
+			&label.email,
+			&disabled,
+		); err != nil {
 			return nil, fmt.Errorf("scan forge access shadow identity label: %w", err)
 		}
-		if label.identityID <= 0 || !validRemoteName(label.usernameAtLink) || disabled < 0 || disabled > 1 {
+		if label.identityID <= 0 || label.userID <= 0 || !validRemoteName(label.usernameAtLink) ||
+			disabled < 0 || disabled > 1 {
 			return nil, errors.New("forge access shadow identity data is malformed")
 		}
 		label.disabled = disabled == 1
@@ -366,34 +375,34 @@ ORDER BY i.id`, connectionID)
 	return labels, nil
 }
 
-func loadAccessShadowBindingLabels(ctx context.Context, q queryer, connectionID int64) ([]accessShadowBindingLabel, error) {
+func loadAccessShadowBoundRepositories(ctx context.Context, q queryer, connectionID int64) ([]AccessShadowBoundRepository, error) {
 	rows, err := q.QueryContext(ctx, `
 SELECT b.repository_id, r.owner, r.name
 FROM forge_repository_bindings b
 JOIN repositories r ON r.id = b.repository_id
 WHERE b.connection_id = ?
-ORDER BY b.repository_id`, connectionID)
+ORDER BY r.owner || '/' || r.name, b.repository_id`, connectionID)
 	if err != nil {
 		return nil, fmt.Errorf("read forge access shadow binding labels: %w", err)
 	}
 	defer rows.Close()
-	labels := make([]accessShadowBindingLabel, 0, AccessShadowRepositoryLimit)
+	repositories := make([]AccessShadowBoundRepository, 0, AccessShadowRepositoryLimit)
 	for rows.Next() {
-		var label accessShadowBindingLabel
+		var repository AccessShadowBoundRepository
 		var owner, name string
-		if err := rows.Scan(&label.repositoryID, &owner, &name); err != nil {
+		if err := rows.Scan(&repository.RepositoryID, &owner, &name); err != nil {
 			return nil, fmt.Errorf("scan forge access shadow binding label: %w", err)
 		}
-		if label.repositoryID <= 0 || owner == "" || name == "" {
+		if repository.RepositoryID <= 0 || owner == "" || name == "" {
 			return nil, errors.New("forge access shadow binding data is malformed")
 		}
-		label.fullName = owner + "/" + name
-		labels = append(labels, label)
+		repository.RepositoryFullName = owner + "/" + name
+		repositories = append(repositories, repository)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("read forge access shadow binding label rows: %w", err)
 	}
-	return labels, nil
+	return repositories, nil
 }
 
 func loadAccessShadowObservations(ctx context.Context, q queryer, connectionID int64) (map[[2]int64]accessShadowObservationRecord, error) {
@@ -480,24 +489,32 @@ WHERE connection_id = ?`, connectionID)
 // label, repository label, then internal ids.
 func buildAccessShadowPairRows(
 	identities []accessShadowIdentityLabel,
-	bindings []accessShadowBindingLabel,
+	bindings []AccessShadowBoundRepository,
 	observations map[[2]int64]accessShadowObservationRecord,
-) []AccessShadowPairRow {
+) ([]AccessShadowPairRow, error) {
 	rows := make([]AccessShadowPairRow, 0, len(identities)*len(bindings))
+	seen := make(map[[2]int64]bool, len(identities)*len(bindings))
 	for _, identity := range identities {
 		for _, binding := range bindings {
+			key := [2]int64{identity.userID, binding.RepositoryID}
+			if seen[key] {
+				return nil, errors.New("forge access shadow pair data contains duplicate user and repository")
+			}
+			seen[key] = true
 			row := AccessShadowPairRow{
 				IdentityID:         identity.identityID,
-				RepositoryID:       binding.repositoryID,
+				UserID:             identity.userID,
+				RepositoryID:       binding.RepositoryID,
 				UserDisplayName:    identity.displayName,
 				UserEmail:          identity.email,
 				UserDisabled:       identity.disabled,
 				UsernameAtLink:     identity.usernameAtLink,
-				RepositoryFullName: binding.fullName,
+				RepositoryFullName: binding.RepositoryFullName,
 			}
-			if observation, found := observations[[2]int64{identity.identityID, binding.repositoryID}]; found {
+			if observation, found := observations[[2]int64{identity.identityID, binding.RepositoryID}]; found {
 				row.Observed = true
 				row.LatestReason = observation.latestReason
+				row.LatestRunID = observation.latestRunID
 				row.LatestObservedAt = observation.latestObservedAt
 				if !observation.latestReason.Confirmed() && observation.lastConfirmedReason != "" {
 					row.PriorConfirmedReason = observation.lastConfirmedReason
@@ -519,5 +536,5 @@ func buildAccessShadowPairRows(
 		}
 		return rows[i].RepositoryID < rows[j].RepositoryID
 	})
-	return rows
+	return rows, nil
 }

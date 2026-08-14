@@ -85,7 +85,10 @@
   </div>
 
   {{ if .DetailsLink }}
-  <div>{{ template "ui/button" dict "Label" "View pair evidence" "Variant" "secondary" "Href" "/settings/forge-access/shadow-access" }}</div>
+  <div class="flex flex-wrap gap-2">
+    {{ template "ui/button" dict "Label" "View pair evidence" "Variant" "secondary" "Href" "/settings/forge-access/shadow-access" }}
+    {{ template "ui/button" dict "Label" "Compare current roles" "Variant" "secondary" "Href" "/settings/forge-access/role-evidence" }}
+  </div>
   {{ end }}
   {{ end }}
 </div>

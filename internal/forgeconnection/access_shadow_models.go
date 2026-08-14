@@ -336,6 +336,7 @@ type AccessShadowAttempt struct {
 
 // AccessShadowSnapshot is the newest completed snapshot anchor.
 type AccessShadowSnapshot struct {
+	RunID        int64
 	PresentCount int64
 	AbsentCount  int64
 	UnknownCount int64
@@ -359,6 +360,7 @@ func (s AccessShadowSnapshot) Fresh() bool {
 // local labels only; remote ids never enter web models.
 type AccessShadowPairRow struct {
 	IdentityID         int64
+	UserID             int64
 	RepositoryID       int64
 	UserDisplayName    string
 	UserEmail          string
@@ -369,11 +371,19 @@ type AccessShadowPairRow struct {
 	// pair; the UI derives never_observed.
 	Observed         bool
 	LatestReason     AccessObservationReason
+	LatestRunID      int64
 	LatestObservedAt time.Time
 	// PriorConfirmedReason and PriorConfirmedAt are set only when the
 	// latest reason is unknown and an earlier confirmation is preserved.
 	PriorConfirmedReason AccessObservationReason
 	PriorConfirmedAt     time.Time
+}
+
+// AccessShadowBoundRepository is one current local repository binding exposed
+// for read-only selection. Remote repository identifiers never enter the view.
+type AccessShadowBoundRepository struct {
+	RepositoryID       int64
+	RepositoryFullName string
 }
 
 // AccessShadowView is everything the summary and details pages need.
@@ -399,6 +409,9 @@ type AccessShadowView struct {
 	PeriodicNextDueAt *time.Time
 	PeriodicDueStatus AccessShadowPeriodicDueStatus
 	PeriodicBlockers  []AccessShadowPeriodicBlocker
+	// BoundRepositories is populated independently of pair-detail limits so a
+	// read-only repository selector remains truthful for every current binding.
+	BoundRepositories []AccessShadowBoundRepository
 	// Pairs is populated only within limits, sorted by local user label,
 	// repository label, then internal ids.
 	Pairs []AccessShadowPairRow

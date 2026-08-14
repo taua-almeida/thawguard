@@ -6,8 +6,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -871,9 +873,17 @@ func TestAccessShadowViewDerivesAttemptSnapshotAndPairs(t *testing.T) {
 	if len(view.Pairs) != 4 {
 		t.Fatalf("expected 4 never-observed pairs, got %d", len(view.Pairs))
 	}
+	if len(view.BoundRepositories) != 2 ||
+		view.BoundRepositories[0] != (AccessShadowBoundRepository{RepositoryID: 11, RepositoryFullName: "fixture-org/alpha"}) ||
+		view.BoundRepositories[1] != (AccessShadowBoundRepository{RepositoryID: 12, RepositoryFullName: "fixture-org/beta"}) {
+		t.Fatalf("bound repository selector = %+v", view.BoundRepositories)
+	}
 	for _, pair := range view.Pairs {
 		if pair.Observed {
 			t.Fatalf("pair observed before any run: %+v", pair)
+		}
+		if pair.UserID <= 0 || pair.LatestRunID != 0 {
+			t.Fatalf("never-observed pair identity = %+v", pair)
 		}
 	}
 	// Sorted by user label then repository label: Administrator before
@@ -914,14 +924,18 @@ func TestAccessShadowViewDerivesAttemptSnapshotAndPairs(t *testing.T) {
 		view.LatestSnapshot.AbsentCount != 3 || view.LatestSnapshot.PairCount != 4 {
 		t.Fatalf("completed view: attempt=%+v snapshot=%+v", view.LatestAttempt, view.LatestSnapshot)
 	}
+	if view.LatestSnapshot.RunID != fixture.newestRunID(t) {
+		t.Fatalf("snapshot run id = %d", view.LatestSnapshot.RunID)
+	}
 	var adminAlpha *AccessShadowPairRow
 	for i := range view.Pairs {
 		if view.Pairs[i].IdentityID == 21 && view.Pairs[i].RepositoryID == 11 {
 			adminAlpha = &view.Pairs[i]
 		}
 	}
-	if adminAlpha == nil || !adminAlpha.Observed ||
+	if adminAlpha == nil || adminAlpha.UserID != fixture.adminID || !adminAlpha.Observed ||
 		adminAlpha.LatestReason != AccessReasonPermissionUnavailable ||
+		adminAlpha.LatestRunID != view.LatestSnapshot.RunID ||
 		adminAlpha.PriorConfirmedReason != AccessReasonDirectCollaborator {
 		t.Fatalf("pair evidence wrong: %+v", adminAlpha)
 	}
@@ -938,6 +952,94 @@ func TestAccessShadowViewDerivesAttemptSnapshotAndPairs(t *testing.T) {
 	}
 	if view.LatestAttempt.Status != AccessAttemptCompleted || view.LatestSnapshot.ScopeCurrent {
 		t.Fatalf("stale-scope view: attempt=%+v snapshot=%+v", view.LatestAttempt, view.LatestSnapshot)
+	}
+}
+
+func TestAccessShadowViewKeepsBoundRepositoriesWithoutPairDetail(t *testing.T) {
+	assertBoundRepositories := func(t *testing.T, view AccessShadowView) {
+		t.Helper()
+		want := []AccessShadowBoundRepository{
+			{RepositoryID: 12, RepositoryFullName: "fixture-org/alpha"},
+			{RepositoryID: 11, RepositoryFullName: "fixture-org/zeta"},
+		}
+		if len(view.BoundRepositories) != len(want) {
+			t.Fatalf("bound repositories = %+v", view.BoundRepositories)
+		}
+		for i := range want {
+			if view.BoundRepositories[i] != want[i] {
+				t.Fatalf("bound repositories = %+v, want %+v", view.BoundRepositories, want)
+			}
+		}
+	}
+
+	t.Run("zero identities", func(t *testing.T) {
+		fixture := newAccessShadowFixture(t)
+		if _, err := fixture.database.Exec(`
+UPDATE repositories SET name = 'zeta' WHERE id = 11;
+UPDATE repositories SET name = 'alpha' WHERE id = 12;
+DELETE FROM forgejo_identities`); err != nil {
+			t.Fatal(err)
+		}
+		view, err := fixture.service.View(fixture.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertBoundRepositories(t, view)
+		if view.IdentityCount != 0 || len(view.Pairs) != 0 {
+			t.Fatalf("zero-identity detail = %+v", view)
+		}
+	})
+
+	t.Run("scope over limit", func(t *testing.T) {
+		fixture := newAccessShadowFixture(t)
+		if _, err := fixture.database.Exec(`
+UPDATE repositories SET name = 'zeta' WHERE id = 11;
+UPDATE repositories SET name = 'alpha' WHERE id = 12`); err != nil {
+			t.Fatal(err)
+		}
+		for i := int64(3); i <= 11; i++ {
+			if _, err := fixture.database.ExecContext(fixture.ctx, `
+INSERT INTO users(id, email, display_name, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?)`,
+				i,
+				fmt.Sprintf("user-%d@example.test", i),
+				fmt.Sprintf("User %d", i),
+				accessShadowFixtureTime,
+				accessShadowFixtureTime,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.database.ExecContext(fixture.ctx, `
+INSERT INTO forgejo_identities(id, connection_id, user_id, remote_user_id, username_at_link, linked_at)
+VALUES (?, 1, ?, ?, ?, ?)`,
+				i+20,
+				i,
+				strconv.FormatInt(i+100, 10),
+				fmt.Sprintf("user-%d", i),
+				accessShadowFixtureTime,
+			); err != nil {
+				t.Fatal(err)
+			}
+		}
+		view, err := fixture.service.View(fixture.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertBoundRepositories(t, view)
+		if view.IdentityCount != 11 || view.WithinLimits || len(view.Pairs) != 0 {
+			t.Fatalf("over-limit detail = %+v", view)
+		}
+	})
+}
+
+func TestBuildAccessShadowPairRowsRejectsDuplicateUserRepositoryKeys(t *testing.T) {
+	identities := []accessShadowIdentityLabel{
+		{identityID: 21, userID: 7},
+		{identityID: 22, userID: 7},
+	}
+	bindings := []AccessShadowBoundRepository{{RepositoryID: 11}}
+	if _, err := buildAccessShadowPairRows(identities, bindings, nil); err == nil {
+		t.Fatal("duplicate user and repository pair key was accepted")
 	}
 }
 

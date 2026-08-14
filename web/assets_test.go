@@ -10,14 +10,15 @@ import (
 	"testing"
 )
 
-var shadowTemplateClassAttribute = regexp.MustCompile(`class="([^"]+)"`)
+var templateClassAttribute = regexp.MustCompile(`class="([^"]+)"`)
 
-// TestForgeShadowTemplatesUseOnlyCompiledSelectors proves every static
-// utility class the shadow-access templates use has a compiled selector in
-// web/static/app.css, so the pages render styled without CSS generation.
+// TestForgeEvidenceTemplatesUseOnlyCompiledSelectors proves every static
+// utility class the shadow-access and role-evidence templates use has a
+// compiled selector in web/static/app.css, so the pages render styled without
+// CSS generation.
 // Class lists computed by primitives carry template actions and are covered
 // by the primitives' own compiled sources.
-func TestForgeShadowTemplatesUseOnlyCompiledSelectors(t *testing.T) {
+func TestForgeEvidenceTemplatesUseOnlyCompiledSelectors(t *testing.T) {
 	css, err := os.ReadFile("static/app.css")
 	if err != nil {
 		t.Fatal(err)
@@ -27,12 +28,14 @@ func TestForgeShadowTemplatesUseOnlyCompiledSelectors(t *testing.T) {
 		"../internal/web/templates/components/forge-shadow-summary.html",
 		"../internal/web/templates/pages/forge-access-shadow.html",
 		"../internal/web/templates/layouts/forge-access-shadow.html",
+		"../internal/web/templates/pages/forge-role-evidence.html",
+		"../internal/web/templates/layouts/forge-role-evidence.html",
 	} {
 		source, err := os.ReadFile(file)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, match := range shadowTemplateClassAttribute.FindAllStringSubmatch(string(source), -1) {
+		for _, match := range templateClassAttribute.FindAllStringSubmatch(string(source), -1) {
 			if strings.Contains(match[1], "{{") {
 				continue
 			}
