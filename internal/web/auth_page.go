@@ -98,6 +98,9 @@ func (s *Server) renderPageBuffered(w http.ResponseWriter, status int, name stri
 // boundary.
 func errorPageContent(status int) (heading, message string) {
 	switch status {
+	case http.StatusBadRequest:
+		return "Bad request",
+			"That address contains query values Thawguard cannot accept. Check the link and try again."
 	case http.StatusForbidden:
 		return "You don't have access to this page",
 			"Your account doesn't have the role this page needs, or the session that opened it has ended."

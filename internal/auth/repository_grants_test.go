@@ -454,6 +454,187 @@ func TestGrantsForUserCombinesGlobalAdminAndScopedRoles(t *testing.T) {
 	}
 }
 
+func TestListRepositoryRoleHoldersReturnsCurrentScopedPopulation(t *testing.T) {
+	ctx := context.Background()
+	database := newAuthTestDB(t, ctx)
+	service := NewService(database)
+	admin := mustCreateFirstAdmin(t, ctx, service)
+	first := mustCreateUser(t, ctx, service, "a-holder@example.test", false)
+	second := mustCreateUser(t, ctx, service, "z-holder@example.test", false)
+	adminHolder := mustCreateUser(t, ctx, service, "admin-holder@example.test", true)
+	disabled := mustCreateUser(t, ctx, service, "disabled@example.test", false)
+	noGrant := mustCreateUser(t, ctx, service, "no-grant@example.test", false)
+	otherOnly := mustCreateUser(t, ctx, service, "other-only@example.test", false)
+	repositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "thawguard")
+	otherRepositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "other")
+
+	for userID, displayName := range map[int64]string{
+		first.ID:       " Same ",
+		second.ID:      "same",
+		adminHolder.ID: "Zulu Admin",
+		disabled.ID:    "Later",
+	} {
+		if _, err := database.ExecContext(ctx, `UPDATE users SET display_name = ? WHERE id = ?`, displayName, userID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := service.DisableUser(ctx, admin.User.ID, disabled.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, grant := range []struct {
+		userID int64
+		role   Role
+	}{
+		{userID: first.ID, role: RoleThawApprover},
+		{userID: first.ID, role: RoleViewer},
+		{userID: first.ID, role: RoleFreezer},
+		{userID: second.ID, role: RoleViewer},
+		{userID: adminHolder.ID, role: RoleFreezer},
+		{userID: disabled.ID, role: RoleThawApprover},
+	} {
+		if err := service.GrantRepositoryRole(ctx, GrantRepositoryRoleParams{
+			ActorUserID:  admin.User.ID,
+			RepositoryID: repositoryID,
+			UserID:       grant.userID,
+			Role:         grant.role,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := service.GrantRepositoryRole(ctx, GrantRepositoryRoleParams{
+		ActorUserID:  admin.User.ID,
+		RepositoryID: otherRepositoryID,
+		UserID:       otherOnly.ID,
+		Role:         RoleViewer,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CreateInvitation(ctx, CreateInvitationParams{
+		ActorUserID: admin.User.ID,
+		Email:       "invited@example.test",
+		DisplayName: "Invited",
+		IsAdmin:     true,
+		RepositoryGrants: []InvitationRepositoryGrant{{
+			RepositoryID: repositoryID,
+			Role:         RoleViewer,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	holders, err := service.ListRepositoryRoleHolders(ctx, repositoryID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(holders) != 4 {
+		t.Fatalf("holders = %+v", holders)
+	}
+	wantIDs := []int64{disabled.ID, first.ID, second.ID, adminHolder.ID}
+	for i, wantID := range wantIDs {
+		if holders[i].UserID != wantID {
+			t.Fatalf("holder order = %+v, want ids %v", holders, wantIDs)
+		}
+	}
+	if !holders[0].Disabled || holders[0].IsAdmin ||
+		holders[0].Roles.Label() != "Thaw approver" {
+		t.Fatalf("disabled holder = %+v", holders[0])
+	}
+	if holders[1].DisplayName != " Same " || holders[1].Email != "a-holder@example.test" ||
+		holders[1].Disabled || holders[1].IsAdmin ||
+		holders[1].Roles.Label() != "Viewer, Freezer, Thaw approver" {
+		t.Fatalf("canonical role holder = %+v", holders[1])
+	}
+	if holders[2].Email != "z-holder@example.test" || holders[2].Roles.Label() != "Viewer" {
+		t.Fatalf("email tie-break holder = %+v", holders[2])
+	}
+	if !holders[3].IsAdmin || holders[3].Roles.Label() != "Freezer" {
+		t.Fatalf("admin projection holder = %+v", holders[3])
+	}
+	for _, excludedID := range []int64{admin.User.ID, noGrant.ID, otherOnly.ID} {
+		for _, holder := range holders {
+			if holder.UserID == excludedID {
+				t.Fatalf("user %d without a current scoped grant entered %+v", excludedID, holders)
+			}
+		}
+	}
+
+	empty, err := service.ListRepositoryRoleHolders(ctx, otherRepositoryID+100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("unknown repository holders = %+v", empty)
+	}
+}
+
+func TestListRepositoryRoleHoldersRejectsZeroRepositoryID(t *testing.T) {
+	service := NewService(nil)
+	if _, err := service.ListRepositoryRoleHolders(context.Background(), 0); !IsValidationError(err) {
+		t.Fatalf("error = %v, want validation error", err)
+	}
+}
+
+func TestListRepositoryRoleHoldersRejectsNegativeRepositoryID(t *testing.T) {
+	service := NewService(nil)
+	if _, err := service.ListRepositoryRoleHolders(context.Background(), -1); !IsValidationError(err) {
+		t.Fatalf("error = %v, want validation error", err)
+	}
+}
+
+func TestListRepositoryRoleHoldersRejectsMalformedStoredRoles(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		corrupt func(int64, int64) (string, []any)
+	}{
+		{
+			name: "repository role",
+			corrupt: func(repositoryID, userID int64) (string, []any) {
+				return `
+INSERT INTO repository_grants(repository_id, user_id, role, granted_at)
+VALUES (?, ?, 'owner', ?)`, []any{repositoryID, userID, time.Now().UTC().Format(time.RFC3339Nano)}
+			},
+		},
+		{
+			name: "comma-smuggled repository roles",
+			corrupt: func(repositoryID, userID int64) (string, []any) {
+				return `
+INSERT INTO repository_grants(repository_id, user_id, role, granted_at)
+VALUES (?, ?, 'viewer,freezer', ?)`, []any{repositoryID, userID, time.Now().UTC().Format(time.RFC3339Nano)}
+			},
+		},
+		{
+			name: "global role projection",
+			corrupt: func(_ int64, userID int64) (string, []any) {
+				return `
+INSERT INTO user_roles(user_id, role, created_at)
+VALUES (?, 'viewer', ?)`, []any{userID, time.Now().UTC().Format(time.RFC3339Nano)}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			database := newAuthTestDB(t, ctx)
+			service := NewService(database)
+			admin := mustCreateFirstAdmin(t, ctx, service)
+			user := mustCreateUser(t, ctx, service, "holder@example.test", false)
+			repositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "thawguard")
+			if err := service.GrantRepositoryRole(ctx, GrantRepositoryRoleParams{
+				ActorUserID:  admin.User.ID,
+				RepositoryID: repositoryID,
+				UserID:       user.ID,
+				Role:         RoleViewer,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			query, args := tc.corrupt(repositoryID, user.ID)
+			execIgnoringCheckConstraints(t, ctx, database, query, args...)
+			if _, err := service.ListRepositoryRoleHolders(ctx, repositoryID); err == nil {
+				t.Fatal("malformed stored role was accepted")
+			}
+		})
+	}
+}
+
 func TestRepositoryGrantSurvivesGranterDeletionWithoutAttribution(t *testing.T) {
 	ctx := context.Background()
 	database := newAuthTestDB(t, ctx)

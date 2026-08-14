@@ -15,8 +15,9 @@ import (
 )
 
 type fakeForgeAccessShadowService struct {
-	view    forgeconnection.AccessShadowView
-	viewErr error
+	view      forgeconnection.AccessShadowView
+	viewErr   error
+	viewCalls int
 
 	runResult forgeconnection.AccessSyncResultCode
 	runErr    error
@@ -53,6 +54,7 @@ func (f *fakeForgeAccessShadowService) DisablePeriodic(
 }
 
 func (f *fakeForgeAccessShadowService) View(context.Context) (forgeconnection.AccessShadowView, error) {
+	f.viewCalls++
 	return f.view, f.viewErr
 }
 
@@ -196,6 +198,10 @@ func TestForgeAccessPageRendersShadowSummaryAndRunForm(t *testing.T) {
 		t.Fatalf("status = %d", response.Code)
 	}
 	body := response.Body.String()
+	if !strings.Contains(body, ">No explicit access</dt>") ||
+		strings.Contains(body, ">No explicit access observed in the complete credential-visible snapshot.</dt>") {
+		t.Fatalf("shadow summary does not use the compact absence count label: %q", body)
+	}
 	for _, fragment := range []string{
 		"Shadow access snapshot",
 		"credential-visible snapshot",
@@ -219,6 +225,7 @@ func TestForgeAccessPageRendersShadowSummaryAndRunForm(t *testing.T) {
 		"576 automatic Activity rows",
 		"Manual snapshots add traffic",
 		"one Thawguard process per SQLite database",
+		"/settings/forge-access/role-evidence",
 		`name="expected_periodic_revision" value="0"`,
 		`name="confirm_periodic_enable" value="periodic-shadow-enable"`,
 		"/settings/forge-access/shadow-access",
@@ -360,6 +367,7 @@ func TestForgeShadowDetailsPageRendersPairEvidence(t *testing.T) {
 		"4 min ago",
 		"Completed evidence becomes stale at ten minutes.",
 		"Scope-changed evidence remains retained and marked until a later complete snapshot replaces it or the Forge connection is reset.",
+		"Current role evidence",
 	} {
 		if !strings.Contains(body, fragment) {
 			t.Fatalf("details page is missing %q", fragment)
