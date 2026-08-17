@@ -379,6 +379,17 @@ type AccessShadowPairRow struct {
 	PriorConfirmedAt     time.Time
 }
 
+// AccessShadowLinkedUser is one current local user linked to the Forge
+// connection. Historical usernames are retained for display, while remote
+// user identifiers stay outside the web-facing view.
+type AccessShadowLinkedUser struct {
+	UserID          int64
+	UserDisplayName string
+	UserEmail       string
+	UserDisabled    bool
+	UsernameAtLink  string
+}
+
 // AccessShadowBoundRepository is one current local repository binding exposed
 // for read-only selection. Remote repository identifiers never enter the view.
 type AccessShadowBoundRepository struct {
@@ -412,6 +423,9 @@ type AccessShadowView struct {
 	// BoundRepositories is populated independently of pair-detail limits so a
 	// read-only repository selector remains truthful for every current binding.
 	BoundRepositories []AccessShadowBoundRepository
+	// LinkedUsers is populated independently of bindings and pair-detail limits
+	// in local user ID order.
+	LinkedUsers []AccessShadowLinkedUser
 	// Pairs is populated only within limits, sorted by local user label,
 	// repository label, then internal ids.
 	Pairs []AccessShadowPairRow

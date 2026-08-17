@@ -21,7 +21,7 @@ const (
 	forgeRoleEvidenceMissingIdentity      = "No linked Forgejo identity in this loaded scope"
 )
 
-type forgeRoleEvidenceRepositoryOption struct {
+type forgeAccessRepositoryOption struct {
 	Value    string
 	Label    string
 	Selected bool
@@ -61,7 +61,7 @@ type forgeRoleEvidencePageData struct {
 
 	HasConnection        bool
 	HasBoundRepositories bool
-	RepositoryOptions    []forgeRoleEvidenceRepositoryOption
+	RepositoryOptions    []forgeAccessRepositoryOption
 	HasSelection         bool
 	SelectedRepository   forgeconnection.AccessShadowBoundRepository
 
@@ -107,13 +107,13 @@ func (s *Server) handleForgeRoleEvidence(w http.ResponseWriter, r *http.Request)
 		CSRFField:            csrfFormField,
 		HasConnection:        view.HasConnection,
 		HasBoundRepositories: len(view.BoundRepositories) > 0,
-		RepositoryOptions:    forgeRoleEvidenceRepositoryOptions(view.BoundRepositories, repositoryID, selected),
+		RepositoryOptions:    forgeAccessRepositoryOptions(view.BoundRepositories, repositoryID, selected),
 	}
 	if !selected {
 		s.renderPageStatus(w, http.StatusOK, "layouts/forge-role-evidence", data)
 		return
 	}
-	boundRepository, found := forgeRoleEvidenceBoundRepository(view.BoundRepositories, repositoryID)
+	boundRepository, found := forgeAccessBoundRepository(view.BoundRepositories, repositoryID)
 	if !found {
 		s.renderErrorPage(w, http.StatusNotFound, false)
 		return
@@ -152,18 +152,18 @@ func parseForgeRoleEvidenceQuery(requestURL *url.URL) (int64, bool, error) {
 	return repositoryID, true, nil
 }
 
-func forgeRoleEvidenceRepositoryOptions(
+func forgeAccessRepositoryOptions(
 	repositories []forgeconnection.AccessShadowBoundRepository,
 	selectedID int64,
 	selected bool,
-) []forgeRoleEvidenceRepositoryOption {
-	options := make([]forgeRoleEvidenceRepositoryOption, 0, len(repositories)+1)
-	options = append(options, forgeRoleEvidenceRepositoryOption{
+) []forgeAccessRepositoryOption {
+	options := make([]forgeAccessRepositoryOption, 0, len(repositories)+1)
+	options = append(options, forgeAccessRepositoryOption{
 		Label:    "Choose a bound repository",
 		Selected: !selected,
 	})
 	for _, repository := range repositories {
-		options = append(options, forgeRoleEvidenceRepositoryOption{
+		options = append(options, forgeAccessRepositoryOption{
 			Value:    strconv.FormatInt(repository.RepositoryID, 10),
 			Label:    repository.RepositoryFullName,
 			Selected: selected && repository.RepositoryID == selectedID,
@@ -172,7 +172,7 @@ func forgeRoleEvidenceRepositoryOptions(
 	return options
 }
 
-func forgeRoleEvidenceBoundRepository(
+func forgeAccessBoundRepository(
 	repositories []forgeconnection.AccessShadowBoundRepository,
 	repositoryID int64,
 ) (forgeconnection.AccessShadowBoundRepository, bool) {
@@ -188,7 +188,7 @@ func forgeRoleEvidenceGate(
 	view forgeconnection.AccessShadowView,
 	repositoryID int64,
 ) (bool, string, string, string) {
-	_, repositoryBound := forgeRoleEvidenceBoundRepository(view.BoundRepositories, repositoryID)
+	_, repositoryBound := forgeAccessBoundRepository(view.BoundRepositories, repositoryID)
 	switch {
 	case !view.HasConnection:
 		return false, forgeRoleEvidenceIndeterminateOutcome, "warning", "No Forge connection is configured."
@@ -333,14 +333,12 @@ func classifyForgeRoleEvidence(
 	pairRunID int64,
 	latestReason forgeconnection.AccessObservationReason,
 ) string {
-	switch {
-	case !gateQualified:
-		return forgeRoleEvidenceIndeterminateOutcome
-	case !pairExists:
-		return forgeRoleEvidenceIndeterminateOutcome
-	case !pairObserved:
-		return forgeRoleEvidenceIndeterminateOutcome
-	case snapshotRunID <= 0 || pairRunID <= 0 || snapshotRunID != pairRunID:
+	if !gateQualified || !forgeRoleEvidencePairAnchored(
+		pairExists,
+		pairObserved,
+		snapshotRunID,
+		pairRunID,
+	) {
 		return forgeRoleEvidenceIndeterminateOutcome
 	}
 	switch latestReason.State() {
@@ -351,6 +349,15 @@ func classifyForgeRoleEvidence(
 	default:
 		return forgeRoleEvidenceIndeterminateOutcome
 	}
+}
+
+func forgeRoleEvidencePairAnchored(
+	pairExists bool,
+	pairObserved bool,
+	snapshotRunID int64,
+	pairRunID int64,
+) bool {
+	return pairExists && pairObserved && snapshotRunID > 0 && pairRunID > 0 && snapshotRunID == pairRunID
 }
 
 func forgeRoleEvidenceOutcomePresentation(

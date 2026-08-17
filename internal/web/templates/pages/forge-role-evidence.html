@@ -102,6 +102,7 @@
   {{ end }}
 
   <div class="flex flex-wrap gap-2">
+    {{ template "ui/button" dict "Label" "Viewer access scenario" "Variant" "secondary" "Href" "/settings/forge-access/viewer-scenario" }}
     {{ template "ui/button" dict "Label" "Full pair evidence" "Variant" "secondary" "Href" "/settings/forge-access/shadow-access" }}
     {{ template "ui/button" dict "Label" "Forge access" "Variant" "secondary" "Href" "/settings/forge-access" }}
     {{ template "ui/button" dict "Label" "Users & Access" "Variant" "secondary" "Href" "/users" }}

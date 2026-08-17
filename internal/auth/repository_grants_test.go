@@ -581,6 +581,97 @@ func TestListRepositoryRoleHoldersRejectsNegativeRepositoryID(t *testing.T) {
 	}
 }
 
+func TestListRepositoryAccessUsersUnionsLinkedUsersWithSelectedRepositoryRoles(t *testing.T) {
+	ctx := context.Background()
+	database := newAuthTestDB(t, ctx)
+	service := NewService(database)
+	admin := mustCreateFirstAdmin(t, ctx, service)
+	linkedOnly := mustCreateUser(t, ctx, service, "linked-only@example.test", false)
+	holder := mustCreateUser(t, ctx, service, "holder@example.test", false)
+	linkedAdmin := mustCreateUser(t, ctx, service, "linked-admin@example.test", true)
+	otherOnly := mustCreateUser(t, ctx, service, "other-only@example.test", false)
+	repositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "thawguard")
+	otherRepositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "other")
+
+	for userID, displayName := range map[int64]string{
+		linkedOnly.ID:  "Alpha",
+		holder.ID:      "Bravo",
+		linkedAdmin.ID: "Charlie",
+		otherOnly.ID:   "Delta",
+	} {
+		if _, err := database.ExecContext(ctx, `UPDATE users SET display_name = ? WHERE id = ?`, displayName, userID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := service.DisableUser(ctx, admin.User.ID, linkedOnly.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.GrantRepositoryRole(ctx, GrantRepositoryRoleParams{
+		ActorUserID:  admin.User.ID,
+		RepositoryID: repositoryID,
+		UserID:       holder.ID,
+		Role:         RoleFreezer,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.GrantRepositoryRole(ctx, GrantRepositoryRoleParams{
+		ActorUserID:  admin.User.ID,
+		RepositoryID: otherRepositoryID,
+		UserID:       otherOnly.ID,
+		Role:         RoleViewer,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	users, err := service.ListRepositoryAccessUsers(ctx, repositoryID, []int64{linkedAdmin.ID, linkedOnly.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(users) != 3 {
+		t.Fatalf("access users = %+v", users)
+	}
+	wantIDs := []int64{linkedOnly.ID, holder.ID, linkedAdmin.ID}
+	for i, wantID := range wantIDs {
+		if users[i].UserID != wantID {
+			t.Fatalf("access user order = %+v, want ids %v", users, wantIDs)
+		}
+	}
+	if !users[0].Disabled || users[0].IsAdmin || len(users[0].Roles) != 0 {
+		t.Fatalf("linked user without selected grant = %+v", users[0])
+	}
+	if users[1].Disabled || users[1].IsAdmin || users[1].Roles.Label() != "Freezer" {
+		t.Fatalf("selected repository holder = %+v", users[1])
+	}
+	if users[2].Disabled || !users[2].IsAdmin || len(users[2].Roles) != 0 {
+		t.Fatalf("linked administrator = %+v", users[2])
+	}
+	for _, user := range users {
+		if user.UserID == otherOnly.ID || user.UserID == admin.User.ID {
+			t.Fatalf("unrelated user entered selected population: %+v", users)
+		}
+	}
+}
+
+func TestListRepositoryAccessUsersRejectsMalformedLinkedIDs(t *testing.T) {
+	service := NewService(nil)
+	for _, ids := range [][]int64{{0}, {-1}, {7, 7}} {
+		if _, err := service.ListRepositoryAccessUsers(context.Background(), 1, ids); !IsValidationError(err) {
+			t.Fatalf("ids %v error = %v, want validation error", ids, err)
+		}
+	}
+}
+
+func TestListRepositoryAccessUsersRejectsMissingLinkedUser(t *testing.T) {
+	ctx := context.Background()
+	database := newAuthTestDB(t, ctx)
+	service := NewService(database)
+	mustCreateFirstAdmin(t, ctx, service)
+	repositoryID := mustCreateTestRepository(t, ctx, database, "taua-almeida", "thawguard")
+	if _, err := service.ListRepositoryAccessUsers(ctx, repositoryID, []int64{999}); err == nil || IsValidationError(err) {
+		t.Fatalf("missing linked user error = %v", err)
+	}
+}
+
 func TestListRepositoryRoleHoldersRejectsMalformedStoredRoles(t *testing.T) {
 	for _, tc := range []struct {
 		name    string

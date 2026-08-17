@@ -13,7 +13,7 @@ import (
 var templateClassAttribute = regexp.MustCompile(`class="([^"]+)"`)
 
 // TestForgeEvidenceTemplatesUseOnlyCompiledSelectors proves every static
-// utility class the shadow-access and role-evidence templates use has a
+// utility class the shadow-access, role-evidence, and Viewer-scenario templates use has a
 // compiled selector in web/static/app.css, so the pages render styled without
 // CSS generation.
 // Class lists computed by primitives carry template actions and are covered
@@ -30,6 +30,8 @@ func TestForgeEvidenceTemplatesUseOnlyCompiledSelectors(t *testing.T) {
 		"../internal/web/templates/layouts/forge-access-shadow.html",
 		"../internal/web/templates/pages/forge-role-evidence.html",
 		"../internal/web/templates/layouts/forge-role-evidence.html",
+		"../internal/web/templates/pages/forge-viewer-scenario.html",
+		"../internal/web/templates/layouts/forge-viewer-scenario.html",
 	} {
 		source, err := os.ReadFile(file)
 		if err != nil {

@@ -142,6 +142,7 @@ type AuthService interface {
 	GetUser(ctx context.Context, userID int64) (auth.User, error)
 	ListUserRepositoryGrants(ctx context.Context, userID int64) ([]auth.RepositoryGrantDetail, error)
 	ListRepositoryRoleHolders(ctx context.Context, repositoryID int64) ([]auth.RepositoryRoleHolder, error)
+	ListRepositoryAccessUsers(ctx context.Context, repositoryID int64, linkedUserIDs []int64) ([]auth.RepositoryAccessUser, error)
 	CreateUser(ctx context.Context, params auth.CreateUserParams) (auth.User, error)
 	SetUserAdmin(ctx context.Context, params auth.SetUserAdminParams) (auth.User, error)
 	SetUserRepositoryRoles(ctx context.Context, params auth.SetUserRepositoryRolesParams) error
@@ -543,6 +544,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /settings/forge-access/repositories/unbind", s.handleForgeRepositoryUnbind)
 	s.mux.HandleFunc("GET /settings/forge-access/shadow-access", s.handleForgeAccessShadow)
 	s.mux.HandleFunc("GET /settings/forge-access/role-evidence", s.handleForgeRoleEvidence)
+	s.mux.HandleFunc("GET /settings/forge-access/viewer-scenario", s.handleForgeViewerScenario)
 	s.mux.HandleFunc("POST /settings/forge-access/shadow-access/run", s.handleForgeAccessShadowRun)
 	s.mux.HandleFunc("POST /settings/forge-access/shadow-access/periodic/enable", s.handleForgeAccessShadowPeriodicEnable)
 	s.mux.HandleFunc("POST /settings/forge-access/shadow-access/periodic/disable", s.handleForgeAccessShadowPeriodicDisable)
