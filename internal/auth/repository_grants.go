@@ -55,10 +55,10 @@ type RepositoryGrantDetail struct {
 	Migrated           bool
 }
 
-// RepositoryRoleHolder is one current user with at least one scoped role on a
-// repository. Admin is projected separately from the canonical scoped role
-// list because it is installation-wide authority, not a repository grant.
-type RepositoryRoleHolder struct {
+// RepositoryAccessUser is one current repository role holder or one supplied
+// linked local user. Admin is projected separately from the canonical scoped
+// role list because it is installation-wide authority, not a repository grant.
+type RepositoryAccessUser struct {
 	UserID      int64
 	Email       string
 	DisplayName string
@@ -66,6 +66,8 @@ type RepositoryRoleHolder struct {
 	IsAdmin     bool
 	Roles       RoleSet
 }
+
+type RepositoryRoleHolder = RepositoryAccessUser
 
 // GrantsForUser loads the repository-aware authorization model for one
 // user. It is an administrative state lookup, not an authentication
@@ -346,18 +348,44 @@ ORDER BY user_id, role`, repositoryID)
 	return grants, nil
 }
 
-// ListRepositoryRoleHolders returns one row for each user with a current
-// scoped grant on the repository. Disabled users remain visible. The query
-// also projects the independent global Admin role without broadening the
-// population beyond repository_grants.
-func (s *Service) ListRepositoryRoleHolders(ctx context.Context, repositoryID int64) ([]RepositoryRoleHolder, error) {
+// ListRepositoryAccessUsers returns the union of current scoped role holders
+// on one repository and supplied linked local users. Disabled users remain
+// visible, and Admin is projected independently from selected-repository
+// grants.
+func (s *Service) ListRepositoryAccessUsers(
+	ctx context.Context,
+	repositoryID int64,
+	linkedUserIDs []int64,
+) ([]RepositoryAccessUser, error) {
 	if repositoryID <= 0 {
 		return nil, ValidationError{Message: "repository was not found"}
+	}
+	if linkedUserIDs == nil {
+		linkedUserIDs = []int64{}
+	}
+	linkedIDSet := make(map[int64]bool, len(linkedUserIDs))
+	for _, userID := range linkedUserIDs {
+		if userID <= 0 || linkedIDSet[userID] {
+			return nil, ValidationError{Message: "linked user id is invalid"}
+		}
+		linkedIDSet[userID] = true
 	}
 	if s == nil || s.db == nil {
 		return nil, errors.New("auth service has no database")
 	}
+	linkedIDsJSON, err := json.Marshal(linkedUserIDs)
+	if err != nil {
+		return nil, fmt.Errorf("encode linked user ids: %w", err)
+	}
 	rows, err := s.db.QueryContext(ctx, `
+WITH population(user_id, role) AS (
+  SELECT user_id, role
+  FROM repository_grants
+  WHERE repository_id = ?
+  UNION ALL
+  SELECT value, NULL
+  FROM json_each(?)
+)
 SELECT
   u.id,
   u.email,
@@ -372,15 +400,14 @@ SELECT
     FROM user_roles ur
     WHERE ur.user_id = u.id
   ),
-  group_concat(rg.role, ','),
-  COUNT(*)
-FROM repository_grants rg
-JOIN users u ON u.id = rg.user_id
-WHERE rg.repository_id = ?
+  group_concat(p.role, ','),
+  COUNT(p.role)
+FROM population p
+JOIN users u ON u.id = p.user_id
 GROUP BY u.id, u.email, u.display_name, u.disabled_at
-ORDER BY lower(trim(u.display_name)), lower(u.email), u.id`, repositoryID)
+ORDER BY lower(trim(u.display_name)), lower(u.email), u.id`, repositoryID, string(linkedIDsJSON))
 	if err != nil {
-		return nil, fmt.Errorf("list repository role holders: %w", err)
+		return nil, fmt.Errorf("list repository access users: %w", err)
 	}
 	defer rows.Close()
 
@@ -389,53 +416,74 @@ ORDER BY lower(trim(u.display_name)), lower(u.email), u.id`, repositoryID)
 	for _, role := range canonicalRoles {
 		validRoles[role] = true
 	}
-	holders := make([]RepositoryRoleHolder, 0)
+	users := make([]RepositoryAccessUser, 0)
+	seenUserIDs := make(map[int64]bool)
 	for rows.Next() {
-		var holder RepositoryRoleHolder
+		var user RepositoryAccessUser
 		var disabled, adminProjection int64
-		var rolesText string
+		var rolesText sql.NullString
 		var roleCount int64
 		if err := rows.Scan(
-			&holder.UserID,
-			&holder.Email,
-			&holder.DisplayName,
+			&user.UserID,
+			&user.Email,
+			&user.DisplayName,
 			&disabled,
 			&adminProjection,
 			&rolesText,
 			&roleCount,
 		); err != nil {
-			return nil, fmt.Errorf("scan repository role holder: %w", err)
+			return nil, fmt.Errorf("scan repository access user: %w", err)
 		}
-		if holder.UserID <= 0 || disabled < 0 || disabled > 1 ||
-			adminProjection < 0 || adminProjection > 1 || roleCount < 1 {
-			return nil, errors.New("repository role holder data is malformed")
+		if user.UserID <= 0 || seenUserIDs[user.UserID] || disabled < 0 || disabled > 1 ||
+			adminProjection < 0 || adminProjection > 1 || roleCount < 0 ||
+			rolesText.Valid != (roleCount > 0) {
+			return nil, errors.New("repository access user data is malformed")
 		}
-		rawRoles := strings.Split(rolesText, ",")
-		if int64(len(rawRoles)) != roleCount {
-			return nil, errors.New("repository role holder data is malformed")
+		supplied := linkedIDSet[user.UserID]
+		if roleCount == 0 && !supplied {
+			return nil, errors.New("repository access user data is malformed")
 		}
-		seenRoles := make(map[Role]bool, len(rawRoles))
-		for _, rawRole := range rawRoles {
-			role := Role(rawRole)
-			if !validRoles[role] || seenRoles[role] {
-				return nil, errors.New("repository role holder data is malformed")
+		seenUserIDs[user.UserID] = true
+		seenRoles := make(map[Role]bool, roleCount)
+		if rolesText.Valid {
+			rawRoles := strings.Split(rolesText.String, ",")
+			if int64(len(rawRoles)) != roleCount {
+				return nil, errors.New("repository access user data is malformed")
 			}
-			seenRoles[role] = true
+			for _, rawRole := range rawRoles {
+				role := Role(rawRole)
+				if !validRoles[role] || seenRoles[role] {
+					return nil, errors.New("repository access user data is malformed")
+				}
+				seenRoles[role] = true
+			}
 		}
-		holder.Disabled = disabled == 1
-		holder.IsAdmin = adminProjection == 1
-		holder.Roles = make(RoleSet, 0, len(seenRoles))
+		user.Disabled = disabled == 1
+		user.IsAdmin = adminProjection == 1
+		user.Roles = make(RoleSet, 0, len(seenRoles))
 		for _, role := range canonicalRoles {
 			if seenRoles[role] {
-				holder.Roles = append(holder.Roles, role)
+				user.Roles = append(user.Roles, role)
 			}
 		}
-		holders = append(holders, holder)
+		delete(linkedIDSet, user.UserID)
+		users = append(users, user)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list repository role holder rows: %w", err)
+		return nil, fmt.Errorf("list repository access user rows: %w", err)
 	}
-	return holders, nil
+	if len(linkedIDSet) != 0 {
+		return nil, errors.New("repository access user data is malformed")
+	}
+	return users, nil
+}
+
+// ListRepositoryRoleHolders retains the scoped-role-only Slice 3C view.
+func (s *Service) ListRepositoryRoleHolders(
+	ctx context.Context,
+	repositoryID int64,
+) ([]RepositoryRoleHolder, error) {
+	return s.ListRepositoryAccessUsers(ctx, repositoryID, nil)
 }
 
 // ListUserRepositoryGrants returns retained grants and honest attribution for

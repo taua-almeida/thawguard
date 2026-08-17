@@ -130,11 +130,34 @@ func qualifyingRoleEvidenceView() forgeconnection.AccessShadowView {
 		BoundRepositories: []forgeconnection.AccessShadowBoundRepository{
 			{RepositoryID: 11, RepositoryFullName: "fixture-org/alpha"},
 		},
+		LinkedUsers: []forgeconnection.AccessShadowLinkedUser{
+			{
+				UserID:          1,
+				UserDisplayName: "Admin holder",
+				UserEmail:       "admin-holder@example.test",
+				UsernameAtLink:  "admin-user",
+			},
+			{
+				UserID:          2,
+				UserDisplayName: "Approver",
+				UserEmail:       "approver@example.test",
+				UsernameAtLink:  "approver-user",
+			},
+			{
+				UserID:          4,
+				UserDisplayName: "Disabled holder",
+				UserEmail:       "disabled@example.test",
+				UserDisabled:    true,
+				UsernameAtLink:  "disabled-user",
+			},
+		},
 		Pairs: []forgeconnection.AccessShadowPairRow{
 			{
 				IdentityID:         21,
 				UserID:             1,
 				RepositoryID:       11,
+				UserDisplayName:    "Admin holder",
+				UserEmail:          "admin-holder@example.test",
 				UsernameAtLink:     "admin-user",
 				RepositoryFullName: "fixture-org/alpha",
 				Observed:           true,
@@ -146,6 +169,8 @@ func qualifyingRoleEvidenceView() forgeconnection.AccessShadowView {
 				IdentityID:         22,
 				UserID:             2,
 				RepositoryID:       11,
+				UserDisplayName:    "Approver",
+				UserEmail:          "approver@example.test",
 				UsernameAtLink:     "approver-user",
 				RepositoryFullName: "fixture-org/alpha",
 				Observed:           true,
@@ -157,6 +182,9 @@ func qualifyingRoleEvidenceView() forgeconnection.AccessShadowView {
 				IdentityID:         24,
 				UserID:             4,
 				RepositoryID:       11,
+				UserDisplayName:    "Disabled holder",
+				UserEmail:          "disabled@example.test",
+				UserDisabled:       true,
 				UsernameAtLink:     "disabled-user",
 				RepositoryFullName: "fixture-org/alpha",
 				Observed:           true,
@@ -455,6 +483,7 @@ func TestForgeRoleEvidencePageRendersReadOnlyComparison(t *testing.T) {
 		"Freezer",
 		"Thaw approver",
 		`href="/settings/forge-access/shadow-access"`,
+		`href="/settings/forge-access/viewer-scenario"`,
 		`href="/settings/forge-access"`,
 		`href="/users"`,
 	} {

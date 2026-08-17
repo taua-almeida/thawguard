@@ -85,7 +85,17 @@ func (s *AccessShadowService) View(ctx context.Context) (AccessShadowView, error
 	if err != nil {
 		return AccessShadowView{}, err
 	}
-	view.IdentityCount = len(identities)
+	view.LinkedUsers = make([]AccessShadowLinkedUser, 0, len(identities))
+	for _, identity := range identities {
+		view.LinkedUsers = append(view.LinkedUsers, AccessShadowLinkedUser{
+			UserID:          identity.userID,
+			UserDisplayName: identity.displayName,
+			UserEmail:       identity.email,
+			UserDisabled:    identity.disabled,
+			UsernameAtLink:  identity.usernameAtLink,
+		})
+	}
+	view.IdentityCount = len(view.LinkedUsers)
 	view.BindingCount = len(bindings)
 	view.WithinLimits = accessShadowScopeWithinLimits(len(identities), len(bindings))
 	view.BoundRepositories = bindings
@@ -343,12 +353,13 @@ SELECT i.id, i.user_id, i.username_at_link, u.display_name, u.email, u.disabled_
 FROM forgejo_identities i
 JOIN users u ON u.id = i.user_id
 WHERE i.connection_id = ?
-ORDER BY i.id`, connectionID)
+ORDER BY i.user_id`, connectionID)
 	if err != nil {
 		return nil, fmt.Errorf("read forge access shadow identity labels: %w", err)
 	}
 	defer rows.Close()
 	labels := make([]accessShadowIdentityLabel, 0, AccessShadowIdentityLimit)
+	var previousUserID int64
 	for rows.Next() {
 		var label accessShadowIdentityLabel
 		var disabled int64
@@ -362,12 +373,14 @@ ORDER BY i.id`, connectionID)
 		); err != nil {
 			return nil, fmt.Errorf("scan forge access shadow identity label: %w", err)
 		}
-		if label.identityID <= 0 || label.userID <= 0 || !validRemoteName(label.usernameAtLink) ||
+		if label.identityID <= 0 || label.userID <= 0 || label.userID == previousUserID ||
+			!validRemoteName(label.usernameAtLink) ||
 			disabled < 0 || disabled > 1 {
 			return nil, errors.New("forge access shadow identity data is malformed")
 		}
 		label.disabled = disabled == 1
 		labels = append(labels, label)
+		previousUserID = label.userID
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("read forge access shadow identity label rows: %w", err)

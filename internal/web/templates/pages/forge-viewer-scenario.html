@@ -1,0 +1,136 @@
+{{ define "pages/forge-viewer-scenario" }}
+<div class="flex min-w-0 flex-col gap-6">
+  <header>
+    <h1 class="m-0 text-page-title font-bold text-text">Viewer access scenario</h1>
+    <p class="m-0 mt-1 text-sm text-text-muted">Calculate a Viewer-only scenario for one currently bound repository without saving or changing authority.</p>
+  </header>
+
+  <div class="flex min-w-0 flex-col gap-3" role="note">
+    {{ template "ui/callout" dict "Tone" "info" "Title" "Unsaved and no authority" "Body" "This is an unsaved request-time scenario. It preserves every current role and changes no Thawguard or Forgejo authority. It is not a saved policy, exact preflight, Apply plan, or reusable authorization proof." }}
+    {{ template "ui/callout" dict "Tone" "info" "Title" "Separate local reads" "Body" "Forge linkage and evidence are loaded separately from local account and role state. They may change between those reads, so this is not an atomic authorization snapshot." }}
+    {{ template "ui/callout" dict "Tone" "info" "Title" "Request values may be logged" "Body" "Thawguard stores no scenario or Activity event. The repository and baseline values in this URL may still appear in browser history or deployment access logs." }}
+  </div>
+
+  <section class="min-w-0 rounded-panel border border-border bg-surface p-4 shadow-card sm:p-6" aria-labelledby="viewer-scenario-selector-title">
+    <h2 id="viewer-scenario-selector-title" class="m-0 text-lg font-bold text-text">Scenario inputs</h2>
+    <p class="m-0 mt-1 text-sm text-text-muted">Choose one currently bound repository. The optional baseline can only add Viewer for qualifying linked users.</p>
+    <form method="get" action="/settings/forge-access/viewer-scenario" class="mt-4 flex min-w-0 flex-col gap-4">
+      <div class="w-full max-w-md">{{ template "ui/select" dict "ID" "viewer-scenario-repository" "Name" "repository_id" "Label" "Bound repository" "Required" true "Disabled" (not .HasBoundRepositories) "Options" .RepositoryOptions }}</div>
+      <div class="max-w-md">{{ template "ui/checkbox" dict "ID" "viewer-scenario-baseline" "Name" "viewer_baseline" "Value" "qualifying_explicit_access" "Label" "Include Viewer for qualifying linked users" "Hint" "Uses only the strict current shadow-evidence gate for this request." "Checked" .BaselineOn "Disabled" (not .HasBoundRepositories) }}</div>
+      <div>{{ template "ui/button" dict "Label" "Calculate scenario" "Variant" "primary" "Type" "submit" "Disabled" (not .HasBoundRepositories) }}</div>
+    </form>
+  </section>
+
+  {{ if not .HasSelection }}
+    {{ if not .HasConnection }}
+    {{ template "ui/empty-state" dict "Title" "No Forge connection configured" "Hint" "Configure Forge access before calculating a Viewer scenario." "Icon" "tg-i-lock" }}
+    {{ else if not .HasBoundRepositories }}
+    {{ template "ui/empty-state" dict "Title" "No bound repositories" "Hint" "Bind an existing local repository in Forge access before calculating a Viewer scenario." "Icon" "tg-i-repositories" }}
+    {{ else }}
+    {{ template "ui/empty-state" dict "Title" "Choose a repository" "Hint" "The unsaved scenario is calculated only after an exact bound repository is selected." "Icon" "tg-i-search" }}
+    {{ end }}
+  {{ else }}
+
+  <section class="min-w-0 rounded-panel border border-border bg-surface p-4 shadow-card sm:p-6" aria-labelledby="viewer-scenario-context-title">
+    <div class="flex flex-wrap items-start justify-between gap-3">
+      <div>
+        <h2 id="viewer-scenario-context-title" class="m-0 text-lg font-bold text-text">Scenario and evidence context</h2>
+        <p class="m-0 mt-1 break-all font-mono text-sm text-text">{{ .SelectedRepository.RepositoryFullName }}</p>
+        <p class="m-0 mt-1 text-sm text-text-muted">The strict evidence gate controls only Viewer eligibility. Encryption availability and periodic health remain separate status axes.</p>
+      </div>
+      <div class="flex flex-wrap gap-2">
+        {{ if .BaselineOn }}{{ template "ui/badge" dict "Label" "Baseline on" "Tone" "info" }}{{ else }}{{ template "ui/badge" dict "Label" "Baseline off" "Tone" "neutral" }}{{ end }}
+        {{ template "ui/badge" dict "Label" .GateLabel "Tone" .GateTone }}
+      </div>
+    </div>
+    <div class="mt-4" role="status">{{ template "ui/callout" dict "Tone" .GateTone "Title" .GateLabel "Body" .GateDetail }}</div>
+    {{ if .HasNewerAttempt }}<div class="mt-4" role="alert">{{ template "ui/callout" dict "Tone" "warning" "Title" "Newer non-completed attempt" "Body" .NewerAttemptDetail }}</div>{{ end }}
+    <div class="mt-5">{{ template "components/forge-shadow-summary" dict "Shadow" .Shadow "DetailsLink" false }}</div>
+  </section>
+
+  <section class="min-w-0 rounded-panel border border-border bg-surface p-4 shadow-card sm:p-6" aria-labelledby="viewer-scenario-counts-title">
+    <h2 id="viewer-scenario-counts-title" class="m-0 text-lg font-bold text-text">Scenario outcome counts</h2>
+    <p class="m-0 mt-1 text-sm text-text-muted">Every population member appears in exactly one outcome. Disabled accounts remain visible.</p>
+    <dl class="mt-4 grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-2">
+      <div class="rounded-card border border-border bg-surface-muted p-4"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Current Viewer retained</dt><dd class="m-0 mt-2 text-lg font-bold text-text">{{ .Counts.CurrentViewer }}</dd></div>
+      <div class="rounded-card border border-border bg-surface-muted p-4"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Scenario adds Viewer</dt><dd class="m-0 mt-2 text-lg font-bold text-text">{{ .Counts.AddedViewer }}</dd></div>
+      <div class="rounded-card border border-border bg-surface-muted p-4"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Viewer eligibility indeterminate</dt><dd class="m-0 mt-2 text-lg font-bold text-text">{{ .Counts.IndeterminateViewer }}</dd></div>
+      <div class="rounded-card border border-border bg-surface-muted p-4"><dt class="text-xs font-semibold uppercase tracking-wide text-text-muted">Scenario adds nothing</dt><dd class="m-0 mt-2 text-lg font-bold text-text">{{ .Counts.NoChange }}</dd></div>
+    </dl>
+  </section>
+
+  <section class="min-w-0 rounded-panel border border-border bg-surface p-4 shadow-card sm:p-6" aria-labelledby="viewer-scenario-population-title">
+    <h2 id="viewer-scenario-population-title" class="m-0 text-lg font-bold text-text">Ordered scenario population</h2>
+    <p class="m-0 mt-1 text-sm text-text-muted">Current roles are retained. Account state, Administrator authority, scoped roles, linkage, evidence, and the scenario outcome are shown independently.</p>
+    {{ if not .Rows }}
+    <div class="mt-4">{{ template "ui/empty-state" dict "Title" "No scenario population" "Hint" "No linked local users or current scoped role holders are available for this repository." "Icon" "tg-i-users" }}</div>
+    {{ else }}
+    <div class="mt-4 overflow-x-auto rounded-panel border border-border bg-surface shadow-card">
+      <table class="w-full border-collapse text-sm">
+        <caption class="sr-only">Ordered Viewer scenario population and independent decision axes</caption>
+        <thead>
+          <tr class="bg-surface-muted text-left">
+            <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Population member</th>
+            <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Account state</th>
+            <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Admin</th>
+            <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Current roles</th>
+            <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Linkage</th>
+            <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Evidence</th>
+            <th scope="col" class="px-4 py-3 text-xs font-bold tracking-wide text-text-muted uppercase">Scenario outcome</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{ range .Rows }}
+          <tr class="border-t border-border">
+            <td class="px-4 py-3 align-top">
+              <p class="m-0 font-semibold text-text">{{ .DisplayName }}</p>
+              <p class="m-0 mt-1 break-all text-xs text-text-muted">{{ .Email }}</p>
+            </td>
+            <td class="px-4 py-3 align-top">
+              {{ if .Disabled }}
+              {{ template "ui/badge" dict "Label" "Disabled" "Tone" "warning" }}
+              <p class="m-0 mt-2 text-xs font-semibold text-warning">Non-exercisable while disabled</p>
+              {{ else }}
+              {{ template "ui/badge" dict "Label" "Enabled" "Tone" "success" }}
+              {{ end }}
+            </td>
+            <td class="px-4 py-3 align-top">{{ if .IsAdmin }}{{ template "ui/badge" dict "Label" "Administrator" "Tone" "info" }}{{ else }}{{ template "ui/badge" dict "Label" "Not Administrator" "Tone" "neutral" }}{{ end }}</td>
+            <td class="px-4 py-3 align-top">
+              {{ if .ScopedRoles }}<div class="flex flex-wrap gap-1.5">{{ range .ScopedRoles }}{{ template "ui/badge" dict "Label" . "Tone" "neutral" }}{{ end }}</div>{{ else }}<span class="text-xs text-text-muted">No scoped roles</span>{{ end }}
+            </td>
+            <td class="px-4 py-3 align-top">
+              {{ if .Linked }}
+              {{ template "ui/badge" dict "Label" "Linked" "Tone" "success" }}
+              <p class="m-0 mt-2 text-xs text-text-muted">Current local account linkage</p>
+              <p class="m-0 mt-1 text-xs text-text-muted">Forgejo username at link (historical): {{ .UsernameAtLink }}</p>
+              {{ else }}
+              {{ template "ui/badge" dict "Label" "Unlinked" "Tone" "neutral" }}
+              <p class="m-0 mt-2 text-xs text-text-muted">No linked Forgejo identity in this loaded scope</p>
+              {{ end }}
+            </td>
+            <td class="px-4 py-3 align-top">
+              {{ template "ui/badge" dict "Label" .EvidenceLabel "Tone" .EvidenceTone }}
+              {{ if .EvidenceDetail }}<p class="m-0 mt-2 text-xs text-text-muted">{{ .EvidenceDetail }}</p>{{ end }}
+              {{ if .EvidenceObservedAt }}<p class="m-0 mt-1 text-xs text-text-muted">Observed {{ .EvidenceObservedAt }} · {{ .EvidenceAge }}</p>{{ end }}
+            </td>
+            <td class="px-4 py-3 align-top">
+              {{ template "ui/badge" dict "Label" .ScenarioOutcome "Tone" .ScenarioTone }}
+              <p class="m-0 mt-2 text-xs text-text-muted">{{ .ScenarioDetail }}</p>
+            </td>
+          </tr>
+          {{ end }}
+        </tbody>
+      </table>
+    </div>
+    {{ end }}
+  </section>
+  {{ end }}
+
+  <div class="flex flex-wrap gap-2">
+    {{ template "ui/button" dict "Label" "Current role evidence" "Variant" "secondary" "Href" "/settings/forge-access/role-evidence" }}
+    {{ template "ui/button" dict "Label" "Full pair evidence" "Variant" "secondary" "Href" "/settings/forge-access/shadow-access" }}
+    {{ template "ui/button" dict "Label" "Forge access" "Variant" "secondary" "Href" "/settings/forge-access" }}
+    {{ template "ui/button" dict "Label" "Users & Access" "Variant" "secondary" "Href" "/users" }}
+  </div>
+</div>
+{{ end }}

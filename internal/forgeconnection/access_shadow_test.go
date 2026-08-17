@@ -878,6 +878,22 @@ func TestAccessShadowViewDerivesAttemptSnapshotAndPairs(t *testing.T) {
 		view.BoundRepositories[1] != (AccessShadowBoundRepository{RepositoryID: 12, RepositoryFullName: "fixture-org/beta"}) {
 		t.Fatalf("bound repository selector = %+v", view.BoundRepositories)
 	}
+	if view.IdentityCount != len(view.LinkedUsers) || len(view.LinkedUsers) != 2 ||
+		view.LinkedUsers[0] != (AccessShadowLinkedUser{
+			UserID:          fixture.adminID,
+			UserDisplayName: "Administrator",
+			UserEmail:       "admin@example.test",
+			UsernameAtLink:  "admin-user",
+		}) ||
+		view.LinkedUsers[1] != (AccessShadowLinkedUser{
+			UserID:          2,
+			UserDisplayName: "Developer",
+			UserEmail:       "dev@example.test",
+			UserDisabled:    true,
+			UsernameAtLink:  "dev-user",
+		}) {
+		t.Fatalf("linked users = %+v", view.LinkedUsers)
+	}
 	for _, pair := range view.Pairs {
 		if pair.Observed {
 			t.Fatalf("pair observed before any run: %+v", pair)
@@ -1026,10 +1042,83 @@ VALUES (?, 1, ?, ?, ?, ?)`,
 			t.Fatal(err)
 		}
 		assertBoundRepositories(t, view)
-		if view.IdentityCount != 11 || view.WithinLimits || len(view.Pairs) != 0 {
+		if view.IdentityCount != 11 || len(view.LinkedUsers) != 11 || view.WithinLimits || len(view.Pairs) != 0 {
 			t.Fatalf("over-limit detail = %+v", view)
 		}
 	})
+}
+
+func TestAccessShadowViewKeepsLinkedUsersWithoutBindings(t *testing.T) {
+	fixture := newAccessShadowFixture(t)
+	if _, err := fixture.database.Exec(`DELETE FROM forge_repository_bindings`); err != nil {
+		t.Fatal(err)
+	}
+	view, err := fixture.service.View(fixture.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.BindingCount != 0 || len(view.Pairs) != 0 ||
+		view.IdentityCount != 2 || len(view.LinkedUsers) != 2 {
+		t.Fatalf("view without bindings = %+v", view)
+	}
+	if view.LinkedUsers[0].UserID != 1 || view.LinkedUsers[1].UserID != 2 {
+		t.Fatalf("linked user order = %+v", view.LinkedUsers)
+	}
+}
+
+func TestLoadAccessShadowIdentityLabelsOrdersByUserAndRejectsAdjacentDuplicates(t *testing.T) {
+	ctx := context.Background()
+	database, err := db.Open(ctx, db.DefaultConfig(filepath.Join(t.TempDir(), "identity-labels.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if _, err := database.ExecContext(ctx, `
+CREATE TABLE users (
+  id INTEGER PRIMARY KEY,
+  email TEXT NOT NULL,
+  display_name TEXT NOT NULL,
+  disabled_at TEXT
+);
+CREATE TABLE forgejo_identities (
+  id INTEGER PRIMARY KEY,
+  connection_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  username_at_link TEXT NOT NULL
+);
+INSERT INTO users(id, email, display_name) VALUES
+  (1, 'first@example.test', 'First'),
+  (2, 'second@example.test', 'Second');
+INSERT INTO forgejo_identities(id, connection_id, user_id, username_at_link) VALUES
+  (10, 1, 2, 'second-user'),
+  (20, 1, 1, 'first-user')`); err != nil {
+		t.Fatal(err)
+	}
+	labels, err := loadAccessShadowIdentityLabels(ctx, database, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(labels) != 2 || labels[0].userID != 1 || labels[1].userID != 2 {
+		t.Fatalf("identity label order = %+v", labels)
+	}
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO forgejo_identities(id, connection_id, user_id, username_at_link)
+VALUES (30, 1, 1, 'duplicate-user')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadAccessShadowIdentityLabels(ctx, database, 1); err == nil {
+		t.Fatal("adjacent duplicate linked user was accepted")
+	}
+}
+
+func TestAccessShadowViewRejectsMalformedHistoricalUsername(t *testing.T) {
+	fixture := newAccessShadowFixture(t)
+	if _, err := fixture.database.Exec(`UPDATE forgejo_identities SET username_at_link = char(10) WHERE id = 21`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.service.View(fixture.ctx); err == nil {
+		t.Fatal("malformed historical username was accepted")
+	}
 }
 
 func TestBuildAccessShadowPairRowsRejectsDuplicateUserRepositoryKeys(t *testing.T) {
