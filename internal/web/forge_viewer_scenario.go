@@ -353,7 +353,7 @@ func forgeViewerScenarioRows(
 			if row.EvidenceDetail == "" {
 				return nil, forgeViewerScenarioCounts{}, errors.New("viewer scenario indeterminate evidence detail is missing")
 			}
-			row.ScenarioDetail = "Viewer eligibility remains indeterminate. The Evidence column reports: " + row.EvidenceDetail
+			row.ScenarioDetail = "Viewer eligibility remains indeterminate. Evidence detail: " + row.EvidenceDetail
 		}
 		if forgeRoleEvidencePairAnchored(
 			pairExists,
@@ -450,7 +450,7 @@ func forgeViewerScenarioPresentation(reason forgeViewerScenarioReason) (string, 
 	case forgeViewerReasonEvidenceGateFailed:
 		return forgeViewerIndeterminateOutcome, "warning", "Viewer eligibility remains indeterminate. See the global evidence gate above for the blocking facts.", nil
 	case forgeViewerReasonPairIndeterminate:
-		return forgeViewerIndeterminateOutcome, "warning", "Viewer eligibility remains indeterminate. See this row's Evidence column.", nil
+		return forgeViewerIndeterminateOutcome, "warning", "Viewer eligibility remains indeterminate. Review the evidence detail for this population member.", nil
 	case forgeViewerReasonBaselineOff:
 		return forgeViewerNoChangeOutcome, "neutral", "The Viewer baseline is off, so the scenario adds nothing. Every current role is retained.", nil
 	case forgeViewerReasonAccountDisabled:
