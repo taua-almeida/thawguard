@@ -20,6 +20,11 @@ type viewerScenarioAccessCall struct {
 	linkedIDs    []int64
 }
 
+const (
+	viewerScenarioDesktopWrapperClass = "mt-4 hidden overflow-x-auto rounded-panel border border-border bg-surface shadow-card md:block"
+	viewerScenarioMobileWrapperClass  = "mt-4 flex flex-col gap-3 md:hidden"
+)
+
 type fakeViewerScenarioAuthService struct {
 	AuthService
 	session auth.Session
@@ -232,7 +237,7 @@ func TestForgeViewerScenarioPresentationDetails(t *testing.T) {
 		},
 		{
 			reason: forgeViewerReasonPairIndeterminate, outcome: forgeViewerIndeterminateOutcome,
-			detail: "Viewer eligibility remains indeterminate. See this row's Evidence column.",
+			detail: "Viewer eligibility remains indeterminate. Review the evidence detail for this population member.",
 		},
 		{
 			reason: forgeViewerReasonSupportingEvidence, outcome: forgeViewerAddedOutcome,
@@ -319,7 +324,7 @@ func TestForgeViewerScenarioRowsUseBaselineAndExactCurrentPairEvidence(t *testin
 		t.Fatal(err)
 	}
 	if rows[2].ScenarioOutcome != forgeViewerIndeterminateOutcome ||
-		rows[2].ScenarioDetail != "Viewer eligibility remains indeterminate. The Evidence column reports: The pair observation does not belong to the qualifying completed snapshot." ||
+		rows[2].ScenarioDetail != "Viewer eligibility remains indeterminate. Evidence detail: The pair observation does not belong to the qualifying completed snapshot." ||
 		rows[2].EvidenceObservedAt != "" || rows[2].EvidenceAge != "" {
 		t.Fatalf("non-current pair row = %+v", rows[2])
 	}
@@ -637,6 +642,310 @@ func TestForgeViewerScenarioPageRendersUnsavedScenario(t *testing.T) {
 		if strings.Contains(body, control) {
 			t.Fatalf("page contains forbidden control %q", control)
 		}
+	}
+}
+
+func TestForgeViewerScenarioPageRendersResponsivePopulation(t *testing.T) {
+	view := qualifyingViewerScenarioView()
+	users := viewerScenarioAccessUsers()
+	server, _, _, session := newViewerScenarioServer(view, users)
+	response := viewerScenarioGET(
+		server,
+		session,
+		"viewer_baseline=qualifying_explicit_access&repository_id=11",
+		false,
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", response.Code, response.Body.String())
+	}
+
+	body := response.Body.String()
+	desktop := renderedElementWithExactClass(t, body, "div", viewerScenarioDesktopWrapperClass)
+	if !strings.Contains(desktop, "<table ") || strings.Contains(desktop, "<article ") {
+		t.Fatalf("desktop population wrapper does not contain only the table: %q", desktop)
+	}
+	mobile := renderedElementWithExactClass(t, body, "div", viewerScenarioMobileWrapperClass)
+	if strings.Contains(mobile, "<table ") {
+		t.Fatalf("mobile population wrapper contains the desktop table: %q", mobile)
+	}
+	articles := renderedElementsByTag(t, mobile, "article")
+	if len(articles) != len(users) {
+		t.Fatalf("mobile article count = %d, want %d", len(articles), len(users))
+	}
+
+	qualified, _, _, _ := forgeRoleEvidenceGate(view, 11)
+	rows, _, err := forgeViewerScenarioRows(view, 11, true, qualified, users)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		article := renderedViewerScenarioArticle(t, articles, row.DisplayName)
+		disclosureIndex := strings.Index(article, "<details ")
+		if disclosureIndex < 0 {
+			t.Fatalf("mobile article for %q has no disclosure", row.DisplayName)
+		}
+		visible := article[:disclosureIndex]
+		assertRenderedOrder(t, visible, row.ScenarioOutcome, row.ScenarioDetail, "Current roles")
+		if headingIndex := strings.Index(visible, ">"+row.DisplayName+"</h3>"); headingIndex < 0 {
+			t.Fatalf("mobile article for %q does not use a heading", row.DisplayName)
+		} else if emailIndex := strings.Index(visible, ">"+row.Email+"</p>"); emailIndex < headingIndex {
+			t.Fatalf("mobile article for %q does not place email after its heading", row.DisplayName)
+		}
+		if row.ScopedRoles == nil || len(row.ScopedRoles) == 0 {
+			if !strings.Contains(visible, "No scoped roles") {
+				t.Fatalf("mobile article for %q omits its empty role state", row.DisplayName)
+			}
+		} else {
+			for _, role := range row.ScopedRoles {
+				if !strings.Contains(visible, ">"+role+"</span>") {
+					t.Fatalf("mobile article for %q omits current role %q", row.DisplayName, role)
+				}
+			}
+		}
+
+		details := renderedFirstElementByTag(t, article, "details")
+		openingTag := details[:strings.Index(details, ">")]
+		if strings.Contains(openingTag, " open") {
+			t.Fatalf("mobile disclosure for %q is open by default: %q", row.DisplayName, openingTag)
+		}
+		summary := "Evidence and account details — " + row.DisplayName
+		if !strings.Contains(details, ">"+summary+"</summary>") {
+			t.Fatalf("mobile disclosure for %q is not person-qualified: %q", row.DisplayName, details)
+		}
+
+		state := "Enabled"
+		if row.Disabled {
+			state = "Disabled"
+			for _, fragment := range []string{">Disabled</span>", "Non-exercisable while disabled"} {
+				if !strings.Contains(visible, fragment) {
+					t.Fatalf("disabled truth for %q is not visible before disclosure: %q", row.DisplayName, fragment)
+				}
+			}
+		}
+		adminState := "Not Administrator"
+		if row.IsAdmin {
+			adminState = "Administrator"
+		}
+		for _, fragment := range []string{
+			">Account state</dt>",
+			">" + state + "</span>",
+			">Administrator state</dt>",
+			">" + adminState + "</span>",
+			">Linkage</dt>",
+			">Evidence</dt>",
+			">" + row.EvidenceLabel + "</span>",
+		} {
+			if !strings.Contains(details, fragment) {
+				t.Fatalf("mobile disclosure for %q omits %q", row.DisplayName, fragment)
+			}
+		}
+		if row.Linked {
+			for _, fragment := range []string{
+				">Linked</span>",
+				"Current local account linkage",
+				"Forgejo username at link (historical): <span class=\"break-all\">" + row.UsernameAtLink + "</span>",
+			} {
+				if !strings.Contains(details, fragment) {
+					t.Fatalf("mobile disclosure for %q omits linked detail %q", row.DisplayName, fragment)
+				}
+			}
+		} else if !strings.Contains(details, ">Unlinked</span>") ||
+			!strings.Contains(details, "No linked Forgejo identity in this loaded scope") ||
+			strings.Contains(details, "Forgejo username at link") {
+			t.Fatalf("mobile disclosure for %q has incorrect unlinked details: %q", row.DisplayName, details)
+		}
+		if row.EvidenceDetail != "" && !strings.Contains(details, row.EvidenceDetail) {
+			t.Fatalf("mobile disclosure for %q omits evidence detail %q", row.DisplayName, row.EvidenceDetail)
+		}
+		if row.EvidenceObservedAt != "" {
+			observed := "Observed " + row.EvidenceObservedAt + " · " + row.EvidenceAge
+			if !strings.Contains(details, observed) {
+				t.Fatalf("mobile disclosure for %q omits %q", row.DisplayName, observed)
+			}
+		} else if strings.Contains(details, "Observed ") {
+			t.Fatalf("mobile disclosure for %q invents observed-at evidence", row.DisplayName)
+		}
+	}
+
+	for _, forbidden := range []string{
+		"<form", "<button", "<input", "<select", "<textarea", " action=", " method=\"post\"", " hx-",
+		">Save<", ">Apply<", ">Allow<", ">Deny<",
+	} {
+		if strings.Contains(mobile, forbidden) {
+			t.Fatalf("mobile population contains forbidden mutation surface %q", forbidden)
+		}
+	}
+}
+
+func TestForgeViewerScenarioMobileDisabledViewerRetainsVisibleTruth(t *testing.T) {
+	users := viewerScenarioAccessUsers()
+	for i := range users {
+		if users[i].UserID == 4 {
+			users[i].Roles = auth.RoleSet{auth.RoleViewer}
+		}
+	}
+	server, _, _, session := newViewerScenarioServer(qualifyingViewerScenarioView(), users)
+	response := viewerScenarioGET(
+		server,
+		session,
+		"viewer_baseline=qualifying_explicit_access&repository_id=11",
+		false,
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", response.Code, response.Body.String())
+	}
+
+	mobile := renderedElementWithExactClass(t, response.Body.String(), "div", viewerScenarioMobileWrapperClass)
+	article := renderedViewerScenarioArticle(t, renderedElementsByTag(t, mobile, "article"), "Disabled holder")
+	visible := article[:strings.Index(article, "<details ")]
+	assertRenderedOrder(
+		t,
+		visible,
+		">Disabled</span>",
+		"Non-exercisable while disabled",
+		forgeViewerCurrentOutcome,
+		"The current Viewer role is retained. No role is removed by this scenario.",
+		"Current roles",
+		">Viewer</span>",
+	)
+}
+
+func TestForgeViewerScenarioMobileCardsWrapLongUnbrokenValues(t *testing.T) {
+	displayName := strings.Repeat("DisplayName", 24)
+	email := strings.Repeat("email", 40) + "@example.test"
+	username := strings.Repeat("username", 32)
+	evidence := strings.Repeat("evidence", 48)
+	data := forgeViewerScenarioPageData{
+		AppName:              "Thawguard",
+		PageTitle:            "Viewer access scenario",
+		ActivePage:           "forge-access",
+		HasConnection:        true,
+		HasBoundRepositories: true,
+		HasSelection:         true,
+		SelectedRepository: forgeconnection.AccessShadowBoundRepository{
+			RepositoryID:       11,
+			RepositoryFullName: "fixture-org/alpha",
+		},
+		Rows: []forgeViewerScenarioRowView{
+			{
+				DisplayName:        displayName,
+				Email:              email,
+				Linked:             true,
+				UsernameAtLink:     username,
+				EvidenceLabel:      forgeRoleEvidenceIndeterminateOutcome,
+				EvidenceTone:       "warning",
+				EvidenceDetail:     evidence,
+				EvidenceObservedAt: "2026-08-14 09:58:00 UTC",
+				EvidenceAge:        "2 min ago",
+				ScenarioOutcome:    forgeViewerIndeterminateOutcome,
+				ScenarioTone:       "warning",
+				ScenarioDetail:     "Viewer eligibility remains indeterminate. Evidence detail: " + evidence,
+			},
+		},
+	}
+	var rendered bytes.Buffer
+	if err := pageTemplates.ExecuteTemplate(&rendered, "layouts/forge-viewer-scenario", data); err != nil {
+		t.Fatal(err)
+	}
+
+	mobile := renderedElementWithExactClass(t, rendered.String(), "div", viewerScenarioMobileWrapperClass)
+	article := renderedFirstElementByTag(t, mobile, "article")
+	for _, fragment := range []string{
+		`<article class="min-w-0 rounded-card border border-border bg-surface p-4">`,
+		`<h3 class="m-0 break-words text-sm font-bold text-text">` + displayName + `</h3>`,
+		`<p class="m-0 mt-1 break-all text-xs text-text-muted">` + email + `</p>`,
+		`<summary class="cursor-pointer break-words text-sm font-semibold text-accent-strong">Evidence and account details — ` + displayName + `</summary>`,
+		`<span class="break-all">` + username + `</span>`,
+		`<p class="m-0 mt-2 break-words text-xs text-text-muted">` + evidence + `</p>`,
+	} {
+		if !strings.Contains(article, fragment) {
+			t.Fatalf("long-value mobile article is missing %q", fragment)
+		}
+	}
+}
+
+func renderedElementWithExactClass(t *testing.T, body, tag, class string) string {
+	t.Helper()
+	marker := "<" + tag + ` class="` + class + `">`
+	start := strings.Index(body, marker)
+	if start < 0 {
+		t.Fatalf("rendered page is missing exact %s wrapper class %q", tag, class)
+	}
+	return renderedElementAt(t, body, tag, start)
+}
+
+func renderedFirstElementByTag(t *testing.T, body, tag string) string {
+	t.Helper()
+	start := strings.Index(body, "<"+tag)
+	if start < 0 {
+		t.Fatalf("rendered fragment is missing <%s>", tag)
+	}
+	return renderedElementAt(t, body, tag, start)
+}
+
+func renderedElementsByTag(t *testing.T, body, tag string) []string {
+	t.Helper()
+	var elements []string
+	for cursor := 0; cursor < len(body); {
+		relativeStart := strings.Index(body[cursor:], "<"+tag)
+		if relativeStart < 0 {
+			break
+		}
+		start := cursor + relativeStart
+		element := renderedElementAt(t, body, tag, start)
+		elements = append(elements, element)
+		cursor = start + len(element)
+	}
+	return elements
+}
+
+func renderedElementAt(t *testing.T, body, tag string, start int) string {
+	t.Helper()
+	openMarker := "<" + tag
+	closeMarker := "</" + tag + ">"
+	depth := 0
+	for cursor := start; cursor < len(body); {
+		nextOpen := strings.Index(body[cursor:], openMarker)
+		nextClose := strings.Index(body[cursor:], closeMarker)
+		if nextClose < 0 {
+			t.Fatalf("rendered <%s> starting at byte %d is not closed", tag, start)
+		}
+		if nextOpen >= 0 && nextOpen < nextClose {
+			depth++
+			cursor += nextOpen + len(openMarker)
+			continue
+		}
+		depth--
+		cursor += nextClose + len(closeMarker)
+		if depth == 0 {
+			return body[start:cursor]
+		}
+	}
+	t.Fatalf("rendered <%s> starting at byte %d is not closed", tag, start)
+	return ""
+}
+
+func renderedViewerScenarioArticle(t *testing.T, articles []string, displayName string) string {
+	t.Helper()
+	heading := ">" + displayName + "</h3>"
+	for _, article := range articles {
+		if strings.Contains(article, heading) {
+			return article
+		}
+	}
+	t.Fatalf("mobile population is missing an article headed %q", displayName)
+	return ""
+}
+
+func assertRenderedOrder(t *testing.T, body string, fragments ...string) {
+	t.Helper()
+	position := 0
+	for _, fragment := range fragments {
+		relative := strings.Index(body[position:], fragment)
+		if relative < 0 {
+			t.Fatalf("rendered fragment is missing %q after byte %d", fragment, position)
+		}
+		position += relative + len(fragment)
 	}
 }
 
